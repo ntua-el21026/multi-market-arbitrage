@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import logging
 import math
+import time
 from collections.abc import AsyncGenerator
 from contextlib import suppress
 from dataclasses import dataclass
@@ -255,6 +256,9 @@ class PolymarketObservationService:
                 "observation duration must be finite, positive, and no greater than "
                 f"{maximum_duration} seconds"
             )
+        loop = asyncio.get_running_loop()
+        started_monotonic_ns = time.monotonic_ns()
+        deadline = loop.time() + duration_seconds
         started = UtcTimestamp.now()
         run_id = CollectorRunId.new()
         logger = self._logger.bind(collector_run_id=run_id)
@@ -308,8 +312,6 @@ class PolymarketObservationService:
         except BaseException:
             outputs.close()
             raise
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + duration_seconds
         try:
             async with PolymarketPublicClient(
                 gamma_url=self._config.polymarket.gamma_base_url,
@@ -352,6 +354,7 @@ class PolymarketObservationService:
                 journal_metrics = writer.metrics
                 analytical_summary = outputs.close()
         ended = UtcTimestamp.now()
+        actual_duration_nanoseconds = time.monotonic_ns() - started_monotonic_ns
         status = (
             ComponentHealth.HEALTHY
             if stream_result.completed and not deviations
@@ -365,8 +368,7 @@ class PolymarketObservationService:
             "bounded public observation completed",
             book_health=status.value,
             count=journal_metrics.durable,
-            duration_ms=(ended.nanoseconds_since_epoch - started.nanoseconds_since_epoch)
-            / 1_000_000,
+            duration_ms=actual_duration_nanoseconds / 1_000_000,
         )
         return ObservationSummary(
             collector_run_id=run_id,
@@ -374,9 +376,7 @@ class PolymarketObservationService:
             started_at=started,
             ended_at=ended,
             requested_duration_seconds=duration_seconds,
-            actual_duration_nanoseconds=(
-                ended.nanoseconds_since_epoch - started.nanoseconds_since_epoch
-            ),
+            actual_duration_nanoseconds=actual_duration_nanoseconds,
             selected_condition_ids=tuple(item.condition_id for item in selected),
             selected_asset_ids=selected_assets,
             journal_root=journal_root,

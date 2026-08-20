@@ -284,6 +284,49 @@ async def test_observation_closes_writer_task_on_bootstrap_exception(
 
 
 @pytest.mark.asyncio
+async def test_observation_duration_uses_monotonic_time_when_wall_clock_steps_backward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wall_times = iter(
+        (
+            UtcTimestamp(2_000_000_000),
+            UtcTimestamp(1_000_000_000),
+        )
+    )
+    monotonic_times = iter((10_000_000_000, 10_250_000_000))
+
+    class _SteppingWallClock:
+        @staticmethod
+        def now() -> UtcTimestamp:
+            return next(wall_times)
+
+    async def empty_bootstrap(
+        service: PolymarketObservationService,
+        *,
+        client: object,
+        capture: object,
+        processor: object,
+    ) -> tuple[tuple[object, ...], tuple[str, ...]]:
+        del service, client, capture, processor
+        return (), ()
+
+    monkeypatch.setattr(observe_module, "PolymarketPublicClient", _BrokenPublicClient)
+    monkeypatch.setattr(observe_module, "UtcTimestamp", _SteppingWallClock)
+    monkeypatch.setattr(observe_module.time, "monotonic_ns", lambda: next(monotonic_times))
+    monkeypatch.setattr(PolymarketObservationService, "_bootstrap", empty_bootstrap)
+    service = PolymarketObservationService(
+        load_phase1_config(Path("config/phase1.toml")),
+        workspace_root=tmp_path,
+        code_commit="fixture",
+    )
+
+    summary = await service.run(duration_seconds=1)
+
+    assert summary.ended_at < summary.started_at
+    assert summary.actual_duration_nanoseconds == 250_000_000
+
+
+@pytest.mark.asyncio
 async def test_observation_closes_writer_task_on_websocket_exception(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
