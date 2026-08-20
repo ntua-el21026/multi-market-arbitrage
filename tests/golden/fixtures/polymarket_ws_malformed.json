@@ -1,0 +1,13 @@
+{
+  "event_type": "price_change",
+  "market": "0xcondition",
+  "price_changes": [
+    {
+      "asset_id": "token-yes",
+      "price": "0.45",
+      "side": "BUY",
+      "hash": "opaque-order-hash"
+    }
+  ],
+  "timestamp": "1787198405000"
+}

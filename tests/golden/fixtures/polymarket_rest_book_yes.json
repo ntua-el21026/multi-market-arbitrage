@@ -1,0 +1,18 @@
+{
+  "market": "0xcondition",
+  "asset_id": "token-yes",
+  "timestamp": "1787198400123",
+  "hash": "opaque-rest-hash-not-a-checksum-contract",
+  "bids": [
+    {"price": "0.40", "size": "10"},
+    {"price": "0.45", "size": "4"}
+  ],
+  "asks": [
+    {"price": "0.60", "size": "8"},
+    {"price": "0.55", "size": "3"}
+  ],
+  "min_order_size": "5",
+  "tick_size": "0.01",
+  "neg_risk": false,
+  "last_trade_price": "0.46"
+}

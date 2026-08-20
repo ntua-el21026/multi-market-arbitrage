@@ -1,0 +1,25 @@
+{
+  "event_type": "price_change",
+  "market": "0xcondition",
+  "price_changes": [
+    {
+      "asset_id": "token-yes",
+      "price": "0.45",
+      "size": "7",
+      "side": "BUY",
+      "hash": "opaque-order-hash-1",
+      "best_bid": "0.45",
+      "best_ask": "0.60"
+    },
+    {
+      "asset_id": "token-yes",
+      "price": "0.55",
+      "size": "0",
+      "side": "SELL",
+      "hash": "opaque-order-hash-2",
+      "best_bid": "0.45",
+      "best_ask": "0.60"
+    }
+  ],
+  "timestamp": "1787198402000"
+}

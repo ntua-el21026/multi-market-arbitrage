@@ -1,0 +1,37 @@
+{
+  "markets": [
+    {
+      "id": 101,
+      "conditionId": "0xcondition",
+      "question": "Will the deterministic fixture resolve Yes?",
+      "slug": "deterministic-fixture",
+      "outcomes": "[\"Yes\",\"No\"]",
+      "outcomePrices": "[\"0.46\",\"0.54\"]",
+      "clobTokenIds": "[\"token-yes\",\"token-no\"]",
+      "orderPriceMinTickSize": 0.0100,
+      "orderMinSize": 5.000,
+      "feesEnabled": true,
+      "feeSchedule": {
+        "rate": 0.070,
+        "exponent": 2,
+        "takerOnly": true,
+        "rebateRate": 0.20
+      },
+      "active": true,
+      "closed": false,
+      "archived": false,
+      "acceptingOrders": true,
+      "enableOrderBook": true,
+      "restricted": false,
+      "negRisk": false,
+      "negRiskOther": false,
+      "resolutionSource": "https://example.invalid/sanitized-source",
+      "umaResolutionStatus": "proposed",
+      "automaticallyResolved": false,
+      "startDate": "2026-08-20T00:00:00Z",
+      "endDate": "2026-08-21T00:00:00Z",
+      "events": [{"id": 501}]
+    }
+  ],
+  "next_cursor": "cursor-2"
+}

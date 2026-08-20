@@ -1,0 +1,15 @@
+{
+  "event_type": "book",
+  "asset_id": "token-yes",
+  "market": "0xcondition",
+  "bids": [
+    {"price": "0.40", "size": "10"},
+    {"price": "0.45", "size": "4"}
+  ],
+  "asks": [
+    {"price": "0.60", "size": "8"},
+    {"price": "0.55", "size": "3"}
+  ],
+  "timestamp": "1787198401000",
+  "hash": "opaque-ws-book-hash"
+}

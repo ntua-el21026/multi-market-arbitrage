@@ -1,0 +1,17 @@
+{
+  "gst": null,
+  "r": {},
+  "t": [
+    {"t": "token-yes", "o": "Yes"},
+    {"t": "token-no", "o": "No"}
+  ],
+  "mos": 5,
+  "mts": 0.01,
+  "mbf": 0,
+  "tbf": 0,
+  "rfqe": true,
+  "itode": true,
+  "ibce": true,
+  "fd": {"r": 0.07, "e": 2, "to": true},
+  "oas": 30
+}

@@ -4,8 +4,8 @@ Multi-venue quantitative arbitrage, market-making, and delta-neutral trading res
 
 **Initial venues:** Polymarket, Kalshi, Kraken  
 **Architecture:** Python modular monolith  
-**Current project state:** Design Freeze v0.1 complete; implementation has not started  
-**Live trading:** Disabled / not implemented in the initial foundation
+**Current project state:** Phase 1 public-observation implementation<br>
+**Live trading:** Structurally unavailable in Phase 1
 
 ## Engineering priorities
 
@@ -32,6 +32,30 @@ An apparent arbitrage is not treated as executable until data health, settlement
 - [`docs/ADR_INDEX.md`](docs/ADR_INDEX.md) — architecture decision index
 
 Historical pass reports and adversarial reviews live under `docs/design_freeze/`. They are audit evidence, not current implementation authority.
+
+## Phase 1 development
+
+The implementation targets CPython 3.13.14 and uses a locked `uv`
+environment:
+
+```bash
+uv python install
+uv sync --frozen --all-groups
+uv run mma --help
+```
+
+The focused public/read-only commands are:
+
+```bash
+uv run mma observe polymarket --duration 30 --config config/phase1.toml
+uv run mma replay data/raw --run-id <collector-run-id> --config config/phase1.toml
+uv run mma validate-data data
+uv run mma scan-report data/analytical
+```
+
+See [`docs/PHASE_1_IMPLEMENTATION.md`](docs/PHASE_1_IMPLEMENTATION.md) for
+configuration, validation, storage, replay, official protocol evidence, and
+the explicit Phase 1 safety boundary.
 
 ## Repository policy
 

@@ -1,0 +1,45 @@
+[system]
+runtime_role = "OBSERVE"
+queue_capacity = 1024
+code_version = "phase1-v1"
+maximum_observation_duration_seconds = 86400.0
+
+[storage]
+root = "data"
+journal_directory = "data/raw"
+analytical_directory = "data/analytical"
+journal_segment_max_events = 10000
+journal_segment_max_uncompressed_bytes = 67108864
+journal_run_max_uncompressed_bytes = 4294967296
+journal_submit_timeout_seconds = 5.0
+parquet_batch_size = 1000
+
+[polymarket]
+gamma_base_url = "https://gamma-api.polymarket.com"
+clob_base_url = "https://clob.polymarket.com"
+market_websocket_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+request_timeout_seconds = 10.0
+discovery_limit = 1
+snapshot_audit_interval_seconds = 30.0
+heartbeat_interval_seconds = 10.0
+reconnect_initial_seconds = 1.0
+reconnect_max_seconds = 15.0
+max_reconnect_attempts = 8
+maximum_http_response_bytes = 8388608
+maximum_websocket_message_bytes = 1048576
+
+[scanner]
+enabled = true
+maximum_book_age_seconds = 5.0
+maximum_interleg_skew_seconds = 1.0
+minimum_edge_thresholds = ["0", "0.0025", "0.005", "0.01"]
+quantity_increment = "0.01"
+maximum_capacity_evaluations = 4096
+
+[replay]
+clock = "RECORDED_ORDER"
+reference_interpretation = "AS_KNOWN_AT_TIME"
+
+[logging]
+level = "INFO"
+json = true

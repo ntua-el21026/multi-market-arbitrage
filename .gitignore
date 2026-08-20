@@ -1,0 +1,36 @@
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.hypothesis/
+.mypy_cache/
+.pyright/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+config/local*.toml
+
+# Runtime data and logs
+data/
+logs/
+*.log
+*.jsonl.partial
+*.jsonl.zst
+*.parquet
+*.duckdb
+*.duckdb.wal
+
+# Build and editor artifacts
+build/
+dist/
+*.egg-info/
+.idea/
+.vscode/
+*.swp
+.DS_Store

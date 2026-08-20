@@ -1,0 +1,9 @@
+{
+  "event_type": "market_resolved",
+  "id": "101",
+  "market": "0xcondition",
+  "assets_ids": ["token-yes", "token-no"],
+  "winning_asset_id": "token-yes",
+  "winning_outcome": "Yes",
+  "timestamp": "1787198404000"
+}

@@ -1,0 +1,11 @@
+{
+  "event_type": "last_trade_price",
+  "asset_id": "token-yes",
+  "market": "0xcondition",
+  "price": "0.46",
+  "size": "2.5",
+  "side": "BUY",
+  "fee_rate_bps": "700",
+  "transaction_hash": "0xsanitized",
+  "timestamp": "1787198402500"
+}

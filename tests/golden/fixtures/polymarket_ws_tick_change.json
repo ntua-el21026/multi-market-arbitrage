@@ -1,0 +1,8 @@
+{
+  "event_type": "tick_size_change",
+  "asset_id": "token-yes",
+  "market": "0xcondition",
+  "old_tick_size": "0.01",
+  "new_tick_size": "0.001",
+  "timestamp": "1787198403000"
+}
