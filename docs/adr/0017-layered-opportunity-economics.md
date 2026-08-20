@@ -1,6 +1,6 @@
 # ADR-0017: Layered Opportunity Economics
 
-**Status:** Accepted  
+**Status:** Superseded by ADR-0044  
 **Design freeze:** v0.1 Pass 2
 
 ## Context

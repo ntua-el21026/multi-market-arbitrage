@@ -1,14 +1,14 @@
 # Opportunity Model
 
-## 1. Candidate vs opportunity
+## 1. Candidate vs validated opportunity
 
-A scanner first emits an `OpportunityCandidate`.
+A scanner emits `OpportunityCandidate`.
 
-It becomes a validated `Opportunity` only after required semantic, data, cost, and depth checks.
+Required validators produce a validated `Opportunity`.
 
-This avoids labelling every price discrepancy "arbitrage".
+Do not call every visible discrepancy "arbitrage".
 
-## 2. Canonical structure
+## 2. Opportunity
 
 ```text
 Opportunity
@@ -21,7 +21,7 @@ Opportunity
 ├── economic_relation_ids
 ├── legs
 ├── payoff_identity
-├── economic_layers
+├── economics
 ├── capacity_curve
 ├── validation_results
 ├── expiry
@@ -29,7 +29,7 @@ Opportunity
 └── provenance
 ```
 
-## 3. Opportunity leg
+## 3. Leg
 
 ```text
 OpportunityLeg
@@ -45,7 +45,7 @@ OpportunityLeg
 └── semantics_reference
 ```
 
-Execution style examples:
+Styles may include:
 
 ```text
 AGGRESSIVE
@@ -55,23 +55,40 @@ SETTLEMENT
 TRANSFER
 ```
 
-Future live order types are handled in Pass 3.
-
-## 4. Economic layers
-
-Each opportunity stores distinct economics:
+## 4. Canonical economic layers
 
 ```text
-theoretical
-book_executable
-simulated_by_scenario
-paper_realized
-live_realized
+THEORETICAL
+BOOK_UPPER_BOUND
+REPLAY_SIMULATED
+SHADOW_SIMULATED
+LIVE_REALIZED
 ```
 
-A missing layer stays missing; the system does not copy a theoretical number into a later layer.
+A missing layer remains missing.
 
-## 5. Opportunity lifecycle
+### THEORETICAL
+Payoff/price inconsistency before realistic execution.
+
+### BOOK_UPPER_BOUND
+Aggressive full-depth, precision/cost-aware, zero-latency analytical upper bound at the exact observation snapshot.
+
+It is **not** proof an order sent afterward will fill.
+
+Passive/maker candidates do not receive this label merely because they could post a profitable quote.
+
+### REPLAY_SIMULATED
+Historical event-driven simulated execution.
+
+### SHADOW_SIMULATED
+Live shadow-paper simulated execution with no venue mutation.
+
+### LIVE_REALIZED
+Ledger-derived actual economic result from future live fills/costs/settlement.
+
+Historical `BOOK_EXECUTABLE` and `paper_realized` terminology is superseded.
+
+## 5. Lifecycle
 
 ```text
 DISCOVERED
@@ -79,83 +96,50 @@ INPUTS_VALIDATED
 SEMANTICS_VALIDATED
 ECONOMICS_VALIDATED
 DEPTH_VALIDATED
-BOOK_EXECUTABLE
+BOOK_UPPER_BOUND_VALIDATED   # aggressive-only analytical stage
 SIMULATION_ELIGIBLE
 REPLAY_VALIDATED
-PAPER_ELIGIBLE
-PAPER_VALIDATED
+SHADOW_PAPER_ELIGIBLE
+SHADOW_PAPER_VALIDATED
 EXPIRED
 SUPERSEDED
 REJECTED_*
 ```
 
-Passive strategies can skip `BOOK_EXECUTABLE` because no current-book resting fill can be proven.
+Passive strategies can skip `BOOK_UPPER_BOUND_VALIDATED`.
 
 ## 6. Lifecycle identity
 
-Repeated scanner observations are associated with an existing lifecycle when they represent continuation of the same economic dislocation.
+Repeated observations of the same economic dislocation belong to one deterministic/versioned lifecycle.
 
-Lifecycle matching is strategy-specific but deterministic and versioned.
+Report both:
+- raw scanner observations;
+- unique opportunity lifecycles.
 
-A lifecycle records:
-- first/last observed;
-- peak/median edge;
-- capacity evolution;
-- observation count;
-- duration;
-- final reason.
+## 7. Capacity
 
-## 7. Book-executable definition
-
-`BOOK_EXECUTABLE` means:
-
-> Given the immutable detection snapshot, if all aggressive orders could act against that same observed state with zero latency and the known deterministic cost context, sufficient full depth exists for the stated size.
-
-This is deliberately an upper-bound analytical property.
-
-It does **not** mean an order sent now will fill.
-
-## 8. Passive opportunity definition
-
-A passive/maker candidate records:
-
-```text
-quote_price
-expected_locked_edge_if_filled
-queue_model_required
-inventory_impact
-rebate_assumptions
-fill_uncertainty
-```
-
-It is never called executable merely because a resting quote would be profitable if filled.
-
-## 9. Capacity curve
-
-For edge threshold \(e\):
+For required net edge threshold \(e\):
 
 \[
-C(e)=\max \{q:\ NetEdge(q)\ge e\}
+C(e)=\max\{q: NetEdge(q)\ge e\}
 \]
 
-The system may materialize several standardized thresholds but retains enough information to reconstruct the curve.
+Capacity is not linearly extrapolated.
 
-## 10. Expiry
+## 8. Expiry
 
-Every opportunity has an explicit expiry/freshness rule.
-
-Expiry may be caused by:
+Triggers may include:
 - book update;
-- reference-data update;
-- semantics update;
-- configured age threshold;
-- market close/halt;
-- capacity loss;
-- cost update.
+- reference change;
+- semantics change;
+- age threshold;
+- market halt/close;
+- depth/capacity loss;
+- cost change.
 
-## 11. Shared-liquidity conflicts
+## 9. Shared resources
 
-An opportunity may identify resources it consumes:
+Opportunity metadata may identify:
 
 ```text
 liquidity_resource_ids
@@ -163,11 +147,9 @@ capital_resource_ids
 inventory_resource_ids
 ```
 
-Aggregate simulations use these to prevent double-counting.
+Aggregate simulation cannot consume them twice.
 
-## 12. P&L decomposition
-
-Report:
+## 10. P&L decomposition
 
 \[
 NetPnL =
@@ -188,40 +170,27 @@ RealizedRebates
 FundingCashflows
 \]
 
-with every component separately persisted.
+Persist components separately.
 
-## 13. Residual inventory
+## 11. Residual inventory
 
-If all hedge legs do not complete:
+Separate:
 
 ```text
 locked_component
-+
 residual_component
 ```
 
-are tracked separately.
+Residual mark is not locked arbitrage profit.
 
-Residual mark-to-market is not locked arbitrage P&L.
+## 12. Capture ratio
 
-## 14. Capture ratio
-
-For a compatible opportunity basis:
+For a consistent size/lifecycle basis:
 
 \[
 CaptureRatio =
-\frac{PaperOrLiveRealizedPnL}
-{BookExecutableUpperBoundPnL}
+\frac{ShadowSimulatedOrLiveRealizedPnL}
+{BookUpperBoundPnL}
 \]
 
-The denominator must use the same lifecycle/size basis; otherwise the metric is invalid.
-
-## 15. Opportunity de-duplication
-
-Raw scanner event count is not used as opportunity count.
-
-Reports should expose both:
-- scanner observations;
-- unique opportunity lifecycles.
-
-This prevents persistent ten-second arbitrage from being counted as hundreds of independent opportunities.
+Do not compare mismatched sizes/lifecycles.

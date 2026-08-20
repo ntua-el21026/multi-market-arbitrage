@@ -1,70 +1,68 @@
 # Data Architecture
 
-## 1. Three logical data layers
+## 1. Layers
 
 ```text
 RAW / BRONZE
-Exact observations
+exact application observations
         ↓
 CANONICAL / SILVER
-Validated normalized events/state
+validated normalized events/state
         ↓
 RESEARCH / GOLD
-Opportunities, experiments, replay results
+opportunities, experiments, replay results
 ```
 
-Raw is immutable. Canonical is reproducible. Gold is recomputable.
+Raw is immutable.
 
-## 2. Raw event journal
+Canonical is reproducible.
 
-The raw journal is the historical research source of truth.
+Gold is recomputable.
+
+## 2. Raw journal
+
+The raw journal is historical market-data authority.
 
 Conceptual flow:
 
 ```text
-Transport
+network client
    ↓
-Timestamp + Envelope
+RawEventEnvelope
    ↓
-Bounded Journal Queue
+bounded journal queue
    ↓
-Raw Journal
+append-only segment
    ↓
-JournaledRawEvent
+durability watermark
    ↓
-Decode / Normalize / Validate
+decode/normalize/validate
 ```
 
-## 3. Recommended physical format
+## 3. Raw physical format
 
-Active:
+Initial recommendation:
 
 ```text
-*.jsonl.partial
+active: *.jsonl.partial
+sealed: *.jsonl.zst
+        *.manifest.json
 ```
 
-Sealed:
+Exact payload bytes are reversibly encoded.
+
+## 4. Durability states
 
 ```text
-*.jsonl.zst
-*.manifest.json
-```
-
-The exact received payload bytes must be preserved reversibly; parsed JSON must not be re-serialized and treated as original data.
-
-## 4. Segment lifecycle
-
-```text
-OPEN
-  ↓
-FLUSHED
-  ↓
+RECEIVED
+ENQUEUED
+APPENDED
+DURABLE
 SEALED
-  ↓
-CHECKSUMMED
+VERIFIED
 ```
 
-Sealed segments are immutable.
+These states are not interchangeable.
 
 ## 5. Segment manifest
 
@@ -73,6 +71,7 @@ At minimum:
 ```text
 journal_format_version
 writer_id
+collector_run_id
 venue
 stream
 first_ingest_seq
@@ -90,54 +89,46 @@ git_commit
 created_at
 ```
 
-A previous-segment digest is recommended for tamper-evident sequencing.
-
 ## 6. Crash recovery
 
-Startup must:
-1. discover `.partial` files;
-2. validate complete records;
-3. truncate only invalid trailing bytes if necessary;
-4. preserve every valid record;
-5. seal recovered segments;
-6. record a recovery event.
+Recover valid complete records from `.partial`, preserve them, seal a recovery segment/state, and record recovery evidence.
 
-A valid interior record must never be silently discarded.
+No valid interior record is silently discarded.
 
-## 7. Raw storage failure
+## 7. Failure behavior
 
-If raw storage is not trustworthy:
-- emit a critical health event;
-- affected downstream state loses authoritative provenance;
-- scanner/execution eligibility is disabled;
-- ingestion may pause/disconnect until safe persistence is restored.
+Raw persistence failure is a high-severity health fault.
 
-## 8. Canonical storage
+Affected new authoritative research/live-risk creation is blocked according to runtime role.
 
-Canonical and derived analytical datasets use:
+Unrelated healthy raw capture may continue when isolation is provable.
+
+## 8. Canonical/derived storage
+
+Use:
 
 ```text
-Parquet + ZSTD
+Parquet + Zstandard
 ```
 
-Initial query layer:
+Query via:
 
 ```text
 DuckDB
 ```
 
-No server database is required initially.
+## 9. Dataset names
 
-## 9. Logical datasets
-
-Reference/version datasets:
+Reference:
 
 ```text
 instrument_versions/
 market_versions/
-settlement_versions/
-fee_rule_versions/
 precision_rule_versions/
+cost_rule_set_versions/
+settlement_versions/
+contract_semantics_versions/
+funding_rule_versions/
 ```
 
 Market data:
@@ -147,153 +138,95 @@ book_snapshots/
 book_deltas/
 trades/
 funding_observations/
+index_price_observations/
+mark_price_observations/
 market_status/
 ```
 
-Quality/validation:
+Quality:
 
 ```text
 health_events/
 validation_events/
 ```
 
-Derived research:
+Research:
 
 ```text
 opportunities/
-opportunity_lifecycle/
+opportunity_lifecycles/
+experiments/
 data_quality_reports/
 replay_runs/
 ```
 
-Future:
-
-```text
-paper_orders/
-paper_fills/
-live_orders/
-live_fills/
-ledger_entries/
-```
-
 ## 10. Partitioning
 
-Default partition dimensions:
+Default dimensions:
 
 ```text
-dataset
-venue
-date
-hour where justified by volume
+dataset / venue / date [/ hour if justified]
 ```
 
-Instrument-level filesystem partitioning is not the default because it can create pathological small-file counts.
+Do not default to per-instrument file partitions.
 
-## 11. Small-file policy
+## 11. Small files
 
-Never use:
+Batch writes.
 
-```text
-one message = one file
-```
+Never use one message/update per file.
 
-or:
+Raw sealed segments are not rewritten for compaction.
 
-```text
-one instrument update = one Parquet file
-```
+## 12. Checkpoints
 
-Writers batch records. Canonical/derived datasets may be compacted; raw sealed segments are not rewritten for compaction.
+Replay checkpoints may accelerate replay but are derived/rebuildable and are not source of truth.
 
-## 12. Replay checkpoints
-
-Periodic canonical state checkpoints may accelerate replay, but they are:
-- derived;
-- replaceable;
-- rebuildable;
-- not source of truth.
-
-## 13. Provenance
-
-Every canonical or derived record identifies:
-- source ingest event(s);
-- source payload hash(es);
-- relevant reference-data version(s);
-- schema version;
-- code version;
-- configuration identity where applicable.
-
-Conceptual chain:
+## 13. Provenance chain
 
 ```text
-Opportunity
-    ↓
-Canonical State
-    ↓
-Canonical Events
-    ↓
-Raw ingest IDs
-    ↓
+Opportunity / Experiment
+        ↓
+Canonical state/event versions
+        ↓
+Raw ingest identities/hashes
+        ↓
 Raw segment + record
-    ↓
-Exact venue payload
+        ↓
+Application payload
 ```
 
-## 14. Deterministic serialization and hashing
+## 14. Hashing/schema evolution
 
-Persisted canonical objects used for hashing require:
-- deterministic field order;
-- deterministic exact-number encoding;
-- no floating-point authoritative representation;
-- explicit schema version;
-- UTF-8;
-- stable cryptographic digest such as SHA-256.
+Persisted schemas are versioned.
 
-## 15. Schema evolution
+Hash serialization is deterministic.
 
-Persisted logical schemas are versioned.
+Raw history is never rewritten to satisfy a new canonical schema.
 
-Raw observations are never rewritten to conform to new canonical schemas. Historical raw data can be re-normalized after parser, validator, or schema changes.
+## 15. Decision-evidence durability for future live use
 
-## 16. Git/data separation
+A future live order may not be sent unless the market/reference evidence underlying the approved plan is durably preservable.
 
-Git contains:
-- source;
-- schemas;
-- docs;
-- configuration templates;
-- tiny deterministic fixtures.
-
-Collected market data does not belong in repository history.
-
-## 17. Journal durability states
-
-Raw ingestion distinguishes:
+Initial live design:
 
 ```text
-RECEIVED
-ENQUEUED
-APPENDED
-DURABLE
-SEALED
-VERIFIED
+max referenced raw ingest position
+<= required raw durable watermark
 ```
 
-The implementation must not use "journaled" as an ambiguous single state.
+before the send boundary.
 
-Authoritative persisted derived records may not depend on raw provenance that was never durably retained.
+This keeps live forensic provenance consistent with the raw-history invariant.
 
-Exact durability/fsync cadence remains a measured implementation decision.
+A lower-latency alternative requires a future ADR and an equivalently durable `DecisionEvidenceCapsule`.
 
-## 18. Provisional vs authoritative research state
+## 16. Git separation
 
-Market health and persistence authority are separate dimensions.
+Git stores source/docs/schemas/config templates/small fixtures.
 
-A live state may be:
-
-```text
-market_health = HEALTHY
-persistence_authority = PROVISIONAL
-```
-
-and become authoritative when its required raw provenance crosses the configured durability/verification boundary.
+It does not store:
+- collected market data;
+- live operational DB;
+- credentials;
+- large experiment artifacts.

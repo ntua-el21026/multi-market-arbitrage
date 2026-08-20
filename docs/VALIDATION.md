@@ -124,7 +124,7 @@ The validator must distinguish:
 - unknown;
 - realized.
 
-Unknown material cost prevents `net-executable`.
+Unknown material cost prevents net-economic validation and any `BOOK_UPPER_BOUND_VALIDATED` classification.
 
 ## 10. V7 — Depth/capacity
 

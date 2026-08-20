@@ -1,91 +1,95 @@
 # Event Model
 
-## 1. Raw transport event
+## 1. Raw event boundary
 
-Every received venue message is preserved in a raw envelope before canonical transformation.
+Every venue application message is captured before semantic decoding.
 
 ```text
 RawEventEnvelope
 ├── format_version
 ├── ingest_id
+├── collector_run_id
 ├── ingest_seq
 ├── venue_id
 ├── connection_id
-├── connection_epoch
+├── subscription_id
 ├── channel
-├── subscription_key
 ├── transport_type
+├── subscription_semantics_hash
 ├── venue_sequence?
 ├── venue_timestamp?
 ├── received_wall_time_utc_ns
 ├── received_monotonic_ns
-├── transport_metadata
+├── transport_metadata_allowlist
 ├── payload_sha256
+├── payload_encoding
 └── payload_bytes
 ```
 
-`payload_bytes` are the exact received bytes. Secrets and authentication headers must never be recorded.
+`payload_bytes` means the exact application payload delivered by the selected network client before parsing. It does not claim packet/TCP/WebSocket-frame capture.
 
-## 2. Time semantics
+Secrets/auth headers are never stored.
 
-The system distinguishes:
+## 2. Ordering
+
+`ingest_seq` is monotonically increasing only within `collector_run_id`.
+
+Local replay observation identity is:
+
+```text
+(collector_run_id, ingest_seq)
+```
+
+Venue sequence semantics remain independent and authoritative when available.
+
+## 3. Time
+
+Distinct notions:
 
 ```text
 venue_timestamp
 received_wall_time_utc_ns
 received_monotonic_ns
-journal_timestamp
+journal_time
 ```
 
-Wall-clock time is UTC. Monotonic time is used for local duration measurement.
-
-## 3. Ingestion ordering
-
-The initial single-process collector assigns a monotonically increasing `ingest_seq` before downstream transformation.
-
-`ingest_seq` establishes deterministic local observation order for replay. It does **not** replace venue-native sequence semantics.
+Monotonic timestamps are compared only inside their collector/clock epoch.
 
 ## 4. Delivery semantics
 
 Assume:
 
 ```text
-at-least-once ingestion
+at-least-once observation
 +
-idempotent downstream processing
+idempotent downstream application where protocol evidence allows
 ```
 
-Expected conditions include:
-- duplicates;
-- reconnects;
-- repeated snapshots;
-- missing deltas;
-- delayed messages;
-- out-of-order data.
+Duplicates/reconnects/delays/missing data are expected.
 
-The design must not claim exactly-once network delivery.
-
-## 5. Canonical event envelope
+## 5. Canonical event
 
 ```text
 CanonicalEventEnvelope
 ├── canonical_event_id
 ├── schema_version
+├── normalizer_version
 ├── event_type
 ├── venue_id
-├── instrument_id?
 ├── market_id?
+├── instrument_id?
 ├── source_ingest_ids
 ├── source_payload_hashes
 ├── reference_version_ids
 ├── venue_timestamp?
 ├── receive_timestamp
+├── deduplication_key?
 └── canonical_payload
 ```
 
-No economically important canonical event may exist without source provenance.
+`canonical_event_id` is deterministically reproducible from source identity + versioned normalization semantics.
 
-## 6. Initial canonical event types
+## 6. Initial event families
 
 ```text
 InstrumentVersion
@@ -96,17 +100,22 @@ OrderBookSnapshot
 OrderBookDelta
 Trade
 
-FeeRuleVersion
 PrecisionRuleVersion
+CostRuleSetVersion
 SettlementDefinitionVersion
+ContractSemanticsVersion
+FundingRuleVersion
 
 FundingObservation
-DerivativeReferenceObservation
+IndexPriceObservation
+MarkPriceObservation
 
 HealthEvent
 ```
 
-## 7. Order-book state
+Venue support varies; unsupported event families are not fabricated.
+
+## 7. Order book
 
 ```text
 OrderBook
@@ -117,41 +126,32 @@ OrderBook
 ├── asks
 ├── last_source_event
 ├── reference_versions
-├── health_state
+├── book_health
 └── last_valid_update_time
 ```
 
-A `BookLevel` contains exact `price` and `quantity`.
+Book levels contain exact `Price` and `Quantity`.
 
-Zero/negative quantity must not remain in canonical L2 state.
-
-## 8. Order-book health state machine
+## 8. Book health
 
 ```text
 UNINITIALIZED
-      │
-      ▼
+      ↓
 SYNCING
-      │
-      ▼
+      ↓
 HEALTHY
-      │
-      ├────► STALE
-      │
-      └────► INVALID
-                │
-                ▼
-            RESYNCING
-                │
-                ▼
-             SYNCING
+  ├──► STALE
+  └──► INVALID
+          ↓
+      RESYNCING
+          ↓
+       SYNCING
 ```
 
-Lifecycle states may also include:
+Lifecycle may also become:
 
 ```text
 CLOSED
-SETTLED
 UNAVAILABLE
 ```
 
@@ -173,91 +173,34 @@ IMPOSSIBLE_STATE
 PROTOCOL_VIOLATION
 ```
 
-## 10. Scanner eligibility
+## 10. Sequence/checksum capability
 
-A scanner may consume only state that is `HEALTHY` and has all required reference data.
+If a venue exposes sequence numbers/checksums, validate them.
 
-\[
-BookHealth \neq HEALTHY \Rightarrow No\ executable\ opportunity
-\]
+If it does not, the adapter must not invent them.
 
-## 11. Sequence gaps
+Protocol-specific resynchronization/audit rules are declared by the adapter.
 
-```text
-gap detected
-     ↓
-book INVALID
-     ↓
-scanner disabled
-     ↓
-resynchronization requested
-     ↓
-fresh snapshot
-     ↓
-continuity validation
-     ↓
-HEALTHY
-```
+## 11. Backpressure
 
-Missing deltas must never be heuristically invented.
+All event queues are bounded.
 
-## 12. Checksums
+If a required sequence-sensitive event would be lost, invalidate affected state and resynchronize.
 
-Where supported:
+## 12. Scanner eligibility
 
-```text
-checksum mismatch
-      ↓
-INVALID
-      ↓
-resynchronize
-```
+Scanner input requires strategy-declared healthy/fresh canonical state and all required versioned reference data.
 
-Checksums are correctness signals, not optional diagnostics.
+## 13. Joint multi-leg input
 
-## 13. Backpressure
+Multi-leg opportunity evaluation uses one immutable `OpportunityInputSnapshot` containing exact state/reference/semantic versions and timing/skew evidence.
 
-All internal queues are bounded.
+## 14. Subscription provenance
 
-If required sequence-sensitive messages cannot be processed without loss:
+Subscription parameters that alter payload interpretation are part of provenance.
 
-```text
-capacity exceeded
-      ↓
-affected state INVALID
-      ↓
-no strategy consumption
-      ↓
-resynchronize
-```
+## 15. Persistence authority
 
-Silent loss is prohibited.
+A healthy live state can initially be `PROVISIONAL`.
 
-## 14. Staleness
-
-Strategies explicitly declare maximum acceptable age for required state. Unknown freshness is treated as stale.
-
-## 15. Collector run and clock scope
-
-Add:
-
-```text
-collector_run_id
-clock_epoch_id
-```
-
-`ingest_seq` is monotonic within `collector_run_id`.
-
-Monotonic timestamps are comparable only inside the same clock epoch.
-
-## 16. Raw payload boundary
-
-`payload_bytes` is the exact application message payload delivered by the selected network client to the collector boundary before parsing. Packet/frame capture is not required.
-
-## 17. Subscription-semantic provenance
-
-Subscription parameters that alter message interpretation are provenance-bearing inputs and must be captured.
-
-## 18. Joint opportunity state
-
-Multi-leg scanners consume an immutable `OpportunityInputSnapshot` that records exact state versions, reference versions, timing/freshness constraints, semantic assertions, and inter-leg skew.
+It becomes `AUTHORITATIVE` for persisted research only when the required raw provenance crosses the configured durability boundary.

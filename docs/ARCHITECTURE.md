@@ -2,18 +2,23 @@
 
 ## 1. Style
 
-The initial platform is a **Python modular monolith**.
+The initial platform is a **Python modular monolith** with explicit internal module APIs.
 
-Logical modules:
+Conceptual package areas:
 
 ```text
 core/
+  exact/
+  ids/
+  time/
+  config/
+  provenance/
+  validation/
+
 ingestion/
 journal/
-venues/
 reference/
 normalization/
-validation/
 state/
 semantic/
 scanners/
@@ -21,45 +26,58 @@ storage/
 replay/
 research/
 observability/
+venues/
 ```
 
-Future modules:
+Future gated modules:
 
 ```text
 paper/
 execution/
 risk/
 accounting/
+reconciliation/
 portfolio/
 ```
-
-Future modules are architectural placeholders only; live execution is not implemented during the foundation phase.
 
 ## 2. Dependency direction
 
 ```text
-Venue-native API
-      │
-      ▼
-Venue Adapter
-      │
-      ▼
-Canonical Domain
-      │
-      ▼
-Strategies / Research
+native venue protocol
+      ↓
+venue adapter
+      ↓
+canonical domain
+      ↓
+validation/state/reference
+      ↓
+strategy/research
 ```
 
-Core/domain code must not import venue-native schemas or SDK objects. Strategy code must not branch on venue names to interpret native payloads.
+Future execution direction:
+
+```text
+strategy proposal
+      ↓
+execution plan
+      ↓
+risk
+      ↓
+execution adapter
+```
+
+Core/domain code must not import venue-native DTOs/SDK types.
+
+Strategy/scanner code must not branch on native payload shapes.
 
 ## 3. Provider interfaces
 
-Venue modules expose capabilities through interfaces such as:
+Canonical provider capabilities include:
 
 ```text
 MarketDataProvider
 ReferenceDataProvider
-FeeProvider
+CostRuleProvider
 SettlementProvider
 HealthProvider
 ```
@@ -67,74 +85,85 @@ HealthProvider
 Future:
 
 ```text
-ExecutionProvider
-AccountProvider
+ExecutionAdapter
+AccountStateProvider
 PositionProvider
+ReconciliationProvider
 ```
+
+`FeeProvider` is retired terminology; costs are broader than fees.
 
 ## 4. Capability model
 
-Not all venues provide the same guarantees. Capabilities must be explicit:
+Capabilities are explicit rather than inferred from venue name.
+
+Examples:
 
 ```text
 supports_sequence_numbers
-supports_checksums
+supports_book_checksum
 supports_l2
 supports_l3
-supports_native_market_status
 supports_dynamic_tick_size
 supports_funding
-supports_demo_execution
+supports_client_order_id
+supports_private_order_stream
+supports_cancel_all
+supports_server_deadman
 ```
 
-Generic code tests declared capabilities rather than assuming uniform protocol behavior.
+Capability values and protocol behavior are versioned/current external reference data where changeable.
 
-## 5. Failure isolation
+## 5. Concurrency
 
-Failures in derived layers should not unnecessarily destroy healthy raw capture.
+See `CONCURRENCY_AND_OWNERSHIP.md`.
 
-Example:
+Key rule:
 
 ```text
-Canonical Parquet writer fails
-        │
-        ├── raw journal remains healthy
-        ├── raw capture may continue
-        ├── derived persistence is degraded
-        └── authoritative downstream research outputs are disabled
+single mutable-state owner
++
+bounded queues
++
+immutable consumer snapshots
 ```
 
-Fail-closed applies to economic decisions when prerequisites are invalid; it does not mean independent healthy collection must always terminate.
+## 6. Failure isolation
 
-## 6. Initial technology decisions
+A failure in derived research persistence should not unnecessarily stop healthy raw capture.
+
+A failure that invalidates a prerequisite for economic decisions removes decision eligibility for the affected scope.
+
+## 7. Technology baseline
+
+Initial:
 
 | Area | Decision |
 |---|---|
 | Language | Python |
-| Dependency/environment | `uv` |
-| Concurrency | `asyncio`/async I/O where appropriate |
-| Types | strict static type checking |
+| Environment/dependencies | `uv` |
+| Async | `asyncio` where appropriate |
+| Type checking | strict Pyright |
 | Lint/format | Ruff |
-| Unit/integration tests | pytest |
-| Property tests | Hypothesis |
-| Raw journal | segmented append-only journal |
+| Tests | pytest + Hypothesis |
+| Raw journal | segmented append-only |
 | Compression | Zstandard |
-| Canonical storage | Parquet |
-| Query/analysis | DuckDB |
+| Analytical storage | Parquet |
+| Query | DuckDB |
 | CI | GitHub Actions |
 
-## 7. Rejected premature complexity
+Future live control state may add embedded SQLite only at the execution-engineering gate.
 
-Do not initially introduce:
+## 8. Rejected premature complexity
 
-- Kafka or Redpanda;
+No initial:
+- Kafka/Redpanda;
 - Redis;
-- PostgreSQL or TimescaleDB;
+- PostgreSQL/Timescale server;
 - ClickHouse;
 - Kubernetes;
 - microservices;
-- multiple implementation languages;
-- distributed consensus;
+- multi-language services;
 - ML trading decisions.
 
-Any later introduction requires a measured requirement and an ADR.
+Any introduction requires measured evidence and ADR.

@@ -2,13 +2,11 @@
 
 ## 1. Purpose
 
-Venue-native naming and payload shapes must not leak into strategy logic. The canonical domain model provides typed, versioned, venue-independent semantics.
+The canonical domain model isolates strategy/research code from venue-native schemas and expresses economic meaning with exact, typed values.
 
-## 2. Exact scalar representation
+## 2. Exact scalar
 
-Authoritative financial quantities use exact decimal/fixed-point semantics.
-
-Conceptual form:
+Conceptual:
 
 ```text
 ExactDecimal
@@ -20,36 +18,11 @@ ExactDecimal
 x = coefficient \times 10^{-scale}
 \]
 
-Examples:
+Equivalent values normalize deterministically where required.
 
-\[
-0.4725 = 4725 \times 10^{-4}
-\]
+Authoritative binary float is prohibited.
 
-\[
-12.25 = 1225 \times 10^{-2}
-\]
-
-Equivalent values should normalize deterministically where appropriate.
-
-## 3. No authoritative binary float
-
-Binary `float` is prohibited for:
-
-- order prices;
-- executed prices;
-- authoritative quantities;
-- balances;
-- fees;
-- funding;
-- realized P&L;
-- settlement proceeds;
-- opportunity profitability;
-- financial risk limits.
-
-Float is allowed only in non-authoritative analytics, statistics, charting, or explicitly approximate transformations.
-
-## 4. Distinct domain types
+## 3. Distinct value types
 
 At minimum:
 
@@ -64,13 +37,11 @@ Percentage
 BasisPoints
 ```
 
-These are not interchangeable raw numbers.
+Cross-asset arithmetic requires explicit conversion.
 
-Cross-asset arithmetic is prohibited without an explicit conversion.
+## 4. Precision rules
 
-## 5. Precision and increments
-
-Runtime reference rules define:
+Versioned reference rules:
 
 ```text
 PriceIncrement
@@ -80,16 +51,13 @@ MinimumNotional
 PriceBounds
 ```
 
-No silent rounding is permitted. Quantization requires:
-- target increment;
-- explicit rounding policy;
-- applicable reference-data version.
+No silent quantization.
 
-## 6. Identity model
+Rounding policy is explicit.
 
-Human-readable titles are metadata, not identity.
+## 5. Stable identity
 
-Canonical IDs include:
+Current canonical IDs:
 
 ```text
 VenueId
@@ -99,35 +67,35 @@ OutcomeId
 AssetId
 ```
 
-`InstrumentId` is conceptually derived from durable venue identity plus explicit contract/version semantics.
+Stable identity is separate from metadata/reference version.
+
+See `IDENTITY_AND_VERSIONING.md`.
+
+## 6. Versions
+
+Examples:
+
+```text
+MarketVersion
+InstrumentVersion
+PrecisionRuleVersion
+CostRuleSetVersion
+SettlementDefinitionVersion
+ContractSemanticsVersion
+FundingRuleVersion
+```
 
 ## 7. Market vs instrument
 
-A **Market** is a venue-defined economic/listing group.
+**Market**: venue-defined economic/listing grouping.
 
-An **Instrument** is a directly tradable object with an order book or execution surface.
+**Instrument**: directly tradable object/execution surface.
 
-Prediction example:
+Prediction market may contain multiple outcome instruments.
 
-```text
-Market
-├── YES instrument
-└── NO instrument
-```
+## 8. Instrument
 
-Multi-outcome example:
-
-```text
-Market
-├── outcome A instrument
-├── outcome B instrument
-├── outcome C instrument
-└── ...
-```
-
-## 8. Canonical `Instrument`
-
-An instrument contains or references:
+Conceptually:
 
 ```text
 Instrument
@@ -136,13 +104,11 @@ Instrument
 ├── native_id
 ├── instrument_kind
 ├── market_id
-├── base_or_contract_unit
-├── quote_or_collateral_asset
-├── precision_spec_version
-├── trading_status
-├── creation/observation metadata
-└── provenance
+├── economic_specification
+└── current_version_ref
 ```
+
+Versioned metadata is held in `InstrumentVersion`, not embedded into stable identity.
 
 Initial kinds:
 
@@ -154,41 +120,48 @@ BINARY_OUTCOME
 MULTI_OUTCOME
 ```
 
-## 9. Prediction-market semantics
+## 9. Asset identity
 
-Prediction instruments require:
+Where economically material, `AssetId` distinguishes:
+- economic asset;
+- chain/network;
+- token contract;
+- venue custody/collateral representation.
+
+Display symbol alone never establishes fungibility.
+
+## 10. Derivative specification
+
+```text
+DerivativeSpecification
+├── underlying_asset
+├── quote_asset
+├── collateral_asset
+├── settlement_asset
+├── contract_multiplier
+├── linear_or_inverse
+├── expiry?
+├── funding_rule_ref?
+├── index_spec_ref?
+└── precision_refs
+```
+
+## 11. Prediction-market semantics
 
 ```text
 Outcome
 PayoffSpecification
-SettlementDefinition
 SettlementPredicate
+SettlementDefinition
 ContractSemantics
+OutcomePartition
 ```
 
-Price similarity does not establish economic equivalence.
+A UI event grouping is not proof of a complete payoff partition.
 
-## 10. Canonical market status
+## 12. Economic relations
 
-At minimum:
-
-```text
-UNKNOWN
-PREOPEN
-OPEN
-HALTED
-CLOSED
-SETTLED
-CANCELLED
-```
-
-`UNKNOWN` is never equivalent to `OPEN`.
-
-## 11. Economic relations
-
-Cross-contract semantics use an explicit `EconomicRelation` rather than an equivalence-only model.
-
-Initial relation kinds:
+Relation type:
 
 ```text
 EQUIVALENT
@@ -199,20 +172,48 @@ EXHAUSTIVE_PARTITION_MEMBER
 UNKNOWN
 ```
 
-Proof/classification state is stored separately.
+Proof status:
 
-## 12. Outcome partitions
+```text
+PROVEN
+POTENTIAL
+AMBIGUOUS
+REJECTED
+UNPARSEABLE
+```
 
-Multi-outcome structural claims require an `OutcomePartition` proving mutual exclusivity, exhaustiveness, payout behavior, and cancellation behavior.
+These are orthogonal.
 
-## 13. Asset identity
+## 13. Cost model
 
-Where economically material, `AssetId` distinguishes network, token contract, custody/venue context, and version. Display symbols alone never establish fungibility.
+Use:
 
-## 14. Derivative specification
+```text
+CostRuleSet
+CostContext
+CostVector
+```
 
-Derivatives explicitly model underlying, quote, collateral, settlement asset, contract multiplier, linear/inverse payoff form, expiry, funding specification, index specification, and precision/reference versions.
+not a venue-global fee scalar.
 
-## 15. Cost context
+## 14. Market status
 
-Applicable fees/rebates are derived from a `CostRuleSet` evaluated under an explicit `CostContext`, not from an assumed venue-global scalar fee.
+Canonical:
+
+```text
+UNKNOWN
+PREOPEN
+OPEN
+HALTED
+CLOSED
+SETTLED
+CANCELED
+```
+
+`UNKNOWN` is never treated as `OPEN`.
+
+## 15. Health types
+
+Health is scoped.
+
+Use `BookHealth`, `ComponentHealth`, and `PersistenceAuthority` as separate types rather than one overloaded enum.

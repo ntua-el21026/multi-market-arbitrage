@@ -1,6 +1,6 @@
 # ADR-0013: Proven Semantic Equivalence
 
-**Status:** Accepted  
+**Status:** Superseded by ADR-0015 and ADR-0045  
 **Design freeze:** v0.1 Pass 1
 
 ## Context
