@@ -42,6 +42,8 @@ Directional prediction is not an initial objective.
 >
 \text{Reliability}
 >
+\text{Risk control / recoverability}
+>
 \text{Performance}
 >
 \text{Feature breadth}

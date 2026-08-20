@@ -12,8 +12,8 @@ Multi-venue quantitative arbitrage, market-making, and delta-neutral trading res
 1. Correctness and data integrity
 2. Realistic execution modelling
 3. Reproducibility and provenance
-4. Risk control and recoverability
-5. Maintainability
+4. Reliability
+5. Risk control and recoverability
 6. Performance
 7. Feature breadth
 
@@ -21,15 +21,17 @@ An apparent arbitrage is not treated as executable until data health, settlement
 
 ## Start here
 
+- [`docs/DESIGN_INDEX.md`](docs/DESIGN_INDEX.md) — read first; documentation map and implementation read order
+- [`docs/DOCUMENT_GOVERNANCE.md`](docs/DOCUMENT_GOVERNANCE.md) — document authority and conflict rules
 - [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) — product/system contract
 - [`docs/SYSTEM_DESIGN.md`](docs/SYSTEM_DESIGN.md) — canonical architecture
-- [`docs/DESIGN_INDEX.md`](docs/DESIGN_INDEX.md) — documentation map and precedence
 - [`docs/INVARIANTS.md`](docs/INVARIANTS.md) — hard system invariants
+- [`docs/GLOSSARY.md`](docs/GLOSSARY.md) — canonical terminology
 - [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) — staged engineering plan
 - [`docs/CODEX_PHASE_1_SPEC.md`](docs/CODEX_PHASE_1_SPEC.md) — first implementation scope
 - [`docs/ADR_INDEX.md`](docs/ADR_INDEX.md) — architecture decision index
 
-Historical pass reports and adversarial reviews live under `docs/design_freeze/`.
+Historical pass reports and adversarial reviews live under `docs/design_freeze/`. They are audit evidence, not current implementation authority.
 
 ## Repository policy
 

@@ -21,25 +21,35 @@ without live trading capability.
 
 ## 2. Repository authority
 
-Before coding, Codex must read:
+Before coding, Codex must read the current repository documentation in this order:
 
-1. `PROJECT_SPEC.md`
-2. `SYSTEM_DESIGN.md`
-3. `INVARIANTS.md`
-4. `DESIGN_INDEX.md`
-5. `IMPLEMENTATION_PLAN.md`
-6. `ARCHITECTURE.md`
-7. `DOMAIN_MODEL.md`
-8. `IDENTITY_AND_VERSIONING.md`
-9. `EVENT_MODEL.md`
-10. `DATA_ARCHITECTURE.md`
-11. `CONCURRENCY_AND_OWNERSHIP.md`
-12. `ERROR_MODEL.md`
-13. `VALIDATION.md`
-14. `STRATEGY_CONTRACTS.md`
-15. relevant ADRs
+1. `DESIGN_INDEX.md`
+2. `DOCUMENT_GOVERNANCE.md`
+3. `PROJECT_SPEC.md`
+4. `SYSTEM_DESIGN.md`
+5. `INVARIANTS.md`
+6. `GLOSSARY.md`
+7. `IMPLEMENTATION_PLAN.md`
+8. `ARCHITECTURE.md`
+9. `DOMAIN_MODEL.md`
+10. `IDENTITY_AND_VERSIONING.md`
+11. `EVENT_MODEL.md`
+12. `DATA_ARCHITECTURE.md`
+13. `CONCURRENCY_AND_OWNERSHIP.md`
+14. `ERROR_MODEL.md`
+15. `VALIDATION.md`
+16. `STRATEGY_CONTRACTS.md`
+17. `OPPORTUNITY_MODEL.md`
+18. `FEE_AND_COST_MODEL.md`
+19. `REPLAY_AND_SIMULATION.md`
+20. `TESTING_STRATEGY.md`
+21. `ADR_INDEX.md` and the relevant accepted, non-superseded ADRs
 
-If documents conflict, stop and report the conflict. Do not invent a new architecture.
+This file, `CODEX_PHASE_1_SPEC.md`, is the normative scope contract for this implementation task and must be followed together with the documents above.
+
+Files under `docs/design_freeze/` are historical/audit evidence only. Read them only when decision history is needed; do not treat superseded historical terminology as implementation authority.
+
+If current normative documents conflict, stop and report the conflict. Do not invent a new architecture or silently resolve the contradiction by precedence.
 
 ## 3. Python/toolchain baseline
 
