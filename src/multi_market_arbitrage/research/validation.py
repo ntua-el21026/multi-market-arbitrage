@@ -12,6 +12,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from multi_market_arbitrage.core.ids import CollectorRunId, VenueId
+from multi_market_arbitrage.core.limits import MAX_ARTIFACT_PATHS_PER_ROOT
 from multi_market_arbitrage.ingestion import RawEventEnvelope
 from multi_market_arbitrage.journal import (
     ABSOLUTE_MAX_UNCOMPRESSED_SEGMENT_BYTES,
@@ -53,7 +54,7 @@ _PARTIAL_NAME = re.compile(
     r"^run-(?P<run_key>[0-9a-f]{16})\.(?P<stream>[A-Za-z0-9_.-]+)\."
     r"(?P<first_sequence>[0-9]{20})\.jsonl\.partial$"
 )
-_MAX_VALIDATION_ARTIFACT_PATHS = 65_536
+_MAX_VALIDATION_ARTIFACT_PATHS = MAX_ARTIFACT_PATHS_PER_ROOT
 type _JournalScope = tuple[Path, CollectorRunId, str]
 type _DatasetScope = tuple[Path, str, VenueId, str]
 

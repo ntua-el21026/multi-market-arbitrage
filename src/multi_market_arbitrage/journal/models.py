@@ -141,6 +141,8 @@ class JournalMetricsSnapshot:
     group_delay_flushes: int = 0
     group_rotation_splits: int = 0
     group_shutdown_flushes: int = 0
+    run_uncompressed_bytes: int = 0
+    durability_watermark_sequence: int | None = None
 
 
 @dataclass(slots=True)
@@ -164,7 +166,13 @@ class JournalMetrics:
     group_rotation_splits: int = 0
     group_shutdown_flushes: int = 0
 
-    def snapshot(self, *, queue_depth: int) -> JournalMetricsSnapshot:
+    def snapshot(
+        self,
+        *,
+        queue_depth: int,
+        run_uncompressed_bytes: int = 0,
+        durability_watermark_sequence: int | None = None,
+    ) -> JournalMetricsSnapshot:
         return JournalMetricsSnapshot(
             received=self.received,
             enqueued=self.enqueued,
@@ -185,6 +193,8 @@ class JournalMetrics:
             group_delay_flushes=self.group_delay_flushes,
             group_rotation_splits=self.group_rotation_splits,
             group_shutdown_flushes=self.group_shutdown_flushes,
+            run_uncompressed_bytes=run_uncompressed_bytes,
+            durability_watermark_sequence=durability_watermark_sequence,
         )
 
 

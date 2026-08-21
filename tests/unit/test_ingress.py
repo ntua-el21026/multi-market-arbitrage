@@ -6,6 +6,7 @@ from types import TracebackType
 
 import pytest
 
+from multi_market_arbitrage.core.ids import ConnectionId
 from multi_market_arbitrage.core.time import UtcTimestamp
 from multi_market_arbitrage.pipeline.ingress import (
     BoundedRawIngress,
@@ -67,7 +68,12 @@ async def test_socket_owner_stamps_and_admits_before_downstream_consumes(
         "multi_market_arbitrage.venues.polymarket.client.websockets.connect",
         fake_connect,
     )
-    ingress = BoundedRawIngress(max_items=4, max_bytes=1024)
+    connection_id = ConnectionId("ingress-watermark-test")
+    ingress = BoundedRawIngress(
+        max_items=4,
+        max_bytes=1024,
+        connection_id=connection_id,
+    )
     stream = PolymarketMarketWebSocket(["yes", "no"])
     ready = asyncio.Event()
     producer = asyncio.create_task(
@@ -90,7 +96,16 @@ async def test_socket_owner_stamps_and_admits_before_downstream_consumes(
     assert second.message.received_monotonic_ns < downstream_started_ns
     assert first.message.payload_bytes == b"first"
     assert second.message.payload_bytes == b"second"
+    assert first.watermark.connection_id == connection_id
+    assert first.watermark.ordinal == 1
+    assert second.watermark.ordinal == 2
+    assert ingress.snapshot_watermark().ordinal == 2
     assert ingress.metrics.received == ingress.metrics.admitted == 2
+    assert ingress.metrics.received_bytes == ingress.metrics.admitted_bytes == 11
+    assert ingress.metrics.connection_id == connection_id
+    assert ingress.metrics.last_frame_received_monotonic_ns == (
+        second.message.received_monotonic_ns
+    )
 
 
 def test_ingress_overflow_is_explicit_and_does_not_mutate_admitted_prefix() -> None:
@@ -114,7 +129,11 @@ def test_ingress_overflow_is_explicit_and_does_not_mutate_admitted_prefix() -> N
     assert ingress.metrics.received == 2
     assert ingress.metrics.admitted == 1
     assert ingress.metrics.overflows == 1
+    assert ingress.metrics.received_bytes == 6
+    assert ingress.metrics.admitted_bytes == 5
     assert ingress.metrics.queued_bytes == 5
     assert ingress.get_nowait().message == first
     assert ingress.metrics.queue_depth == 0
     assert ingress.metrics.queued_bytes == 0
+    with pytest.raises(RawIngressBackpressureError, match="continuity is ambiguous"):
+        ingress.snapshot_watermark()

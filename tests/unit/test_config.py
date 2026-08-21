@@ -5,6 +5,7 @@ from typing import cast
 import pytest
 from pydantic import ValidationError
 
+from multi_market_arbitrage.cli import main as cli_main
 from multi_market_arbitrage.core.config import Phase1Config, Phase1RuntimeRole, load_config
 from multi_market_arbitrage.core.errors import ConfigurationFault
 from multi_market_arbitrage.core.exact import ExactDecimal
@@ -27,6 +28,10 @@ def test_committed_phase1_configuration_loads_strictly() -> None:
     assert config.logging.json_output is True
     assert config.polymarket.maximum_http_response_bytes == 8 * 1024 * 1024
     assert config.polymarket.maximum_websocket_message_bytes == 1024 * 1024
+    assert config.polymarket.snapshot_audit_max_race_retries == 2
+    assert config.polymarket.public_reads.maximum_attempts == 3
+    assert config.polymarket.public_reads.gamma_markets_requests_per_window == 30
+    assert config.polymarket.public_reads.rate_limit_checked_on.isoformat() == "2026-08-21"
     assert config.scanner.maximum_capacity_evaluations == 4096
     assert config.storage.journal_segment_max_uncompressed_bytes == 64 * 1024 * 1024
     assert config.storage.journal_run_max_uncompressed_bytes == 4 * 1024 * 1024 * 1024
@@ -104,6 +109,13 @@ def test_threshold_and_timing_cross_field_validation() -> None:
 
     raw = _raw_config()
     polymarket = _section(raw, "polymarket")
+    polymarket["snapshot_audit_max_race_retries"] = -1
+    raw["polymarket"] = polymarket
+    with pytest.raises(ValidationError):
+        Phase1Config.from_mapping(raw)
+
+    raw = _raw_config()
+    polymarket = _section(raw, "polymarket")
     polymarket["reconnect_initial_seconds"] = 20.0
     raw["polymarket"] = polymarket
     with pytest.raises(ValidationError):
@@ -113,14 +125,39 @@ def test_threshold_and_timing_cross_field_validation() -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     [
+        ("request_timeout_seconds", 60.1),
         ("maximum_http_response_bytes", 8 * 1024 * 1024 + 1),
         ("maximum_websocket_message_bytes", 1024 * 1024 + 1),
     ],
 )
-def test_public_payload_limits_are_hard_bounded(field: str, value: int) -> None:
+def test_public_payload_limits_are_hard_bounded(field: str, value: int | float) -> None:
     raw = _raw_config()
     polymarket = _section(raw, "polymarket")
     polymarket[field] = value
+    raw["polymarket"] = polymarket
+    with pytest.raises(ValidationError):
+        Phase1Config.from_mapping(raw)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("maximum_concurrency", 65),
+        ("maximum_attempts", 9),
+        ("initial_backoff_seconds", 3.0),
+        ("jitter_fraction", 1.1),
+        ("maximum_retry_after_seconds", 61.0),
+        ("rate_limit_window_seconds", 61.0),
+        ("clob_books_requests_per_window", 10_001),
+        ("rate_limit_source_url", "http://docs.example.invalid/rate-limits"),
+    ],
+)
+def test_public_read_policy_is_strict_and_hard_bounded(field: str, value: object) -> None:
+    raw = _raw_config()
+    polymarket = _section(raw, "polymarket")
+    public_reads = dict(cast(dict[str, object], polymarket["public_reads"]))
+    public_reads[field] = value
+    polymarket["public_reads"] = public_reads
     raw["polymarket"] = polymarket
     with pytest.raises(ValidationError):
         Phase1Config.from_mapping(raw)
@@ -160,3 +197,39 @@ def test_missing_or_invalid_toml_is_typed_configuration_fault(tmp_path: Path) ->
     invalid.write_text("[broken\n", encoding="utf-8")
     with pytest.raises(ConfigurationFault):
         load_config(invalid)
+
+
+def test_invalid_secret_like_config_input_is_not_exposed_by_fault_or_cli(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = "TOPSECRET-CONFIG-CANARY"  # noqa: S105 - rejected redaction canary
+    invalid = tmp_path / "secret-bearing-invalid.toml"
+    invalid.write_text(
+        _CONFIG_PATH.read_text(encoding="utf-8").replace(
+            'gamma_base_url = "https://gamma-api.polymarket.com"',
+            f'gamma_base_url = "https://user:{secret}@gamma-api.polymarket.com"',
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigurationFault) as captured:
+        load_config(invalid)
+    assert secret not in str(captured.value)
+    assert captured.value.__cause__ is not None
+    assert secret not in str(captured.value.__cause__)
+
+    exit_code = cli_main(
+        [
+            "observe",
+            "polymarket",
+            "--duration",
+            "1",
+            "--config",
+            str(invalid),
+        ]
+    )
+    stderr = capsys.readouterr().err
+    assert exit_code == 3
+    assert "configuration/data error" in stderr
+    assert secret not in stderr

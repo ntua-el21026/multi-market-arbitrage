@@ -100,11 +100,20 @@ all explicitly bounded. The committed raw limits are 8 MiB per HTTP response,
 1 MiB per WebSocket message, 64 MiB uncompressed per journal segment, and 4 GiB
 uncompressed per observation run.
 
+`[polymarket.public_reads]` defines the public-only concurrency, attempt,
+absolute-deadline, exponential-backoff, deterministic-jitter, `Retry-After`, and
+per-endpoint sliding-window policy. Its source URL and `rate_limit_checked_on`
+date make the external venue evidence reviewable rather than an architectural
+constant. `[health]` independently bounds checkpoint cadence, queue capacity,
+checkpoint count, file size, and minimum free-disk headroom. The committed
+checkpoint cadence is five seconds.
+
 ## CLI
 
 ```bash
 uv run --frozen --all-groups mma --help
-uv run --frozen --all-groups mma observe polymarket --config config/phase1.toml --duration 30
+uv run --frozen --all-groups mma observe polymarket --gamma-market-id <id> --duration 30 --config config/phase1.toml
+uv run --frozen --all-groups mma calibrate polymarket --gamma-market-id <id> --duration 180 --output data/calibration/<fresh-run> --config config/phase1.toml
 uv run --frozen --all-groups mma replay data/raw --run-id <collector-run-id> --config config/phase1.toml
 uv run --frozen --all-groups mma replay data/raw --run-id <collector-run-id> --include-partial --config config/phase1.toml
 uv run --frozen --all-groups mma rebuild-analytical data/raw --output data/rebuilt/<collector-run-id> --run-id <collector-run-id> --config config/phase1.toml
@@ -116,6 +125,43 @@ The observation duration is bounded by the operator. A short run is a smoke
 test, not a soak test. Normal replay requires a clean completion head;
 `--include-partial` is the explicit recovery path for an interrupted,
 integrity-checked contiguous prefix.
+
+Gate-1 observation and calibration require an explicit Gamma market ID. The
+service fetches that market directly and fails closed unless it is active,
+open, unarchived, accepting orders, order-book enabled, non-negative-risk, and
+an ordinary ordered YES/NO binary whose token/reference mapping has a proven
+complement semantic relation. It records the requested and resolved Gamma IDs,
+condition/event IDs, YES/NO token IDs, reference versions, semantic version,
+and selection rationale. It never falls back to another market. Omitting
+`--gamma-market-id` keeps the bounded listing-order discovery path for
+developer smoke tests only; its evidence is marked `DEVELOPER_DISCOVERY` and is
+not Gate-1 eligible.
+
+The recommended calibration duration is 180–300 seconds against the exact
+explicit target and a fresh output directory. It fails before acquisition
+unless the claimed Git SHA is the checked-out `HEAD` and the worktree is clean.
+Calibration is a bounded projection workflow, not a Gate-1 result. It binds
+code, config, lock, runtime, host, filesystem, and target identities; measures
+message, raw, canonical, and scan rates, queue high-water marks, journal
+groups/fsyncs, audit outcomes, latency, CPU, RSS, and artifact growth; and
+projects 21,600 seconds with ceiling integer arithmetic and 2.0x workload
+headroom. The journal latency distribution is explicitly commit-start to
+durable-receipt time: it includes subgroup selection/serialization, possible
+segment creation and directory sync, append/flush, and the data `fsync`; it is
+not mislabeled as syscall-only `fsync` latency. Disk accounting includes raw,
+analytical, health, logs, temporary
+sealing, replay/rebuild, reserve, and an additional safety factor. Threatening
+the fixed 4 GiB raw cap, disk reserve, path ceiling, queue bounds, configured
+health-checkpoint count, or configured health-evidence file size fails
+calibration; the tool does not enlarge a limit. The `phase1-pre-soak-calibration-v2`
+report binds the configured checkpoint cadence/count/file bounds and includes
+the mandatory final checkpoint in its count projection. Phase 1 does not create
+an application-managed log file: logging is stdout/stderr only, so calibration
+binds `log_storage_model=STDIO_STREAM_ONLY_UNMANAGED` and `log_bytes=0`. An operator
+who redirects process output to a file must budget and record that external file
+separately. A fresh successful publication contains
+`calibration.json`, `calibration.md`, and `calibration.bindings.json`, with
+SHA-256 bindings between the report, code, config, and target.
 
 ## Corrected receive and ingress boundary
 
@@ -201,21 +247,77 @@ the next integrity deadline as the minimum of:
 - the earliest actual receive-time freshness expiry among required healthy
   books.
 
-An audit/freshness deadline closes acquisition for that socket generation,
-drains already admitted frames through raw durability and canonical processing,
-then compares public REST books. A matching audit establishes a new exact REST
-baseline; a mismatch invalidates and resynchronizes. Disconnect, parser/state
-uncertainty, and ingress overflow also end the generation and require a REST
-baseline before resubscription. Audit downtime, socket-unavailable duration,
-generation, reconnect, resynchronization, audit, and mismatch metrics are
-separate.
+Routine audit HTTP I/O does not close or cancel a healthy WebSocket generation.
+The dedicated acquisition task continues to receive, timestamp, and admit
+frames while one supervised audit request is in flight and while the canonical
+owner catches up. True WebSocket disconnect, parser/state uncertainty, ingress
+loss, or a proven REST mismatch may still end the generation and require a
+fresh baseline; those are separate recovery cases and metrics.
+
+Each audit is an ordered, replayable protocol:
+
+1. The canonical stream durably stages an `mma-rest-audit-start-v1` control
+   record containing request/connection/instrument identity, attempt number,
+   request-start monotonic time, the contiguous WebSocket admission and
+   processed ordinals at start, and the starting book generation/economic hash.
+2. The HTTP task fetches the exact raw book without entering the canonical
+   processor. At the actual response handoff it records wall/monotonic time,
+   payload identity, and the current contiguous successful-admission watermark
+   for the same socket generation.
+3. Acquisition continues. The single canonical owner processes every durable
+   WebSocket frame through that response-boundary ordinal; later frames may
+   continue entering ingress but are not allowed to cross the classification
+   barrier.
+4. The raw REST response and barrier metadata are durably ordered through the
+   same capture boundary. Only then does the canonical owner compare the
+   response with the book identity at the barrier.
+
+The typed outcomes are:
+
+- `MATCH`: no relevant economic book mutation crossed the request window and
+  the REST book equals canonical state;
+- `MISMATCH`: no relevant economic mutation crossed the window but the states
+  differ, so the affected state is invalidated and resynchronized;
+- `RACED`: the audited economic identity changed during the window, so the
+  response cannot prove either match or mismatch and is retried only within the
+  configured race budget; and
+- `FAILED`: HTTP, deadline, response, watermark, socket-generation, local
+  comparability, race-budget, or run-end evidence could not establish a safe
+  result.
+
+The audit generation advances only for level, health, or reference mutations;
+its comparison hash excludes receive freshness, timestamps, lineage, and
+last-trade diagnostics. Consequently, duplicate price changes that leave the
+audited state unchanged do not force `RACED`, while a changed-then-restored book
+still races because its relevant-mutation generation advanced. An ambiguous or
+non-contiguous watermark fails closed.
+Only a proven `MISMATCH` requests socket resynchronization; `RACED` and
+`FAILED` never masquerade as a disconnect or refresh authoritative integrity.
+Failed/race-exhausted instruments remain audit-ineligible for research until a
+later race-free match establishes integrity. Start, response/failure, boundary,
+barrier, economic identities, attempts, outcome counters, and an audit-outcome
+hash chain are replay evidence, so classification does not depend on replay
+task scheduling.
 
 Reference refresh requests are accepted only for the selected market's Gamma
 market/event and condition/assets. Requests are coalesced to one selected-market
 refresh per generation; unrelated fanout is ignored and counted. All public
-HTTP awaits use the observation's absolute deadline. Deadline cancellation can
-cancel only the remote await: bytes that already arrived are still journaled
-and processed.
+HTTP reads use the observation's absolute deadline. Deadline cancellation can
+cancel only the remote await: bounded bytes that already reached the adapter's
+response handoff remain available for journaling and processing.
+
+The adapter exposes fixed unauthenticated read methods only. The public-read
+controller applies one bounded concurrency semaphore, per-endpoint local
+sliding windows, at most the configured attempts, explicit retryable status/
+transport categories, bounded exponential backoff with reproducible jitter,
+and standards-aware `Retry-After` bounded by policy. Malformed framing/schema,
+configuration/client-state faults, permanent statuses, deadline exhaustion, and
+over-policy `Retry-After` do not enter an unbounded retry loop. Metrics retain
+requests, attempts, first-attempt successes, retries, status classes, timeouts,
+temporary network faults, throttle/`Retry-After` observations, backoff,
+rate-window waits, exhausted budgets, final failures, and endpoint latency.
+This controller is not a generic mutation API and cannot be inherited by future
+live writes.
 
 ## Book-state, arithmetic, capacity, and provenance optimizations
 
@@ -230,11 +332,27 @@ alignment, comparison, addition, subtraction, multiplication, and finite
 division avoid intermediate `Fraction` allocation where finite base-10 integer
 arithmetic is sufficient. Binary float input remains prohibited.
 
-Capacity evaluation derives only economically relevant depth breakpoints and
-uses the monotone cumulative depth curve instead of rescanning every level for
-every point. The 4,096-evaluation fail-closed cap is unchanged. Property tests
-compare the optimized path with an exhaustive oracle across prices, quantities,
-increments, minimum sizes, fees, rounding, and capacity boundaries.
+Capacity planning retains the 4,096-point quantity lattice as a fail-closed
+semantic/work bound but no longer constructs full economics at every lattice
+point. It partitions both depth profiles into exact terminal-level intervals,
+merges their boundaries, splits again at fee-zero regime onsets, and compiles
+each resulting atom into lossless common-scale integers. For every configured
+edge threshold, a rigorous affine upper envelope prunes impossible ranges; the
+solver then walks only exact rounded-fee state runs and solves the threshold
+root on the integer lattice. It evaluates full `OpportunityEconomics` only at
+the selected maximum quantities.
+
+The algorithm does not assume global quantity monotonicity. It preserves
+strict-positive semantics at the zero threshold, exact minimum-order
+boundaries, price-dependent fee factors, fee-quantum `HALF_UP` discontinuities,
+and the existing fail-closed evaluation limit. The exhaustive
+`PolymarketCompleteSetReferenceScanner` remains the semantic oracle. Randomized,
+property, boundary, multi-level, half-quantum, no-edge, edge, and exact
+4,096-grid differential tests compare dispositions, validations, quantities,
+economics, and terminal identities. Optional non-canonical diagnostics expose
+lattice points, merged depth regions, fee-regime atoms, envelope pruning,
+rounded-fee runs, exact fee evaluations, root solves, and rich evaluations
+without changing scanner output.
 
 Raw lineage is represented as inseparable `(IngestId, payload_sha256)` pairs.
 One identity cannot be associated with two payload hashes. Each active level
@@ -318,6 +436,34 @@ decimal/integer lexemes, and timestamps outside the supported UTC range. These
 bounds are protocol errors; they never become default zero values or partial
 economic state.
 
+## Supervised Gate-1 health evidence
+
+The observer emits versioned `gate1-health-checkpoint-v1` JSONL evidence at the
+configured five-second cadence and once at finalization. The producer creates
+an immutable point-in-time snapshot and performs one `put_nowait`; a dedicated
+single-owner task performs canonical serialization, append, and file `fsync`.
+The queue, checkpoint count, and file bytes are bounded. Output starts as a
+run-scoped `.jsonl.partial` and is atomically renamed to `.jsonl` with a
+directory sync only after clean completion; the summary records counts,
+high-water, bytes, SHA-256, completion/evidence eligibility, and failure type.
+
+Checkpoint groups are `target`, `capture`, per-book `books`, `ingress`,
+`journal`, `analytical`, `http`, `audit`, `scanner`, `recovery`, and
+`resources`, plus run/code/config identity. Decisions are deliberately scoped:
+`capture_healthy`, `research_eligible`, and `gate1_eligible_so_far` carry stable
+typed reason codes. For example, an analytical or audit-integrity failure can
+block research without falsifying raw-journal durability, while a health-writer
+failure leaves authoritative capture independent but blocks automatic Gate-1
+evidence eligibility. A public-HTTP final failure or exhausted retry budget
+likewise blocks research and Gate-1 integrity evidence without being relabeled
+as raw-capture or WebSocket failure. Queue saturation, count/file exhaustion,
+storage failure, missing explicit target, book/integrity problems, ingress
+loss, persistence faults, protocol deviations, raw-cap pressure, and
+insufficient disk are never silently treated as healthy.
+
+The health path is derived diagnostic evidence. It never mutates canonical
+state and is not permitted to block socket acquisition or raw durability.
+
 ## Data layout
 
 ```text
@@ -327,10 +473,18 @@ data/
 │   ├── run-<run-hash>.*.jsonl.zst
 │   ├── run-<run-hash>.*.jsonl.zst.manifest.json
 │   └── run-<run-hash>.<stream>.completed.json
-└── analytical/
-    ├── reference/
-    ├── canonical_events/
-    └── complete_set_scans/
+├── analytical/
+│   ├── reference/
+│   ├── canonical_events/
+│   └── complete_set_scans/
+├── health/
+│   ├── run-<collector-run-id>.health-checkpoints.jsonl.partial
+│   └── run-<collector-run-id>.health-checkpoints.jsonl
+└── calibration/
+    └── <fresh-run>/
+        ├── calibration.json
+        ├── calibration.md
+        └── calibration.bindings.json
 ```
 
 Raw records preserve the exact application payload as reversible base64 plus
@@ -345,7 +499,9 @@ extra, symlinked, or inconsistent artifacts.
 
 ## Current official Polymarket evidence
 
-The adapter was checked against current official sources on 2026-08-20:
+The public-adapter source set below was checked on 2026-08-20. The rate-limit
+and batch-book pages were rechecked on 2026-08-21 for the pre-soak public-read
+controller:
 
 - [Discover Markets](https://docs.polymarket.com/market-data/discover-markets)
 - [Market Details](https://docs.polymarket.com/market-data/market-details)
@@ -353,6 +509,7 @@ The adapter was checked against current official sources on 2026-08-20:
 - [CLOB market information](https://docs.polymarket.com/api-reference/markets/get-clob-market-info)
 - [REST order book](https://docs.polymarket.com/api-reference/market-data/get-order-book)
 - [Batch REST order books](https://docs.polymarket.com/api-reference/market-data/get-order-books-request-body)
+- [Rate limits](https://docs.polymarket.com/api-reference/rate-limits)
 - [Place Orders (public constraint semantics)](https://docs.polymarket.com/trading/place-orders)
 - [Public market WebSocket](https://docs.polymarket.com/api-reference/wss/market)
 - [Real-time data guide](https://docs.polymarket.com/market-data/realtime-data)
@@ -367,6 +524,19 @@ The adapter was checked against current official sources on 2026-08-20:
 
 Current protocol conclusions:
 
+- The official rate-limit page describes Cloudflare/IP-based sliding windows
+  that throttle by delaying or queueing over-limit traffic. On the check date
+  it listed general traffic at 15,000 requests/10 s; Gamma general at
+  4,000/10 s, `/events` at 500/10 s, `/markets` at 300/10 s, and combined
+  `/markets` + `/events` listing at 900/10 s; and CLOB general at 9,000/10 s,
+  `/book` at 1,500/10 s, and `/books` at 500/10 s. The committed local budgets
+  are deliberately much lower and remain dated configuration evidence, not
+  permanent venue facts.
+- Official documentation confirms `POST /books` is a public read-only batch
+  query. It does not prove that the returned books are one atomic
+  cross-instrument snapshot. The adapter exposes a bounded fixed batch read,
+  but the current audit retains distinct per-instrument `GET /book` requests,
+  provenance, and race fences rather than inferring cross-book atomicity.
 - CLOB V2 is public at the existing production hosts and uses pUSD collateral.
 - Current Gamma keyset responses use top-level `markets`/`events` collections;
   the parser also retains compatibility with the legacy `data`/list shapes.
@@ -413,5 +583,8 @@ Current protocol conclusions:
   distinct opportunities.
 - Replay covers deterministic observation/state/scanner reconstruction. The
   later event-driven fill/latency simulator is outside Phase 1.
+- A passing bounded calibration is only a conservative resource projection for
+  the selected target; it does not establish six-hour capture coverage or pass
+  Gate 1.
 - Long-duration data-quality soak evidence remains an independent Gate 1
   operator activity.

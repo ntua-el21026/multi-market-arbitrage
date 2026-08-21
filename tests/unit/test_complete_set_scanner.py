@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from multi_market_arbitrage.core.exact import ExactDecimal, Price, Quantity, Rate
+from multi_market_arbitrage.core.exact import ExactDecimal, Money, Price, Quantity, Rate
 from multi_market_arbitrage.core.health import BookHealth
 from multi_market_arbitrage.core.ids import CanonicalEventId, IngestId
 from multi_market_arbitrage.core.provenance import Provenance
@@ -22,8 +22,10 @@ from multi_market_arbitrage.reference import (
     ReferenceBundle,
 )
 from multi_market_arbitrage.scanners.polymarket_complete_set import (
+    CapacityPlannerDiagnostics,
     CompleteSetScannerConfig,
     CompleteSetScanResult,
+    PolymarketCompleteSetReferenceScanner,
     PolymarketCompleteSetScanner,
     ScanDisposition,
 )
@@ -297,6 +299,168 @@ def test_break_even_at_maximum_depth_preserves_smaller_positive_capacity() -> No
     assert result.opportunity is not None
     assert result.capacity_curve[0].maximum_quantity == Quantity.parse("5")
     assert result.opportunity.book_upper_bound.net_pnl.value > ExactDecimal.zero()
+
+
+def test_fee_zero_onset_and_half_up_ties_match_exhaustive_oracle() -> None:
+    base = _bundle()
+    bundle = replace(
+        base,
+        precision=replace(
+            base.precision,
+            minimum_order_size=Quantity.parse("0.05"),
+        ),
+        cost_rule_set=replace(
+            base.cost_rule_set,
+            rate=Rate.parse("0.1"),
+            exponent=0,
+            fee_quantum=Money.parse("0.01"),
+        ),
+    )
+    books = _books(
+        bundle,
+        yes_asks=(_level("0.40", "1"),),
+        no_asks=(_level("0.50", "1"),),
+    )
+    config = CompleteSetScannerConfig(
+        maximum_book_age_ns=1_000_000_000,
+        maximum_interleg_skew_ns=100_000_000,
+        minimum_edge_thresholds=(Rate.parse("0"), Rate.parse("0.1")),
+        quantity_increment=Quantity.parse("0.05"),
+    )
+
+    optimized = PolymarketCompleteSetScanner(config).scan(
+        bundle=bundle,
+        proof=prove_binary_complement(bundle),
+        books=books,
+        observed_at=NOW,
+        provenance=_provenance(),
+    )
+    exhaustive = PolymarketCompleteSetReferenceScanner(config).scan(
+        bundle=bundle,
+        proof=prove_binary_complement(bundle),
+        books=books,
+        observed_at=NOW,
+        provenance=_provenance(),
+    )
+
+    assert optimized == exhaustive
+    assert optimized.terminal_hash == exhaustive.terminal_hash
+    assert tuple(point.maximum_quantity for point in optimized.capacity_curve) == (
+        Quantity.parse("0.05"),
+        Quantity.parse("0.05"),
+    )
+
+
+def test_capacity_planner_diagnostics_are_noncanonical_and_sublinear_on_4096_grid() -> None:
+    base = _bundle()
+    bundle = replace(
+        base,
+        precision=replace(
+            base.precision,
+            minimum_order_size=Quantity.parse("0.01"),
+        ),
+    )
+    books = _books(
+        bundle,
+        yes_asks=(_level("0.45", "40.96"),),
+        no_asks=(_level("0.50", "40.96"),),
+    )
+    config = CompleteSetScannerConfig(
+        maximum_book_age_ns=1_000_000_000,
+        maximum_interleg_skew_ns=100_000_000,
+        minimum_edge_thresholds=tuple(
+            Rate.parse(value) for value in ("0", "0.0025", "0.005", "0.01")
+        ),
+        quantity_increment=Quantity.parse("0.01"),
+    )
+    diagnostics: list[CapacityPlannerDiagnostics] = []
+    instrumented = PolymarketCompleteSetScanner(
+        config,
+        capacity_diagnostics_observer=diagnostics.append,
+    ).scan(
+        bundle=bundle,
+        proof=prove_binary_complement(bundle),
+        books=books,
+        observed_at=NOW,
+        provenance=_provenance(),
+    )
+    plain = PolymarketCompleteSetScanner(config).scan(
+        bundle=bundle,
+        proof=prove_binary_complement(bundle),
+        books=books,
+        observed_at=NOW,
+        provenance=_provenance(),
+    )
+
+    assert instrumented == plain
+    assert instrumented.terminal_hash == plain.terminal_hash
+    assert len(diagnostics) == 1
+    diagnostic = diagnostics[0]
+    assert diagnostic.lattice_points == 4_096
+    assert diagnostic.minimum_eligible_points == 4_096
+    assert diagnostic.merged_depth_regions == 1
+    assert diagnostic.fee_regime_atoms <= 3
+    assert diagnostic.unique_exact_fee_evaluations < 16
+    assert diagnostic.rich_evaluations == 1
+    assert diagnostic.selected_quantities == 1
+    assert diagnostic.scalar_fallback_evaluations == 0
+
+
+def test_capacity_planner_exhausts_ambiguous_fee_runs_exactly_at_4096_limit() -> None:
+    base = _bundle()
+    bundle = replace(
+        base,
+        precision=replace(
+            base.precision,
+            minimum_order_size=Quantity.parse("0.02"),
+        ),
+        cost_rule_set=replace(
+            base.cost_rule_set,
+            rate=Rate.parse("0.5"),
+            exponent=0,
+            fee_quantum=Money.parse("0.01"),
+        ),
+    )
+    books = _books(
+        bundle,
+        yes_asks=(_level("0", "40.96"),),
+        no_asks=(_level("0", "40.96"),),
+    )
+    config = CompleteSetScannerConfig(
+        maximum_book_age_ns=1_000_000_000,
+        maximum_interleg_skew_ns=100_000_000,
+        minimum_edge_thresholds=(Rate.parse("0"),),
+        quantity_increment=Quantity.parse("0.01"),
+    )
+    diagnostics: list[CapacityPlannerDiagnostics] = []
+    optimized = PolymarketCompleteSetScanner(
+        config,
+        capacity_diagnostics_observer=diagnostics.append,
+    ).scan(
+        bundle=bundle,
+        proof=prove_binary_complement(bundle),
+        books=books,
+        observed_at=NOW,
+        provenance=_provenance(),
+    )
+    exhaustive = PolymarketCompleteSetReferenceScanner(config).scan(
+        bundle=bundle,
+        proof=prove_binary_complement(bundle),
+        books=books,
+        observed_at=NOW,
+        provenance=_provenance(),
+    )
+
+    assert optimized == exhaustive
+    assert optimized.terminal_hash == exhaustive.terminal_hash
+    assert optimized.capacity_curve[0].maximum_quantity == Quantity.parse("0")
+    assert optimized.capacity_curve[0].economics is None
+    assert len(diagnostics) == 1
+    diagnostic = diagnostics[0]
+    assert diagnostic.lattice_points == 4_096
+    assert diagnostic.unique_exact_fee_evaluations >= 2_000
+    assert diagnostic.fee_state_runs >= 2_000
+    assert diagnostic.rich_evaluations == 0
 
 
 def test_opportunity_expiry_is_bounded_by_oldest_book_update() -> None:

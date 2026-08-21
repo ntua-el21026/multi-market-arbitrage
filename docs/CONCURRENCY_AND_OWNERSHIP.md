@@ -26,16 +26,45 @@ Recommended ownership:
 Sole owner of active segment files and durability watermarks.
 
 ### Venue connection task
-Owns one connection/socket lifecycle and produces raw envelopes.
+Owns one connection/socket generation. A dedicated acquisition coroutine stamps
+each frame immediately after `recv()` and synchronously performs the one
+non-blocking admission into the application-owned ingress queue. It never waits
+for journal durability, schema parsing, canonical state, scanning, REST audit,
+or health persistence.
 
 ### Reference registry
 Owns current/versioned reference state.
 
 ### Order-book state owner
-A single task/shard owns mutable book state for its assigned instruments.
+A single serialized canonical owner holds reference/book/lifecycle state for
+its assigned instruments. It alone advances the processed WebSocket admission
+watermark and classifies REST audit outcomes after the response-boundary
+barrier. Audit HTTP work never calls the processor concurrently.
 
 ### Canonical/Parquet writer
-Owns output batches/files for its dataset partition stream.
+Each dataset writer owns its output batches/files. The live canonical producer
+uses a bounded non-blocking command queue; derived writer failure does not take
+ownership of or weaken the raw journal.
+
+### Public HTTP controller
+Owns bounded public-read concurrency, per-endpoint sliding-window admissions,
+attempt/backoff state, and endpoint metrics. Callers can invoke only fixed
+unauthenticated read methods. The controller does not own WebSocket recovery
+and exposes no future mutation retry surface.
+
+### REST audit coordinator
+Stages one immutable durable start command, launches at most one supervised
+HTTP request for the active audit, and receives one immutable response/failure
+handoff through a one-slot queue. It captures the response-boundary admission
+watermark without pausing acquisition. The canonical owner drains every
+pre-boundary frame and performs the only classification; post-boundary frames
+may continue to enter ingress meanwhile.
+
+### Health-checkpoint writer
+Owns its run-scoped JSONL file, serialization, append, `fsync`, publication,
+bounded queue, and failure state. The runtime producer uses `put_nowait` only.
+Health evidence is derived: writer failure blocks automatic Gate-1 eligibility
+but cannot mutate books or stall raw acquisition.
 
 ### Scanner tasks
 Consume immutable validated snapshots/events; they do not mutate canonical market state.
@@ -62,6 +91,15 @@ metrics
 ```
 
 Sequence-sensitive market-data queues must never silently drop required events.
+
+The Phase-1 WebSocket ingress is bounded by both record count and queued bytes;
+its monotonically increasing per-connection admission ordinal describes the
+exact contiguous successfully admitted prefix. Overflow makes the watermark
+ambiguous, journals `BACKPRESSURE_DATA_LOSS`, invalidates affected state, and
+requires a new REST baseline/socket generation. The journal and analytical
+queues are separately bounded. The one-slot audit handoff cannot accumulate
+responses, and the health queue degrades health evidence instead of applying
+backpressure to acquisition.
 
 ## 5. Overflow
 
@@ -95,6 +133,12 @@ Every long-lived task has:
 
 Unexpected task death must be observable.
 
+The Phase-1 observer explicitly names and awaits socket acquisition,
+subscription readiness, audit HTTP, raw journal, analytical owners, and health
+writer tasks. Routine audit completion is not a socket-task failure. HTTP and
+WebSocket supervisors catch only their typed families; cancellation is never
+reclassified as a retryable transport event.
+
 ## 8. Failure propagation
 
 Examples:
@@ -123,8 +167,10 @@ Shutdown is structured:
 2. drain/close producers;
 3. flush writers;
 4. finalize manifests;
-5. stop consumers;
-6. emit health/shutdown result.
+5. emit a final health checkpoint and close/publish or retain explicit partial
+   health evidence;
+6. stop consumers;
+7. emit health/shutdown result.
 
 Future live shutdown follows the stricter operations runbook.
 

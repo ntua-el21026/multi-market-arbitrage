@@ -38,6 +38,23 @@ class _ScanWrite:
     lifecycle: OpportunityLifecycle | None
 
 
+@dataclass(frozen=True, slots=True)
+class AnalyticalQueueSnapshot:
+    domain: str
+    depth: int
+    high_water: int
+
+
+@dataclass(frozen=True, slots=True)
+class AnalyticalRuntimeSnapshot:
+    healthy: bool
+    accepted_records: int
+    processed_records: int
+    rejected_records: int
+    queues: tuple[AnalyticalQueueSnapshot, ...]
+    failure_type: str | None
+
+
 CommandT = TypeVar("CommandT")
 
 
@@ -105,6 +122,25 @@ class SupervisedAnalyticalOutputs:
     @property
     def failure_type(self) -> str | None:
         return self._failure_type
+
+    @property
+    def runtime_snapshot(self) -> AnalyticalRuntimeSnapshot:
+        owners = (self._references, self._canonical, self._scans)
+        return AnalyticalRuntimeSnapshot(
+            healthy=self._healthy,
+            accepted_records=self._accepted,
+            processed_records=self._processed,
+            rejected_records=self._rejected,
+            queues=tuple(
+                AnalyticalQueueSnapshot(
+                    domain=owner.name,
+                    depth=owner.queue.qsize(),
+                    high_water=owner.high_water,
+                )
+                for owner in owners
+            ),
+            failure_type=self._failure_type,
+        )
 
     def _reject_or_put(self, owner: _DomainOwner[CommandT], command: CommandT) -> None:
         if not self._healthy or self._closed:
@@ -276,4 +312,8 @@ class SupervisedAnalyticalOutputs:
         )
 
 
-__all__ = ["SupervisedAnalyticalOutputs"]
+__all__ = [
+    "AnalyticalQueueSnapshot",
+    "AnalyticalRuntimeSnapshot",
+    "SupervisedAnalyticalOutputs",
+]

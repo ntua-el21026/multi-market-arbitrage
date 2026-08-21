@@ -2,10 +2,12 @@
 
 ## Status and interpretation
 
-This document records the 2026-08-21 same-machine acceptance campaign for the
-Phase 1 public Polymarket observation pipeline. It is a reproducible engineering
-baseline, not a production service-level objective and not evidence of trading
-profitability.
+This document preserves the 2026-08-21 same-machine acceptance campaign for the
+Phase 1 public Polymarket observation pipeline implementation finalized in
+commit `d31204e6c8b09aa722f0828f8ded96a2739148a5`. It is historical,
+reproducible engineering evidence, not a production service-level objective and
+not evidence of trading profitability. Later implementation changes do not
+rewrite the measurements or hashes recorded here.
 
 Latency deltas use `(Final C - baseline) / baseline`; negative is faster.
 Throughput deltas use the opposite interpretation: positive is faster. Small
@@ -25,6 +27,12 @@ percentiles, and the same recorded fixture set:
 | Baseline A | commit `4d34bf8663bac2af54d229032dbb63710f0976f7`; ordinary-GIL CPython 3.13.14 | `2e99ee38d0309f95abac0b228465397a9e7131429685e729edabbc628206752c` |
 | Baseline B | migration-only commit `e4a086ba01699946b998d2fd8f336009e931fbd5`; ordinary-GIL CPython 3.14.7 | `abae8e587abbb7af73c6a260647b96ee48bb0a17de0c18bcd94f3f7dfc78982b` |
 | Final C | the same migration commit plus source-stable correction worktree `7a634c4ee64c94124d18ee44785fc42c5f7de6e0ca996457273e2e5b2316a83f`; ordinary-GIL CPython 3.14.7 | `d2b6231d6dd6880c6d4dab9f63a766fa91ba2051442ab3081eaedf603ec6d57e` |
+
+The executable scanner and pipeline represented by Final C were subsequently
+committed in `d31204e`. The source-snapshot hash remains the authoritative
+identity for the measured pre-commit worktree; the commit association explains
+where that implementation entered history without replacing the recorded
+snapshot identity.
 
 Final C additionally recorded:
 
@@ -50,7 +58,7 @@ percentile method make all 54 A/B/C series comparable. Final C adds corrected
 production-boundary and provenance-stress series that cannot be backported to
 the historical implementations without changing them.
 
-## Representative A/B/C p50 results
+## Historical representative A/B/C p50 results
 
 | Series | A p50 | B p50 | Final C p50 | C vs B |
 |---|---:|---:|---:|---:|
@@ -82,7 +90,7 @@ book construction, and authoritative resnapshot provenance. The full JSON
 retains every regression, including noisier queue/admission and filesystem
 microseries; none is concealed or used to weaken a correctness boundary.
 
-## Final-C comparable stage distributions
+## Historical Final-C comparable stage distributions
 
 | Stage/workload | p50 | p95 | p99 | max | Throughput |
 |---|---:|---:|---:|---:|---:|
@@ -107,7 +115,7 @@ microseries; none is concealed or used to weaken a correctness boundary.
 The historical receive and queue rows remain proxies so they are comparable
 with A/B. The corrected production boundary is measured separately below.
 
-## Corrected production boundary and end-to-end latency
+## Historical corrected production boundary and end-to-end latency
 
 | Corrected stage | p50 | p95 | p99 | max | Important bound/result |
 |---|---:|---:|---:|---:|---|
@@ -126,7 +134,7 @@ The end-to-end burst includes the journal-before-processing durability boundary,
 decode, normalization, state mutation, dirty-market scan routing, and scanner
 completion. It is not a network round-trip measurement.
 
-## Production group-commit experiment
+## Historical production group-commit experiment
 
 Every candidate was run three times in five scenarios, for 75 trials and 19,920
 events total. No durability failure occurred. Segment rotation split groups
@@ -149,7 +157,7 @@ configured sparse-event wait. A 64-event/2 ms group can win saturated throughput
 but imposes avoidable delay on sparse traffic and is therefore not the Phase 1
 default.
 
-## CPU, memory, queue, and allocation evidence
+## Historical CPU, memory, queue, and allocation evidence
 
 - Corrected production-stage process peak RSS was 160,868 KiB; the final
   active-lineage stage ended at 154,680 KiB. The campaign-wide peak, including
@@ -167,7 +175,7 @@ default.
 - Active book lineage remained exactly two raw sources through 2,000 same-price
   replacements; the bounded owner did not accumulate historical provenance.
 
-## Determinism and correctness
+## Historical determinism and correctness
 
 Baseline A and B had exact semantic/oracle equality and the same six replay
 terminal hashes. Final C intentionally changes diagnostic hashes because it
@@ -184,10 +192,113 @@ The exhaustive and optimized capacity algorithms agreed under unit and
 property tests; the worst benchmark retained four capacity points and
 `VALIDATED_OPPORTUNITY` disposition.
 
+## Post-baseline exact scanner breakpoint A/B
+
+A focused follow-up spot campaign used the same benchmark definitions and
+locked runtime to compare the historical scalar-grid scanner with the new exact
+breakpoint planner. Its control was freshly extracted from committed
+`73beba5c98a25d081b7ab8f066f5365bdc2d3b09`; the three commits after
+`d31204e` are documentation-only, so its scanner is the historical Final-C
+scanner. The treatment was the current implementation worktree.
+
+This was not a rerun of the complete sealed 54-series campaign. No artifact
+directory, result hash, source-snapshot hash, or final treatment commit is
+claimed. In particular, its fresh 107.744 ms control p50 is a new spot
+measurement and does not replace the sealed Final-C value of 107.691 ms above.
+
+### Focused latency, CPU, and allocation results
+
+The 4,096-point series retained its harness protocol of one warmup and seven
+measured scans; p95 and p99 use nearest-rank percentiles and therefore equal the
+maximum for seven observations. The 30-point series used five warmups and 50
+measurements.
+
+| Measure | Historical scanner control | Exact breakpoint planner | Treatment change |
+|---|---:|---:|---:|
+| 4,096-point p50 | 107.744 ms | 1.269 ms | 84.9x faster |
+| 4,096-point p95 | 110.611 ms | 1.872 ms | 59.1x faster |
+| 4,096-point p99 | 110.611 ms | 1.872 ms | 59.1x faster |
+| 4,096-point maximum | 110.611 ms | 1.872 ms | 59.1x faster |
+| Aggregate process CPU for 7 scans | 703.368 ms | 9.087 ms | 77.4x lower |
+| Aggregate wall time for 7 scans | 755.616 ms | 9.688 ms | 78.0x lower |
+| 30-point p50 | 2.058 ms | 1.328 ms | 1.55x faster |
+| Warm scan retained traced bytes | 36,879 bytes | 37,234 bytes | +0.96% |
+| Warm scan peak traced bytes | 167,035 bytes | 167,134 bytes | +0.06% |
+
+The allocation deltas are preserved rather than rounded away. They are small
+enough to be measurement noise and do not support an allocation-improvement
+claim. The large latency and CPU changes instead track the reduction in
+quantity-grid work.
+
+### Algorithm and observed work
+
+The planner constructs exact quantity-lattice intervals from the intersection
+of both legs' depth regions. It splits those regions where a leg enters or
+leaves the explicit fee-zero regime, scales all inputs to integers without
+discarding decimal places, and derives affine P&L expressions per threshold.
+A rigorous unrounded-fee envelope accounts for at most half a fee quantum per
+normal-regime leg under `HALF_UP` rounding and safely removes ranges that cannot
+qualify. Within the remaining ranges, the planner jumps across exact rounded-
+fee state runs and solves affine roots for the greatest qualifying lattice
+index.
+
+The search proceeds from high quantity to low quantity and may reuse the nested
+upper bound implied by ordered edge thresholds, but it does not assume global
+profitability monotonicity. Full opportunity economics are evaluated only for
+the distinct selected quantities. The prior exhaustive implementation remains
+available as the reference oracle and is not weakened to make the optimized
+path pass.
+
+The production-shaped 4,096-point fixture produced these optional,
+non-canonical diagnostics:
+
+| Diagnostic | Count |
+|---|---:|
+| Quantity-lattice points | 4,096 |
+| Minimum-size-eligible points | 3,597 |
+| Merged depth regions | 1 |
+| Fee-regime atoms | 1 |
+| Threshold/atom visits | 4 |
+| Envelope-pruned threshold points | 0 |
+| Rounded-fee state runs | 4 |
+| Unique exact terminal-fee evaluations | 1 |
+| Affine-root solves | 4 |
+| Selected quantities | 1 |
+| Rich opportunity-economics evaluations | 1 |
+| Scalar fallback evaluations | 0 |
+
+Both implementations returned `VALIDATED_OPPORTUNITY`, the same four capacity
+points with maximum quantity `40.96`, and terminal hash
+`b720b5bfe0bb4ca6f06631cc4007eb8585a480c210d276ff076260a3098df350`.
+Instrumentation is delivered through an optional observer and is excluded from
+canonical result serialization and terminal hashes.
+
+### Equivalence evidence and caveats
+
+The optimized and exhaustive scanners had exact result equality across 2,000
+randomized differential cases. The generator covers fractional and non-aligned
+depths, deep and multi-level books, minimum-order and common-depth boundaries,
+fee-zero onset and `HALF_UP` rounding boundaries, multiple ordered thresholds,
+and both edge and no-edge results. Targeted tests add the 4,096-point profitable
+fixture, depth and minimum-size boundary cases, and explicit fee-zero/tie cases.
+
+An adversarial 4,096-point no-edge fixture deliberately creates ambiguous fee
+runs and forces at least 2,000 exact fee evaluations. It verifies that the
+planner falls back to bounded exact work when an envelope cannot prove enough;
+the algorithm is not claimed to be sublinear on every input. The configured
+4,096-point ceiling still bounds that case, and exact equality with the
+reference oracle remains mandatory.
+
+The scoped scanner suite comprised 17 unit/property tests, including the 2,000
+differential examples, and passed with Ruff, Pyright, and whitespace/diff checks.
+These correctness results support the implementation change. The focused
+timings remain one-machine spot evidence and require a sealed full-campaign
+rerun before they can become a new general Phase 1 performance baseline.
+
 ## Reproduction
 
-From the accepted locked environment, pin to one logical CPU and require an
-unchanged source snapshot:
+To reproduce the historical campaign, use its accepted locked environment, pin
+to one logical CPU, and require the recorded unchanged source snapshot:
 
 ```bash
 test "$(uv --version)" = "uv 0.12.5 (x86_64-unknown-linux-gnu)"
@@ -200,6 +311,14 @@ PYTHONHASHSEED=0 taskset -c 0 uv run --frozen --all-groups --no-sync python \
   --baseline-a-json <baseline-a-results.json> \
   --baseline-b-json <baseline-b-results.json>
 ```
+
+The current harness emits `mma-phase1-performance-final-c-v2`. It leaves the
+historical 54-series comparable contract unchanged and adds production-path
+current-stage records for bounded audit HTTP adapter work, fixed-lag response
+barrier catch-up, and typed audit classification. The separate
+`gate1-health-benchmark-v2` harness now measures the production observation
+checkpoint builder plus non-blocking enqueue, off-path write/`fsync`, and
+periodic-plus-final count/file projections.
 
 The output directory must be absent. The harness records the complete machine,
 runtime, dependency, Git/worktree, fixture, config, invocation, filesystem,
@@ -219,6 +338,12 @@ document, as recorded in the artifact's before/after source identities.
   migration/dependency snapshot from the later Phase 1 corrections.
 - The sustainable rates are workload- and machine-specific. They are not venue
   capacity claims or six-hour-soak results.
+- The later exact-scanner A/B is a focused, unsealed spot campaign. Its strong
+  scanner improvement does not update the historical end-to-end, resource, or
+  storage measurements and is not a complete current-worktree baseline.
+- The breakpoint planner can still perform thousands of exact fee evaluations
+  for adversarial rounded-fee patterns; the configured lattice ceiling, rather
+  than an unconditional sublinear-complexity claim, is the worst-case bound.
 - No native extension, free-threaded build, or custom PGO/LTO/tail-call
   interpreter was adopted. Ordinary upstream GIL-enabled CPython 3.14.7 remains
   primary; ADR-0051 defines the reproducibility, parity, A/B, and maintenance

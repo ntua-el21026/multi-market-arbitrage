@@ -39,6 +39,7 @@ No secrets.
 ## 3. Metrics
 
 ### Data
+
 ```text
 feed_connected
 feed_message_rate
@@ -49,6 +50,23 @@ resyncs
 raw_journal_latency
 queue_depth
 ```
+
+For the current Phase-1 Polymarket observer, the concrete data path also
+records socket generations/disconnects/reconnects/unavailable duration,
+resynchronizations, receive→ingress and ingress-dwell latency, raw
+receive→durable latency, journal group size/flush reason, queue depth/high-water
+and byte high-water, parse failures, healthy books, audit barrier lag and
+classification latency, typed audit outcomes/retries/exhaustion, scanner
+latency, and receive→scan-complete `T_obs`. Polymarket does not expose a proven
+sequence number; a zero sequence-gap counter must never be substituted for
+continuity evidence.
+
+Public HTTP metrics are bounded by fixed endpoint-class labels and include
+requests, attempts, first-attempt successes, retries, HTTP status class,
+timeouts, temporary network failures, throttle observations, `Retry-After`
+observations split into parsed/malformed dispositions, cumulative backoff,
+local rate-window waits, exhausted retry budget, final failure category,
+active-attempt high-water, and latency.
 
 ### Execution
 ```text
@@ -154,11 +172,40 @@ Health is scoped. A healthy process does not imply healthy market data, persiste
 
 ### Phase-1 Gate-1 health evidence
 
-For the Phase-1 six-hour Polymarket soak, a final summary alone is insufficient. The observer emits periodic versioned machine-readable health checkpoints as required by `GATE_1_SOAK_SPEC.md` and ADR-0052.
+For the Phase-1 six-hour Polymarket soak, a final summary alone is insufficient.
+The observer emits `gate1-health-checkpoint-v1` JSONL records at the configured
+five-second cadence and at finalization, as required by
+[`GATE_1_SOAK_SPEC.md`](GATE_1_SOAK_SPEC.md) and
+[`ADR-0052`](adr/0052-continuous-capture-audit-and-gate1-evidence.md). Each
+record binds collector run, UTC timestamp, runtime role, full Git commit, code
+version, config hash, and the explicit requested/resolved target identity.
 
-The health-evidence path is bounded and supervised and cannot block raw acquisition. Its failure is represented explicitly: authoritative raw capture may continue, but the run loses automatic Gate-1 evidence eligibility.
+The schema contains these explicit groups:
 
-Gate-1 checkpoints distinguish at least:
+```text
+target
+capture
+books[]
+ingress
+journal
+analytical
+http
+audit
+scanner
+recovery
+resources
+decisions
+```
+
+Together they record the socket generation/connected state and last-frame age;
+per-book health, generation, age, and reference identity; record/byte queue
+depth and high-water/loss; journal durability watermark, group/fsync and writer
+health; analytical queue/rejection/failure state; endpoint-class HTTP retry and
+rate evidence; `MATCH`/`MISMATCH`/`RACED`/`FAILED` counts and integrity age;
+scan dispositions and latency/`T_obs`; reconnect/resync/protocol/data-loss
+state; and raw-cap, disk, CPU, and RSS evidence where safely available.
+
+Each checkpoint distinguishes:
 
 ```text
 capture_healthy
@@ -166,9 +213,28 @@ research_eligible
 gate1_eligible_so_far
 ```
 
-and carry typed reason codes plus run/code/config/target identity. They include current WebSocket/book health and age, ingress/journal/analytical queues and failures, HTTP retry/rate-limit evidence, audit outcomes, reconnect/resync/data-loss state, scanner latency, raw-size/disk headroom, and the latest relevant durability/integrity evidence.
+Stable reason codes distinguish target, socket/book, ingress, journal,
+analytical, health-evidence, HTTP-integrity, audit, protocol, raw-cap, and disk
+failures. These decisions are scoped: a derived analytical failure can leave
+capture evidence valid while blocking research, and a health-evidence failure
+can leave raw capture operating while making `gate1_eligible_so_far=false`.
+Likewise, public HTTP final failure or exhausted retry budget blocks research
+and Gate-1 integrity evidence without being mislabeled as raw-capture or
+WebSocket failure.
 
-Routine REST integrity auditing must not be represented as a WebSocket disconnect. HTTP and WebSocket failures are separate operational dimensions.
+The health writer has its own single owner and bounded queue. Producers use a
+non-blocking admission only; JSON serialization, append, and file `fsync` occur
+off the acquisition path. Count and file bytes are bounded. A run writes a
+`.jsonl.partial` file and publishes the completed `.jsonl` only after clean
+close and directory sync. Saturation, write failure, or bound exhaustion is
+retained in the final health summary and makes automatic Gate-1 evidence
+ineligible; it must not corrupt canonical state or be relabeled as raw-journal
+failure.
+
+Routine REST integrity auditing must not be represented as a WebSocket
+disconnect. HTTP and WebSocket failures are separate operational dimensions,
+and audit HTTP failure does not create artificial socket downtime or reconnect
+counts.
 
 ## 8. Alert routing
 

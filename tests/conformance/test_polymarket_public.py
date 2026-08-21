@@ -301,6 +301,29 @@ def test_market_subscription_rejects_out_of_range_queue_bounds(max_queue: int) -
         PolymarketMarketWebSocket(["yes", "no"], max_queue=max_queue)
 
 
+@pytest.mark.parametrize(
+    "ping_interval_seconds",
+    [True, False, 0.0, -1.0, float("nan"), float("inf"), 60.000_001],
+)
+def test_market_subscription_rejects_invalid_or_unbounded_ping_interval(
+    ping_interval_seconds: object,
+) -> None:
+    with pytest.raises((TypeError, ValueError), match="ping_interval_seconds"):
+        PolymarketMarketWebSocket(
+            ["yes", "no"],
+            ping_interval_seconds=cast(float, ping_interval_seconds),
+        )
+
+
+def test_market_subscription_accepts_maximum_ping_interval() -> None:
+    stream = PolymarketMarketWebSocket(
+        ["yes", "no"],
+        ping_interval_seconds=60.0,
+    )
+
+    assert stream.ping_interval_seconds == 60.0
+
+
 @pytest.mark.parametrize("max_message_bytes", [0, 1024 * 1024 + 1])
 def test_market_subscription_rejects_out_of_range_message_bounds(
     max_message_bytes: int,

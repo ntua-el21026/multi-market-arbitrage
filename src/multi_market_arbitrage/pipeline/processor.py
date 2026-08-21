@@ -6,7 +6,7 @@ import hashlib
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Protocol, cast
 
@@ -15,6 +15,7 @@ from multi_market_arbitrage.core.errors import ProgrammingInvariantViolation
 from multi_market_arbitrage.core.health import BookHealth
 from multi_market_arbitrage.core.ids import (
     CanonicalEventId,
+    ConnectionId,
     IngestId,
     InstrumentId,
     MarketId,
@@ -73,6 +74,7 @@ from multi_market_arbitrage.venues.polymarket.schemas import (
     ClobMarketInfo,
     GammaEvent,
     GammaMarket,
+    JsonNumber,
     RestBookSnapshot,
     WsNewMarketEvent,
     decode_json_exact,
@@ -84,9 +86,21 @@ from multi_market_arbitrage.venues.polymarket.schemas import (
     parse_rest_book,
 )
 
+from .audit import (
+    AUDIT_FAILURE_SCHEMA,
+    AUDIT_START_SCHEMA,
+    AuditBookIdentity,
+    AuditFailureReason,
+    AuditOutcome,
+    AuditOutcomeEvidence,
+    AuditStartEvidence,
+    WebSocketAdmissionWatermark,
+)
 from .channels import (
     CLOB_MARKET_PREFIX,
     CONTROL_BOOK_INVALIDATION,
+    CONTROL_REST_AUDIT_FAILED,
+    CONTROL_REST_AUDIT_START,
     GAMMA_EVENT_PREFIX,
     GAMMA_MARKET_PREFIX,
     GAMMA_MARKETS_KEYSET,
@@ -168,6 +182,7 @@ class ProcessedEnvelope:
     book_freshness_updates: tuple[BookFreshnessUpdate, ...]
     scan_triggers: tuple[MarketScanTrigger, ...]
     error_type: str | None
+    audit_outcomes: tuple[AuditOutcomeEvidence, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,12 +198,18 @@ class ProcessorSummary:
     canonical_events: int
     reference_updates: int
     scans: int
+    scan_disposition_counts: tuple[tuple[ScanDisposition, int], ...]
     candidates: int
     validated_opportunities: int
     invalidations: int
     resyncs: int
     rest_audits: int
+    rest_audit_matches: int
     rest_audit_mismatches: int
+    rest_audit_raced: int
+    rest_audit_failed: int
+    pending_rest_audits: int
+    audit_ineligible_books: int
     reference_refresh_requests: int
     unique_opportunity_lifecycles: int
     healthy_books: int
@@ -198,12 +219,15 @@ class ProcessorSummary:
     scan_chain_sha256: str
     validated_opportunity_chain_sha256: str
     reference_refresh_chain_sha256: str
+    audit_outcome_chain_sha256: str
     lifecycle_state_sha256: str
     scan_results_truncated: bool
     opportunity_hashes_truncated: bool
     reference_refresh_requests_truncated: bool
+    audit_outcomes_truncated: bool
     terminal_hash: str
     opportunity_hashes: tuple[str, ...]
+    audit_outcomes: tuple[AuditOutcomeEvidence, ...]
 
 
 class AnalyticalOutputSink(Protocol):
@@ -272,10 +296,16 @@ class CanonicalProcessor:
         self._reference_refresh_requests: deque[ReferenceRefreshRequest] = deque(
             maxlen=_RECENT_HISTORY_LIMIT
         )
+        self._audit_outcomes: deque[AuditOutcomeEvidence] = deque(maxlen=_RECENT_HISTORY_LIMIT)
+        self._pending_rest_audits: dict[str, AuditStartEvidence] = {}
+        self._audit_ineligible_instruments: set[InstrumentId] = set()
+        self._audit_economic_generations: dict[InstrumentId, int] = {}
+        self._processed_ws_watermarks: dict[ConnectionId, int] = {}
         self._active_refresh_requests: list[ReferenceRefreshRequest] | None = None
         self._active_dirty_markets: dict[MarketId, set[ScanTriggerReason]] | None = None
         self._active_freshness_updates: dict[InstrumentId, BookFreshnessUpdate] | None = None
         self._active_received_monotonic: MonotonicTimestamp | None = None
+        self._active_audit_outcomes: list[AuditOutcomeEvidence] | None = None
         self._last_accepted_l2_monotonic: dict[InstrumentId, MonotonicTimestamp] = {}
         self._raw_input_chain = _chain_seed("raw-input")
         self._canonical_event_chain = _chain_seed("canonical-event")
@@ -283,10 +313,12 @@ class CanonicalProcessor:
         self._scan_chain = _chain_seed("scan")
         self._validated_opportunity_chain = _chain_seed("validated-opportunity")
         self._reference_refresh_chain = _chain_seed("reference-refresh")
+        self._audit_outcome_chain = _chain_seed("rest-audit-outcome")
         self._processed = 0
         self._parse_failures = 0
         self._canonical_events = 0
         self._scan_count = 0
+        self._scan_disposition_counts = dict.fromkeys(ScanDisposition, 0)
         self._candidate_count = 0
         self._validated_opportunity_count = 0
         self._reference_refresh_count = 0
@@ -294,7 +326,10 @@ class CanonicalProcessor:
         self._invalidations = 0
         self._resyncs = 0
         self._rest_audits = 0
+        self._rest_audit_matches = 0
         self._rest_audit_mismatches = 0
+        self._rest_audit_raced = 0
+        self._rest_audit_failed = 0
 
     @property
     def discovered_markets(self) -> tuple[GammaMarket, ...]:
@@ -324,6 +359,50 @@ class CanonicalProcessor:
             if bundle is not None:
                 bundles.append(bundle)
         return tuple(bundles)
+
+    @property
+    def audit_outcomes(self) -> tuple[AuditOutcomeEvidence, ...]:
+        return tuple(self._audit_outcomes)
+
+    @property
+    def audit_ineligible_instruments(self) -> tuple[InstrumentId, ...]:
+        """Books excluded from opportunity eligibility after an unproven audit."""
+
+        return tuple(sorted(self._audit_ineligible_instruments, key=lambda item: item.value))
+
+    def processed_websocket_watermark(
+        self, connection_id: ConnectionId
+    ) -> WebSocketAdmissionWatermark:
+        """Return the durable canonical prefix for one socket generation."""
+
+        return WebSocketAdmissionWatermark(
+            connection_id=connection_id,
+            ordinal=self._processed_ws_watermarks.get(connection_id, 0),
+        )
+
+    def audit_book_identity(self, native_asset_id: str) -> AuditBookIdentity:
+        """Capture one relevant identity from the single canonical owner."""
+
+        owner = self._owner_for_native_asset(native_asset_id)
+        return AuditBookIdentity(
+            instrument_id=owner.instrument_id,
+            generation=self._audit_economic_generations.get(owner.instrument_id, 0),
+            economic_content_sha256=owner.audit_comparison_sha256(),
+        )
+
+    def _owner_for_native_asset(self, native_asset_id: str) -> CanonicalL2BookOwner:
+        matches: list[InstrumentId] = []
+        for bundle in self.current_bundles:
+            try:
+                instrument = bundle.instrument_for_token(native_asset_id)
+            except KeyError:
+                continue
+            matches.append(instrument.instrument_id)
+        if len(matches) != 1 or matches[0] not in self._owners:
+            raise NormalizationError(
+                "REST audit asset does not resolve to exactly one canonical owner"
+            )
+        return self._owners[matches[0]]
 
     @staticmethod
     def _market_id_for_condition(condition_id: str) -> MarketId:
@@ -361,6 +440,7 @@ class CanonicalProcessor:
             or self._active_dirty_markets is not None
             or self._active_freshness_updates is not None
             or self._active_received_monotonic is not None
+            or self._active_audit_outcomes is not None
         ):
             raise ProgrammingInvariantViolation(
                 "canonical processor cannot process envelopes reentrantly",
@@ -377,10 +457,12 @@ class CanonicalProcessor:
         current_refresh_requests: list[ReferenceRefreshRequest] = []
         current_dirty_markets: dict[MarketId, set[ScanTriggerReason]] = {}
         current_freshness_updates: dict[InstrumentId, BookFreshnessUpdate] = {}
+        current_audit_outcomes: list[AuditOutcomeEvidence] = []
         self._active_refresh_requests = current_refresh_requests
         self._active_dirty_markets = current_dirty_markets
         self._active_freshness_updates = current_freshness_updates
         self._active_received_monotonic = envelope.received_monotonic
+        self._active_audit_outcomes = current_audit_outcomes
         try:
             try:
                 self._route(envelope)
@@ -413,6 +495,7 @@ class CanonicalProcessor:
                     ),
                     scan_triggers=scan_triggers,
                     error_type=error_type,
+                    audit_outcomes=tuple(current_audit_outcomes),
                 )
             else:
                 scan_triggers = self._flush_dirty_scans(envelope.received_wall_time)
@@ -435,12 +518,14 @@ class CanonicalProcessor:
                     ),
                     scan_triggers=scan_triggers,
                     error_type=None,
+                    audit_outcomes=tuple(current_audit_outcomes),
                 )
         finally:
             self._active_refresh_requests = None
             self._active_dirty_markets = None
             self._active_freshness_updates = None
             self._active_received_monotonic = None
+            self._active_audit_outcomes = None
         return processed
 
     def _record_book_mutation(
@@ -449,6 +534,10 @@ class CanonicalProcessor:
         *,
         reason: ScanTriggerReason,
     ) -> None:
+        if mutation.audit_economic_changed:
+            self._audit_economic_generations[mutation.instrument_id] = (
+                self._audit_economic_generations.get(mutation.instrument_id, 0) + 1
+            )
         dirty = self._active_dirty_markets
         freshness = self._active_freshness_updates
         received_monotonic = self._active_received_monotonic
@@ -564,6 +653,7 @@ class CanonicalProcessor:
             context = self._normalization_context(envelope, bundle)
             rest = self._normalizer.normalize_rest_book(native, context)
             owner = self._owners[rest.instrument_id]
+            self._audit_ineligible_instruments.discard(rest.instrument_id)
             was_unhealthy = owner.health is not BookHealth.HEALTHY
             self._prepare_for_rest_snapshot(owner)
             mutation = owner.apply_rest_snapshot(rest)
@@ -574,42 +664,28 @@ class CanonicalProcessor:
             if was_unhealthy:
                 self._resyncs += 1
             return
+        if channel == CONTROL_REST_AUDIT_START:
+            self._stage_rest_audit(envelope)
+            return
+        if channel == CONTROL_REST_AUDIT_FAILED:
+            self._fail_rest_audit_from_control(envelope)
+            return
         if channel == REST_BOOK_AUDIT:
-            native = parse_rest_book(envelope.payload_bytes)
-            market_id = self._market_id_for_condition(native.condition_id)
-            bundle = self._registry.as_known_at(market_id, envelope.received_wall_time)
-            if bundle is None:
-                raise NormalizationError(
-                    "REST book audit arrived before matching as-known reference data"
-                )
-            context = self._normalization_context(envelope, bundle)
-            rest = self._normalizer.normalize_rest_book(native, context)
-            owner = self._owners[rest.instrument_id]
-            previous_health = owner.health
-            try:
-                result = owner.audit_rest_snapshot(
-                    rest,
-                    checked_at=envelope.received_wall_time,
-                )
-            except RawSourceInvariantError as error:
-                raise ProgrammingInvariantViolation(
-                    "REST audit provenance contains conflicting raw source pairs",
-                    component="canonical-processor",
-                ) from error
-            self._rest_audits += 1
-            if result.status is RestAuditStatus.MISMATCH:
-                self._rest_audit_mismatches += 1
-                if previous_health is not BookHealth.INVALID:
-                    self._invalidations += 1
-            self._record_book_mutation(
-                result.mutation,
-                reason=ScanTriggerReason.REST_AUDIT,
-            )
+            self._complete_rest_audit_response(envelope)
             return
         if channel == CONTROL_BOOK_INVALIDATION:
+            for request_id in tuple(sorted(self._pending_rest_audits)):
+                start = self._pending_rest_audits.pop(request_id)
+                self._record_audit_outcome(
+                    self._failed_audit_outcome(
+                        start,
+                        reason=AuditFailureReason.SOCKET_GENERATION_CHANGED,
+                    )
+                )
             self.invalidate_all(self._parse_control_invalidation(envelope.payload_bytes))
             return
         if channel == WS_MARKET:
+            self._advance_websocket_watermark(envelope)
             self._route_websocket(envelope)
             return
         raise ValueError(f"unsupported raw channel: {channel}")
@@ -638,6 +714,404 @@ class CanonicalProcessor:
                 "book-invalidation control payload must use canonical JSON encoding"
             )
         return reason
+
+    @staticmethod
+    def _control_object(
+        payload: bytes,
+        *,
+        schema: str,
+        expected_keys: frozenset[str],
+    ) -> dict[str, object]:
+        decoded = decode_json_exact(payload)
+        if not isinstance(decoded, dict):
+            raise NormalizationError("audit control payload must be an object")
+        control = cast(dict[str, object], decoded)
+        if frozenset(control) != expected_keys:
+            raise NormalizationError("audit control payload fields differ from schema")
+        if control.get("schema") != schema:
+            raise NormalizationError("audit control payload schema is unsupported")
+        return control
+
+    @staticmethod
+    def _control_text(control: dict[str, object], key: str, *, maximum: int = 2048) -> str:
+        value = control[key]
+        if not isinstance(value, str) or not value or len(value) > maximum:
+            raise NormalizationError(f"audit control {key} must be bounded non-empty text")
+        return value
+
+    @staticmethod
+    def _control_integer(
+        control: dict[str, object],
+        key: str,
+        *,
+        minimum: int = 0,
+    ) -> int:
+        value = control[key]
+        if not isinstance(value, JsonNumber):
+            raise NormalizationError(f"audit control {key} is outside its integer bounds")
+        lexeme = str(value)
+        if (
+            not lexeme.isascii()
+            or not lexeme.isdigit()
+            or (len(lexeme) > 1 and lexeme.startswith("0"))
+            or len(lexeme) > 20
+        ):
+            raise NormalizationError(f"audit control {key} must be a canonical integer")
+        parsed = int(lexeme)
+        if parsed < minimum:
+            raise NormalizationError(f"audit control {key} is outside its integer bounds")
+        return parsed
+
+    def _parse_audit_start(self, payload: bytes) -> AuditStartEvidence:
+        control = self._control_object(
+            payload,
+            schema=AUDIT_START_SCHEMA,
+            expected_keys=frozenset(
+                {
+                    "attempt",
+                    "connection_id",
+                    "instrument_id",
+                    "native_asset_id",
+                    "request_id",
+                    "request_started_monotonic_ns",
+                    "schema",
+                    "starting_admission_ordinal",
+                    "starting_book_economic_sha256",
+                    "starting_book_generation",
+                    "starting_processed_ordinal",
+                }
+            ),
+        )
+        try:
+            connection_id = ConnectionId(self._control_text(control, "connection_id"))
+            instrument_id = InstrumentId(self._control_text(control, "instrument_id"))
+            start = AuditStartEvidence(
+                request_id=self._control_text(control, "request_id", maximum=128),
+                connection_id=connection_id,
+                native_asset_id=self._control_text(control, "native_asset_id"),
+                attempt=self._control_integer(control, "attempt", minimum=1),
+                request_started_monotonic_ns=self._control_integer(
+                    control,
+                    "request_started_monotonic_ns",
+                ),
+                starting_admission_watermark=WebSocketAdmissionWatermark(
+                    connection_id=connection_id,
+                    ordinal=self._control_integer(control, "starting_admission_ordinal"),
+                ),
+                starting_processed_watermark=WebSocketAdmissionWatermark(
+                    connection_id=connection_id,
+                    ordinal=self._control_integer(control, "starting_processed_ordinal"),
+                ),
+                starting_book=AuditBookIdentity(
+                    instrument_id=instrument_id,
+                    generation=self._control_integer(control, "starting_book_generation"),
+                    economic_content_sha256=self._control_text(
+                        control,
+                        "starting_book_economic_sha256",
+                        maximum=64,
+                    ),
+                ),
+            )
+        except ValueError as error:
+            raise NormalizationError("audit start evidence is invalid") from error
+        if payload != start.to_payload():
+            raise NormalizationError("audit start evidence must use canonical encoding")
+        return start
+
+    def _stage_rest_audit(self, envelope: RawEventEnvelope) -> None:
+        start = self._parse_audit_start(envelope.payload_bytes)
+        if start.connection_id != envelope.connection_id:
+            raise NormalizationError("audit start envelope belongs to another socket generation")
+        if start.request_started_monotonic_ns != envelope.received_monotonic.nanoseconds:
+            raise NormalizationError("audit start timestamp differs from raw receive evidence")
+        if start.request_id in self._pending_rest_audits:
+            raise NormalizationError("audit request ID is already pending")
+        if self._pending_rest_audits:
+            raise NormalizationError("only one REST audit request may be pending")
+        current_processed = self.processed_websocket_watermark(start.connection_id)
+        if current_processed != start.starting_processed_watermark:
+            raise NormalizationError("audit start processed watermark is ambiguous")
+        current = self.audit_book_identity(start.native_asset_id)
+        if current != start.starting_book:
+            raise NormalizationError("audit start book identity changed before staging")
+        self._pending_rest_audits[start.request_id] = start
+
+    def _parse_audit_failure(self, payload: bytes) -> tuple[str, AuditFailureReason]:
+        control = self._control_object(
+            payload,
+            schema=AUDIT_FAILURE_SCHEMA,
+            expected_keys=frozenset({"reason", "request_id", "schema"}),
+        )
+        request_id = self._control_text(control, "request_id", maximum=128)
+        try:
+            reason = AuditFailureReason(self._control_text(control, "reason", maximum=128))
+        except ValueError as error:
+            raise NormalizationError("audit failure reason is unknown") from error
+        if payload != canonical_json_bytes(
+            {
+                "reason": reason.value,
+                "request_id": request_id,
+                "schema": AUDIT_FAILURE_SCHEMA,
+            }
+        ):
+            raise NormalizationError("audit failure evidence must use canonical encoding")
+        return request_id, reason
+
+    def _record_audit_outcome(self, evidence: AuditOutcomeEvidence) -> None:
+        active = self._active_audit_outcomes
+        if active is None:
+            raise ProgrammingInvariantViolation(
+                "audit outcome was recorded outside envelope processing",
+                component="canonical-processor",
+            )
+        self._rest_audits += 1
+        if evidence.outcome is AuditOutcome.MATCH:
+            self._rest_audit_matches += 1
+        elif evidence.outcome is AuditOutcome.MISMATCH:
+            self._rest_audit_mismatches += 1
+        elif evidence.outcome is AuditOutcome.RACED:
+            self._rest_audit_raced += 1
+        else:
+            self._rest_audit_failed += 1
+        self._audit_outcome_chain = _chain_extend(
+            self._audit_outcome_chain,
+            "rest-audit-outcome",
+            evidence,
+        )
+        self._audit_outcomes.append(evidence)
+        active.append(evidence)
+
+    def _failed_audit_outcome(
+        self,
+        start: AuditStartEvidence,
+        *,
+        reason: AuditFailureReason,
+        response: RawEventEnvelope | None = None,
+        response_boundary_ordinal: int | None = None,
+    ) -> AuditOutcomeEvidence:
+        owner = self._owners[start.starting_book.instrument_id]
+        barrier = self.audit_book_identity(start.native_asset_id)
+        processed = self.processed_websocket_watermark(start.connection_id).ordinal
+        self._audit_ineligible_instruments.add(owner.instrument_id)
+        self._mark_market_dirty(owner.market_id, ScanTriggerReason.REST_AUDIT)
+        return AuditOutcomeEvidence(
+            request_id=start.request_id,
+            connection_id=start.connection_id,
+            native_asset_id=start.native_asset_id,
+            attempt=start.attempt,
+            request_started_monotonic_ns=start.request_started_monotonic_ns,
+            starting_admission_ordinal=start.starting_admission_watermark.ordinal,
+            starting_processed_ordinal=start.starting_processed_watermark.ordinal,
+            starting_book=start.starting_book,
+            outcome=AuditOutcome.FAILED,
+            reason=reason,
+            response_ingest_id=None if response is None else response.ingest_id,
+            raw_response_sha256=None if response is None else response.payload_sha256,
+            response_received_wall_time=(None if response is None else response.received_wall_time),
+            response_received_monotonic_ns=(
+                None if response is None else response.received_monotonic.nanoseconds
+            ),
+            response_boundary_ordinal=response_boundary_ordinal,
+            barrier_processed_ordinal=None if response is None else processed,
+            barrier_book=None if response is None else barrier,
+            requires_resync=False,
+        )
+
+    def _fail_rest_audit_from_control(self, envelope: RawEventEnvelope) -> None:
+        request_id, reason = self._parse_audit_failure(envelope.payload_bytes)
+        start = self._pending_rest_audits.pop(request_id, None)
+        if start is None:
+            raise NormalizationError("audit failure references no pending request")
+        if envelope.connection_id != start.connection_id:
+            reason = AuditFailureReason.SOCKET_GENERATION_CHANGED
+        self._record_audit_outcome(self._failed_audit_outcome(start, reason=reason))
+
+    def _advance_websocket_watermark(self, envelope: RawEventEnvelope) -> None:
+        metadata = envelope.transport_metadata
+        raw_ordinal = metadata.get("websocket_admission_ordinal")
+        if raw_ordinal is None:
+            if any(
+                start.connection_id == envelope.connection_id
+                for start in self._pending_rest_audits.values()
+            ):
+                raise NormalizationError(
+                    "pending audit encountered WebSocket input without admission ordinal"
+                )
+            return
+        if isinstance(raw_ordinal, bool) or not isinstance(raw_ordinal, int):
+            raise NormalizationError("WebSocket admission ordinal must be an integer")
+        expected = self._processed_ws_watermarks.get(envelope.connection_id, 0) + 1
+        if raw_ordinal != expected:
+            raise NormalizationError("WebSocket admission ordinals are not contiguous")
+        self._processed_ws_watermarks[envelope.connection_id] = raw_ordinal
+
+    def _audit_response_metadata(self, envelope: RawEventEnvelope) -> tuple[str, int, int, int]:
+        metadata = envelope.transport_metadata
+        request_id = metadata.get("request_id")
+        boundary = metadata.get("response_boundary_websocket_ordinal")
+        barrier = metadata.get("barrier_websocket_ordinal")
+        attempt = metadata.get("audit_attempt")
+        if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
+            raise NormalizationError("REST audit response request ID is invalid")
+        for name, value in (
+            ("response boundary", boundary),
+            ("barrier", barrier),
+            ("attempt", attempt),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise NormalizationError(f"REST audit {name} metadata is invalid")
+        if cast(int, attempt) <= 0:
+            raise NormalizationError("REST audit attempt metadata must be positive")
+        return request_id, cast(int, boundary), cast(int, barrier), cast(int, attempt)
+
+    def _complete_rest_audit_response(self, envelope: RawEventEnvelope) -> None:
+        request_id, boundary, barrier_ordinal, attempt = self._audit_response_metadata(envelope)
+        start = self._pending_rest_audits.pop(request_id, None)
+        if start is None:
+            raise NormalizationError("REST audit response references no pending request")
+        if envelope.connection_id != start.connection_id or attempt != start.attempt:
+            self._record_audit_outcome(
+                self._failed_audit_outcome(
+                    start,
+                    reason=AuditFailureReason.SOCKET_GENERATION_CHANGED,
+                    response=envelope,
+                    response_boundary_ordinal=boundary,
+                )
+            )
+            return
+        if envelope.received_monotonic.nanoseconds < start.request_started_monotonic_ns:
+            self._record_audit_outcome(
+                self._failed_audit_outcome(
+                    start,
+                    reason=AuditFailureReason.RESPONSE_INVALID,
+                    response=envelope,
+                    response_boundary_ordinal=boundary,
+                )
+            )
+            return
+        processed = self.processed_websocket_watermark(start.connection_id).ordinal
+        if (
+            boundary != barrier_ordinal
+            or processed != boundary
+            or boundary < start.starting_admission_watermark.ordinal
+        ):
+            self._record_audit_outcome(
+                self._failed_audit_outcome(
+                    start,
+                    reason=AuditFailureReason.WATERMARK_AMBIGUOUS,
+                    response=envelope,
+                    response_boundary_ordinal=boundary,
+                )
+            )
+            return
+        barrier_book = self.audit_book_identity(start.native_asset_id)
+        try:
+            native = parse_rest_book(envelope.payload_bytes)
+            if native.asset_id != start.native_asset_id:
+                raise NormalizationError("REST audit response identifies another asset")
+            market_id = self._market_id_for_condition(native.condition_id)
+            bundle = self._registry.as_known_at(market_id, envelope.received_wall_time)
+            if bundle is None:
+                raise NormalizationError(
+                    "REST book audit arrived before matching as-known reference data"
+                )
+            context = self._normalization_context(envelope, bundle)
+            rest = self._normalizer.normalize_rest_book(native, context)
+        except BookStateError, NormalizationError, PolymarketSchemaError:
+            self._record_audit_outcome(
+                self._failed_audit_outcome(
+                    start,
+                    reason=AuditFailureReason.RESPONSE_INVALID,
+                    response=envelope,
+                    response_boundary_ordinal=boundary,
+                )
+            )
+            return
+
+        if barrier_book != start.starting_book:
+            evidence = AuditOutcomeEvidence(
+                request_id=start.request_id,
+                connection_id=start.connection_id,
+                native_asset_id=start.native_asset_id,
+                attempt=start.attempt,
+                request_started_monotonic_ns=start.request_started_monotonic_ns,
+                starting_admission_ordinal=start.starting_admission_watermark.ordinal,
+                starting_processed_ordinal=start.starting_processed_watermark.ordinal,
+                starting_book=start.starting_book,
+                outcome=AuditOutcome.RACED,
+                reason=None,
+                response_ingest_id=envelope.ingest_id,
+                raw_response_sha256=envelope.payload_sha256,
+                response_received_wall_time=envelope.received_wall_time,
+                response_received_monotonic_ns=envelope.received_monotonic.nanoseconds,
+                response_boundary_ordinal=boundary,
+                barrier_processed_ordinal=processed,
+                barrier_book=barrier_book,
+                requires_resync=False,
+            )
+            self._record_audit_outcome(evidence)
+            return
+
+        owner = self._owners[start.starting_book.instrument_id]
+        previous_health = owner.health
+        try:
+            result = owner.audit_rest_snapshot(rest, checked_at=envelope.received_wall_time)
+        except RawSourceInvariantError as error:
+            raise ProgrammingInvariantViolation(
+                "REST audit provenance contains conflicting raw source pairs",
+                component="canonical-processor",
+            ) from error
+        except BookStateError:
+            self._record_audit_outcome(
+                self._failed_audit_outcome(
+                    start,
+                    reason=AuditFailureReason.LOCAL_STATE_NOT_COMPARABLE,
+                    response=envelope,
+                    response_boundary_ordinal=boundary,
+                )
+            )
+            return
+        self._record_book_mutation(result.mutation, reason=ScanTriggerReason.REST_AUDIT)
+        if result.status is RestAuditStatus.NOT_COMPARABLE:
+            self._record_audit_outcome(
+                self._failed_audit_outcome(
+                    start,
+                    reason=AuditFailureReason.LOCAL_STATE_NOT_COMPARABLE,
+                    response=envelope,
+                    response_boundary_ordinal=boundary,
+                )
+            )
+            return
+        outcome = (
+            AuditOutcome.MATCH if result.status is RestAuditStatus.MATCH else AuditOutcome.MISMATCH
+        )
+        if outcome is AuditOutcome.MISMATCH and previous_health is not BookHealth.INVALID:
+            self._invalidations += 1
+        if outcome is AuditOutcome.MATCH:
+            self._audit_ineligible_instruments.discard(owner.instrument_id)
+        elif outcome is AuditOutcome.MISMATCH:
+            self._audit_ineligible_instruments.add(owner.instrument_id)
+        evidence = AuditOutcomeEvidence(
+            request_id=start.request_id,
+            connection_id=start.connection_id,
+            native_asset_id=start.native_asset_id,
+            attempt=start.attempt,
+            request_started_monotonic_ns=start.request_started_monotonic_ns,
+            starting_admission_ordinal=start.starting_admission_watermark.ordinal,
+            starting_processed_ordinal=start.starting_processed_watermark.ordinal,
+            starting_book=start.starting_book,
+            outcome=outcome,
+            reason=None,
+            response_ingest_id=envelope.ingest_id,
+            raw_response_sha256=envelope.payload_sha256,
+            response_received_wall_time=envelope.received_wall_time,
+            response_received_monotonic_ns=envelope.received_monotonic.nanoseconds,
+            response_boundary_ordinal=boundary,
+            barrier_processed_ordinal=processed,
+            barrier_book=barrier_book,
+            requires_resync=outcome is AuditOutcome.MISMATCH,
+        )
+        self._record_audit_outcome(evidence)
 
     @staticmethod
     def _prepare_for_rest_snapshot(owner: CanonicalL2BookOwner) -> None:
@@ -1030,9 +1504,19 @@ class CanonicalProcessor:
         instrument_ids = self._market_instruments.get(bundle.market.market_id, ())
         if len(instrument_ids) != 2:
             return
-        snapshot_views = tuple(
-            self._owners[item].snapshot_with_economic_hash() for item in instrument_ids
-        )
+        snapshot_views_list: list[tuple[ImmutableOrderBookSnapshot, str]] = []
+        for instrument_id in instrument_ids:
+            owner = self._owners[instrument_id]
+            if instrument_id in self._audit_ineligible_instruments:
+                snapshot = replace(
+                    owner.snapshot(),
+                    health=BookHealth.STALE,
+                    invalidation_reason=None,
+                )
+                snapshot_views_list.append((snapshot, snapshot.economic_content_sha256()))
+            else:
+                snapshot_views_list.append(owner.snapshot_with_economic_hash())
+        snapshot_views = tuple(snapshot_views_list)
         books = tuple(item[0] for item in snapshot_views)
         book_state_hashes = {
             snapshot.instrument_id: state_hash for snapshot, state_hash in snapshot_views
@@ -1062,6 +1546,7 @@ class CanonicalProcessor:
                 component="canonical-processor",
             ) from error
         self._scan_count += 1
+        self._scan_disposition_counts[result.disposition] += 1
         self._scan_chain = _chain_extend(self._scan_chain, "scan", result.terminal_hash)
         if result.candidate is not None:
             self._candidate_count += 1
@@ -1199,9 +1684,19 @@ class CanonicalProcessor:
         scan_chain_sha256 = self._scan_chain.hex()
         validated_opportunity_chain_sha256 = self._validated_opportunity_chain.hex()
         reference_refresh_chain_sha256 = self._reference_refresh_chain.hex()
+        audit_outcome_chain_sha256 = self._audit_outcome_chain.hex()
+        audit_outcomes = tuple(self._audit_outcomes)
+        audit_ineligible_instrument_ids = tuple(
+            item.value for item in self.audit_ineligible_instruments
+        )
+        audit_ineligible_books = len(audit_ineligible_instrument_ids)
         lifecycles = self._lifecycle_tracker.snapshot()
         lifecycle_state_sha256 = canonical_sha256(lifecycles)
         healthy_books = sum(snapshot.health is BookHealth.HEALTHY for snapshot in snapshots)
+        scan_disposition_counts = tuple(
+            (disposition, self._scan_disposition_counts[disposition])
+            for disposition in sorted(ScanDisposition, key=lambda item: item.value)
+        )
         terminal_hash = canonical_sha256(
             {
                 "config_hash": self._config.config_hash.value,
@@ -1214,10 +1709,16 @@ class CanonicalProcessor:
                     "processed_raw_messages": self._processed,
                     "reference_refresh_requests": self._reference_refresh_count,
                     "reference_updates": self._reference_updates,
+                    "rest_audit_failed": self._rest_audit_failed,
+                    "rest_audit_matches": self._rest_audit_matches,
                     "rest_audit_mismatches": self._rest_audit_mismatches,
+                    "rest_audit_raced": self._rest_audit_raced,
                     "rest_audits": self._rest_audits,
+                    "pending_rest_audits": len(self._pending_rest_audits),
+                    "audit_ineligible_books": audit_ineligible_books,
                     "resyncs": self._resyncs,
                     "scans": self._scan_count,
+                    "scan_dispositions": scan_disposition_counts,
                     "validated_opportunities": self._validated_opportunity_count,
                     "unique_opportunity_lifecycles": len(lifecycles),
                 },
@@ -1226,11 +1727,16 @@ class CanonicalProcessor:
                     "expected_data_error": error_chain_sha256,
                     "raw_input": raw_input_chain_sha256,
                     "reference_refresh": reference_refresh_chain_sha256,
+                    "rest_audit_outcome": audit_outcome_chain_sha256,
                     "scan": scan_chain_sha256,
                     "validated_opportunity": validated_opportunity_chain_sha256,
                 },
                 "reference_versions": reference_versions,
                 "lifecycle_state_sha256": lifecycle_state_sha256,
+                "audit_ineligible_instrument_ids": audit_ineligible_instrument_ids,
+                "pending_rest_audits": tuple(
+                    self._pending_rest_audits[key] for key in sorted(self._pending_rest_audits)
+                ),
                 "snapshot_hashes": snapshot_hashes,
             }
         )
@@ -1240,12 +1746,18 @@ class CanonicalProcessor:
             canonical_events=self._canonical_events,
             reference_updates=self._reference_updates,
             scans=self._scan_count,
+            scan_disposition_counts=scan_disposition_counts,
             candidates=self._candidate_count,
             validated_opportunities=self._validated_opportunity_count,
             invalidations=self._invalidations,
             resyncs=self._resyncs,
             rest_audits=self._rest_audits,
+            rest_audit_matches=self._rest_audit_matches,
             rest_audit_mismatches=self._rest_audit_mismatches,
+            rest_audit_raced=self._rest_audit_raced,
+            rest_audit_failed=self._rest_audit_failed,
+            pending_rest_audits=len(self._pending_rest_audits),
+            audit_ineligible_books=audit_ineligible_books,
             reference_refresh_requests=self._reference_refresh_count,
             unique_opportunity_lifecycles=len(lifecycles),
             healthy_books=healthy_books,
@@ -1255,6 +1767,7 @@ class CanonicalProcessor:
             scan_chain_sha256=scan_chain_sha256,
             validated_opportunity_chain_sha256=validated_opportunity_chain_sha256,
             reference_refresh_chain_sha256=reference_refresh_chain_sha256,
+            audit_outcome_chain_sha256=audit_outcome_chain_sha256,
             lifecycle_state_sha256=lifecycle_state_sha256,
             scan_results_truncated=self._scan_count > len(self._scan_results),
             opportunity_hashes_truncated=(
@@ -1263,8 +1776,10 @@ class CanonicalProcessor:
             reference_refresh_requests_truncated=(
                 self._reference_refresh_count > len(self._reference_refresh_requests)
             ),
+            audit_outcomes_truncated=self._rest_audits > len(self._audit_outcomes),
             terminal_hash=terminal_hash,
             opportunity_hashes=opportunity_hashes,
+            audit_outcomes=audit_outcomes,
         )
 
 

@@ -20,6 +20,7 @@ from multi_market_arbitrage.core.provenance import (
     RawSourceRef,
     merge_raw_source_refs,
 )
+from multi_market_arbitrage.core.serialization import canonical_sha256
 from multi_market_arbitrage.core.time import UtcTimestamp
 from multi_market_arbitrage.normalization import (
     BookSide,
@@ -945,6 +946,34 @@ class CanonicalL2BookOwner:
             cached = self.snapshot().economic_content_sha256()
             self._economic_hash_cache = cached
         return cached
+
+    def audit_comparison_sha256(self) -> str:
+        """Hash only state whose mutation makes a REST book audit ambiguous.
+
+        Receive freshness, source lineage, timestamps, last trades, and the
+        owner's general generation are deliberately excluded.  The processor
+        pairs this identity with a dedicated relevant-mutation generation so a
+        changed-then-restored book still races while an economic no-op does not.
+        """
+
+        return canonical_sha256(
+            {
+                "schema": "mma-rest-audit-comparison-v1",
+                "instrument_id": self._instrument_id,
+                "market_id": self._market_id,
+                "health": self._health,
+                "invalidation_reason": self._reason,
+                "bids": self._bids,
+                "asks": self._asks,
+                "market_version_id": self._market_version_id,
+                "precision_rule_version_id": self._precision_version_id,
+                "cost_rule_set_version_id": self._cost_version_id,
+                "tick_size": self._tick_size,
+                "minimum_order_size": self._minimum_order_size,
+                "neg_risk": self._neg_risk,
+                "precision_verified": self._precision_verified,
+            }
+        )
 
     def snapshot_with_economic_hash(self) -> tuple[ImmutableOrderBookSnapshot, str]:
         return self.snapshot(), self.economic_content_sha256()

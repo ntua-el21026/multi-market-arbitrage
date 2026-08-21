@@ -23,12 +23,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, cast
 
+import httpx
+
 REPO = Path(__file__).resolve().parents[1]
 FIXTURES = REPO / "tests" / "golden" / "fixtures"
 FROZEN_COMMIT = "e7d69aedc328ceda220120377307d5ebcc1a80d9"
 BASELINE_HARNESS_SHA256 = "8f10c2f1881a987c9c2439396ae82e2e6adb88c343dde500a25654559672cb87"
 EXPECTED_FIXTURE_SET_SHA256 = "9e52a576eb7f6874d9c494e093aee8e61fb56ab0d33e7ca302bc5a1d1d4ae70c"
-RESULT_SCHEMA = "mma-phase1-performance-final-c-v1"
+RESULT_SCHEMA = "mma-phase1-performance-final-c-v2"
 SOURCE_SNAPSHOT_EXCLUSIONS = frozenset({"docs/PHASE_1_PERFORMANCE_BASELINE.md"})
 COMPARABLE_SERIES_NAMES = (
     "socket_receive_to_raw_envelope_proxy",
@@ -131,10 +133,15 @@ from multi_market_arbitrage.normalization import (  # noqa: E402
 )
 from multi_market_arbitrage.pipeline import (  # noqa: E402
     CLOB_MARKET_PREFIX,
+    CONTROL_REST_AUDIT_START,
     GAMMA_MARKETS_KEYSET,
     REST_BOOK,
+    REST_BOOK_AUDIT,
     WS_MARKET,
+    AuditOutcome,
+    AuditStartEvidence,
     CanonicalProcessor,
+    WebSocketAdmissionWatermark,
 )
 from multi_market_arbitrage.pipeline.ingress import BoundedRawIngress  # noqa: E402
 from multi_market_arbitrage.reference import (  # noqa: E402
@@ -147,6 +154,7 @@ from multi_market_arbitrage.research import (  # noqa: E402
     SupervisedAnalyticalOutputs,
 )
 from multi_market_arbitrage.scanners.polymarket_complete_set import (  # noqa: E402
+    CapacityPlannerDiagnostics,
     CompleteSetScannerConfig,
     CompleteSetScanResult,
     PolymarketCompleteSetScanner,
@@ -163,6 +171,9 @@ from multi_market_arbitrage.storage import (  # noqa: E402
     AnalyticalProvenance,
 )
 from multi_market_arbitrage.venues.polymarket import (  # noqa: E402
+    PolymarketEndpointClass,
+    PolymarketPublicClient,
+    PublicReadPolicy,
     ReceivedWebSocketMessage,
 )
 from multi_market_arbitrage.venues.polymarket.schemas import (  # noqa: E402
@@ -473,7 +484,12 @@ def books_for_scan(
     return books[0], books[1]
 
 
-def scanner_for(*, increment: str, maximum: int = 4096) -> PolymarketCompleteSetScanner:
+def scanner_for(
+    *,
+    increment: str,
+    maximum: int = 4096,
+    capacity_diagnostics_observer: Callable[[CapacityPlannerDiagnostics], None] | None = None,
+) -> PolymarketCompleteSetScanner:
     return PolymarketCompleteSetScanner(
         CompleteSetScannerConfig(
             maximum_book_age_ns=1_000_000_000,
@@ -483,7 +499,8 @@ def scanner_for(*, increment: str, maximum: int = 4096) -> PolymarketCompleteSet
             ),
             quantity_increment=Quantity.parse(increment),
             maximum_capacity_evaluations=maximum,
-        )
+        ),
+        capacity_diagnostics_observer=capacity_diagnostics_observer,
     )
 
 
@@ -920,20 +937,36 @@ def microbenchmarks() -> tuple[list[dict[str, Any]], dict[str, Any]]:
             )
         ]
 
-    results.append(
-        measure_callable(
-            BenchSpec(
-                "scanner_worst_permitted_4096_evaluations",
-                "E_worst_4096",
-                "scanner",
-                1,
-                7,
-                "Full exact candidate/cost/capacity path at the configured 4,096-evaluation "
-                "ceiling with four edge thresholds.",
-            ),
-            scan_worst,
-        )
+    worst_measurement = measure_callable(
+        BenchSpec(
+            "scanner_worst_permitted_4096_evaluations",
+            "E_worst_4096",
+            "scanner",
+            1,
+            7,
+            "Full exact candidate/cost/capacity path at the configured 4,096-evaluation "
+            "ceiling with four edge thresholds.",
+        ),
+        scan_worst,
     )
+    worst_planner_diagnostics: list[CapacityPlannerDiagnostics] = []
+    diagnostic_result = scanner_for(
+        increment="0.01",
+        capacity_diagnostics_observer=worst_planner_diagnostics.append,
+    ).scan(
+        bundle=BUNDLE,
+        proof=PROOF,
+        books=worst_books,
+        observed_at=NOW,
+        provenance=FIXTURE_PROVENANCE,
+    )
+    require(bool(worst_planner_diagnostics), "scanner planner diagnostics were not captured")
+    require(
+        diagnostic_result.terminal_hash == worst_result_holder[0].terminal_hash,
+        "instrumented scanner result differs from the timed production scan",
+    )
+    worst_measurement["planner_diagnostics"] = asdict(worst_planner_diagnostics[-1])
+    results.append(worst_measurement)
     result_hashes = {
         "quiet_terminal_hash": scanner_quiet.scan(
             bundle=BUNDLE,
@@ -1850,6 +1883,352 @@ async def ingress_stage_benchmarks() -> list[dict[str, Any]]:
         )
     )
     return results
+
+
+def _configured_public_read_policy() -> PublicReadPolicy:
+    configured = CONFIG.polymarket.public_reads
+    return PublicReadPolicy(
+        maximum_concurrency=configured.maximum_concurrency,
+        maximum_attempts=configured.maximum_attempts,
+        initial_backoff_seconds=configured.initial_backoff_seconds,
+        maximum_backoff_seconds=configured.maximum_backoff_seconds,
+        jitter_fraction=configured.jitter_fraction,
+        jitter_seed=configured.jitter_seed,
+        maximum_retry_after_seconds=configured.maximum_retry_after_seconds,
+        rate_limit_window_seconds=configured.rate_limit_window_seconds,
+        gamma_general_requests_per_window=configured.gamma_general_requests_per_window,
+        gamma_markets_requests_per_window=configured.gamma_markets_requests_per_window,
+        clob_general_requests_per_window=configured.clob_general_requests_per_window,
+        clob_book_requests_per_window=configured.clob_book_requests_per_window,
+        clob_books_requests_per_window=configured.clob_books_requests_per_window,
+    )
+
+
+async def audit_http_benchmark() -> dict[str, Any]:
+    """Measure the production public-read adapter without claiming network latency."""
+
+    payload = fixture("polymarket_rest_book_yes.json")
+    fixture_sha256 = hashlib.sha256(payload).hexdigest()
+    warmups = 10
+    repetitions = 50
+    handler_requests = [0]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        require(request.method == "GET", "audit HTTP benchmark used a non-GET request")
+        require(request.url.path == "/book", "audit HTTP benchmark used an unexpected path")
+        require(
+            request.url.params.get("token_id") == "token-yes",
+            "audit HTTP benchmark used an unexpected token ID",
+        )
+        handler_requests[0] += 1
+        return httpx.Response(200, content=payload, request=request)
+
+    async with PolymarketPublicClient(
+        clob_url="https://clob.example.invalid",
+        timeout_seconds=CONFIG.polymarket.request_timeout_seconds,
+        max_response_bytes=CONFIG.polymarket.maximum_http_response_bytes,
+        transport=httpx.MockTransport(handler),
+        public_read_policy=_configured_public_read_policy(),
+    ) as client:
+        for _ in range(warmups):
+            result = await client.fetch_order_book_raw_with_evidence("token-yes")
+            require(result.payload_bytes == payload, "audit HTTP warmup changed the fixture bytes")
+            require(result.evidence.attempts == 1, "audit HTTP warmup unexpectedly retried")
+        gc.collect()
+        samples: list[int] = []
+        wall_start = time.perf_counter_ns()
+        cpu_start = time.process_time_ns()
+        for _ in range(repetitions):
+            started = time.perf_counter_ns()
+            result = await client.fetch_order_book_raw_with_evidence("token-yes")
+            samples.append(time.perf_counter_ns() - started)
+            require(
+                result.payload_bytes == payload, "audit HTTP response changed the fixture bytes"
+            )
+            require(result.evidence.attempts == 1, "audit HTTP benchmark unexpectedly retried")
+            require(
+                result.evidence.payload_sha256 == fixture_sha256,
+                "audit HTTP evidence hash differs from the response fixture",
+            )
+        cpu_ns = time.process_time_ns() - cpu_start
+        wall_ns = time.perf_counter_ns() - wall_start
+        endpoint_metrics = next(
+            item
+            for item in client.public_read_metrics_snapshot().endpoints
+            if item.endpoint_class is PolymarketEndpointClass.CLOB_BOOK
+        )
+
+    expected_requests = warmups + repetitions
+    require(handler_requests[0] == expected_requests, "audit HTTP handler request count differs")
+    require(
+        endpoint_metrics.requests == expected_requests, "audit HTTP metrics request count differs"
+    )
+    require(
+        endpoint_metrics.attempts == expected_requests, "audit HTTP metrics attempt count differs"
+    )
+    require(endpoint_metrics.retries == 0, "audit HTTP benchmark unexpectedly recorded retries")
+    require(
+        endpoint_metrics.local_rate_limit_waits == 0,
+        "audit HTTP benchmark exceeded the configured local request budget",
+    )
+    return summarize_samples(
+        BenchSpec(
+            "audit_http_adapter_success_mock_transport",
+            "B_normal_update",
+            "audit HTTP adapter request -> bounded response evidence",
+            warmups,
+            repetitions,
+            "Production PolymarketPublicClient and configured public-read controller over an "
+            "httpx.MockTransport returning the recorded REST-book fixture. Includes request "
+            "construction, concurrency/rate-budget admission, bounded response streaming, "
+            "evidence hashing, and metrics; excludes DNS, TCP/TLS, and venue/network latency.",
+        ),
+        samples,
+        cpu_ns=cpu_ns,
+        wall_ns=wall_ns,
+        extra={
+            "endpoint_class": PolymarketEndpointClass.CLOB_BOOK.value,
+            "fixture": "tests/golden/fixtures/polymarket_rest_book_yes.json",
+            "fixture_bytes": len(payload),
+            "fixture_sha256": fixture_sha256,
+            "handler_requests_including_warmups": handler_requests[0],
+            "mock_transport": True,
+            "network_latency_included": False,
+            "public_read_metrics_including_warmups": asdict(endpoint_metrics),
+        },
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _AuditBenchmarkCase:
+    processor: CanonicalProcessor
+    backlog: tuple[RawEventEnvelope, ...]
+    response: RawEventEnvelope
+
+
+def _audit_envelope(
+    *,
+    run_id: CollectorRunId,
+    sequence: int,
+    connection_id: ConnectionId,
+    channel: str,
+    transport_type: str,
+    payload: bytes,
+    received_wall_ns: int,
+    received_monotonic_ns: int,
+    transport_metadata: Mapping[str, str | int | bool] | None = None,
+) -> RawEventEnvelope:
+    return RawEventEnvelope.capture(
+        collector_run_id=run_id,
+        ingest_seq=sequence,
+        venue_id=POLYMARKET_VENUE_ID,
+        connection_id=connection_id,
+        subscription_id=SubscriptionId("final-c-audit-benchmark"),
+        channel=channel,
+        transport_type=transport_type,
+        subscription_semantics_hash=hashlib.sha256(f"{channel}:benchmark".encode()).hexdigest(),
+        received_wall_time=UtcTimestamp(received_wall_ns),
+        received_monotonic=MonotonicTimestamp(run_id.value, received_monotonic_ns),
+        payload_bytes=payload,
+        payload_encoding="utf-8",
+        transport_metadata=transport_metadata,
+        ingest_id=IngestId(f"audit-benchmark-{sequence}"),
+    )
+
+
+def _prepare_audit_benchmark_case(*, seed: int, backlog_messages: int) -> _AuditBenchmarkCase:
+    if seed < 0 or backlog_messages < 0:
+        raise ValueError("audit benchmark seed and backlog must be non-negative")
+    run_id = CollectorRunId(f"final-c-audit-{backlog_messages}-{seed}")
+    connection_id = ConnectionId(f"final-c-audit-{backlog_messages}-{seed}")
+    processor = CanonicalProcessor(CONFIG)
+    for envelope in processor_bootstrap_inputs(run_id, no_edge=True):
+        require(processor.process_replayed(envelope).success, "audit benchmark bootstrap failed")
+
+    native_asset_id = GAMMA.clob_token_ids[0]
+    starting_book = processor.audit_book_identity(native_asset_id)
+    start_ns = 10_000_000_000 + seed * 1_000_000
+    zero_watermark = WebSocketAdmissionWatermark(connection_id=connection_id, ordinal=0)
+    start = AuditStartEvidence(
+        request_id=f"audit-request-{backlog_messages}-{seed}",
+        connection_id=connection_id,
+        native_asset_id=native_asset_id,
+        attempt=1,
+        request_started_monotonic_ns=start_ns,
+        starting_admission_watermark=zero_watermark,
+        starting_processed_watermark=zero_watermark,
+        starting_book=starting_book,
+    )
+    start_result = processor.process_replayed(
+        _audit_envelope(
+            run_id=run_id,
+            sequence=4,
+            connection_id=connection_id,
+            channel=CONTROL_REST_AUDIT_START,
+            transport_type="CONTROL",
+            payload=start.to_payload(),
+            received_wall_ns=2_000_000_000 + seed,
+            received_monotonic_ns=start_ns,
+            transport_metadata={"audit_attempt": 1, "request_id": start.request_id},
+        )
+    )
+    require(start_result.success, "audit benchmark could not stage its request")
+    require(not start_result.audit_outcomes, "audit benchmark classified at request staging")
+
+    backlog_payload = fixture("polymarket_ws_last_trade.json")
+    backlog = tuple(
+        _audit_envelope(
+            run_id=run_id,
+            sequence=4 + ordinal,
+            connection_id=connection_id,
+            channel=WS_MARKET,
+            transport_type="WEBSOCKET",
+            payload=backlog_payload,
+            received_wall_ns=2_100_000_000 + seed + ordinal,
+            received_monotonic_ns=start_ns + ordinal,
+            transport_metadata={"websocket_admission_ordinal": ordinal},
+        )
+        for ordinal in range(1, backlog_messages + 1)
+    )
+    response = _audit_envelope(
+        run_id=run_id,
+        sequence=5 + backlog_messages,
+        connection_id=connection_id,
+        channel=REST_BOOK_AUDIT,
+        transport_type="HTTP",
+        payload=fixture("polymarket_rest_book_yes.json"),
+        received_wall_ns=3_000_000_000 + seed,
+        received_monotonic_ns=start_ns + backlog_messages + 1,
+        transport_metadata={
+            "audit_attempt": 1,
+            "barrier_websocket_ordinal": backlog_messages,
+            "request_id": start.request_id,
+            "response_boundary_websocket_ordinal": backlog_messages,
+        },
+    )
+    return _AuditBenchmarkCase(processor=processor, backlog=backlog, response=response)
+
+
+def _complete_audit_benchmark_case(case: _AuditBenchmarkCase) -> None:
+    result = case.processor.process_replayed(case.response)
+    require(result.success, "audit benchmark response processing failed")
+    require(len(result.audit_outcomes) == 1, "audit benchmark response produced no single outcome")
+    outcome = result.audit_outcomes[0]
+    require(outcome.outcome is AuditOutcome.MATCH, "audit benchmark response did not MATCH")
+    require(
+        outcome.response_boundary_ordinal == outcome.barrier_processed_ordinal,
+        "audit benchmark classified before its response barrier",
+    )
+
+
+def audit_pipeline_benchmarks() -> list[dict[str, Any]]:
+    """Measure deterministic barrier catch-up and production MATCH classification."""
+
+    barrier_warmups = 3
+    barrier_repetitions = 20
+    barrier_messages = 64
+    for index in range(barrier_warmups):
+        case = _prepare_audit_benchmark_case(seed=index, backlog_messages=barrier_messages)
+        for envelope in case.backlog:
+            require(
+                case.processor.process_replayed(envelope).success, "audit barrier warmup failed"
+            )
+        _complete_audit_benchmark_case(case)
+    gc.collect()
+    barrier_samples: list[int] = []
+    barrier_cpu_ns = 0
+    for index in range(barrier_repetitions):
+        case = _prepare_audit_benchmark_case(
+            seed=barrier_warmups + index,
+            backlog_messages=barrier_messages,
+        )
+        cpu_started = time.process_time_ns()
+        started = time.perf_counter_ns()
+        for envelope in case.backlog:
+            result = case.processor.process_replayed(envelope)
+            require(result.success, "audit barrier benchmark failed to process backlog")
+            require(not result.audit_outcomes, "audit barrier backlog classified prematurely")
+        barrier_samples.append(time.perf_counter_ns() - started)
+        barrier_cpu_ns += time.process_time_ns() - cpu_started
+        _complete_audit_benchmark_case(case)
+    barrier_wall_ns = sum(barrier_samples)
+    barrier = summarize_samples(
+        BenchSpec(
+            "audit_barrier_catchup_64_messages",
+            "C_high_volatility_burst",
+            "audit response barrier backlog -> processed watermark",
+            barrier_warmups,
+            barrier_repetitions,
+            "Production CanonicalProcessor catches up from processed ordinal 0 to the response "
+            "boundary at ordinal 64 using preserved diagnostic-only last-trade frames. The timed "
+            "region excludes HTTP and final REST classification; every trial then proves MATCH.",
+        ),
+        barrier_samples,
+        cpu_ns=barrier_cpu_ns,
+        wall_ns=barrier_wall_ns,
+        extra={
+            "backlog_fixture": "tests/golden/fixtures/polymarket_ws_last_trade.json",
+            "barrier_lag_messages": barrier_messages,
+            "classification_excluded_from_timed_region": True,
+            "messages_per_second_from_sample_sum": (
+                barrier_repetitions * barrier_messages * 1_000_000_000 / sum(barrier_samples)
+            ),
+            "response_boundary_ordinal": barrier_messages,
+            "starting_processed_ordinal": 0,
+            "validated_outcome_after_barrier": AuditOutcome.MATCH.value,
+        },
+    )
+
+    classification_warmups = 10
+    classification_repetitions = 100
+    for index in range(classification_warmups):
+        case = _prepare_audit_benchmark_case(seed=10_000 + index, backlog_messages=0)
+        _complete_audit_benchmark_case(case)
+    gc.collect()
+    classification_samples: list[int] = []
+    classification_cpu_ns = 0
+    response_sha256 = hashlib.sha256(fixture("polymarket_rest_book_yes.json")).hexdigest()
+    for index in range(classification_repetitions):
+        case = _prepare_audit_benchmark_case(
+            seed=10_000 + classification_warmups + index,
+            backlog_messages=0,
+        )
+        cpu_started = time.process_time_ns()
+        started = time.perf_counter_ns()
+        result = case.processor.process_replayed(case.response)
+        classification_samples.append(time.perf_counter_ns() - started)
+        classification_cpu_ns += time.process_time_ns() - cpu_started
+        require(result.success, "audit classification benchmark response failed")
+        require(len(result.audit_outcomes) == 1, "audit classification produced no single outcome")
+        outcome = result.audit_outcomes[0]
+        require(outcome.outcome is AuditOutcome.MATCH, "audit classification did not MATCH")
+        require(outcome.raw_response_sha256 == response_sha256, "audit classification hash differs")
+    classification_wall_ns = sum(classification_samples)
+    classification = summarize_samples(
+        BenchSpec(
+            "audit_classification_match",
+            "B_normal_update",
+            "preserved REST audit response -> typed MATCH outcome",
+            classification_warmups,
+            classification_repetitions,
+            "Production CanonicalProcessor REST-audit route on an already satisfied zero-lag "
+            "barrier. Includes strict response metadata, REST parsing/normalization, economic book "
+            "comparison, mutation accounting, typed evidence, and outcome-chain hashing. HTTP and "
+            "raw journal durability are excluded.",
+        ),
+        classification_samples,
+        cpu_ns=classification_cpu_ns,
+        wall_ns=classification_wall_ns,
+        extra={
+            "barrier_lag_messages": 0,
+            "fixture": "tests/golden/fixtures/polymarket_rest_book_yes.json",
+            "fixture_sha256": response_sha256,
+            "http_included": False,
+            "journal_durability_included": False,
+            "outcome": AuditOutcome.MATCH.value,
+        },
+    )
+    return [barrier, classification]
 
 
 async def current_receive_to_scan_benchmark(
@@ -3161,6 +3540,8 @@ def main() -> int:
         comparable_benchmarks(out, output, json_path)
         output["current_pipeline_stages"].extend(asyncio.run(ingress_stage_benchmarks()))
         output["current_pipeline_stages"].append(analytical_enqueue_benchmark(out))
+        output["current_pipeline_stages"].append(asyncio.run(audit_http_benchmark()))
+        output["current_pipeline_stages"].extend(audit_pipeline_benchmarks())
         stage_results, receive_validation = asyncio.run(current_receive_to_scan_benchmark(out))
         output["current_pipeline_stages"].extend(stage_results)
         output["receive_to_scan_validation"] = receive_validation

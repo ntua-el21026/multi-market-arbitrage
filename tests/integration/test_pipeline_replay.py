@@ -36,12 +36,17 @@ from multi_market_arbitrage.observability import InMemoryMetrics
 from multi_market_arbitrage.pipeline import (
     CLOB_MARKET_PREFIX,
     CONTROL_BOOK_INVALIDATION,
+    CONTROL_REST_AUDIT_START,
     GAMMA_MARKETS_KEYSET,
     REST_BOOK,
+    REST_BOOK_AUDIT,
     WS_MARKET,
+    AuditFailureReason,
+    AuditOutcome,
     CanonicalProcessor,
 )
 from multi_market_arbitrage.pipeline import observe as observe_module
+from multi_market_arbitrage.pipeline.health import ObservationRuntimeHealth
 from multi_market_arbitrage.pipeline.observe import PolymarketObservationService
 from multi_market_arbitrage.pipeline.processor import ProcessedEnvelope, ReferenceRefreshRequest
 from multi_market_arbitrage.reference import POLYMARKET_VENUE_ID
@@ -64,7 +69,16 @@ from multi_market_arbitrage.storage import (
     analytical_run_completion_path,
     load_analytical_run_completion,
 )
-from multi_market_arbitrage.venues.polymarket import ReceivedWebSocketMessage
+from multi_market_arbitrage.venues.polymarket import (
+    PolymarketEndpointClass,
+    PolymarketHttpFailureCategory,
+    PolymarketHttpTransportError,
+    PolymarketPublicClient,
+    PublicReadEvidence,
+    PublicReadMetricsSnapshot,
+    PublicReadResult,
+    ReceivedWebSocketMessage,
+)
 from multi_market_arbitrage.venues.polymarket.schemas import GammaMarket, parse_gamma_markets
 
 FIXTURES = Path(__file__).parents[1] / "golden" / "fixtures"
@@ -574,10 +588,18 @@ class _BrokenPublicClient:
         return None
 
     async def fetch_markets_keyset_raw(
-        self, *, after_cursor: str | None = None, limit: int = 100, closed: bool = False
+        self,
+        *,
+        after_cursor: str | None = None,
+        limit: int = 100,
+        closed: bool = False,
+        deadline: float | None = None,
     ) -> bytes:
-        del after_cursor, limit, closed
+        del after_cursor, limit, closed, deadline
         raise RuntimeError("bootstrap fixture failure")
+
+    def public_read_metrics_snapshot(self) -> PublicReadMetricsSnapshot:
+        return PublicReadMetricsSnapshot((), 0, 0)
 
 
 class _ExplodingSocket:
@@ -706,6 +728,7 @@ async def test_ingress_overflow_is_journaled_and_forces_rest_resnapshot(
     )
 
     await writer.start()
+    runtime_health = ObservationRuntimeHealth()
     stream = await observe_websocket(
         client=object(),
         capture=capture,
@@ -713,6 +736,7 @@ async def test_ingress_overflow_is_journaled_and_forces_rest_resnapshot(
         asset_ids=selected.clob_token_ids,
         deadline=asyncio.get_running_loop().time() + 0.2,
         logger=service.__getattribute__("_logger"),
+        runtime_health=runtime_health,
     )
     await writer.close()
 
@@ -726,10 +750,230 @@ async def test_ingress_overflow_is_journaled_and_forces_rest_resnapshot(
     assert resnapshots == [(selected.gamma_market_id,)]
     assert counters["mma_ingress_overflows_total"] == 1
     assert counters["mma_resynchronizations_total"] == 1
+    assert runtime_health.snapshot().data_loss_count == 1
+    assert runtime_health.snapshot().resyncs == 1
     assert [record.channel for record in records] == [WS_MARKET, CONTROL_BOOK_INVALIDATION]
     assert json.loads(records[-1].payload_bytes) == {
         "reason": InvalidationReason.BACKPRESSURE_DATA_LOSS.value
     }
+
+
+@pytest.mark.asyncio
+async def test_continuous_audit_fences_response_without_replacing_socket_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    config = config.model_copy(
+        update={
+            "polymarket": config.polymarket.model_copy(
+                update={"snapshot_audit_interval_seconds": 0.05}
+            )
+        }
+    )
+    run_id = CollectorRunId("continuous-audit-generation")
+    writer = RawJournalWriter(
+        JournalWriterConfig(
+            root=tmp_path / "raw",
+            collector_run_id=run_id,
+            venue_id=POLYMARKET_VENUE_ID,
+            stream="polymarket-public",
+            writer_id=WriterId("writer-continuous-audit"),
+            writer_software_version="test",
+            git_commit="fixture",
+        )
+    )
+    processor = CanonicalProcessor(config)
+    metrics = InMemoryMetrics()
+    capture = observe_module._RawCaptureBoundary(  # pyright: ignore[reportPrivateUsage]
+        collector_run_id=run_id,
+        writer=writer,
+        processor=processor,
+        metrics=metrics,
+    )
+    selected = parse_gamma_markets(_fixture("polymarket_gamma_market_keyset.json")).markets[0]
+
+    class _ContinuousSocket:
+        instances = 0
+        active: _ContinuousSocket | None = None
+
+        def __init__(self, asset_ids: tuple[str, ...], **kwargs: object) -> None:
+            del asset_ids, kwargs
+            type(self).instances += 1
+            type(self).active = self
+            self.admitted = 0
+            self.emit_economic_update = False
+            self.frame_admitted = asyncio.Event()
+            self.subscription_semantics_sha256 = hashlib.sha256(
+                b"continuous-audit-fixture"
+            ).hexdigest()
+
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            ready.set()
+            for _ in range(100):
+                await asyncio.sleep(0.003)
+                payload = (
+                    _fixture("polymarket_ws_price_change.json")
+                    if self.emit_economic_update
+                    else _fixture("polymarket_ws_last_trade.json")
+                )
+                self.emit_economic_update = False
+                admit(
+                    ReceivedWebSocketMessage(
+                        payload_bytes=payload,
+                        received_wall_time=UtcTimestamp.now(),
+                        received_monotonic_ns=observe_module.time.monotonic_ns(),
+                        message_type="TEXT",
+                    )
+                )
+                self.admitted += 1
+                self.frame_admitted.set()
+            await asyncio.Event().wait()
+
+    class _AuditClient:
+        def __init__(self) -> None:
+            self.frames_admitted_during_requests: list[int] = []
+            self.calls = 0
+
+        async def fetch_order_book_raw_with_evidence(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+            on_response_body_complete: Callable[[UtcTimestamp, int], None] | None = None,
+        ) -> PublicReadResult:
+            del deadline
+            socket = _ContinuousSocket.active
+            assert socket is not None
+            self.calls += 1
+            if self.calls == 2:
+                socket.emit_economic_update = True
+            before = socket.admitted
+            while socket.admitted < before + 2:
+                socket.frame_admitted.clear()
+                if socket.admitted < before + 2:
+                    await socket.frame_admitted.wait()
+            self.frames_admitted_during_requests.append(socket.admitted - before)
+            if self.calls == 1:
+                raise PolymarketHttpTransportError(
+                    endpoint_class=PolymarketEndpointClass.CLOB_BOOK,
+                    category=PolymarketHttpFailureCategory.NETWORK,
+                    retryable=False,
+                    attempt=3,
+                    detail="bounded audit fixture exhausted HTTP retries",
+                )
+            if asset_id == "token-yes":
+                payload = _fixture("polymarket_rest_book_yes.json")
+                if self.calls >= 3:
+                    payload = payload.replace(
+                        b'"price": "0.45", "size": "4"',
+                        b'"price": "0.45", "size": "7"',
+                    ).replace(
+                        b',\n    {"price": "0.55", "size": "3"}',
+                        b"",
+                    )
+            else:
+                payload = _no_book()
+            response_ns = observe_module.time.monotonic_ns()
+            response_wall_time = UtcTimestamp.now()
+            if on_response_body_complete is not None:
+                on_response_body_complete(response_wall_time, response_ns)
+            return PublicReadResult(
+                payload_bytes=payload,
+                evidence=PublicReadEvidence(
+                    endpoint_class=PolymarketEndpointClass.CLOB_BOOK,
+                    attempts=1,
+                    started_monotonic_ns=response_ns - 1,
+                    response_received_wall_time=response_wall_time,
+                    response_received_monotonic_ns=response_ns,
+                    completed_monotonic_ns=response_ns,
+                    status_code=200,
+                    cumulative_backoff_seconds=0.0,
+                    cumulative_rate_limit_wait_seconds=0.0,
+                    payload_sha256=hashlib.sha256(payload).hexdigest(),
+                ),
+            )
+
+    monkeypatch.setattr(
+        observe_module,
+        "PolymarketMarketWebSocket",
+        _ContinuousSocket,
+    )
+    service = PolymarketObservationService(
+        config,
+        workspace_root=tmp_path,
+        code_commit="fixture",
+        metrics=metrics,
+    )
+    await writer.start()
+    for channel, payload in (
+        (GAMMA_MARKETS_KEYSET, _fixture("polymarket_gamma_market_keyset.json")),
+        (
+            f"{CLOB_MARKET_PREFIX}0xcondition",
+            _fixture("polymarket_clob_market_info.json"),
+        ),
+        (REST_BOOK, _fixture("polymarket_rest_book_yes.json")),
+        (REST_BOOK, _no_book()),
+    ):
+        result = await capture.preserve_then_process(
+            channel=channel,
+            payload=payload,
+            transport_type="HTTP",
+            semantics_hash=hashlib.sha256(channel.encode()).hexdigest(),
+        )
+        assert result.success
+
+    client = _AuditClient()
+    runtime_health = ObservationRuntimeHealth()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 0.2
+    generation = await service._run_generation(  # pyright: ignore[reportPrivateUsage]
+        client=cast(PolymarketPublicClient, client),
+        capture=capture,
+        asset_ids=selected.clob_token_ids,
+        deadline=deadline,
+        deadline_ns=observe_module.time.monotonic_ns() + 200_000_000,
+        periodic_audit_due_ns=observe_module.time.monotonic_ns(),
+        connection_id=ConnectionId("continuous-audit-socket"),
+        subscription_id=SubscriptionId("continuous-audit-subscription"),
+        unavailable_started_ns=None,
+        runtime_health=runtime_health,
+    )
+    runtime_health.finish_generation(
+        continuity_interrupted=False,
+        now_ns=observe_module.time.monotonic_ns(),
+    )
+    await writer.close()
+
+    records = JournalReader(tmp_path / "raw", run_id).read_all()
+    live = processor.summary()
+    replayed = replay_journal(tmp_path / "raw", run_id, config).processor
+    assert generation.reason.value == "DEADLINE"
+    assert _ContinuousSocket.instances == 1
+    assert len(client.frames_admitted_during_requests) >= 3
+    assert all(count >= 2 for count in client.frames_admitted_during_requests)
+    assert live.rest_audit_matches >= 1
+    assert live.rest_audit_raced == 1
+    assert live.rest_audit_failed >= 1
+    assert tuple(outcome.outcome for outcome in live.audit_outcomes[:3]) == (
+        AuditOutcome.FAILED,
+        AuditOutcome.RACED,
+        AuditOutcome.MATCH,
+    )
+    assert live.audit_outcomes[0].reason is AuditFailureReason.HTTP_REQUEST_FAILED
+    assert live.terminal_hash == replayed.terminal_hash
+    counters = {key.name: value for key, value in metrics.snapshot().counters}
+    assert counters["mma_rest_audit_retries_total"] == 1
+    assert runtime_health.snapshot().socket_connected
+    assert runtime_health.snapshot().unavailable_intervals == 0
+    assert runtime_health.snapshot().reconnects == 0
+    assert [record.channel for record in records].count(CONTROL_REST_AUDIT_START) >= 3
+    assert [record.channel for record in records].count(REST_BOOK_AUDIT) >= 2
 
 
 @pytest.mark.asyncio
@@ -761,10 +1005,17 @@ async def test_observation_duration_uses_monotonic_time_when_wall_clock_steps_ba
     wall_times = iter(
         (
             UtcTimestamp(2_000_000_000),
+            UtcTimestamp(1_500_000_000),
             UtcTimestamp(1_000_000_000),
         )
     )
-    monotonic_times = iter((10_000_000_000, 10_250_000_000))
+    monotonic_times = iter(
+        (
+            10_000_000_000,
+            10_250_000_000,
+            10_250_000_000,
+        )
+    )
 
     class _SteppingWallClock:
         @staticmethod
@@ -778,9 +1029,9 @@ async def test_observation_duration_uses_monotonic_time_when_wall_clock_steps_ba
         capture: object,
         processor: object,
         deadline: float | None = None,
-    ) -> tuple[tuple[object, ...], tuple[str, ...]]:
+    ) -> tuple[tuple[object, ...], tuple[str, ...], None]:
         del service, client, capture, processor, deadline
-        return (), ()
+        return (), (), None
 
     monkeypatch.setattr(observe_module, "PolymarketPublicClient", _BrokenPublicClient)
     monkeypatch.setattr(observe_module, "UtcTimestamp", _SteppingWallClock)
@@ -809,10 +1060,10 @@ async def test_observation_closes_writer_task_on_websocket_exception(
         capture: object,
         processor: object,
         deadline: float | None = None,
-    ) -> tuple[tuple[object, ...], tuple[str, ...]]:
+    ) -> tuple[tuple[object, ...], tuple[str, ...], None]:
         del service, client, capture, processor, deadline
         market = parse_gamma_markets(_fixture("polymarket_gamma_market_keyset.json")).markets[0]
-        return (market,), market.clob_token_ids
+        return (market,), market.clob_token_ids, None
 
     monkeypatch.setattr(observe_module, "PolymarketPublicClient", _BrokenPublicClient)
     monkeypatch.setattr(observe_module, "PolymarketMarketWebSocket", _ExplodingSocket)
@@ -926,24 +1177,38 @@ async def test_refresh_requests_are_selected_market_bounded_and_coalesced(
 
 
 @pytest.mark.asyncio
-async def test_remote_deadline_cancels_fetch_but_not_received_payload_preservation(
+async def test_remote_deadline_is_adapter_owned_but_not_applied_to_payload_preservation(
     tmp_path: Path,
 ) -> None:
     class _SlowClient:
         def __init__(self) -> None:
-            self.cancelled = asyncio.Event()
+            self.deadline: float | None = None
 
-        async def fetch_order_book_raw(self, asset_id: str) -> bytes:
+        async def fetch_order_book_raw(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+        ) -> bytes:
             del asset_id
-            try:
-                await asyncio.sleep(60)
-            finally:
-                self.cancelled.set()
-            return b"unreachable"
+            self.deadline = deadline
+            raise PolymarketHttpTransportError(
+                endpoint_class=PolymarketEndpointClass.CLOB_BOOK,
+                category=PolymarketHttpFailureCategory.DEADLINE_EXCEEDED,
+                retryable=False,
+                attempt=0,
+                detail="adapter fixture enforced the absolute deadline",
+            )
 
     class _ImmediateClient:
-        async def fetch_order_book_raw(self, asset_id: str) -> bytes:
+        async def fetch_order_book_raw(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+        ) -> bytes:
             del asset_id
+            assert deadline is not None
             return b"received"
 
     class _SlowCapture:
@@ -976,16 +1241,17 @@ async def test_remote_deadline_cancels_fetch_but_not_received_payload_preservati
         service.__getattribute__("_fetch_book"),
     )
 
-    with pytest.raises(RuntimeError) as deadline_error:
+    absolute_deadline = loop.time() + 0.01
+    with pytest.raises(PolymarketHttpTransportError) as deadline_error:
         await fetch_book(
             slow_client,
             object(),
             "asset",
             audit=False,
-            deadline=loop.time() + 0.01,
+            deadline=absolute_deadline,
         )
-    assert type(deadline_error.value).__name__ == "_ObservationDeadlineReached"
-    assert slow_client.cancelled.is_set()
+    assert deadline_error.value.category is PolymarketHttpFailureCategory.DEADLINE_EXCEEDED
+    assert slow_client.deadline == absolute_deadline
 
     expected = cast(ProcessedEnvelope, object())
     slow_capture = _SlowCapture(expected)

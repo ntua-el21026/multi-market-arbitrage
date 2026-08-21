@@ -49,12 +49,21 @@ uv run --frozen --all-groups mma --help
 The focused public/read-only commands are:
 
 ```bash
-uv run --frozen --all-groups mma observe polymarket --duration 30 --config config/phase1.toml
+uv run --frozen --all-groups mma observe polymarket --gamma-market-id <id> --duration 30 --config config/phase1.toml
+uv run --frozen --all-groups mma calibrate polymarket --gamma-market-id <id> --duration 180 --output data/calibration/<fresh-run> --config config/phase1.toml
 uv run --frozen --all-groups mma replay data/raw --run-id <collector-run-id> --config config/phase1.toml
 uv run --frozen --all-groups mma rebuild-analytical data/raw --output data/rebuilt/<collector-run-id> --run-id <collector-run-id> --config config/phase1.toml
 uv run --frozen --all-groups mma validate-data data
 uv run --frozen --all-groups mma scan-report data/analytical
 ```
+
+Gate-1 evidence requires `--gamma-market-id`; the resolved Gamma, condition,
+event, YES/NO token, reference-version, and semantic identities are frozen into
+the run evidence. Omitting the flag retains bounded discovery only for
+developer smoke work and is explicitly ineligible for Gate-1. The recommended
+pre-soak calibration is 180–300 seconds against the same explicit target; it
+requires an exact clean Git checkout, projects the six-hour workload
+conservatively, and is not the six-hour soak.
 
 See [`docs/PHASE_1_IMPLEMENTATION.md`](docs/PHASE_1_IMPLEMENTATION.md) for
 configuration, validation, storage, replay, official protocol evidence, and

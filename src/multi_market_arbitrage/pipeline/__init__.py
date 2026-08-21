@@ -1,8 +1,22 @@
 """Shared live/replay Phase 1 canonical processing path."""
 
+from .audit import (
+    AuditBookIdentity,
+    AuditFailureCommand,
+    AuditFailureReason,
+    AuditHttpFailureHandoff,
+    AuditHttpHandoff,
+    AuditHttpResponseHandoff,
+    AuditOutcome,
+    AuditOutcomeEvidence,
+    AuditStartEvidence,
+    WebSocketAdmissionWatermark,
+)
 from .channels import (
     CLOB_MARKET_PREFIX,
     CONTROL_BOOK_INVALIDATION,
+    CONTROL_REST_AUDIT_FAILED,
+    CONTROL_REST_AUDIT_START,
     GAMMA_EVENT_PREFIX,
     GAMMA_MARKET_PREFIX,
     GAMMA_MARKETS_KEYSET,
@@ -20,10 +34,19 @@ from .processor import (
     ReferenceRefreshRequest,
     ScanTriggerReason,
 )
+from .targeting import (
+    ObservationTargetMode,
+    ResolvedPolymarketTarget,
+    TargetSelectionError,
+    require_supported_gamma_market,
+    resolve_polymarket_target,
+)
 
 __all__ = [
     "CLOB_MARKET_PREFIX",
     "CONTROL_BOOK_INVALIDATION",
+    "CONTROL_REST_AUDIT_FAILED",
+    "CONTROL_REST_AUDIT_START",
     "GAMMA_EVENT_PREFIX",
     "GAMMA_MARKETS_KEYSET",
     "GAMMA_MARKET_PREFIX",
@@ -31,11 +54,26 @@ __all__ = [
     "REST_BOOK_AUDIT",
     "WS_MARKET",
     "AnalyticalOutputSink",
+    "AuditBookIdentity",
+    "AuditFailureCommand",
+    "AuditFailureReason",
+    "AuditHttpFailureHandoff",
+    "AuditHttpHandoff",
+    "AuditHttpResponseHandoff",
+    "AuditOutcome",
+    "AuditOutcomeEvidence",
+    "AuditStartEvidence",
     "BookFreshnessUpdate",
     "CanonicalProcessor",
     "MarketScanTrigger",
+    "ObservationTargetMode",
     "ProcessedEnvelope",
     "ProcessorSummary",
     "ReferenceRefreshRequest",
+    "ResolvedPolymarketTarget",
     "ScanTriggerReason",
+    "TargetSelectionError",
+    "WebSocketAdmissionWatermark",
+    "require_supported_gamma_market",
+    "resolve_polymarket_target",
 ]

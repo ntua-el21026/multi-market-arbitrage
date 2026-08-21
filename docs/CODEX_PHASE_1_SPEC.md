@@ -136,7 +136,9 @@ Configuration groups:
 - system;
 - storage;
 - Polymarket public endpoints/settings;
+- bounded public-read resilience with dated rate-limit evidence;
 - scanner;
+- health-checkpoint evidence;
 - replay;
 - logging.
 
@@ -209,6 +211,32 @@ invalidate affected book state and require a fresh authoritative snapshot/resubs
 
 Implement a periodic/triggered public REST book snapshot comparison/audit if needed to compensate for lack of documented sequence continuity. The exact cadence is measured/configured, not hard-coded into strategy logic.
 
+Routine REST auditing must preserve continuous healthy WebSocket acquisition.
+For each request, durably record the start connection/admission/processed
+watermarks and economic book identity; at the actual HTTP response handoff,
+capture exact response time/raw identity and the contiguous successful-admission
+watermark for that socket generation. The single canonical owner must process
+every durable frame through that boundary before classifying the audit. Later
+frames remain admissible during catch-up.
+
+Audit outcomes are exactly `MATCH`, `MISMATCH`, `RACED`, or `FAILED`. Only a
+race-free exact comparison may match/mismatch; a relevant economic mutation
+crossing the request window is `RACED`, while ambiguous barrier/response/
+generation/HTTP evidence is `FAILED`. Last-trade-only change is not an economic
+race. Race retry is bounded. Only proven mismatch forces audit-driven
+resynchronization; audit HTTP failure does not become a WebSocket disconnect.
+Control/response/outcome evidence must replay without remote I/O or scheduler
+timing dependence.
+
+HTTP and WebSocket failures must use distinct typed taxonomies and metrics. A
+dedicated public-read-only controller must enforce fixed endpoint classes,
+bounded concurrency/attempts, an absolute deadline, bounded exponential
+backoff, reproducible jitter, policy-bounded standards-aware `Retry-After`,
+explicit temporary/permanent classifications, per-endpoint local rate budgets,
+and complete retry/rate/final-failure metrics. It must expose no generic future
+mutation retry surface. Current external rate evidence is dated configuration,
+not a permanent architectural constant.
+
 ## 9. Canonical book state
 
 Build validated L2 state with:
@@ -260,6 +288,15 @@ Requirements:
 
 Do not implement passive maker fill assumptions.
 
+The production capacity path must remain exactly equivalent to an exhaustive
+oracle while avoiding a mandatory rich-economics evaluation at every one of the
+up-to-4,096 quantity points. Use lossless integer-lattice depth/fee-regime
+partitioning, rigorous pruning, rounded-fee run boundaries, and exact root/
+boundary candidates without assuming global monotonicity. Preserve minimum
+size, zero-threshold strict-positive, price-dependent fee, `HALF_UP`, work-cap,
+disposition, economics, and hash semantics. Differential/property coverage
+must include thousands of randomized and exact maximum-grid cases.
+
 ## 12. Replay
 
 Replay raw recorded messages through the same:
@@ -275,16 +312,29 @@ Fixed raw/config/version inputs must reproduce identical hashes.
 
 ## 13. CLI
 
-Provide focused commands, naming may be refined:
+Provide these focused command shapes:
 
 ```text
-mma observe polymarket
+mma observe polymarket --gamma-market-id <id> --duration <seconds> --config <phase1.toml>
+mma calibrate polymarket --gamma-market-id <id> --duration <180..300> --output <fresh-directory> --config <phase1.toml>
 mma replay <dataset/run>
 mma validate-data <dataset/run>
 mma scan-report <dataset/run>
 ```
 
 CLI must clearly state that trading is unavailable.
+
+The explicit target mode fetches the requested Gamma market directly, proves
+the open ordinary-binary/non-negative-risk lifecycle and canonical YES/NO
+semantics, records requested/resolved/reference identities, and never falls
+back. Discovery may remain only as visibly non-Gate-1 developer mode.
+
+The bounded calibration command measures the exact explicit target, binds
+code/config/target/runtime/lock/host identity, and projects 21,600 seconds with
+ceiling integer arithmetic and documented conservative headroom. It must fail
+rather than enlarge the 4 GiB raw cap or ignore disk, path, queue, sealing,
+replay/rebuild, analytical, health, log, reserve, or safety costs. It
+publishes canonical JSON, a human summary, and hashes in a fresh directory.
 
 ## 14. Observability
 
@@ -300,6 +350,20 @@ Structured logs and metrics/counters for:
 - queue high-water;
 - opportunities/lifecycles;
 - replay hashes.
+
+The observer must also emit periodic `gate1-health-checkpoint-v1` machine-
+readable evidence plus a final checkpoint. It contains run/code/config/explicit
+target identity and grouped capture, per-book, ingress, journal, analytical,
+HTTP, audit, scanner, recovery, resource, and scoped-decision evidence. The
+decisions are `capture_healthy`, `research_eligible`, and
+`gate1_eligible_so_far` with typed reasons.
+
+Health persistence has its own supervised owner, bounded queue/count/file, and
+non-blocking producer path. Serialization/write/`fsync` cannot block raw
+acquisition. Writer failure is explicit and prevents automatic Gate-1 evidence
+eligibility without corrupting canonical state or falsely invalidating raw
+capture. Public-HTTP final failure or exhausted retry budget is a research and
+Gate-1 integrity blocker, not a raw-capture or WebSocket-continuity blocker.
 
 ## 15. Tests
 
@@ -328,6 +392,13 @@ Structured logs and metrics/counters for:
 - truncated partial segment;
 - disconnect during updates;
 - unsupported schema.
+- queued pre-response WebSocket updates at ingress/journal/processor barriers;
+- all audit outcomes, ambiguous watermark, bounded race retry/exhaustion, and
+  HTTP failure without artificial socket recovery;
+- timeout/connection/`429`/temporary `5xx`/`Retry-After`/permanent `4xx`/schema
+  and WebSocket close/protocol taxonomy;
+- health queue/writer failure with raw-capture independence;
+- explicit target rejection/no-fallback and calibration limit failures.
 
 ### Replay
 Same fixture/run twice → identical state/opportunity hashes.
@@ -359,6 +430,10 @@ No blanket ignore/suppression added merely to make gates green.
 ## 17. Smoke run
 
 If network access/environment permits, perform a bounded live public-data smoke run.
+
+Use an explicit Gamma market ID. If that smoke is healthy, run a separate
+target-specific 180–300 second calibration and produce the six-hour resource
+projection before any long soak. Neither activity is the Gate-1 soak.
 
 Codex must not claim a long soak it did not actually perform.
 

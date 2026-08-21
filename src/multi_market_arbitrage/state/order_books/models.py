@@ -81,6 +81,15 @@ class BookMutation:
     def freshness_changed(self) -> bool:
         return bool(self.kinds & BookMutationKind.FRESHNESS)
 
+    @property
+    def audit_economic_changed(self) -> bool:
+        """Whether a fenced REST comparison must treat this transition as a race."""
+
+        return bool(
+            self.kinds
+            & (BookMutationKind.LEVELS | BookMutationKind.HEALTH | BookMutationKind.REFERENCE)
+        )
+
 
 @dataclass(frozen=True, slots=True, order=True)
 class BookLevel:

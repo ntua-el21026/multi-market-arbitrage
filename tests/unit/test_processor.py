@@ -23,12 +23,19 @@ from multi_market_arbitrage.normalization import polymarket as normalization_mod
 from multi_market_arbitrage.pipeline import (
     CLOB_MARKET_PREFIX,
     CONTROL_BOOK_INVALIDATION,
+    CONTROL_REST_AUDIT_FAILED,
+    CONTROL_REST_AUDIT_START,
     GAMMA_MARKETS_KEYSET,
     REST_BOOK,
     REST_BOOK_AUDIT,
     WS_MARKET,
+    AuditFailureCommand,
+    AuditFailureReason,
+    AuditOutcome,
+    AuditStartEvidence,
     CanonicalProcessor,
     ScanTriggerReason,
+    WebSocketAdmissionWatermark,
 )
 from multi_market_arbitrage.pipeline import processor as processor_module
 from multi_market_arbitrage.reference import POLYMARKET_VENUE_ID, ReferenceBundle
@@ -36,6 +43,7 @@ from multi_market_arbitrage.research import Phase1AnalyticalOutputs
 from multi_market_arbitrage.scanners.polymarket_complete_set import (
     CompleteSetScanResult,
     OpportunityLifecycle,
+    ScanDisposition,
 )
 from multi_market_arbitrage.state import InvalidationReason
 
@@ -62,6 +70,45 @@ def _no_book() -> bytes:
     }"""
 
 
+def _price_change_payload(
+    *,
+    bid_size: str,
+    ask_size: str | None = None,
+    timestamp: str,
+) -> bytes:
+    changes: list[dict[str, str]] = [
+        {
+            "asset_id": "token-yes",
+            "best_ask": "0.55",
+            "best_bid": "0.45",
+            "hash": f"bid-{timestamp}",
+            "price": "0.45",
+            "side": "BUY",
+            "size": bid_size,
+        }
+    ]
+    if ask_size is not None:
+        changes.append(
+            {
+                "asset_id": "token-yes",
+                "best_ask": "0.55",
+                "best_bid": "0.45",
+                "hash": f"ask-{timestamp}",
+                "price": "0.55",
+                "side": "SELL",
+                "size": ask_size,
+            }
+        )
+    return canonical_json_bytes(
+        {
+            "event_type": "price_change",
+            "market": "0xcondition",
+            "price_changes": changes,
+            "timestamp": timestamp,
+        }
+    )
+
+
 def _new_market_payload(market_id: str = "99") -> bytes:
     return canonical_json_bytes(
         {
@@ -81,12 +128,14 @@ def _envelope(
     payload: bytes,
     *,
     monotonic_ns: int | None = None,
+    connection_id: ConnectionId | None = None,
+    transport_metadata: dict[str, str | int | bool] | None = None,
 ) -> RawEventEnvelope:
     return RawEventEnvelope.capture(
         collector_run_id=run_id,
         ingest_seq=sequence,
         venue_id=POLYMARKET_VENUE_ID,
-        connection_id=ConnectionId("processor-test-connection"),
+        connection_id=connection_id or ConnectionId("processor-test-connection"),
         subscription_id=SubscriptionId("processor-test-subscription"),
         channel=channel,
         transport_type="WEBSOCKET" if channel == WS_MARKET else "HTTP",
@@ -98,6 +147,66 @@ def _envelope(
         ),
         payload_bytes=payload,
         payload_encoding="utf-8",
+        transport_metadata=transport_metadata,
+    )
+
+
+def _audit_start(
+    processor: CanonicalProcessor,
+    run_id: CollectorRunId,
+    sequence: int,
+    *,
+    request_id: str,
+    native_asset_id: str = "token-yes",
+    attempt: int = 1,
+    admitted_ordinal: int | None = None,
+) -> tuple[AuditStartEvidence, RawEventEnvelope]:
+    connection_id = ConnectionId("processor-test-connection")
+    processed = processor.processed_websocket_watermark(connection_id)
+    start = AuditStartEvidence(
+        request_id=request_id,
+        connection_id=connection_id,
+        native_asset_id=native_asset_id,
+        attempt=attempt,
+        request_started_monotonic_ns=100 + sequence,
+        starting_admission_watermark=WebSocketAdmissionWatermark(
+            connection_id=connection_id,
+            ordinal=processed.ordinal if admitted_ordinal is None else admitted_ordinal,
+        ),
+        starting_processed_watermark=processed,
+        starting_book=processor.audit_book_identity(native_asset_id),
+    )
+    return start, _envelope(
+        run_id,
+        sequence,
+        CONTROL_REST_AUDIT_START,
+        start.to_payload(),
+        connection_id=connection_id,
+        monotonic_ns=start.request_started_monotonic_ns,
+    )
+
+
+def _audit_response(
+    run_id: CollectorRunId,
+    sequence: int,
+    start: AuditStartEvidence,
+    payload: bytes,
+    *,
+    boundary: int,
+    barrier: int | None = None,
+) -> RawEventEnvelope:
+    return _envelope(
+        run_id,
+        sequence,
+        REST_BOOK_AUDIT,
+        payload,
+        connection_id=start.connection_id,
+        transport_metadata={
+            "audit_attempt": start.attempt,
+            "barrier_websocket_ordinal": boundary if barrier is None else barrier,
+            "request_id": start.request_id,
+            "response_boundary_websocket_ordinal": boundary,
+        },
     )
 
 
@@ -251,7 +360,7 @@ def test_processor_propagates_storage_and_programming_faults(error: Exception) -
 @pytest.mark.parametrize(
     ("channel", "payload", "error_type"),
     [
-        (REST_BOOK_AUDIT, b"{}", "PolymarketSchemaError"),
+        (REST_BOOK_AUDIT, b"{}", "NormalizationError"),
         (CONTROL_BOOK_INVALIDATION, b"{}", "NormalizationError"),
         (
             CONTROL_BOOK_INVALIDATION,
@@ -290,17 +399,27 @@ def test_rest_audit_counts_matches_and_invalidates_on_exact_mismatch() -> None:
     before = owner.snapshot()
     scans_before = processor.summary().scans
 
-    matching = _envelope(
+    matching_start, matching_intent = _audit_start(
+        processor,
         run_id,
         4,
-        REST_BOOK_AUDIT,
+        request_id="matching-audit",
+    )
+    assert processor.process_replayed(matching_intent).success
+    matching = _audit_response(
+        run_id,
+        5,
+        matching_start,
         _fixture("polymarket_rest_book_yes.json"),
+        boundary=0,
     )
     matching_result = processor.process_replayed(matching)
     matched = owner.snapshot()
 
     assert matching_result.success
     assert not matching_result.needs_resync
+    assert len(matching_result.audit_outcomes) == 1
+    assert matching_result.audit_outcomes[0].outcome is AuditOutcome.MATCH
     assert matched.generation == before.generation
     assert matched.bids == before.bids
     assert matched.asks == before.asks
@@ -317,21 +436,292 @@ def test_rest_audit_counts_matches_and_invalidates_on_exact_mismatch() -> None:
         b'"price": "0.40", "size": "10"',
         b'"price": "0.40", "size": "11"',
     )
-    mismatching = _envelope(run_id, 5, REST_BOOK_AUDIT, mismatched_payload)
+    mismatch_start, mismatch_intent = _audit_start(
+        processor,
+        run_id,
+        6,
+        request_id="mismatching-audit",
+    )
+    assert processor.process_replayed(mismatch_intent).success
+    mismatching = _audit_response(
+        run_id,
+        7,
+        mismatch_start,
+        mismatched_payload,
+        boundary=0,
+    )
     mismatch_result = processor.process_replayed(mismatching)
     summary = processor.summary()
 
     assert mismatch_result.success
     assert mismatch_result.needs_resync
+    assert mismatch_result.audit_outcomes[0].outcome is AuditOutcome.MISMATCH
     assert mismatch_result.scan_count == 1
     assert not mismatch_result.book_freshness_updates
     assert mismatch_result.scan_triggers[0].reasons == (ScanTriggerReason.REST_AUDIT,)
     assert owner.snapshot().health is BookHealth.INVALID
     assert owner.snapshot().invalidation_reason is InvalidationReason.REST_AUDIT_MISMATCH
     assert summary.rest_audits == 2
+    assert summary.rest_audit_matches == 1
     assert summary.rest_audit_mismatches == 1
+    assert summary.rest_audit_raced == 0
+    assert summary.rest_audit_failed == 0
+    assert summary.pending_rest_audits == 0
     assert summary.parse_failures == 0
     assert summary.scans == scans_before + 2
+
+
+def test_rest_audit_fence_distinguishes_economic_race_from_last_trade() -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId("processor-rest-audit-fence")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+
+    race_start, race_intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="economic-race",
+        admitted_ordinal=0,
+    )
+    assert processor.process_replayed(race_intent).success
+    economic_update = _envelope(
+        run_id,
+        5,
+        WS_MARKET,
+        _fixture("polymarket_ws_price_change.json"),
+        transport_metadata={"websocket_admission_ordinal": 1},
+    )
+    assert processor.process_replayed(economic_update).success
+    raced = processor.process_replayed(
+        _audit_response(
+            run_id,
+            6,
+            race_start,
+            _fixture("polymarket_rest_book_yes.json"),
+            boundary=1,
+        )
+    )
+
+    assert raced.success
+    assert not raced.needs_resync
+    assert raced.audit_outcomes[0].outcome is AuditOutcome.RACED
+
+    trade_start, trade_intent = _audit_start(
+        processor,
+        run_id,
+        7,
+        request_id="diagnostic-only",
+        admitted_ordinal=1,
+    )
+    assert processor.process_replayed(trade_intent).success
+    trade = _envelope(
+        run_id,
+        8,
+        WS_MARKET,
+        _fixture("polymarket_ws_last_trade.json"),
+        transport_metadata={"websocket_admission_ordinal": 2},
+    )
+    assert processor.process_replayed(trade).success
+    matching_payload = (
+        _fixture("polymarket_rest_book_yes.json")
+        .replace(
+            b'"price": "0.45", "size": "4"',
+            b'"price": "0.45", "size": "7"',
+        )
+        .replace(
+            b',\n    {"price": "0.55", "size": "3"}',
+            b"",
+        )
+    )
+    matched = processor.process_replayed(
+        _audit_response(
+            run_id,
+            9,
+            trade_start,
+            matching_payload,
+            boundary=2,
+        )
+    )
+
+    assert matched.success
+    assert not matched.needs_resync
+    assert matched.audit_outcomes[0].outcome is AuditOutcome.MATCH
+    assert processor.summary().rest_audit_raced == 1
+    assert processor.summary().rest_audit_matches == 1
+
+
+def test_rest_audit_fence_ignores_noop_but_detects_change_then_restore() -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId("processor-rest-audit-economic-generation")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+
+    noop_start, noop_intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="economic-noop",
+        admitted_ordinal=0,
+    )
+    assert processor.process_replayed(noop_intent).success
+    noop = _envelope(
+        run_id,
+        5,
+        WS_MARKET,
+        _price_change_payload(bid_size="4", timestamp="1787198403000"),
+        transport_metadata={"websocket_admission_ordinal": 1},
+    )
+    assert processor.process_replayed(noop).success
+    matched = processor.process_replayed(
+        _audit_response(
+            run_id,
+            6,
+            noop_start,
+            _fixture("polymarket_rest_book_yes.json"),
+            boundary=1,
+        )
+    )
+
+    assert matched.audit_outcomes[0].outcome is AuditOutcome.MATCH
+    assert matched.audit_outcomes[0].barrier_book is not None
+    assert (
+        matched.audit_outcomes[0].starting_book.generation
+        == matched.audit_outcomes[0].barrier_book.generation
+    )
+
+    reverted_start, reverted_intent = _audit_start(
+        processor,
+        run_id,
+        7,
+        request_id="economic-change-then-restore",
+        admitted_ordinal=1,
+    )
+    assert processor.process_replayed(reverted_intent).success
+    changed = _envelope(
+        run_id,
+        8,
+        WS_MARKET,
+        _fixture("polymarket_ws_price_change.json"),
+        transport_metadata={"websocket_admission_ordinal": 2},
+    )
+    restored = _envelope(
+        run_id,
+        9,
+        WS_MARKET,
+        _price_change_payload(
+            bid_size="4",
+            ask_size="3",
+            timestamp="1787198404000",
+        ),
+        transport_metadata={"websocket_admission_ordinal": 3},
+    )
+    assert processor.process_replayed(changed).success
+    assert processor.process_replayed(restored).success
+    raced = processor.process_replayed(
+        _audit_response(
+            run_id,
+            10,
+            reverted_start,
+            _fixture("polymarket_rest_book_yes.json"),
+            boundary=3,
+        )
+    )
+
+    outcome = raced.audit_outcomes[0]
+    assert outcome.outcome is AuditOutcome.RACED
+    assert outcome.barrier_book is not None
+    assert outcome.starting_book.economic_content_sha256 == (
+        outcome.barrier_book.economic_content_sha256
+    )
+    assert outcome.barrier_book.generation == outcome.starting_book.generation + 2
+
+
+def test_rest_audit_failure_blocks_eligibility_without_forcing_socket_resync() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("processor-rest-audit-fail-closed")
+    ambiguous = CanonicalProcessor(config)
+    for envelope in _bootstrap(run_id):
+        assert ambiguous.process_replayed(envelope).success
+    start, intent = _audit_start(
+        ambiguous,
+        run_id,
+        4,
+        request_id="ambiguous-watermark",
+    )
+    assert ambiguous.process_replayed(intent).success
+
+    failed = ambiguous.process_replayed(
+        _audit_response(
+            run_id,
+            5,
+            start,
+            _fixture("polymarket_rest_book_yes.json"),
+            boundary=0,
+            barrier=1,
+        )
+    )
+
+    assert failed.success
+    assert not failed.needs_resync
+    assert failed.audit_outcomes[0].outcome is AuditOutcome.FAILED
+    assert failed.audit_outcomes[0].reason is AuditFailureReason.WATERMARK_AMBIGUOUS
+    owner = next(
+        item for item in ambiguous.owners if item.instrument_id == start.starting_book.instrument_id
+    )
+    assert owner.health is BookHealth.HEALTHY
+    assert ambiguous.audit_ineligible_instruments == (owner.instrument_id,)
+    assert ambiguous.scan_results[-1].disposition is ScanDisposition.BLOCKED
+    assert ambiguous.summary().audit_ineligible_books == 1
+
+    explicit = CanonicalProcessor(config)
+    explicit_run = CollectorRunId("processor-rest-audit-explicit-failure")
+    for envelope in _bootstrap(explicit_run):
+        assert explicit.process_replayed(envelope).success
+    explicit_start, explicit_intent = _audit_start(
+        explicit,
+        explicit_run,
+        4,
+        request_id="http-failed",
+    )
+    assert explicit.process_replayed(explicit_intent).success
+    failure = _envelope(
+        explicit_run,
+        5,
+        CONTROL_REST_AUDIT_FAILED,
+        AuditFailureCommand(
+            request_id=explicit_start.request_id,
+            reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+        ).to_payload(),
+        connection_id=explicit_start.connection_id,
+    )
+    explicit_result = explicit.process_replayed(failure)
+
+    assert explicit_result.success
+    assert not explicit_result.needs_resync
+    assert explicit_result.audit_outcomes[0].reason is AuditFailureReason.HTTP_REQUEST_FAILED
+    assert explicit.summary().rest_audit_failed == 1
+    assert explicit.summary().audit_ineligible_books == 1
+
+    recovery_start, recovery_intent = _audit_start(
+        explicit,
+        explicit_run,
+        6,
+        request_id="http-recovered",
+    )
+    assert explicit.process_replayed(recovery_intent).success
+    recovered = explicit.process_replayed(
+        _audit_response(
+            explicit_run,
+            7,
+            recovery_start,
+            _fixture("polymarket_rest_book_yes.json"),
+            boundary=0,
+        )
+    )
+
+    assert recovered.audit_outcomes[0].outcome is AuditOutcome.MATCH
+    assert explicit.summary().audit_ineligible_books == 0
 
 
 def test_scan_dirty_is_coalesced_and_last_trade_is_diagnostic_only() -> None:
@@ -447,24 +837,35 @@ def test_ws_l2_deadline_equality_is_accepted_and_strict_overrun_requires_rest() 
 def test_control_and_audit_channels_have_identical_live_and_replay_results() -> None:
     config = load_phase1_config(Path("config/phase1.toml"))
     run_id = CollectorRunId("processor-control-replay")
+    live = CanonicalProcessor(config)
+    replay = CanonicalProcessor(config)
+
+    for envelope in _bootstrap(run_id):
+        live_result = live.process_durable(envelope, _receipt(envelope))
+        replay_result = replay.process_replayed(envelope)
+        assert live_result == replay_result
+    start, intent = _audit_start(
+        live,
+        run_id,
+        4,
+        request_id="live-replay-audit",
+    )
     inputs = (
-        *_bootstrap(run_id),
-        _envelope(
+        intent,
+        _audit_response(
             run_id,
-            4,
-            REST_BOOK_AUDIT,
+            5,
+            start,
             _fixture("polymarket_rest_book_yes.json"),
+            boundary=0,
         ),
         _envelope(
             run_id,
-            5,
+            6,
             CONTROL_BOOK_INVALIDATION,
             canonical_json_bytes({"reason": InvalidationReason.DISCONNECT.value}),
         ),
     )
-    live = CanonicalProcessor(config)
-    replay = CanonicalProcessor(config)
-
     for envelope in inputs:
         live_result = live.process_durable(envelope, _receipt(envelope))
         replay_result = replay.process_replayed(envelope)

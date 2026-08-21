@@ -63,6 +63,8 @@ def _books(
     bundle: ReferenceBundle,
     yes_levels: tuple[tuple[int, int], ...],
     no_levels: tuple[tuple[int, int], ...],
+    *,
+    quantity_scale: int = 0,
 ) -> tuple[ImmutableOrderBookSnapshot, ImmutableOrderBookSnapshot]:
     provenance = _provenance()
     result: list[ImmutableOrderBookSnapshot] = []
@@ -70,7 +72,10 @@ def _books(
         zip(bundle.instruments, (yes_levels, no_levels), strict=True)
     ):
         asks = tuple(
-            BookLevel(Price(ExactDecimal(price, 2)), Quantity(ExactDecimal(quantity)))
+            BookLevel(
+                Price(ExactDecimal(price, 2)),
+                Quantity(ExactDecimal(quantity, quantity_scale)),
+            )
             for price, quantity in levels
         )
         result.append(
@@ -104,6 +109,7 @@ def _capacity_cases(
 ) -> tuple[
     tuple[tuple[int, int], ...],
     tuple[tuple[int, int], ...],
+    int,
     int,
     int,
     int,
@@ -156,6 +162,7 @@ def _capacity_cases(
     thresholds = tuple(
         sorted(draw(st.lists(st.integers(0, 50), min_size=1, max_size=5, unique=True)))
     )
+    quantity_scale = draw(st.integers(0, 2))
     return (
         tuple(zip(yes_prices, yes_quantities, strict=True)),
         tuple(zip(no_prices, no_quantities, strict=True)),
@@ -165,6 +172,7 @@ def _capacity_cases(
         draw(st.sampled_from((1, 5, 10, 100))),
         tick_step,
         draw(st.integers(1, 3)),
+        quantity_scale,
         thresholds,
     )
 
@@ -186,11 +194,12 @@ def test_capacity_threshold_set_nesting_is_monotone(capacities: list[int]) -> No
 
 
 @given(case=_capacity_cases())
-@settings(max_examples=150, deadline=None)
+@settings(max_examples=2_000, deadline=None)
 def test_optimized_capacity_scan_is_exactly_equivalent_to_exhaustive_oracle(
     case: tuple[
         tuple[tuple[int, int], ...],
         tuple[tuple[int, int], ...],
+        int,
         int,
         int,
         int,
@@ -209,6 +218,7 @@ def test_optimized_capacity_scan_is_exactly_equivalent_to_exhaustive_oracle(
         fee_quantum,
         tick_step,
         quantity_increment,
+        quantity_scale,
         threshold_values,
     ) = case
     base = _bundle()
@@ -217,7 +227,7 @@ def test_optimized_capacity_scan_is_exactly_equivalent_to_exhaustive_oracle(
         precision=replace(
             base.precision,
             tick_size=ExactDecimal(tick_step, 2),
-            minimum_order_size=Quantity(ExactDecimal(minimum_order_size)),
+            minimum_order_size=Quantity(ExactDecimal(minimum_order_size, quantity_scale)),
         ),
         cost_rule_set=replace(
             base.cost_rule_set,
@@ -230,10 +240,10 @@ def test_optimized_capacity_scan_is_exactly_equivalent_to_exhaustive_oracle(
         maximum_book_age_ns=1_000_000_000,
         maximum_interleg_skew_ns=100_000_000,
         minimum_edge_thresholds=tuple(Rate(ExactDecimal(value, 3)) for value in threshold_values),
-        quantity_increment=Quantity(ExactDecimal(quantity_increment)),
+        quantity_increment=Quantity(ExactDecimal(quantity_increment, quantity_scale)),
         maximum_capacity_evaluations=100,
     )
-    books = _books(bundle, yes_levels, no_levels)
+    books = _books(bundle, yes_levels, no_levels, quantity_scale=quantity_scale)
     proof = prove_binary_complement(bundle)
     provenance = _provenance()
     optimized = PolymarketCompleteSetScanner(config).scan(

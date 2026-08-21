@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tomllib
 from collections.abc import Mapping
+from datetime import date
 from enum import StrEnum
 from itertools import pairwise
 from pathlib import Path
@@ -71,6 +72,7 @@ class _StrictFrozenModel(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
         frozen=True,
+        hide_input_in_errors=True,
         validate_default=True,
         arbitrary_types_allowed=True,
     )
@@ -94,6 +96,7 @@ class StorageConfig(_StrictFrozenModel):
     root: Path
     journal_directory: Path
     analytical_directory: Path
+    health_directory: Path
     journal_segment_max_events: PositiveStrictInt
     journal_segment_max_uncompressed_bytes: PositiveStrictInt = 64 * 1024 * 1024
     journal_run_max_uncompressed_bytes: PositiveStrictInt = 4 * 1024 * 1024 * 1024
@@ -105,7 +108,7 @@ class StorageConfig(_StrictFrozenModel):
     analytical_record_max_bytes: PositiveStrictInt = 8 * 1024 * 1024
     analytical_buffer_max_bytes: PositiveStrictInt = 64 * 1024 * 1024
 
-    @field_validator("root", "journal_directory", "analytical_directory")
+    @field_validator("root", "journal_directory", "analytical_directory", "health_directory")
     @classmethod
     def _portable_relative_path(cls, value: Path) -> Path:
         if value.is_absolute():
@@ -124,8 +127,19 @@ class StorageConfig(_StrictFrozenModel):
             raise ValueError("journal_directory must be inside storage root")
         if not self.analytical_directory.is_relative_to(self.root):
             raise ValueError("analytical_directory must be inside storage root")
-        if self.journal_directory == self.analytical_directory:
-            raise ValueError("journal and analytical directories must be distinct")
+        if not self.health_directory.is_relative_to(self.root):
+            raise ValueError("health_directory must be inside storage root")
+        if (
+            len(
+                {
+                    self.journal_directory,
+                    self.analytical_directory,
+                    self.health_directory,
+                }
+            )
+            != 3
+        ):
+            raise ValueError("journal, analytical, and health directories must be distinct")
         if self.journal_segment_max_uncompressed_bytes > 512 * 1024 * 1024:
             raise ValueError("journal_segment_max_uncompressed_bytes cannot exceed 512 MiB")
         if self.journal_run_max_uncompressed_bytes < self.journal_segment_max_uncompressed_bytes:
@@ -166,6 +180,58 @@ def _validate_public_url(value: str, *, schemes: frozenset[str]) -> str:
     return value
 
 
+class PublicReadConfig(_StrictFrozenModel):
+    """Bounded local policy and dated external evidence for public reads."""
+
+    maximum_concurrency: PositiveStrictInt = 4
+    maximum_attempts: PositiveStrictInt = 3
+    initial_backoff_seconds: PositiveFiniteFloat = 0.25
+    maximum_backoff_seconds: PositiveFiniteFloat = 2.0
+    jitter_fraction: NonNegativeFiniteFloat = 0.2
+    jitter_seed: NonNegativeStrictInt = 0
+    maximum_retry_after_seconds: PositiveFiniteFloat = 10.0
+    rate_limit_window_seconds: PositiveFiniteFloat = 10.0
+    gamma_general_requests_per_window: PositiveStrictInt = 100
+    gamma_markets_requests_per_window: PositiveStrictInt = 30
+    clob_general_requests_per_window: PositiveStrictInt = 100
+    clob_book_requests_per_window: PositiveStrictInt = 100
+    clob_books_requests_per_window: PositiveStrictInt = 50
+    rate_limit_source_url: str
+    rate_limit_checked_on: date
+
+    @field_validator("rate_limit_source_url")
+    @classmethod
+    def _https_evidence_url(cls, value: str) -> str:
+        return _validate_public_url(value, schemes=frozenset({"https"}))
+
+    @model_validator(mode="after")
+    def _bounded_policy(self) -> Self:
+        if self.maximum_concurrency > 64:
+            raise ValueError("public read concurrency cannot exceed 64")
+        if self.maximum_attempts > 8:
+            raise ValueError("public read attempts cannot exceed 8")
+        if self.initial_backoff_seconds > self.maximum_backoff_seconds:
+            raise ValueError("initial public read backoff cannot exceed maximum backoff")
+        if self.maximum_backoff_seconds > 60.0:
+            raise ValueError("public read backoff cannot exceed 60 seconds")
+        if self.jitter_fraction > 1.0:
+            raise ValueError("public read jitter fraction cannot exceed 1")
+        if self.maximum_retry_after_seconds > 60.0:
+            raise ValueError("public read Retry-After policy cannot exceed 60 seconds")
+        if self.rate_limit_window_seconds > 60.0:
+            raise ValueError("public read rate window cannot exceed 60 seconds")
+        endpoint_limits = (
+            self.gamma_general_requests_per_window,
+            self.gamma_markets_requests_per_window,
+            self.clob_general_requests_per_window,
+            self.clob_book_requests_per_window,
+            self.clob_books_requests_per_window,
+        )
+        if any(limit > 10_000 for limit in endpoint_limits):
+            raise ValueError("public read endpoint window limit cannot exceed 10000")
+        return self
+
+
 class PolymarketConfig(_StrictFrozenModel):
     gamma_base_url: str
     clob_base_url: str
@@ -180,6 +246,8 @@ class PolymarketConfig(_StrictFrozenModel):
     maximum_http_response_bytes: PositiveStrictInt = 8 * 1024 * 1024
     maximum_websocket_message_bytes: PositiveStrictInt = 1024 * 1024
     maximum_ingress_queue_bytes: PositiveStrictInt = 64 * 1024 * 1024
+    public_reads: PublicReadConfig
+    snapshot_audit_max_race_retries: NonNegativeStrictInt = 2
 
     @field_validator("gamma_base_url", "clob_base_url")
     @classmethod
@@ -199,6 +267,8 @@ class PolymarketConfig(_StrictFrozenModel):
 
     @model_validator(mode="after")
     def _payload_bounds(self) -> Self:
+        if self.request_timeout_seconds > 60.0:
+            raise ValueError("request_timeout_seconds cannot exceed 60 seconds")
         if self.maximum_http_response_bytes > 8 * 1024 * 1024:
             raise ValueError("maximum_http_response_bytes cannot exceed 8 MiB")
         if self.maximum_websocket_message_bytes > 1024 * 1024:
@@ -254,6 +324,24 @@ class ScannerConfig(_StrictFrozenModel):
         return value.to_canonical_string()
 
 
+class HealthConfig(_StrictFrozenModel):
+    checkpoint_interval_seconds: PositiveFiniteFloat = 5.0
+    queue_capacity: PositiveStrictInt = 64
+    maximum_checkpoints: PositiveStrictInt = 8_192
+    maximum_file_bytes: PositiveStrictInt = 64 * 1024 * 1024
+    minimum_free_disk_bytes: PositiveStrictInt = 1024 * 1024 * 1024
+
+    @model_validator(mode="after")
+    def _bounded_cadence(self) -> Self:
+        if self.checkpoint_interval_seconds < 1.0:
+            raise ValueError("health checkpoint interval cannot be below one second")
+        if self.checkpoint_interval_seconds > 30.0:
+            raise ValueError("health checkpoint interval cannot exceed thirty seconds")
+        if self.maximum_file_bytes > 256 * 1024 * 1024:
+            raise ValueError("health evidence file cannot exceed 256 MiB")
+        return self
+
+
 class ReplayConfig(_StrictFrozenModel):
     clock: ReplayClock
     reference_interpretation: ReferenceInterpretation
@@ -269,6 +357,7 @@ class Phase1Config(_StrictFrozenModel):
     storage: StorageConfig
     polymarket: PolymarketConfig
     scanner: ScannerConfig
+    health: HealthConfig
     replay: ReplayConfig
     logging: LoggingConfig
 

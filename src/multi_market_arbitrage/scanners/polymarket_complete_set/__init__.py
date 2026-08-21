@@ -8,6 +8,7 @@ from .lifecycle import (
 from .scanner import (
     POLYMARKET_COMPLETE_SET_STRATEGY_ID,
     POLYMARKET_COMPLETE_SET_STRATEGY_VERSION,
+    CapacityPlannerDiagnostics,
     CompleteSetScannerConfig,
     CompleteSetScanResult,
     DepthFill,
@@ -20,6 +21,7 @@ from .scanner import (
 __all__ = [
     "POLYMARKET_COMPLETE_SET_STRATEGY_ID",
     "POLYMARKET_COMPLETE_SET_STRATEGY_VERSION",
+    "CapacityPlannerDiagnostics",
     "CompleteSetScanResult",
     "CompleteSetScannerConfig",
     "DepthFill",

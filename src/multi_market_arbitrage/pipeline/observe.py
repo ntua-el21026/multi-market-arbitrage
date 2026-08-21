@@ -7,7 +7,8 @@ import hashlib
 import logging
 import math
 import time
-from collections.abc import Awaitable, Callable
+import uuid
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -38,9 +39,15 @@ from multi_market_arbitrage.journal import (
 )
 from multi_market_arbitrage.normalization import CanonicalEventType
 from multi_market_arbitrage.observability import (
+    HealthCheckpoint,
+    HealthDecision,
+    HealthDecisionReason,
+    HealthEvidenceSummary,
     InMemoryMetrics,
     MetricsSnapshot,
+    PeriodicHealthCheckpointEmitter,
     StructuredLogger,
+    SupervisedHealthCheckpointWriter,
     configure_json_logger,
 )
 from multi_market_arbitrage.reference import POLYMARKET_VENUE_ID
@@ -51,16 +58,35 @@ from multi_market_arbitrage.research import (
 )
 from multi_market_arbitrage.state.order_books import InvalidationReason
 from multi_market_arbitrage.venues.polymarket import (
+    PolymarketHttpError,
+    PolymarketHttpFailureCategory,
     PolymarketMarketWebSocket,
     PolymarketPublicClient,
+    PolymarketWebSocketError,
+    PolymarketWebSocketFailureCategory,
+    PolymarketWebSocketProtocolError,
+    PolymarketWebSocketTransportError,
+    PublicReadMetricsSnapshot,
+    PublicReadPolicy,
     ReceivedWebSocketMessage,
 )
-from multi_market_arbitrage.venues.polymarket.errors import PolymarketTransportError
 from multi_market_arbitrage.venues.polymarket.schemas import GammaMarket
 
+from .audit import (
+    AuditFailureCommand,
+    AuditFailureReason,
+    AuditHttpFailureHandoff,
+    AuditHttpHandoff,
+    AuditHttpResponseHandoff,
+    AuditOutcome,
+    AuditStartEvidence,
+    WebSocketAdmissionWatermark,
+)
 from .channels import (
     CLOB_MARKET_PREFIX,
     CONTROL_BOOK_INVALIDATION,
+    CONTROL_REST_AUDIT_FAILED,
+    CONTROL_REST_AUDIT_START,
     GAMMA_EVENT_PREFIX,
     GAMMA_MARKET_PREFIX,
     GAMMA_MARKETS_KEYSET,
@@ -69,6 +95,12 @@ from .channels import (
     WS_MARKET,
 )
 from .freshness import IntegrityDeadline, IntegrityDeadlineReason, next_integrity_deadline
+from .health import (
+    ObservationRuntimeHealth,
+    ObservationRuntimeHealthSnapshot,
+    SupervisedProcessResourceSampler,
+    build_observation_health_checkpoint,
+)
 from .ingress import (
     BoundedRawIngress,
     RawIngressBackpressureError,
@@ -81,34 +113,20 @@ from .processor import (
     ProcessorSummary,
     ReferenceRefreshRequest,
 )
+from .targeting import (
+    ObservationTargetMode,
+    ResolvedPolymarketTarget,
+    TargetSelectionError,
+    require_supported_gamma_market,
+    resolve_polymarket_target,
+)
 
 
 class _GenerationExit(StrEnum):
     DEADLINE = "DEADLINE"
-    AUDIT_DUE = "AUDIT_DUE"
     RESYNC_REQUIRED = "RESYNC_REQUIRED"
     REFERENCE_REFRESH = "REFERENCE_REFRESH"
     INGRESS_OVERFLOW = "INGRESS_OVERFLOW"
-
-
-class _ObservationDeadlineReached(RuntimeError):
-    """The finite public-observation deadline elapsed during remote I/O."""
-
-
-async def _await_remote_before_deadline[T](
-    operation: Callable[[], Awaitable[T]],
-    *,
-    deadline: float | None,
-) -> T:
-    """Bound only remote I/O, leaving returned bytes available for journaling."""
-
-    if deadline is None:
-        return await operation()
-    try:
-        async with asyncio.timeout_at(deadline):
-            return await operation()
-    except TimeoutError as error:
-        raise _ObservationDeadlineReached from error
 
 
 def _empty_ingress_metrics() -> RawIngressMetricsSnapshot:
@@ -121,6 +139,8 @@ def _empty_ingress_metrics() -> RawIngressMetricsSnapshot:
         queue_high_water=0,
         queued_bytes=0,
         queued_bytes_high_water=0,
+        received_bytes=0,
+        admitted_bytes=0,
     )
 
 
@@ -139,6 +159,58 @@ class _StreamResult:
     selected_market_resolved: bool
     deviations: tuple[str, ...]
     ingress_metrics: RawIngressMetricsSnapshot = field(default_factory=_empty_ingress_metrics)
+
+
+@dataclass(slots=True)
+class _AuditResponseBoundaryFence:
+    """Request-scoped receive fence announced before HTTP response cleanup awaits."""
+
+    request_id: str
+    connection_id: ConnectionId
+    announced: bool = False
+    received_wall_time: UtcTimestamp | None = None
+    received_monotonic_ns: int | None = None
+    watermark: WebSocketAdmissionWatermark | None = None
+    error_type: str | None = None
+
+    def announce(
+        self,
+        *,
+        ingress: BoundedRawIngress,
+        received_wall_time: UtcTimestamp,
+        received_monotonic_ns: int,
+    ) -> None:
+        """Capture the contiguous prefix synchronously on the socket event loop."""
+
+        if self.announced:
+            self.watermark = None
+            self.error_type = "DuplicateResponseBoundaryAnnouncement"
+            return
+        self.announced = True
+        self.received_wall_time = received_wall_time
+        self.received_monotonic_ns = received_monotonic_ns
+        try:
+            watermark = ingress.snapshot_watermark()
+        except RawIngressBackpressureError as error:
+            self.error_type = type(error).__name__
+            return
+        if watermark.connection_id != self.connection_id:
+            self.error_type = "ResponseBoundaryConnectionMismatch"
+            return
+        self.watermark = watermark
+
+    def abandon(self) -> None:
+        """Clear a provisional boundary when its HTTP attempt does not complete."""
+
+        self.announced = False
+        self.received_wall_time = None
+        self.received_monotonic_ns = None
+        self.watermark = None
+        self.error_type = None
+
+    @property
+    def barrier_ordinal(self) -> int | None:
+        return None if self.watermark is None else self.watermark.ordinal
 
 
 _EMPTY_INGRESS_METRICS = _empty_ingress_metrics()
@@ -160,6 +232,22 @@ def _merge_ingress_metrics(
             left.queued_bytes_high_water,
             right.queued_bytes_high_water,
         ),
+        received_bytes=left.received_bytes + right.received_bytes,
+        admitted_bytes=left.admitted_bytes + right.admitted_bytes,
+        connection_id=right.connection_id,
+        last_frame_received_monotonic_ns=max(
+            value
+            for value in (
+                left.last_frame_received_monotonic_ns,
+                right.last_frame_received_monotonic_ns,
+            )
+            if value is not None
+        )
+        if (
+            left.last_frame_received_monotonic_ns is not None
+            or right.last_frame_received_monotonic_ns is not None
+        )
+        else None,
     )
 
 
@@ -171,17 +259,24 @@ class ObservationSummary:
     ended_at: UtcTimestamp
     requested_duration_seconds: float
     actual_duration_nanoseconds: int
+    target_selection_mode: ObservationTargetMode
+    target: ResolvedPolymarketTarget | None
     selected_condition_ids: tuple[str, ...]
     selected_asset_ids: tuple[str, ...]
     journal_root: Path
     journal_metrics: JournalMetricsSnapshot
     processor: ProcessorSummary
     analytical_outputs: ResearchOutputSummary
+    health_evidence: HealthEvidenceSummary
+    health_decision: HealthDecision
+    public_read_metrics: PublicReadMetricsSnapshot
+    runtime_health: ObservationRuntimeHealthSnapshot
     observability_metrics: MetricsSnapshot
     ingress_metrics: RawIngressMetricsSnapshot
     reconnects: int
     selected_market_resolved: bool
     protocol_deviations: tuple[str, ...]
+    websocket_observation_nanoseconds: int
 
 
 class _RawCaptureBoundary:
@@ -305,10 +400,14 @@ class _RawCaptureBoundary:
         connection_id: ConnectionId | None = None,
         subscription_id: SubscriptionId | None = None,
         transport_metadata: dict[str, str | int | bool] | None = None,
+        received_wall_time: UtcTimestamp | None = None,
+        received_monotonic_ns: int | None = None,
     ) -> ProcessedEnvelope:
         self.metrics.increment_counter("mma_raw_received_total")
         self.metrics.observe_histogram("mma_raw_payload_bytes", len(payload))
-        received_monotonic_ns = time.monotonic_ns()
+        captured_monotonic_ns = (
+            time.monotonic_ns() if received_monotonic_ns is None else received_monotonic_ns
+        )
         envelope = self._capture_envelope(
             channel=channel,
             payload=payload,
@@ -317,8 +416,8 @@ class _RawCaptureBoundary:
             connection_id=connection_id,
             subscription_id=subscription_id,
             transport_metadata=transport_metadata,
-            received_wall_time=UtcTimestamp.now(),
-            received_monotonic_ns=received_monotonic_ns,
+            received_wall_time=received_wall_time or UtcTimestamp.now(),
+            received_monotonic_ns=captured_monotonic_ns,
         )
         try:
             receipt = await self.writer.submit(envelope)
@@ -351,6 +450,8 @@ class _RawCaptureBoundary:
         admitted: list[tuple[RawEventEnvelope, JournalTicket]] = []
         for item in items:
             message = item.message
+            if item.watermark.connection_id != connection_id:
+                raise ValueError("raw ingress item belongs to another socket generation")
             self.metrics.increment_counter("mma_raw_received_total")
             self.metrics.observe_histogram("mma_raw_payload_bytes", len(message.payload_bytes))
             self.metrics.observe_histogram(
@@ -368,7 +469,10 @@ class _RawCaptureBoundary:
                 semantics_hash=semantics_hash,
                 connection_id=connection_id,
                 subscription_id=subscription_id,
-                transport_metadata={"websocket_message_type": message.message_type},
+                transport_metadata={
+                    "websocket_admission_ordinal": item.watermark.ordinal,
+                    "websocket_message_type": message.message_type,
+                },
                 received_wall_time=message.received_wall_time,
                 received_monotonic_ns=message.received_monotonic_ns,
             )
@@ -433,6 +537,91 @@ def _logging_level(name: str) -> int:
     return levels[name]
 
 
+def _public_read_policy(config: Phase1Config) -> PublicReadPolicy:
+    configured = config.polymarket.public_reads
+    return PublicReadPolicy(
+        maximum_concurrency=configured.maximum_concurrency,
+        maximum_attempts=configured.maximum_attempts,
+        initial_backoff_seconds=configured.initial_backoff_seconds,
+        maximum_backoff_seconds=configured.maximum_backoff_seconds,
+        jitter_fraction=configured.jitter_fraction,
+        jitter_seed=configured.jitter_seed,
+        maximum_retry_after_seconds=configured.maximum_retry_after_seconds,
+        rate_limit_window_seconds=configured.rate_limit_window_seconds,
+        gamma_general_requests_per_window=(configured.gamma_general_requests_per_window),
+        gamma_markets_requests_per_window=(configured.gamma_markets_requests_per_window),
+        clob_general_requests_per_window=(configured.clob_general_requests_per_window),
+        clob_book_requests_per_window=configured.clob_book_requests_per_window,
+        clob_books_requests_per_window=configured.clob_books_requests_per_window,
+    )
+
+
+def _failed_health_summary(
+    *,
+    root: Path,
+    collector_run_id: CollectorRunId,
+    writer: SupervisedHealthCheckpointWriter,
+    error: BaseException,
+) -> HealthEvidenceSummary:
+    """Represent a diagnostic-owner failure without failing raw acquisition."""
+
+    writer.record_failure(error)
+    runtime = writer.runtime_snapshot
+    path = root / (f"run-{collector_run_id.value}.health-checkpoints.jsonl.partial")
+    return HealthEvidenceSummary(
+        schema_version="gate1-health-evidence-summary-v1",
+        collector_run_id=collector_run_id,
+        path=path,
+        completed=False,
+        gate1_evidence_eligible=False,
+        accepted=runtime.accepted,
+        written=runtime.written,
+        rejected=runtime.rejected,
+        queue_high_water=runtime.queue_high_water,
+        file_bytes=runtime.file_bytes,
+        content_sha256=None,
+        failure_type=runtime.failure_type or type(error).__name__,
+    )
+
+
+def _final_health_decision(
+    checkpoint_decision: HealthDecision | None,
+    *,
+    evidence: HealthEvidenceSummary,
+    analytical_outputs: ResearchOutputSummary,
+) -> HealthDecision:
+    """Reconcile the last checkpoint with close-time derived-owner outcomes."""
+
+    if checkpoint_decision is None:
+        reasons = {HealthDecisionReason.HEALTH_EVIDENCE_UNHEALTHY}
+        if not analytical_outputs.research_eligible:
+            reasons.add(HealthDecisionReason.ANALYTICAL_UNHEALTHY)
+        return HealthDecision(
+            capture_healthy=True,
+            research_eligible=analytical_outputs.research_eligible,
+            gate1_eligible_so_far=False,
+            reason_codes=tuple(sorted(reasons, key=str)),
+        )
+    reasons = set(checkpoint_decision.reason_codes)
+    research_eligible = checkpoint_decision.research_eligible
+    if not evidence.gate1_evidence_eligible:
+        reasons.add(HealthDecisionReason.HEALTH_EVIDENCE_UNHEALTHY)
+    if not analytical_outputs.research_eligible:
+        reasons.add(HealthDecisionReason.ANALYTICAL_UNHEALTHY)
+        research_eligible = False
+    return HealthDecision(
+        capture_healthy=checkpoint_decision.capture_healthy,
+        research_eligible=research_eligible,
+        gate1_eligible_so_far=(
+            checkpoint_decision.gate1_eligible_so_far
+            and evidence.gate1_evidence_eligible
+            and analytical_outputs.research_eligible
+            and not reasons
+        ),
+        reason_codes=tuple(sorted(reasons, key=str)),
+    )
+
+
 class PolymarketObservationService:
     """Run one finite, read-only capture using only explicit public adapters."""
 
@@ -468,7 +657,12 @@ class PolymarketObservationService:
             raise ValueError("configured observation output resolves outside workspace")
         return resolved
 
-    async def run(self, *, duration_seconds: float) -> ObservationSummary:
+    async def run(
+        self,
+        *,
+        duration_seconds: float,
+        gamma_market_id: str | None = None,
+    ) -> ObservationSummary:
         maximum_duration = self._config.system.maximum_observation_duration_seconds
         if (
             not math.isfinite(duration_seconds)
@@ -479,6 +673,10 @@ class PolymarketObservationService:
                 "observation duration must be finite, positive, and no greater than "
                 f"{maximum_duration} seconds"
             )
+        if gamma_market_id is not None and (
+            not gamma_market_id or gamma_market_id != gamma_market_id.strip()
+        ):
+            raise ValueError("explicit Gamma market ID must be a non-empty trimmed string")
         loop = asyncio.get_running_loop()
         started_monotonic_ns = time.monotonic_ns()
         deadline = loop.time() + duration_seconds
@@ -487,6 +685,7 @@ class PolymarketObservationService:
         logger = self._logger.bind(collector_run_id=run_id)
         journal_root = self._path(self._config.storage.journal_directory)
         analytical_root = self._path(self._config.storage.analytical_directory)
+        health_root = self._path(self._config.storage.health_directory)
         partition_date = started.to_datetime().date().isoformat()
         persistent_outputs = Phase1AnalyticalOutputs(
             root=analytical_root,
@@ -538,8 +737,35 @@ class PolymarketObservationService:
         )
         selected: tuple[GammaMarket, ...] = ()
         selected_assets: tuple[str, ...] = ()
+        target: ResolvedPolymarketTarget | None = None
+        target_selection_mode = (
+            ObservationTargetMode.EXPLICIT_GATE1
+            if gamma_market_id is not None
+            else ObservationTargetMode.DEVELOPER_DISCOVERY
+        )
         stream_result = _StreamResult(0, False, False, ())
         deviations: list[str] = []
+        runtime_health = ObservationRuntimeHealth()
+        websocket_observation_nanoseconds = 0
+        public_read_metrics = PublicReadMetricsSnapshot(
+            endpoints=(),
+            active_attempts=0,
+            active_attempts_high_water=0,
+        )
+        health_writer = SupervisedHealthCheckpointWriter(
+            root=health_root,
+            collector_run_id=run_id,
+            queue_capacity=self._config.health.queue_capacity,
+            maximum_checkpoints=self._config.health.maximum_checkpoints,
+            maximum_file_bytes=self._config.health.maximum_file_bytes,
+        )
+        health_emitter: PeriodicHealthCheckpointEmitter | None = None
+        health_started = False
+        health_start_error: BaseException | None = None
+        latest_health_decision: HealthDecision | None = None
+        health_checkpoint_builder: Callable[[], HealthCheckpoint] | None = None
+        resource_sampler: SupervisedProcessResourceSampler | None = None
+        resource_sampler_started = False
         capture = _RawCaptureBoundary(
             collector_run_id=run_id,
             writer=writer,
@@ -564,17 +790,113 @@ class PolymarketObservationService:
                 clob_url=self._config.polymarket.clob_base_url,
                 timeout_seconds=self._config.polymarket.request_timeout_seconds,
                 max_response_bytes=self._config.polymarket.maximum_http_response_bytes,
+                public_read_policy=_public_read_policy(self._config),
+                metrics=self._metrics,
             ) as client:
-                try:
-                    selected, selected_assets = await self._bootstrap(
-                        client=client,
-                        capture=capture,
-                        processor=processor,
-                        deadline=deadline,
+
+                def record_resource_sampler_failure(error: BaseException) -> None:
+                    health_writer.record_failure(error)
+                    logger.error(
+                        "health_evidence_failed",
+                        "resource sampler failed; raw capture remains active",
+                        exception_type=type(error).__name__,
                     )
-                except _ObservationDeadlineReached:
+
+                resource_sampler = SupervisedProcessResourceSampler(
+                    storage_path=journal_root,
+                    interval_seconds=self._config.health.checkpoint_interval_seconds,
+                    on_failure=record_resource_sampler_failure,
+                )
+
+                def build_health_checkpoint() -> HealthCheckpoint:
+                    nonlocal latest_health_decision
+                    monotonic_now_ns = int(loop.time() * 1_000_000_000)
+                    resources = resource_sampler.snapshot.latest
+                    if resources is None:
+                        raise RuntimeError("resource sampler has not published a sample")
+                    checkpoint = build_observation_health_checkpoint(
+                        config=self._config,
+                        collector_run_id=run_id,
+                        git_commit=self._code_commit,
+                        target=target,
+                        runtime=runtime_health.snapshot(now_ns=monotonic_now_ns),
+                        processor=processor,
+                        journal=writer.metrics,
+                        journal_failure_type=(
+                            None if writer.failure is None else type(writer.failure).__name__
+                        ),
+                        analytical=outputs.runtime_snapshot,
+                        health_writer=health_writer.runtime_snapshot,
+                        public_reads=client.public_read_metrics_snapshot(),
+                        metrics=self._metrics,
+                        resources=resources,
+                        emitted_at=UtcTimestamp.now(),
+                        monotonic_now_ns=monotonic_now_ns,
+                    )
+                    latest_health_decision = HealthDecision(
+                        capture_healthy=checkpoint.capture_healthy,
+                        research_eligible=checkpoint.research_eligible,
+                        gate1_eligible_so_far=checkpoint.gate1_eligible_so_far,
+                        reason_codes=checkpoint.reason_codes,
+                    )
+                    return checkpoint
+
+                health_checkpoint_builder = build_health_checkpoint
+
+                health_emitter = PeriodicHealthCheckpointEmitter(
+                    writer=health_writer,
+                    interval_seconds=self._config.health.checkpoint_interval_seconds,
+                    build=build_health_checkpoint,
+                    emit_initial=False,
+                    enabled=lambda: (
+                        target is not None and resource_sampler.snapshot.latest is not None
+                    ),
+                    final_enabled=lambda: target is not None,
+                )
+                try:
+                    await health_emitter.start()
+                except BaseException as error:
+                    if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                        raise
+                    health_start_error = error
+                    health_writer.record_failure(error)
+                    logger.error(
+                        "health_evidence_failed",
+                        "health evidence owner failed; raw capture remains active",
+                        exception_type=type(error).__name__,
+                    )
+                else:
+                    health_started = True
+                    try:
+                        await resource_sampler.start()
+                    except BaseException as error:
+                        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                            raise
+                        record_resource_sampler_failure(error)
+                    else:
+                        resource_sampler_started = True
+                try:
+                    if gamma_market_id is None:
+                        selected, selected_assets, target = await self._bootstrap(
+                            client=client,
+                            capture=capture,
+                            processor=processor,
+                            deadline=deadline,
+                        )
+                    else:
+                        selected, selected_assets, target = await self._bootstrap_explicit(
+                            client=client,
+                            capture=capture,
+                            processor=processor,
+                            gamma_market_id=gamma_market_id,
+                            deadline=deadline,
+                        )
+                except PolymarketHttpError as error:
+                    if error.category is not PolymarketHttpFailureCategory.DEADLINE_EXCEEDED:
+                        raise
                     stream_result = _StreamResult(0, True, False, ())
                 if loop.time() < deadline and selected_assets:
+                    websocket_started_ns = time.monotonic_ns()
                     stream_result = await self._observe_websocket(
                         client=client,
                         capture=capture,
@@ -582,9 +904,15 @@ class PolymarketObservationService:
                         asset_ids=selected_assets,
                         deadline=deadline,
                         logger=logger,
+                        runtime_health=runtime_health,
+                    )
+                    websocket_observation_nanoseconds = max(
+                        0,
+                        time.monotonic_ns() - websocket_started_ns,
                     )
                     deviations.extend(stream_result.deviations)
                 run_completed = True
+                public_read_metrics = client.public_read_metrics_snapshot()
         except Exception as error:
             logger.error(
                 "observation_failed",
@@ -608,15 +936,75 @@ class PolymarketObservationService:
                     ).completion_sha256
             finally:
                 journal_metrics = writer.metrics
-                analytical_summary = await outputs.close(
-                    source_journal_completion_sha256=raw_completion_sha256,
-                    completed=run_completed and raw_completion_sha256 is not None,
-                )
+                try:
+                    analytical_summary = await outputs.close(
+                        source_journal_completion_sha256=raw_completion_sha256,
+                        completed=run_completed and raw_completion_sha256 is not None,
+                    )
+                finally:
+                    if resource_sampler_started:
+                        if resource_sampler is None:
+                            raise RuntimeError("started resource sampler is unavailable")
+                        try:
+                            await resource_sampler.close()
+                        except BaseException as error:
+                            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                                raise
+                            health_writer.record_failure(error)
+                    if health_started:
+                        if health_emitter is None:
+                            raise RuntimeError("started health evidence has no emitter")
+                        try:
+                            health_evidence = await health_emitter.close(
+                                completed=run_completed,
+                            )
+                        except BaseException as error:
+                            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                                raise
+                            health_evidence = _failed_health_summary(
+                                root=health_root,
+                                collector_run_id=run_id,
+                                writer=health_writer,
+                                error=error,
+                            )
+                    else:
+                        failure = health_start_error or RuntimeError(
+                            "health evidence owner was not started"
+                        )
+                        health_evidence = _failed_health_summary(
+                            root=health_root,
+                            collector_run_id=run_id,
+                            writer=health_writer,
+                            error=failure,
+                        )
+        if latest_health_decision is None and health_checkpoint_builder is not None:
+            # A pre-target deadline intentionally writes no Gate-1 evidence, but
+            # the returned scoped decision must still reflect the terminal
+            # socket/target/book state rather than defaulting to healthy.
+            try:
+                health_checkpoint_builder()
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
         ended = UtcTimestamp.now()
         actual_duration_nanoseconds = time.monotonic_ns() - started_monotonic_ns
+        health_decision = _final_health_decision(
+            latest_health_decision,
+            evidence=health_evidence,
+            analytical_outputs=analytical_summary,
+        )
+        runtime_health_snapshot = runtime_health.snapshot(now_ns=time.monotonic_ns())
         status = (
             ComponentHealth.HEALTHY
-            if (stream_result.completed and not deviations and analytical_summary.research_eligible)
+            if (
+                target is not None
+                and stream_result.completed
+                and not deviations
+                and analytical_summary.research_eligible
+                and health_evidence.gate1_evidence_eligible
+                and health_decision.capture_healthy
+                and health_decision.research_eligible
+            )
             else ComponentHealth.DEGRADED
         )
         processor_summary = processor.summary()
@@ -636,17 +1024,24 @@ class PolymarketObservationService:
             ended_at=ended,
             requested_duration_seconds=duration_seconds,
             actual_duration_nanoseconds=actual_duration_nanoseconds,
+            target_selection_mode=target_selection_mode,
+            target=target,
             selected_condition_ids=tuple(item.condition_id for item in selected),
             selected_asset_ids=selected_assets,
             journal_root=journal_root,
             journal_metrics=journal_metrics,
             processor=processor_summary,
             analytical_outputs=analytical_summary,
+            health_evidence=health_evidence,
+            health_decision=health_decision,
+            public_read_metrics=public_read_metrics,
+            runtime_health=runtime_health_snapshot,
             observability_metrics=self._metrics.snapshot(),
             ingress_metrics=stream_result.ingress_metrics,
             reconnects=stream_result.reconnects,
             selected_market_resolved=stream_result.selected_market_resolved,
             protocol_deviations=tuple(deviations),
+            websocket_observation_nanoseconds=websocket_observation_nanoseconds,
         )
 
     @staticmethod
@@ -660,12 +1055,14 @@ class PolymarketObservationService:
         capture: _RawCaptureBoundary,
         processor: CanonicalProcessor,
         deadline: float | None = None,
-    ) -> tuple[tuple[GammaMarket, ...], tuple[str, ...]]:
-        discovery = await _await_remote_before_deadline(
-            lambda: client.fetch_markets_keyset_raw(
-                limit=self._config.polymarket.discovery_limit,
-                closed=False,
-            ),
+    ) -> tuple[
+        tuple[GammaMarket, ...],
+        tuple[str, ...],
+        ResolvedPolymarketTarget,
+    ]:
+        discovery = await client.fetch_markets_keyset_raw(
+            limit=self._config.polymarket.discovery_limit,
+            closed=False,
             deadline=deadline,
         )
         await capture.preserve_then_process(
@@ -696,7 +1093,139 @@ class PolymarketObservationService:
                     deadline=deadline,
                 )
         selected_assets = tuple(asset for market in selected for asset in market.clob_token_ids)
-        return selected, selected_assets
+        target = self._resolve_target(
+            processor,
+            selected[0],
+            requested_gamma_market_id=None,
+        )
+        return selected, selected_assets, target
+
+    async def _bootstrap_explicit(
+        self,
+        *,
+        client: PolymarketPublicClient,
+        capture: _RawCaptureBoundary,
+        processor: CanonicalProcessor,
+        gamma_market_id: str,
+        deadline: float | None = None,
+    ) -> tuple[
+        tuple[GammaMarket, ...],
+        tuple[str, ...],
+        ResolvedPolymarketTarget,
+    ]:
+        """Resolve one operator-selected market without consulting discovery.
+
+        Every response is preserved before it is interpreted.  Any missing,
+        mismatched, unsupported, or non-canonical response aborts this exact
+        target; this path never substitutes a discovered market.
+        """
+
+        gamma_payload = await client.fetch_gamma_market_raw(
+            gamma_market_id,
+            deadline=deadline,
+        )
+        gamma_channel = f"{GAMMA_MARKET_PREFIX}{gamma_market_id}"
+        gamma_result = await capture.preserve_then_process(
+            channel=gamma_channel,
+            payload=gamma_payload,
+            transport_type="HTTP",
+            semantics_hash=_semantics(gamma_channel),
+        )
+        self._require_target_surface(gamma_result, surface="Gamma market")
+        matching_markets = tuple(
+            market
+            for market in processor.discovered_markets
+            if market.gamma_market_id == gamma_market_id
+        )
+        if len(matching_markets) != 1:
+            raise TargetSelectionError(
+                "direct Gamma response did not resolve exactly the requested market ID"
+            )
+        market = matching_markets[0]
+        require_supported_gamma_market(
+            market,
+            requested_gamma_market_id=gamma_market_id,
+        )
+
+        event_id = market.event_id
+        if event_id is not None:
+            event_payload = await client.fetch_gamma_event_raw(
+                event_id,
+                deadline=deadline,
+            )
+            event_channel = f"{GAMMA_EVENT_PREFIX}{event_id}"
+            event_result = await capture.preserve_then_process(
+                channel=event_channel,
+                payload=event_payload,
+                transport_type="HTTP",
+                semantics_hash=_semantics(event_channel),
+            )
+            self._require_target_surface(event_result, surface="Gamma event")
+
+        clob_payload = await client.fetch_clob_market_raw(
+            market.condition_id,
+            deadline=deadline,
+        )
+        clob_channel = f"{CLOB_MARKET_PREFIX}{market.condition_id}"
+        clob_result = await capture.preserve_then_process(
+            channel=clob_channel,
+            payload=clob_payload,
+            transport_type="HTTP",
+            semantics_hash=_semantics(clob_channel),
+        )
+        self._require_target_surface(clob_result, surface="CLOB market")
+
+        for asset_id in market.clob_token_ids:
+            book_result = await self._fetch_book(
+                client,
+                capture,
+                asset_id,
+                audit=False,
+                deadline=deadline,
+            )
+            self._require_target_surface(
+                book_result,
+                surface=f"CLOB book for token {asset_id}",
+            )
+
+        target = self._resolve_target(
+            processor,
+            market,
+            requested_gamma_market_id=gamma_market_id,
+        )
+        return (market,), market.clob_token_ids, target
+
+    @staticmethod
+    def _resolve_target(
+        processor: CanonicalProcessor,
+        market: GammaMarket,
+        *,
+        requested_gamma_market_id: str | None,
+    ) -> ResolvedPolymarketTarget:
+        bundles = tuple(
+            bundle
+            for bundle in processor.current_bundles
+            if bundle.market.native_condition_id == market.condition_id
+            and bundle.market.gamma_market_id == market.gamma_market_id
+        )
+        if len(bundles) != 1:
+            raise TargetSelectionError(
+                "selected target did not resolve exactly one canonical reference bundle"
+            )
+        return resolve_polymarket_target(
+            market,
+            bundles[0],
+            requested_gamma_market_id=requested_gamma_market_id,
+        )
+
+    @staticmethod
+    def _require_target_surface(result: ProcessedEnvelope, *, surface: str) -> None:
+        if result.success:
+            return
+        detail = (
+            "unknown canonicalization failure" if result.error_type is None else result.error_type
+        )
+        raise TargetSelectionError(f"{surface} could not be canonicalized: {detail}")
 
     async def _refresh_reference(
         self,
@@ -723,8 +1252,8 @@ class PolymarketObservationService:
         fallback: GammaMarket | None = None,
         deadline: float | None = None,
     ) -> None:
-        gamma_payload = await _await_remote_before_deadline(
-            lambda: client.fetch_gamma_market_raw(gamma_market_id),
+        gamma_payload = await client.fetch_gamma_market_raw(
+            gamma_market_id,
             deadline=deadline,
         )
         channel = f"{GAMMA_MARKET_PREFIX}{gamma_market_id}"
@@ -746,8 +1275,8 @@ class PolymarketObservationService:
             raise RuntimeError("Gamma direct-market refresh did not publish its market")
         event_id = current.event_id
         if event_id is not None:
-            event_payload = await _await_remote_before_deadline(
-                lambda: client.fetch_gamma_event_raw(event_id),
+            event_payload = await client.fetch_gamma_event_raw(
+                event_id,
                 deadline=deadline,
             )
             event_channel = f"{GAMMA_EVENT_PREFIX}{event_id}"
@@ -757,8 +1286,8 @@ class PolymarketObservationService:
                 transport_type="HTTP",
                 semantics_hash=_semantics(event_channel),
             )
-        clob_payload = await _await_remote_before_deadline(
-            lambda: client.fetch_clob_market_raw(current.condition_id),
+        clob_payload = await client.fetch_clob_market_raw(
+            current.condition_id,
             deadline=deadline,
         )
         clob_channel = f"{CLOB_MARKET_PREFIX}{current.condition_id}"
@@ -778,8 +1307,8 @@ class PolymarketObservationService:
         audit: bool,
         deadline: float | None = None,
     ) -> ProcessedEnvelope:
-        payload = await _await_remote_before_deadline(
-            lambda: client.fetch_order_book_raw(asset_id),
+        payload = await client.fetch_order_book_raw(
+            asset_id,
             deadline=deadline,
         )
         channel = REST_BOOK_AUDIT if audit else REST_BOOK
@@ -816,43 +1345,182 @@ class PolymarketObservationService:
                     deadline=deadline,
                 )
 
-    async def _audit_and_resnapshot(
+    async def _stage_audit_start(
         self,
         *,
-        client: PolymarketPublicClient,
         capture: _RawCaptureBoundary,
-        selected: tuple[GammaMarket, ...],
-        deadline: float | None = None,
-    ) -> tuple[str, ...]:
-        deviations: list[str] = []
-        mismatch_detected = False
-        self._metrics.increment_counter("mma_rest_audit_cycles_total")
-        for market in selected:
-            for asset_id in market.clob_token_ids:
-                mismatches_before = capture.processor.summary().rest_audit_mismatches
-                result = await self._fetch_book(
-                    client,
-                    capture,
-                    asset_id,
-                    audit=True,
-                    deadline=deadline,
-                )
-                mismatches_after = capture.processor.summary().rest_audit_mismatches
-                if mismatches_after > mismatches_before:
-                    mismatch_detected = True
-                    deviations.append(f"REST audit mismatch at ingest_seq={result.ingest_seq}")
-                    self._metrics.increment_counter("mma_rest_audit_mismatches_total")
-        # The stream generation is closed before comparison, so a matching
-        # authoritative REST view can advance freshness without a duplicate
-        # fetch. A mismatch remains fail-closed and gets a joint rebaseline.
-        if mismatch_detected:
-            await self._resnapshot(
-                client=client,
-                capture=capture,
-                selected=selected,
-                deadline=deadline,
+        ingress: BoundedRawIngress,
+        native_asset_id: str,
+        attempt: int,
+        connection_id: ConnectionId,
+        subscription_id: SubscriptionId,
+    ) -> tuple[AuditStartEvidence, ProcessedEnvelope]:
+        request_started_ns = time.monotonic_ns()
+        start = AuditStartEvidence(
+            request_id=uuid.uuid4().hex,
+            connection_id=connection_id,
+            native_asset_id=native_asset_id,
+            attempt=attempt,
+            request_started_monotonic_ns=request_started_ns,
+            starting_admission_watermark=ingress.snapshot_watermark(),
+            starting_processed_watermark=(
+                capture.processor.processed_websocket_watermark(connection_id)
+            ),
+            starting_book=capture.processor.audit_book_identity(native_asset_id),
+        )
+        result = await capture.preserve_then_process(
+            channel=CONTROL_REST_AUDIT_START,
+            payload=start.to_payload(),
+            transport_type="CONTROL",
+            semantics_hash=_semantics(CONTROL_REST_AUDIT_START),
+            connection_id=connection_id,
+            subscription_id=subscription_id,
+            transport_metadata={"audit_attempt": attempt, "request_id": start.request_id},
+            received_wall_time=UtcTimestamp.now(),
+            received_monotonic_ns=request_started_ns,
+        )
+        return start, result
+
+    @staticmethod
+    async def _run_audit_http_request(
+        *,
+        client: PolymarketPublicClient,
+        ingress: BoundedRawIngress,
+        start: AuditStartEvidence,
+        deadline: float,
+        handoff: asyncio.Queue[AuditHttpHandoff],
+        response_fence: _AuditResponseBoundaryFence | None = None,
+    ) -> None:
+        if response_fence is None:
+            response_fence = _AuditResponseBoundaryFence(
+                request_id=start.request_id,
+                connection_id=start.connection_id,
             )
-        return tuple(deviations)
+
+        def announce_response_boundary(
+            received_wall_time: UtcTimestamp,
+            received_monotonic_ns: int,
+        ) -> Callable[[], None]:
+            response_fence.announce(
+                ingress=ingress,
+                received_wall_time=received_wall_time,
+                received_monotonic_ns=received_monotonic_ns,
+            )
+            return response_fence.abandon
+
+        try:
+            response = await client.fetch_order_book_raw_with_evidence(
+                start.native_asset_id,
+                deadline=deadline,
+                on_response_body_complete=announce_response_boundary,
+            )
+        except PolymarketHttpError as error:
+            reason = (
+                AuditFailureReason.OBSERVATION_DEADLINE
+                if error.category is PolymarketHttpFailureCategory.DEADLINE_EXCEEDED
+                else AuditFailureReason.HTTP_REQUEST_FAILED
+            )
+            item: AuditHttpHandoff = AuditHttpFailureHandoff(
+                request_id=start.request_id,
+                connection_id=start.connection_id,
+                reason=reason,
+                error_type=f"{type(error).__name__}:{error.category.value}",
+            )
+        else:
+            if response_fence.error_type is not None:
+                item = AuditHttpFailureHandoff(
+                    request_id=start.request_id,
+                    connection_id=start.connection_id,
+                    reason=AuditFailureReason.RESPONSE_WATERMARK_UNAVAILABLE,
+                    error_type=response_fence.error_type,
+                )
+            elif (
+                not response_fence.announced
+                or response_fence.watermark is None
+                or response_fence.received_wall_time is None
+                or response_fence.received_monotonic_ns is None
+            ):
+                item = AuditHttpFailureHandoff(
+                    request_id=start.request_id,
+                    connection_id=start.connection_id,
+                    reason=AuditFailureReason.RESPONSE_WATERMARK_UNAVAILABLE,
+                    error_type="MissingResponseBoundaryAnnouncement",
+                )
+            elif (
+                response_fence.received_wall_time != response.evidence.response_received_wall_time
+                or response_fence.received_monotonic_ns
+                != response.evidence.response_received_monotonic_ns
+            ):
+                item = AuditHttpFailureHandoff(
+                    request_id=start.request_id,
+                    connection_id=start.connection_id,
+                    reason=AuditFailureReason.RESPONSE_WATERMARK_UNAVAILABLE,
+                    error_type="ResponseBoundaryEvidenceMismatch",
+                )
+            else:
+                item = AuditHttpResponseHandoff(
+                    request_id=start.request_id,
+                    connection_id=start.connection_id,
+                    payload_bytes=response.payload_bytes,
+                    received_wall_time=response_fence.received_wall_time,
+                    received_monotonic_ns=response_fence.received_monotonic_ns,
+                    response_boundary_watermark=response_fence.watermark,
+                )
+        try:
+            handoff.put_nowait(item)
+        except asyncio.QueueFull as error:
+            raise RuntimeError("bounded audit response handoff unexpectedly saturated") from error
+
+    @staticmethod
+    async def _preserve_audit_failure(
+        *,
+        capture: _RawCaptureBoundary,
+        failure: AuditHttpFailureHandoff,
+        subscription_id: SubscriptionId,
+    ) -> ProcessedEnvelope:
+        return await capture.preserve_then_process(
+            channel=CONTROL_REST_AUDIT_FAILED,
+            payload=AuditFailureCommand(
+                request_id=failure.request_id,
+                reason=failure.reason,
+            ).to_payload(),
+            transport_type="CONTROL",
+            semantics_hash=_semantics(CONTROL_REST_AUDIT_FAILED),
+            connection_id=failure.connection_id,
+            subscription_id=subscription_id,
+            transport_metadata={"request_id": failure.request_id},
+        )
+
+    @staticmethod
+    async def _preserve_audit_response(
+        *,
+        capture: _RawCaptureBoundary,
+        response: AuditHttpResponseHandoff,
+        start: AuditStartEvidence,
+        barrier_ordinal: int,
+        subscription_id: SubscriptionId,
+    ) -> ProcessedEnvelope:
+        return await capture.preserve_then_process(
+            channel=REST_BOOK_AUDIT,
+            payload=response.payload_bytes,
+            transport_type="HTTP",
+            semantics_hash=_semantics(
+                REST_BOOK_AUDIT,
+                f"token_id={start.native_asset_id}",
+            ),
+            connection_id=response.connection_id,
+            subscription_id=subscription_id,
+            transport_metadata={
+                "audit_attempt": start.attempt,
+                "barrier_websocket_ordinal": barrier_ordinal,
+                "request_id": response.request_id,
+                "response_boundary_websocket_ordinal": (
+                    response.response_boundary_watermark.ordinal
+                ),
+            },
+            received_wall_time=response.received_wall_time,
+            received_monotonic_ns=response.received_monotonic_ns,
+        )
 
     async def _handle_refresh_requests(
         self,
@@ -862,6 +1530,7 @@ class PolymarketObservationService:
         capture: _RawCaptureBoundary,
         selected: tuple[GammaMarket, ...],
         deadline: float | None = None,
+        runtime_health: ObservationRuntimeHealth | None = None,
     ) -> bool:
         selected_by_gamma_id = {market.gamma_market_id: market for market in selected}
         selected_by_condition = {market.condition_id: market for market in selected}
@@ -906,6 +1575,8 @@ class PolymarketObservationService:
                 deadline=deadline,
             )
         if refresh_gamma_ids and not selected_resolved:
+            if runtime_health is not None:
+                runtime_health.record_resync()
             await self._resnapshot(
                 client=client,
                 capture=capture,
@@ -920,14 +1591,19 @@ class PolymarketObservationService:
     async def _run_generation(
         self,
         *,
+        client: PolymarketPublicClient,
         capture: _RawCaptureBoundary,
         asset_ids: tuple[str, ...],
+        deadline: float,
         deadline_ns: int,
         periodic_audit_due_ns: int,
         connection_id: ConnectionId,
         subscription_id: SubscriptionId,
         unavailable_started_ns: int | None,
+        runtime_health: ObservationRuntimeHealth | None = None,
     ) -> _GenerationResult:
+        if runtime_health is None:
+            runtime_health = ObservationRuntimeHealth()
         socket = PolymarketMarketWebSocket(
             asset_ids,
             url=self._config.polymarket.market_websocket_url,
@@ -938,7 +1614,9 @@ class PolymarketObservationService:
         ingress = BoundedRawIngress(
             max_items=self._config.system.queue_capacity,
             max_bytes=self._config.polymarket.maximum_ingress_queue_bytes,
+            connection_id=connection_id,
         )
+        runtime_health.begin_generation(connection_id, ingress)
         ready = asyncio.Event()
 
         async def acquire() -> None:
@@ -967,12 +1645,28 @@ class PolymarketObservationService:
             name="polymarket-public-subscription-ready",
         )
         maximum_book_age_ns = int(self._config.scanner.maximum_book_age_seconds * 1e9)
+        integrity_interval_ns = int(self._config.polymarket.snapshot_audit_interval_seconds * 1e9)
         pending_exit: _GenerationExit | None = None
-        pending_transport_error: PolymarketTransportError | None = None
+        pending_transport_error: PolymarketWebSocketError | None = None
         deviations: list[str] = []
         refresh_requests: list[ReferenceRefreshRequest] = []
+        audit_handoff: asyncio.Queue[AuditHttpHandoff] = asyncio.Queue(maxsize=1)
+        audit_task: asyncio.Task[None] | None = None
+        active_audit: AuditStartEvidence | None = None
+        active_response_fence: _AuditResponseBoundaryFence | None = None
+        pending_response: AuditHttpResponseHandoff | None = None
+        deferred_item: RawIngressItem | None = None
+        audit_cycle_active = False
+        audit_asset_index = 0
+        audit_attempt = 0
+        maximum_race_retries = self._config.polymarket.snapshot_audit_max_race_retries
 
         def current_deadline() -> IntegrityDeadline:
+            if audit_cycle_active:
+                return IntegrityDeadline(
+                    deadline_ns=deadline_ns,
+                    reason=IntegrityDeadlineReason.RUN_DEADLINE,
+                )
             return next_integrity_deadline(
                 run_deadline_ns=deadline_ns,
                 periodic_audit_deadline_ns=periodic_audit_due_ns,
@@ -982,34 +1676,130 @@ class PolymarketObservationService:
                 now_ns=time.monotonic_ns(),
             )
 
+        async def launch_audit(
+            native_asset_id: str,
+            *,
+            attempt: int,
+            issue_http_request: bool = True,
+        ) -> bool:
+            nonlocal active_audit, active_response_fence, audit_task
+            start, result = await self._stage_audit_start(
+                capture=capture,
+                ingress=ingress,
+                native_asset_id=native_asset_id,
+                attempt=attempt,
+                connection_id=connection_id,
+                subscription_id=subscription_id,
+            )
+            if result.needs_resync:
+                deviations.append(f"audit start failed closed at ingest_seq={result.ingest_seq}")
+                if result.success:
+                    active_audit = start
+                    await fail_active_audit(AuditFailureReason.LOCAL_STATE_NOT_COMPARABLE)
+                return False
+            active_audit = start
+            if not issue_http_request:
+                active_response_fence = None
+                audit_task = None
+                return True
+            active_response_fence = _AuditResponseBoundaryFence(
+                request_id=start.request_id,
+                connection_id=start.connection_id,
+            )
+            audit_task = asyncio.create_task(
+                self._run_audit_http_request(
+                    client=client,
+                    ingress=ingress,
+                    start=start,
+                    deadline=deadline,
+                    handoff=audit_handoff,
+                    response_fence=active_response_fence,
+                ),
+                name=f"polymarket-rest-audit-{start.request_id}",
+            )
+            return True
+
+        async def stop_audit_task() -> None:
+            nonlocal audit_task
+            task = audit_task
+            audit_task = None
+            if task is None:
+                return
+            if not task.done():
+                task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+        async def fail_active_audit(reason: AuditFailureReason) -> None:
+            nonlocal active_audit, active_response_fence, pending_response
+            start = active_audit
+            if start is None:
+                return
+            await stop_audit_task()
+            pending_response = None
+            result = await self._preserve_audit_failure(
+                capture=capture,
+                failure=AuditHttpFailureHandoff(
+                    request_id=start.request_id,
+                    connection_id=start.connection_id,
+                    reason=reason,
+                    error_type=reason.value,
+                ),
+                subscription_id=subscription_id,
+            )
+            active_audit = None
+            active_response_fence = None
+            if result.audit_outcomes:
+                self._metrics.increment_counter(
+                    "mma_rest_audit_outcomes_total",
+                    labels={"outcome": result.audit_outcomes[-1].outcome.value},
+                )
+
+        async def complete_audit_response(
+            response: AuditHttpResponseHandoff,
+        ) -> ProcessedEnvelope:
+            start = active_audit
+            if start is None or start.request_id != response.request_id:
+                raise RuntimeError("audit response handoff has no matching active request")
+            processed = capture.processor.processed_websocket_watermark(connection_id).ordinal
+            return await self._preserve_audit_response(
+                capture=capture,
+                response=response,
+                start=start,
+                barrier_ordinal=processed,
+                subscription_id=subscription_id,
+            )
+
         async def stop_acquisition() -> None:
             if not acquisition_task.done():
                 acquisition_task.cancel()
             with suppress(
                 asyncio.CancelledError,
-                PolymarketTransportError,
+                PolymarketWebSocketError,
                 RawIngressBackpressureError,
             ):
                 await acquisition_task
 
         try:
-            initial_due = current_deadline()
             done, _ = await asyncio.wait(
                 {ready_task, acquisition_task},
-                timeout=max(0.0, (initial_due.deadline_ns - time.monotonic_ns()) / 1e9),
+                timeout=max(0.0, (deadline_ns - time.monotonic_ns()) / 1e9),
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if acquisition_task in done and ready_task not in done:
                 acquisition_task.result()
-                raise PolymarketTransportError("public market WebSocket ended before readiness")
+                raise PolymarketWebSocketTransportError(
+                    category=PolymarketWebSocketFailureCategory.CONNECTION_CLOSED,
+                    retryable=True,
+                    detail="public market WebSocket ended before readiness",
+                )
             if ready_task not in done:
                 await stop_acquisition()
-                reason = (
-                    _GenerationExit.DEADLINE
-                    if initial_due.reason is IntegrityDeadlineReason.RUN_DEADLINE
-                    else _GenerationExit.AUDIT_DUE
+                return _GenerationResult(
+                    _GenerationExit.DEADLINE,
+                    ingress_metrics=ingress.metrics,
                 )
-                return _GenerationResult(reason, ingress_metrics=ingress.metrics)
+            runtime_health.mark_connected(now_ns=time.monotonic_ns())
             if unavailable_started_ns is not None:
                 self._metrics.observe_histogram(
                     "mma_socket_unavailable_ns",
@@ -1017,6 +1807,148 @@ class PolymarketObservationService:
                 )
 
             while True:
+                if audit_task is not None and audit_task.done():
+                    audit_task.result()
+                    audit_task = None
+                    if audit_handoff.empty():
+                        raise RuntimeError("audit task completed without a handoff")
+                    handoff = audit_handoff.get_nowait()
+                    if isinstance(handoff, AuditHttpFailureHandoff):
+                        result = await self._preserve_audit_failure(
+                            capture=capture,
+                            failure=handoff,
+                            subscription_id=subscription_id,
+                        )
+                        active_audit = None
+                        active_response_fence = None
+                        if result.audit_outcomes:
+                            outcome = result.audit_outcomes[-1]
+                            self._metrics.increment_counter(
+                                "mma_rest_audit_outcomes_total",
+                                labels={"outcome": outcome.outcome.value},
+                            )
+                        audit_cycle_active = False
+                        periodic_audit_due_ns = time.monotonic_ns() + integrity_interval_ns
+                        deviations.append(
+                            f"REST audit HTTP failure isolated at ingest_seq={result.ingest_seq}"
+                        )
+                    else:
+                        if (
+                            active_response_fence is None
+                            or active_response_fence.request_id != handoff.request_id
+                            or active_response_fence.barrier_ordinal
+                            != handoff.response_boundary_watermark.ordinal
+                        ):
+                            raise RuntimeError(
+                                "active audit fence differs from its response handoff"
+                            )
+                        pending_response = handoff
+                        processed_at_handoff = capture.processor.processed_websocket_watermark(
+                            connection_id
+                        ).ordinal
+                        self._metrics.observe_histogram(
+                            "mma_rest_audit_barrier_lag_messages",
+                            max(
+                                0,
+                                handoff.response_boundary_watermark.ordinal - processed_at_handoff,
+                            ),
+                        )
+
+                if pending_response is not None:
+                    classified_response: AuditHttpResponseHandoff | None = None
+                    processed = capture.processor.processed_websocket_watermark(
+                        connection_id
+                    ).ordinal
+                    boundary = pending_response.response_boundary_watermark.ordinal
+                    if processed >= boundary or (
+                        processed < boundary
+                        and ingress.empty
+                        and (deferred_item is None or deferred_item.watermark.ordinal > boundary)
+                    ):
+                        classified_response = pending_response
+                        result = await complete_audit_response(classified_response)
+                        pending_response = None
+                    else:
+                        result = None
+                    if result is not None:
+                        if classified_response is None:
+                            raise RuntimeError(
+                                "audit result is missing its response-boundary handoff"
+                            )
+                        start = active_audit
+                        if start is None or not result.audit_outcomes:
+                            raise RuntimeError("audit response produced no canonical outcome")
+                        outcome = result.audit_outcomes[-1]
+                        active_audit = None
+                        active_response_fence = None
+                        self._metrics.increment_counter(
+                            "mma_rest_audit_outcomes_total",
+                            labels={"outcome": outcome.outcome.value},
+                        )
+                        self._metrics.observe_histogram(
+                            "mma_rest_audit_classification_latency_ns",
+                            max(
+                                0,
+                                time.monotonic_ns() - classified_response.received_monotonic_ns,
+                            ),
+                        )
+                        if outcome.outcome is AuditOutcome.MISMATCH:
+                            pending_exit = _GenerationExit.RESYNC_REQUIRED
+                            deviations.append(
+                                f"REST audit MISMATCH at ingest_seq={result.ingest_seq}"
+                            )
+                            await stop_acquisition()
+                        elif outcome.outcome is AuditOutcome.FAILED:
+                            audit_cycle_active = False
+                            periodic_audit_due_ns = time.monotonic_ns() + integrity_interval_ns
+                            deviations.append(
+                                f"REST audit FAILED isolated at ingest_seq={result.ingest_seq}"
+                            )
+                        elif outcome.outcome is AuditOutcome.RACED:
+                            if pending_exit is not None:
+                                audit_cycle_active = False
+                                periodic_audit_due_ns = time.monotonic_ns() + integrity_interval_ns
+                                deviations.append(
+                                    "REST audit RACED while socket generation was already "
+                                    "exiting; retry suppressed"
+                                )
+                            elif start.attempt <= maximum_race_retries:
+                                self._metrics.increment_counter("mma_rest_audit_retries_total")
+                                audit_attempt = start.attempt + 1
+                                if not await launch_audit(
+                                    start.native_asset_id,
+                                    attempt=audit_attempt,
+                                ):
+                                    pending_exit = _GenerationExit.RESYNC_REQUIRED
+                                    await stop_acquisition()
+                            else:
+                                self._metrics.increment_counter(
+                                    "mma_rest_audit_race_budget_exhaustions_total"
+                                )
+                                audit_attempt = start.attempt + 1
+                                if await launch_audit(
+                                    start.native_asset_id,
+                                    attempt=audit_attempt,
+                                    issue_http_request=False,
+                                ):
+                                    await fail_active_audit(AuditFailureReason.RACE_RETRY_EXHAUSTED)
+                                audit_cycle_active = False
+                                periodic_audit_due_ns = time.monotonic_ns() + integrity_interval_ns
+                                deviations.append("REST audit race retry budget exhausted")
+                        else:
+                            audit_asset_index += 1
+                            if audit_asset_index < len(asset_ids):
+                                audit_attempt = 1
+                                if not await launch_audit(
+                                    asset_ids[audit_asset_index],
+                                    attempt=audit_attempt,
+                                ):
+                                    pending_exit = _GenerationExit.RESYNC_REQUIRED
+                                    await stop_acquisition()
+                            else:
+                                audit_cycle_active = False
+                                periodic_audit_due_ns = time.monotonic_ns() + integrity_interval_ns
+
                 now_ns = time.monotonic_ns()
                 due = current_deadline()
                 due_ns = due.deadline_ns
@@ -1030,26 +1962,47 @@ class PolymarketObservationService:
                     except RawIngressBackpressureError:
                         pending_exit = _GenerationExit.INGRESS_OVERFLOW
                         deviations.append("bounded application ingress queue exhausted")
+                        runtime_health.record_data_loss()
                         self._metrics.increment_counter("mma_ingress_overflows_total")
-                    except PolymarketTransportError as error:
+                    except PolymarketWebSocketError as error:
                         pending_transport_error = error
                     else:
                         if ingress.empty:
-                            raise PolymarketTransportError(
-                                "public market WebSocket ended without an explicit transport error"
+                            raise PolymarketWebSocketTransportError(
+                                category=(PolymarketWebSocketFailureCategory.CONNECTION_CLOSED),
+                                retryable=True,
+                                detail=(
+                                    "public market WebSocket ended without an explicit "
+                                    "transport error"
+                                ),
                             )
                 if pending_exit is None and now_ns >= due_ns:
-                    pending_exit = (
-                        _GenerationExit.DEADLINE
-                        if due.reason is IntegrityDeadlineReason.RUN_DEADLINE
-                        else _GenerationExit.AUDIT_DUE
-                    )
-                    await stop_acquisition()
+                    if due.reason is IntegrityDeadlineReason.RUN_DEADLINE:
+                        pending_exit = _GenerationExit.DEADLINE
+                        await stop_acquisition()
+                    else:
+                        audit_cycle_active = True
+                        audit_asset_index = 0
+                        audit_attempt = 1
+                        self._metrics.increment_counter("mma_rest_audit_cycles_total")
+                        if not await launch_audit(asset_ids[0], attempt=audit_attempt):
+                            pending_exit = _GenerationExit.RESYNC_REQUIRED
+                            await stop_acquisition()
 
                 first_item: RawIngressItem | None = None
-                if not ingress.empty:
+                if deferred_item is not None:
+                    first_item = deferred_item
+                    deferred_item = None
+                elif not ingress.empty:
                     first_item = ingress.get_nowait()
                 elif pending_exit is not None:
+                    if active_audit is not None:
+                        reason = (
+                            AuditFailureReason.RUN_ENDED
+                            if pending_exit is _GenerationExit.DEADLINE
+                            else AuditFailureReason.SOCKET_GENERATION_CHANGED
+                        )
+                        await fail_active_audit(reason)
                     return _GenerationResult(
                         pending_exit,
                         deviations=tuple(deviations),
@@ -1057,6 +2010,8 @@ class PolymarketObservationService:
                         ingress_metrics=ingress.metrics,
                     )
                 elif pending_transport_error is not None:
+                    if active_audit is not None:
+                        await fail_active_audit(AuditFailureReason.SOCKET_GENERATION_CHANGED)
                     raise pending_transport_error
                 elif acquisition_task.done():
                     try:
@@ -1064,10 +2019,15 @@ class PolymarketObservationService:
                     except RawIngressBackpressureError:
                         pending_exit = _GenerationExit.INGRESS_OVERFLOW
                         deviations.append("bounded application ingress queue exhausted")
+                        runtime_health.record_data_loss()
                         self._metrics.increment_counter("mma_ingress_overflows_total")
                     else:
-                        raise PolymarketTransportError(
-                            "public market WebSocket ended without an explicit transport error"
+                        raise PolymarketWebSocketTransportError(
+                            category=PolymarketWebSocketFailureCategory.CONNECTION_CLOSED,
+                            retryable=True,
+                            detail=(
+                                "public market WebSocket ended without an explicit transport error"
+                            ),
                         )
                     continue
 
@@ -1076,11 +2036,25 @@ class PolymarketObservationService:
                         ingress.get(),
                         name="polymarket-public-ingress-dequeue",
                     )
+                    wait_tasks: set[asyncio.Task[object]] = {
+                        item_task,
+                        acquisition_task,
+                    }
+                    if audit_task is not None:
+                        wait_tasks.add(audit_task)
                     done, _ = await asyncio.wait(
-                        {item_task, acquisition_task},
+                        wait_tasks,
                         timeout=max(0.0, (due_ns - time.monotonic_ns()) / 1e9),
                         return_when=asyncio.FIRST_COMPLETED,
                     )
+                    if audit_task is not None and audit_task in done:
+                        if item_task in done:
+                            deferred_item = item_task.result()
+                        else:
+                            item_task.cancel()
+                            with suppress(asyncio.CancelledError):
+                                await item_task
+                        continue
                     if item_task in done:
                         first_item = item_task.result()
                     else:
@@ -1090,11 +2064,29 @@ class PolymarketObservationService:
                         continue
 
                 batch = [first_item]
+                barrier_limit = (
+                    active_response_fence.barrier_ordinal
+                    if active_response_fence is not None
+                    else None
+                )
+                if barrier_limit is not None and first_item.watermark.ordinal > barrier_limit:
+                    deferred_item = first_item
+                    if audit_task is not None and not audit_task.done():
+                        await asyncio.wait(
+                            {audit_task, acquisition_task},
+                            timeout=max(0.0, (due_ns - time.monotonic_ns()) / 1e9),
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    continue
                 while len(batch) < self._config.storage.journal_group_commit_max_events:
                     try:
-                        batch.append(ingress.get_nowait())
+                        next_item = ingress.get_nowait()
                     except asyncio.QueueEmpty:
                         break
+                    if barrier_limit is not None and next_item.watermark.ordinal > barrier_limit:
+                        deferred_item = next_item
+                        break
+                    batch.append(next_item)
                 results = await capture.preserve_websocket_batch(
                     tuple(batch),
                     semantics_hash=socket.subscription_semantics_sha256,
@@ -1110,6 +2102,7 @@ class PolymarketObservationService:
                     refresh_requests.extend(result.reference_refresh_requests)
                     if result.needs_resync:
                         pending_exit = _GenerationExit.RESYNC_REQUIRED
+                        runtime_health.record_protocol_deviation()
                         deviations.append(
                             f"{result.error_type or 'state-invalidation'} at "
                             f"ingest_seq={result.ingest_seq}"
@@ -1123,6 +2116,7 @@ class PolymarketObservationService:
                 ready_task.cancel()
             with suppress(asyncio.CancelledError):
                 await ready_task
+            await stop_audit_task()
             await stop_acquisition()
 
     async def _observe_websocket(
@@ -1134,7 +2128,10 @@ class PolymarketObservationService:
         asset_ids: tuple[str, ...],
         deadline: float,
         logger: StructuredLogger,
+        runtime_health: ObservationRuntimeHealth | None = None,
     ) -> _StreamResult:
+        if runtime_health is None:
+            runtime_health = ObservationRuntimeHealth()
         reconnects = 0
         deviations: list[str] = []
         delay = self._config.polymarket.reconnect_initial_seconds
@@ -1156,14 +2153,28 @@ class PolymarketObservationService:
                 attempt=reconnects,
             )
             try:
-                generation = await self._run_generation(
-                    capture=capture,
-                    asset_ids=asset_ids,
-                    deadline_ns=deadline_ns,
-                    periodic_audit_due_ns=periodic_audit_due_ns,
-                    connection_id=connection_id,
-                    subscription_id=subscription_id,
-                    unavailable_started_ns=unavailable_started_ns,
+                try:
+                    generation = await self._run_generation(
+                        client=client,
+                        capture=capture,
+                        asset_ids=asset_ids,
+                        deadline=deadline,
+                        deadline_ns=deadline_ns,
+                        periodic_audit_due_ns=periodic_audit_due_ns,
+                        connection_id=connection_id,
+                        subscription_id=subscription_id,
+                        unavailable_started_ns=unavailable_started_ns,
+                        runtime_health=runtime_health,
+                    )
+                except BaseException:
+                    runtime_health.finish_generation(
+                        continuity_interrupted=True,
+                        now_ns=time.monotonic_ns(),
+                    )
+                    raise
+                runtime_health.finish_generation(
+                    continuity_interrupted=generation.reason is not _GenerationExit.DEADLINE,
+                    now_ns=time.monotonic_ns(),
                 )
                 ingress_metrics = _merge_ingress_metrics(
                     ingress_metrics,
@@ -1179,22 +2190,6 @@ class PolymarketObservationService:
                         ingress_metrics,
                     )
                 unavailable_started_ns = time.monotonic_ns()
-                if generation.reason is _GenerationExit.AUDIT_DUE:
-                    logger.info(
-                        "rest_integrity_audit",
-                        "closed stream generation for public REST integrity audit",
-                        connection_id=connection_id,
-                    )
-                    deviations.extend(
-                        await self._audit_and_resnapshot(
-                            client=client,
-                            capture=capture,
-                            selected=selected,
-                            deadline=deadline,
-                        )
-                    )
-                    periodic_audit_due_ns = time.monotonic_ns() + integrity_interval_ns
-                    continue
                 if generation.reason is _GenerationExit.REFERENCE_REFRESH:
                     selected_resolved = await self._handle_refresh_requests(
                         requests=generation.refresh_requests,
@@ -1202,6 +2197,7 @@ class PolymarketObservationService:
                         capture=capture,
                         selected=selected,
                         deadline=deadline,
+                        runtime_health=runtime_health,
                     )
                     if selected_resolved:
                         return _StreamResult(
@@ -1219,6 +2215,7 @@ class PolymarketObservationService:
                 # journaled venue envelope. The old generator is closed; now
                 # establish a baseline before creating a new socket.
                 self._metrics.increment_counter("mma_resynchronizations_total")
+                runtime_health.record_resync()
                 await self._resnapshot(
                     client=client,
                     capture=capture,
@@ -1226,18 +2223,29 @@ class PolymarketObservationService:
                     deadline=deadline,
                 )
                 periodic_audit_due_ns = time.monotonic_ns() + integrity_interval_ns
-            except _ObservationDeadlineReached:
+            except PolymarketHttpError as error:
+                if error.category is PolymarketHttpFailureCategory.DEADLINE_EXCEEDED:
+                    return _StreamResult(
+                        reconnects,
+                        True,
+                        False,
+                        tuple(deviations),
+                        ingress_metrics,
+                    )
+                deviations.append(f"{type(error).__name__}:{error.category.value}")
                 return _StreamResult(
                     reconnects,
-                    True,
+                    False,
                     False,
                     tuple(deviations),
                     ingress_metrics,
                 )
-            except PolymarketTransportError as error:
+            except PolymarketWebSocketError as error:
                 unavailable_started_ns = time.monotonic_ns()
                 await capture.preserve_invalidation(InvalidationReason.DISCONNECT)
                 deviations.append(type(error).__name__)
+                if isinstance(error, PolymarketWebSocketProtocolError):
+                    runtime_health.record_protocol_deviation()
                 self._metrics.increment_counter("mma_websocket_disconnects_total")
                 logger.warning(
                     "websocket_disconnected",
@@ -1256,6 +2264,7 @@ class PolymarketObservationService:
                         ingress_metrics,
                     )
                 reconnects += 1
+                runtime_health.record_reconnect()
                 self._metrics.increment_counter("mma_websocket_reconnects_total")
                 remaining = deadline - loop.time()
                 if remaining <= 0:
@@ -1269,6 +2278,7 @@ class PolymarketObservationService:
                 await asyncio.sleep(min(delay, remaining))
                 delay = min(delay * 2, self._config.polymarket.reconnect_max_seconds)
                 if loop.time() < deadline:
+                    runtime_health.record_resync()
                     await self._resnapshot(
                         client=client,
                         capture=capture,

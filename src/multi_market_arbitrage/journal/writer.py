@@ -140,7 +140,13 @@ class RawJournalWriter:
 
     @property
     def metrics(self) -> JournalMetricsSnapshot:
-        return self._metrics.snapshot(queue_depth=self._queue.qsize())
+        return self._metrics.snapshot(
+            queue_depth=self._queue.qsize(),
+            run_uncompressed_bytes=self._run_uncompressed_bytes,
+            durability_watermark_sequence=(
+                self._watermark.ingest_seq if self._watermark is not None else None
+            ),
+        )
 
     @property
     def failure(self) -> JournalWriteError | None:

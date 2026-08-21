@@ -39,7 +39,11 @@ ALLOWED_TRANSPORT_METADATA_KEYS: Final[frozenset[str]] = frozenset(
         "remote_host",
         "remote_port",
         "request_id",
+        "audit_attempt",
+        "barrier_websocket_ordinal",
+        "response_boundary_websocket_ordinal",
         "websocket_message_type",
+        "websocket_admission_ordinal",
         "websocket_opcode",
     }
 )

@@ -21,6 +21,7 @@ from pyarrow.parquet import (
 )
 
 from multi_market_arbitrage.core.ids import VenueId
+from multi_market_arbitrage.core.limits import MAX_ARTIFACT_PATHS_PER_ROOT
 from multi_market_arbitrage.core.serialization import (
     CanonicalSerializationError,
     CanonicalValue,
@@ -43,7 +44,7 @@ _RESERVED_COLUMNS = frozenset(
     {"_mma_schema_version", "_mma_provenance_sha256", "_mma_record_sha256"}
 )
 _MAX_MANIFEST_BYTES = 8 * 1024 * 1024
-_MAX_ANALYTICAL_ARTIFACT_PATHS = 65_536
+_MAX_ANALYTICAL_ARTIFACT_PATHS = MAX_ARTIFACT_PATHS_PER_ROOT
 
 
 class _WriteParquet(Protocol):

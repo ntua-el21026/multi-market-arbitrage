@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from bisect import bisect_left
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from itertools import pairwise
@@ -160,6 +160,109 @@ class LegEconomics:
     acquisition_cost: Money
     trading_cost: Money
     terminal_fill: DepthFill
+
+
+@dataclass(frozen=True, slots=True)
+class CapacityPlannerDiagnostics:
+    """Non-canonical work counters for the exact capacity planner.
+
+    These counters are deliberately delivered through an optional observer and
+    are not part of :class:`CompleteSetScanResult`.  Enabling instrumentation
+    therefore cannot change result serialization or terminal hashes.
+    """
+
+    lattice_points: int
+    minimum_eligible_points: int
+    merged_depth_regions: int
+    fee_regime_atoms: int
+    threshold_atom_visits: int
+    envelope_pruned_threshold_points: int
+    fee_state_runs: int
+    unique_exact_fee_evaluations: int
+    affine_root_solves: int
+    rich_evaluations: int
+    selected_quantities: int
+    scalar_fallback_evaluations: int
+
+
+@dataclass(frozen=True, slots=True)
+class _GridLegRegion:
+    """One terminal depth level over an inclusive quantity-grid interval."""
+
+    lower_index: int
+    upper_index: int
+    previous_quantity: ExactDecimal
+    prefix_notional: ExactDecimal
+    prefix_cost: ExactDecimal
+    price: ExactDecimal
+    fee_factor: ExactDecimal
+
+
+@dataclass(frozen=True, slots=True)
+class _CapacityAtom:
+    """A grid interval with fixed terminal depth and fee-zero regimes."""
+
+    lower_index: int
+    upper_index: int
+    legs: tuple[_GridLegRegion, _GridLegRegion]
+    normal_fee_regime: tuple[bool, bool]
+
+
+@dataclass(frozen=True, slots=True)
+class _ScaledFeeTerm:
+    """Affine unrounded terminal fee in one atom's common integer scale."""
+
+    slope: int
+    intercept: int
+    quantum: int
+    normal_regime: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ScaledCapacityAtom:
+    """Integer-scaled economics for exact root and fee-state calculations."""
+
+    lower_index: int
+    upper_index: int
+    base_intercept: int
+    threshold_slopes: tuple[int, ...]
+    fee_terms: tuple[_ScaledFeeTerm, _ScaledFeeTerm]
+
+
+@dataclass(slots=True)
+class _CapacityPlannerCounters:
+    threshold_atom_visits: int = 0
+    envelope_pruned_threshold_points: int = 0
+    fee_state_runs: int = 0
+    unique_exact_fee_evaluations: int = 0
+    affine_root_solves: int = 0
+
+
+def _ceil_exact_ratio(numerator: ExactDecimal, denominator: ExactDecimal) -> int:
+    """Return ``ceil(numerator / denominator)`` without division or floats."""
+
+    if denominator <= ExactDecimal.zero():
+        raise ValueError("denominator must be positive")
+    scale = max(numerator.scale, denominator.scale)
+    numerator_integer = numerator.coefficient * 10 ** (scale - numerator.scale)
+    denominator_integer = denominator.coefficient * 10 ** (scale - denominator.scale)
+    return -((-numerator_integer) // denominator_integer)
+
+
+def _ceil_integer_ratio(numerator: int, denominator: int) -> int:
+    """Return ``ceil(numerator / denominator)`` for a positive denominator."""
+
+    if denominator <= 0:
+        raise ValueError("denominator must be positive")
+    return -((-numerator) // denominator)
+
+
+def _scaled_integer(value: ExactDecimal, *, scale: int) -> int:
+    """Represent an exact decimal in a caller-selected common base-10 scale."""
+
+    if value.scale > scale:
+        raise ValueError("common scale cannot discard exact decimal places")
+    return value.coefficient * 10 ** (scale - value.scale)
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,6 +427,37 @@ class _DepthProfile:
         terminal_cost = self._fee_amount(index, terminal_quantity)
         return prefix_notional + terminal_notional, prefix_cost + terminal_cost
 
+    def grid_regions(
+        self,
+        *,
+        increment: ExactDecimal,
+        maximum_index: int,
+    ) -> tuple[_GridLegRegion, ...]:
+        """Return exact terminal-level regions on a positive quantity lattice."""
+
+        regions: list[_GridLegRegion] = []
+        previous_quantity = ExactDecimal.zero()
+        zero = ExactDecimal.zero()
+        for index, cumulative_quantity in enumerate(self._cumulative_quantities):
+            lower_index = previous_quantity.floor_div(increment) + 1
+            upper_index = min(maximum_index, cumulative_quantity.floor_div(increment))
+            if lower_index <= upper_index:
+                regions.append(
+                    _GridLegRegion(
+                        lower_index=lower_index,
+                        upper_index=upper_index,
+                        previous_quantity=previous_quantity,
+                        prefix_notional=(zero if index == 0 else self._prefix_notional[index - 1]),
+                        prefix_cost=zero if index == 0 else self._prefix_cost[index - 1],
+                        price=self.levels[index].price.value,
+                        fee_factor=self._fee_factors[index],
+                    )
+                )
+            previous_quantity = cumulative_quantity
+            if upper_index >= maximum_index:
+                break
+        return tuple(regions)
+
     def evaluate(self, quantity: Quantity) -> LegEconomics:
         requested = quantity.value
         if requested <= ExactDecimal.zero() or requested > self.maximum_quantity:
@@ -449,8 +583,14 @@ class PolymarketCompleteSetScanner:
     strategy_id = POLYMARKET_COMPLETE_SET_STRATEGY_ID
     strategy_version = POLYMARKET_COMPLETE_SET_STRATEGY_VERSION
 
-    def __init__(self, config: CompleteSetScannerConfig) -> None:
+    def __init__(
+        self,
+        config: CompleteSetScannerConfig,
+        *,
+        capacity_diagnostics_observer: Callable[[CapacityPlannerDiagnostics], None] | None = None,
+    ) -> None:
         self.config = config
+        self._capacity_diagnostics_observer = capacity_diagnostics_observer
 
     def scan(
         self,
@@ -1020,10 +1160,19 @@ class PolymarketCompleteSetScanner:
         subject: object,
         provenance: Provenance,
     ) -> tuple[tuple[CapacityPoint, ...], ValidationResult]:
-        """Exhaust the exact grid using scalar totals and monotone depth cursors."""
+        """Solve the exact grid by depth, fee-regime, and rounded-fee runs.
+
+        No monotonicity of profitability over quantity is assumed.  The
+        planner visits every depth/fee atom that can still qualify, while an
+        affine upper envelope proves when whole grid ranges cannot qualify.
+        All breakpoint and root arithmetic is integer-scaled exact decimal
+        arithmetic; the exhaustive reference implementation remains the
+        semantic oracle.
+        """
 
         maximum = min(profiles[0].maximum_quantity, profiles[1].maximum_quantity)
-        evaluations = maximum.floor_div(self.config.quantity_increment.value)
+        increment = self.config.quantity_increment.value
+        evaluations = maximum.floor_div(increment)
         zero = ExactDecimal.zero()
         zero_points = tuple(
             CapacityPoint(
@@ -1034,6 +1183,15 @@ class PolymarketCompleteSetScanner:
             for threshold in self.config.minimum_edge_thresholds
         )
         if evaluations <= 0:
+            self._publish_capacity_diagnostics(
+                evaluations=evaluations,
+                minimum_eligible_points=0,
+                merged_depth_regions=0,
+                fee_regime_atoms=0,
+                counters=None,
+                rich_evaluations=0,
+                selected_quantities=0,
+            )
             return zero_points, _blocked(
                 _DEPTH_VALIDATOR,
                 subject=subject,
@@ -1044,6 +1202,15 @@ class PolymarketCompleteSetScanner:
                 provenance=provenance,
             )
         if evaluations > self.config.maximum_capacity_evaluations:
+            self._publish_capacity_diagnostics(
+                evaluations=evaluations,
+                minimum_eligible_points=0,
+                merged_depth_regions=0,
+                fee_regime_atoms=0,
+                counters=None,
+                rich_evaluations=0,
+                selected_quantities=0,
+            )
             return zero_points, _blocked(
                 _DEPTH_VALIDATOR,
                 subject=subject,
@@ -1055,35 +1222,59 @@ class PolymarketCompleteSetScanner:
                 provenance=provenance,
             )
 
-        best_quantities: list[Quantity | None] = [None for _ in self.config.minimum_edge_thresholds]
-        depth_indices = [0, 0]
         minimum_order_size = bundle.minimum_order_size
-        any_minimum_eligible = False
-        for grid_index in range(1, evaluations + 1):
-            quantity_value = self.config.quantity_increment.value * ExactDecimal(grid_index)
-            if minimum_order_size is not None and quantity_value < minimum_order_size.value:
-                continue
-            any_minimum_eligible = True
-            acquisition = ExactDecimal.zero()
-            trading_cost = ExactDecimal.zero()
-            for leg_index, profile in enumerate(profiles):
-                depth_index = profile.index_at_or_after(
-                    quantity_value,
-                    start=depth_indices[leg_index],
-                )
-                depth_indices[leg_index] = depth_index
-                leg_acquisition, leg_cost = profile.scalar_totals(
-                    quantity_value,
-                    index=depth_index,
-                )
-                acquisition = acquisition + leg_acquisition
-                trading_cost = trading_cost + leg_cost
-            net_pnl = bundle.payout_per_set.value * quantity_value - acquisition - trading_cost
-            for threshold_index, threshold in enumerate(self.config.minimum_edge_thresholds):
-                required_pnl = threshold.value * quantity_value
-                qualifies = net_pnl > zero if threshold.value == zero else net_pnl >= required_pnl
-                if qualifies:
-                    best_quantities[threshold_index] = Quantity(quantity_value)
+        minimum_index = (
+            1
+            if minimum_order_size is None
+            else max(1, _ceil_exact_ratio(minimum_order_size.value, increment))
+        )
+        minimum_eligible_points = max(0, evaluations - minimum_index + 1)
+        if minimum_eligible_points == 0:
+            self._publish_capacity_diagnostics(
+                evaluations=evaluations,
+                minimum_eligible_points=0,
+                merged_depth_regions=0,
+                fee_regime_atoms=0,
+                counters=None,
+                rich_evaluations=0,
+                selected_quantities=0,
+            )
+            return zero_points, _blocked(
+                _DEPTH_VALIDATOR,
+                subject=subject,
+                observed_at=observed_at,
+                status=ValidationStatus.FAIL,
+                code=ValidationReasonCode.MINIMUM_ORDER_SIZE_NOT_MET,
+                message="common executable depth is below the minimum order quantity",
+                provenance=provenance,
+            )
+
+        atoms, merged_depth_regions = self._capacity_atoms(
+            profiles=profiles,
+            increment=increment,
+            maximum_index=evaluations,
+            minimum_index=minimum_index,
+            fee_quantum=bundle.cost_rule_set.fee_quantum.value,
+        )
+        scaled_atoms = tuple(
+            self._scale_capacity_atom(
+                atom=atom,
+                bundle=bundle,
+                increment=increment,
+            )
+            for atom in atoms
+        )
+        counters = (
+            None if self._capacity_diagnostics_observer is None else _CapacityPlannerCounters()
+        )
+        best_indices = self._solve_capacity_thresholds(
+            atoms=scaled_atoms,
+            counters=counters,
+        )
+        best_quantities = [
+            None if index is None else Quantity(increment * ExactDecimal(index))
+            for index in best_indices
+        ]
 
         economics_by_quantity: dict[ExactDecimal, OpportunityEconomics] = {}
         for quantity in best_quantities:
@@ -1107,16 +1298,15 @@ class PolymarketCompleteSetScanner:
                 strict=True,
             )
         )
-        if not any_minimum_eligible:
-            return curve, _blocked(
-                _DEPTH_VALIDATOR,
-                subject=subject,
-                observed_at=observed_at,
-                status=ValidationStatus.FAIL,
-                code=ValidationReasonCode.MINIMUM_ORDER_SIZE_NOT_MET,
-                message="common executable depth is below the minimum order quantity",
-                provenance=provenance,
-            )
+        self._publish_capacity_diagnostics(
+            evaluations=evaluations,
+            minimum_eligible_points=minimum_eligible_points,
+            merged_depth_regions=merged_depth_regions,
+            fee_regime_atoms=len(atoms),
+            counters=counters,
+            rich_evaluations=len(economics_by_quantity),
+            selected_quantities=len(economics_by_quantity),
+        )
         return curve, _passed(
             _DEPTH_VALIDATOR,
             subject=subject,
@@ -1126,6 +1316,323 @@ class PolymarketCompleteSetScanner:
                 ("maximum_common_quantity", maximum.to_canonical_string()),
             ),
             provenance=provenance,
+        )
+
+    def _publish_capacity_diagnostics(
+        self,
+        *,
+        evaluations: int,
+        minimum_eligible_points: int,
+        merged_depth_regions: int,
+        fee_regime_atoms: int,
+        counters: _CapacityPlannerCounters | None,
+        rich_evaluations: int,
+        selected_quantities: int,
+    ) -> None:
+        observer = self._capacity_diagnostics_observer
+        if observer is None:
+            return
+        if counters is None:
+            counters = _CapacityPlannerCounters()
+        observer(
+            CapacityPlannerDiagnostics(
+                lattice_points=max(0, evaluations),
+                minimum_eligible_points=minimum_eligible_points,
+                merged_depth_regions=merged_depth_regions,
+                fee_regime_atoms=fee_regime_atoms,
+                threshold_atom_visits=counters.threshold_atom_visits,
+                envelope_pruned_threshold_points=(counters.envelope_pruned_threshold_points),
+                fee_state_runs=counters.fee_state_runs,
+                unique_exact_fee_evaluations=counters.unique_exact_fee_evaluations,
+                affine_root_solves=counters.affine_root_solves,
+                rich_evaluations=rich_evaluations,
+                selected_quantities=selected_quantities,
+                scalar_fallback_evaluations=0,
+            )
+        )
+
+    @staticmethod
+    def _capacity_atoms(
+        *,
+        profiles: tuple[_DepthProfile, _DepthProfile],
+        increment: ExactDecimal,
+        maximum_index: int,
+        minimum_index: int,
+        fee_quantum: ExactDecimal,
+    ) -> tuple[tuple[_CapacityAtom, ...], int]:
+        """Merge both depth partitions and split terminal fee-zero onsets."""
+
+        left_regions = profiles[0].grid_regions(
+            increment=increment,
+            maximum_index=maximum_index,
+        )
+        right_regions = profiles[1].grid_regions(
+            increment=increment,
+            maximum_index=maximum_index,
+        )
+        left_index = 0
+        right_index = 0
+        merged: list[tuple[int, int, tuple[_GridLegRegion, _GridLegRegion]]] = []
+        while left_index < len(left_regions) and right_index < len(right_regions):
+            left = left_regions[left_index]
+            right = right_regions[right_index]
+            lower_index = max(left.lower_index, right.lower_index, minimum_index)
+            upper_index = min(left.upper_index, right.upper_index, maximum_index)
+            if lower_index <= upper_index:
+                merged.append((lower_index, upper_index, (left, right)))
+            if left.upper_index <= right.upper_index:
+                left_index += 1
+            if right.upper_index <= left.upper_index:
+                right_index += 1
+
+        atoms: list[_CapacityAtom] = []
+        for lower_index, upper_index, legs in merged:
+            cuts = {lower_index, upper_index + 1}
+            for leg in legs:
+                raw_slope = increment * leg.fee_factor
+                if raw_slope <= ExactDecimal.zero():
+                    continue
+                raw_intercept = -(leg.previous_quantity * leg.fee_factor)
+                fee_onset = _ceil_exact_ratio(
+                    fee_quantum - raw_intercept,
+                    raw_slope,
+                )
+                if lower_index < fee_onset <= upper_index:
+                    cuts.add(fee_onset)
+            ordered_cuts = sorted(cuts)
+            for atom_lower, following_cut in pairwise(ordered_cuts):
+                atom_upper = following_cut - 1
+                normal_fee_regime = tuple(
+                    (
+                        (increment * ExactDecimal(atom_lower) - leg.previous_quantity)
+                        * leg.fee_factor
+                    )
+                    >= fee_quantum
+                    for leg in legs
+                )
+                atoms.append(
+                    _CapacityAtom(
+                        lower_index=atom_lower,
+                        upper_index=atom_upper,
+                        legs=legs,
+                        normal_fee_regime=(
+                            normal_fee_regime[0],
+                            normal_fee_regime[1],
+                        ),
+                    )
+                )
+        return tuple(atoms), len(merged)
+
+    def _scale_capacity_atom(
+        self,
+        *,
+        atom: _CapacityAtom,
+        bundle: ReferenceBundle,
+        increment: ExactDecimal,
+    ) -> _ScaledCapacityAtom:
+        """Compile one atom into a lossless common base-10 integer scale."""
+
+        price_sum = atom.legs[0].price + atom.legs[1].price
+        base_slope = (bundle.payout_per_set.value - price_sum) * increment
+        base_intercept = ExactDecimal.zero()
+        raw_terms: list[tuple[ExactDecimal, ExactDecimal]] = []
+        values = [base_slope]
+        for leg in atom.legs:
+            base_intercept = (
+                base_intercept
+                + leg.price * leg.previous_quantity
+                - leg.prefix_notional
+                - leg.prefix_cost
+            )
+            raw_slope = increment * leg.fee_factor
+            raw_intercept = -(leg.previous_quantity * leg.fee_factor)
+            raw_terms.append((raw_slope, raw_intercept))
+            values.extend((raw_slope, raw_intercept))
+        values.append(base_intercept)
+        threshold_slopes = tuple(
+            base_slope - threshold.value * increment
+            for threshold in self.config.minimum_edge_thresholds
+        )
+        values.extend(threshold_slopes)
+        quantum = bundle.cost_rule_set.fee_quantum.value
+        # One extra decimal place makes every aligned quantum divisible by two,
+        # so the HALF_UP error bound q/2 is itself an exact integer.
+        scale = max(quantum.scale + 1, *(value.scale for value in values))
+        scaled_quantum = _scaled_integer(quantum, scale=scale)
+        fee_terms = tuple(
+            _ScaledFeeTerm(
+                slope=_scaled_integer(raw_slope, scale=scale),
+                intercept=_scaled_integer(raw_intercept, scale=scale),
+                quantum=scaled_quantum,
+                normal_regime=normal_regime,
+            )
+            for (raw_slope, raw_intercept), normal_regime in zip(
+                raw_terms,
+                atom.normal_fee_regime,
+                strict=True,
+            )
+        )
+        return _ScaledCapacityAtom(
+            lower_index=atom.lower_index,
+            upper_index=atom.upper_index,
+            base_intercept=_scaled_integer(base_intercept, scale=scale),
+            threshold_slopes=tuple(
+                _scaled_integer(value, scale=scale) for value in threshold_slopes
+            ),
+            fee_terms=(fee_terms[0], fee_terms[1]),
+        )
+
+    def _solve_capacity_thresholds(
+        self,
+        *,
+        atoms: tuple[_ScaledCapacityAtom, ...],
+        counters: _CapacityPlannerCounters | None,
+    ) -> tuple[int | None, ...]:
+        """Find each maximum qualifying grid index without global monotonicity."""
+
+        best_indices: list[int | None] = []
+        fee_cache: dict[tuple[int, int], tuple[int, tuple[int, int]]] = {}
+        upper_cap = atoms[-1].upper_index
+        for threshold_index, threshold in enumerate(self.config.minimum_edge_thresholds):
+            # Qualifying sets are nested as thresholds increase.  This cap is
+            # independent of any quantity monotonicity assumption.
+            if threshold_index > 0:
+                previous = best_indices[-1]
+                if previous is None:
+                    best_indices.append(None)
+                    continue
+                upper_cap = previous
+            required = 1 if threshold.value == ExactDecimal.zero() else 0
+            selected: int | None = None
+            for atom_index in range(len(atoms) - 1, -1, -1):
+                atom = atoms[atom_index]
+                interval_upper = min(atom.upper_index, upper_cap)
+                if interval_upper < atom.lower_index:
+                    continue
+                if counters is not None:
+                    counters.threshold_atom_visits += 1
+                possible = self._envelope_interval(
+                    atom=atom,
+                    threshold_index=threshold_index,
+                    lower_index=atom.lower_index,
+                    upper_index=interval_upper,
+                    required=required,
+                )
+                original_points = interval_upper - atom.lower_index + 1
+                if possible is None:
+                    if counters is not None:
+                        counters.envelope_pruned_threshold_points += original_points
+                    continue
+                possible_lower, possible_upper = possible
+                if counters is not None:
+                    counters.envelope_pruned_threshold_points += original_points - (
+                        possible_upper - possible_lower + 1
+                    )
+                cursor = possible_upper
+                while cursor >= possible_lower:
+                    cache_key = (atom_index, cursor)
+                    cached = fee_cache.get(cache_key)
+                    if cached is None:
+                        cached = self._exact_terminal_fees(atom=atom, grid_index=cursor)
+                        fee_cache[cache_key] = cached
+                        if counters is not None:
+                            counters.unique_exact_fee_evaluations += 1
+                    fee_sum, fee_units = cached
+                    run_lower = possible_lower
+                    for term, units in zip(atom.fee_terms, fee_units, strict=True):
+                        run_lower = max(
+                            run_lower,
+                            self._fee_run_lower_bound(term=term, units=units),
+                        )
+                    if counters is not None:
+                        counters.fee_state_runs += 1
+                        counters.affine_root_solves += 1
+                    slope = atom.threshold_slopes[threshold_index]
+                    intercept = atom.base_intercept - fee_sum
+                    if slope >= 0:
+                        if slope * cursor + intercept >= required:
+                            selected = cursor
+                    else:
+                        root = (intercept - required) // (-slope)
+                        candidate = min(cursor, root)
+                        if candidate >= run_lower:
+                            selected = candidate
+                    if selected is not None:
+                        break
+                    cursor = run_lower - 1
+                if selected is not None:
+                    break
+            best_indices.append(selected)
+        return tuple(best_indices)
+
+    @staticmethod
+    def _envelope_interval(
+        *,
+        atom: _ScaledCapacityAtom,
+        threshold_index: int,
+        lower_index: int,
+        upper_index: int,
+        required: int,
+    ) -> tuple[int, int] | None:
+        """Clip to where a rigorous rounded-fee upper bound can qualify."""
+
+        slope = atom.threshold_slopes[threshold_index]
+        intercept = atom.base_intercept
+        for term in atom.fee_terms:
+            if not term.normal_regime:
+                continue
+            slope -= term.slope
+            intercept -= term.intercept
+            if term.quantum % 2 != 0:  # pragma: no cover - scale invariant
+                raise AssertionError("scaled fee quantum must be divisible by two")
+            intercept += term.quantum // 2
+
+        clipped_lower = lower_index
+        clipped_upper = upper_index
+        if slope > 0:
+            clipped_lower = max(
+                clipped_lower,
+                _ceil_integer_ratio(required - intercept, slope),
+            )
+        elif slope < 0:
+            clipped_upper = min(
+                clipped_upper,
+                (intercept - required) // (-slope),
+            )
+        elif intercept < required:
+            return None
+        if clipped_lower > clipped_upper:
+            return None
+        return clipped_lower, clipped_upper
+
+    @staticmethod
+    def _exact_terminal_fees(
+        *,
+        atom: _ScaledCapacityAtom,
+        grid_index: int,
+    ) -> tuple[int, tuple[int, int]]:
+        units: list[int] = []
+        fee_sum = 0
+        for term in atom.fee_terms:
+            raw = term.slope * grid_index + term.intercept
+            if raw < term.quantum:
+                rounded_units = 0
+            else:
+                rounded_units = (2 * raw + term.quantum) // (2 * term.quantum)
+            units.append(rounded_units)
+            fee_sum += rounded_units * term.quantum
+        return fee_sum, (units[0], units[1])
+
+    @staticmethod
+    def _fee_run_lower_bound(*, term: _ScaledFeeTerm, units: int) -> int:
+        """Return the first lattice index in the current rounded-fee state."""
+
+        if units == 0 or term.slope <= 0:
+            return -1
+        doubled_boundary = 2 * term.quantum if units == 1 else (2 * units - 1) * term.quantum
+        return _ceil_integer_ratio(
+            doubled_boundary - 2 * term.intercept,
+            2 * term.slope,
         )
 
     def _capacity_curve_reference(
@@ -1247,6 +1754,7 @@ class PolymarketCompleteSetReferenceScanner(PolymarketCompleteSetScanner):
 __all__ = [
     "POLYMARKET_COMPLETE_SET_STRATEGY_ID",
     "POLYMARKET_COMPLETE_SET_STRATEGY_VERSION",
+    "CapacityPlannerDiagnostics",
     "CompleteSetScanResult",
     "CompleteSetScannerConfig",
     "DepthFill",

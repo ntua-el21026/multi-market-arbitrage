@@ -10,6 +10,8 @@ REST_BOOK = "polymarket.clob.rest-book.v1"
 REST_BOOK_AUDIT = "polymarket.clob.rest-book-audit.v1"
 WS_MARKET = "polymarket.clob.websocket-market.v2"
 CONTROL_BOOK_INVALIDATION = "mma.control.book-invalidation.v1"
+CONTROL_REST_AUDIT_START = "mma.control.rest-audit-start.v1"
+CONTROL_REST_AUDIT_FAILED = "mma.control.rest-audit-failed.v1"
 
 
 def channel_native_id(channel: str, prefix: str) -> str:
@@ -24,6 +26,8 @@ def channel_native_id(channel: str, prefix: str) -> str:
 __all__ = [
     "CLOB_MARKET_PREFIX",
     "CONTROL_BOOK_INVALIDATION",
+    "CONTROL_REST_AUDIT_FAILED",
+    "CONTROL_REST_AUDIT_START",
     "GAMMA_EVENT_PREFIX",
     "GAMMA_MARKETS_KEYSET",
     "GAMMA_MARKET_PREFIX",

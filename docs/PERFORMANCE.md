@@ -194,16 +194,77 @@ not yet contain the corrected dedicated receive/ingress boundary. These results
 therefore support ADR-0051's runtime decision but do not measure later
 performance-hardening implementation changes.
 
-## 14. Corrected Final-C implementation baseline
+## 14. Historical corrected Final-C baseline (`d31204e`)
 
-The source-stable corrected Phase 1 campaign, including all 54 comparable
+The source-stable corrected Phase 1 campaign finalized in commit
+`d31204e6c8b09aa722f0828f8ded96a2739148a5`, including all 54 comparable
 series, corrected production-boundary distributions, the five-candidate
 group-commit matrix, CPU/RSS/queue evidence, deterministic hashes, material
-regressions, reproduction command, and limitations, is recorded in
+regressions, reproduction command, and limitations, is preserved in
 [`PHASE_1_PERFORMANCE_BASELINE.md`](PHASE_1_PERFORMANCE_BASELINE.md).
 
-The accepted production journal policy is a maximum group of 16 events with
-zero configured delay. On the measured non-sparse scenarios its throughput
-geometric mean was 1,562.57 events/s versus 164.65 events/s for one-event
-`fsync`, while sparse p50 remained 4.891 ms. Final-C live and streaming replay
-terminal hashes were identical.
+At that source state, the production journal policy was a maximum group of 16
+events with zero configured delay. On the measured non-sparse scenarios its
+throughput geometric mean was 1,562.57 events/s versus 164.65 events/s for
+one-event `fsync`, while sparse p50 remained 4.891 ms. Final-C live and
+streaming replay terminal hashes were identical.
+
+Those artifact hashes and measurements remain historical evidence. Later
+scanner implementation changes do not rewrite the sealed campaign and do not
+make its scanner timings representative of the current worktree.
+
+## 15. Exact breakpoint scanner focused A/B
+
+A later focused same-machine, same-runtime, same-harness spot campaign compared:
+
+- Scanner A: committed `73beba5c98a25d081b7ab8f066f5365bdc2d3b09`,
+  whose executable scanner is unchanged from `d31204e` because the intervening
+  commits are documentation-only;
+- Scanner B: the exact integer-lattice breakpoint planner in the current
+  implementation worktree.
+
+This focused comparison was not emitted as a sealed full-campaign artifact and
+does not have a final source commit or result-artifact hash. It supplements,
+rather than replaces, the historical `d31204e` baseline.
+
+| Scanner workload/measure | Scanner A | Scanner B | B vs A |
+|---|---:|---:|---:|
+| 4,096-point capacity scan p50, 7 samples | 107.744 ms | 1.269 ms | 84.9x faster |
+| 4,096-point p95/p99/max | 110.611 ms | 1.872 ms | 59.1x faster |
+| 4,096-point aggregate process CPU, 7 samples | 703.368 ms | 9.087 ms | 77.4x lower |
+| 4,096-point aggregate wall time, 7 samples | 755.616 ms | 9.688 ms | 78.0x lower |
+| 30-point capacity scan p50, 50 samples | 2.058 ms | 1.328 ms | 1.55x faster |
+| Warm scan retained traced bytes | 36,879 | 37,234 | +0.96% |
+| Warm scan peak traced bytes | 167,035 | 167,134 | +0.06% |
+
+The small traced-allocation increases are retained as measured and are likely
+noise at this sample size; the optimization is algorithmic, not an allocation
+reduction claim. For the 4,096-point fixture, both implementations produced the
+same terminal hash,
+`b720b5bfe0bb4ca6f06631cc4007eb8585a480c210d276ff076260a3098df350`,
+and the same four maximum qualifying capacities of `40.96`.
+
+The planner merges the two legs' depth partitions, splits them at explicit fee-
+zero onsets, and scales all decimal economics to an exact integer lattice. For
+each threshold it uses a rigorous unrounded-fee error envelope to prune ranges,
+then traverses exact `HALF_UP` rounded-fee state runs and solves the affine root
+for the largest qualifying index. It does not assume that profitability is
+globally monotone in quantity. The exhaustive reference scanner remains the
+semantic oracle.
+
+Non-canonical diagnostics for the timed 4,096-point fixture recorded 3,597
+minimum-size-eligible points, one merged depth region, one fee-regime atom,
+four threshold/atom visits, four rounded-fee runs, one unique exact fee
+evaluation, four affine-root solves, one selected quantity and rich economics
+evaluation, and zero scalar fallbacks. No points were envelope-pruned in that
+profitable fixture; the speedup came from solving its fee-state runs rather
+than visiting every eligible quantity.
+
+Exact equivalence coverage included 2,000 randomized optimized-versus-
+exhaustive differential cases with fractional and non-aligned depths, deep
+books, depth/minimum-order boundaries, fee-zero onsets, `HALF_UP` ties, multiple
+thresholds, and edge/no-edge outcomes. Targeted cases also include an ambiguous
+4,096-point no-edge fixture that forces at least 2,000 exact fee evaluations.
+That adversarial case is an explicit caveat: the planner preserves exactness
+and the configured work bound, but it is not guaranteed to be sublinear for
+every fee-state pattern.

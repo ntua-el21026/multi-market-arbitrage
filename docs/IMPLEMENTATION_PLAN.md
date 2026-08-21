@@ -95,17 +95,31 @@ Require identical state/opportunity hashes across repeated runs.
 
 Gate-1 evidence is governed by `GATE_1_SOAK_SPEC.md` and ADR-0052.
 
-Before the final six-hour soak:
+The Phase-P4 pre-soak engineering baseline now contains:
 
-- preserve continuous healthy WebSocket acquisition during routine REST integrity audits;
-- implement exact race-fenced `MATCH` / `MISMATCH` / `RACED` / `FAILED` audit semantics;
-- separate typed HTTP from WebSocket transport failures;
-- add bounded, rate-aware retry only for safe public reads;
-- emit periodic scoped machine-readable health evidence through a supervised non-blocking path;
-- select and record an explicit Gate-1 market target rather than relying on listing order;
-- run target-specific workload/storage calibration so the six-hour projection fits raw/file/disk bounds with headroom;
-- perform another exact algorithm-first optimization pass on the 4,096-evaluation scanner hot path and refresh performance evidence;
-- pass full CI/static/SCA/security/replay gates and a new bounded public smoke on the exact final SHA.
+- continuous healthy WebSocket acquisition during routine REST integrity audits;
+- exact receive-watermark-fenced `MATCH` / `MISMATCH` / `RACED` / `FAILED`
+  audit semantics with replay evidence and bounded race retry;
+- separate typed HTTP and WebSocket failure/metric/recovery domains;
+- bounded, deadline- and rate-aware retry only for fixed safe public reads,
+  using dated official external-limit evidence;
+- periodic scoped machine-readable health evidence through its own supervised,
+  bounded, non-blocking owner;
+- explicit fail-closed Gate-1 target selection and identity instead of listing
+  order, with discovery retained only as non-Gate-1 developer mode;
+- a bounded target-specific workload/storage calibration command that publishes
+  hash-bound reports and fails rather than enlarging the raw/file/disk limits;
+- an exact integer-lattice depth/fee-regime scanner optimizer, with the
+  exhaustive implementation retained as the differential oracle; and
+- separate benchmark harnesses for scanner and health-path evidence while
+  preserving historical baselines.
+
+Engineering presence is not Gate-1 acceptance. Before the final six-hour soak,
+the exact final SHA must still pass the full CI/static/SCA/security/replay
+gates, a new bounded explicit-target public smoke, target-specific 180–300
+second calibration with acceptable six-hour projection, independent replay/
+rebuild/data validation, and pre-soak audit review. No unexecuted evidence gate
+may be inferred from this implementation status.
 
 Then run the six-hour soak and collect at least:
 

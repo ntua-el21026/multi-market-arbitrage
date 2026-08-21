@@ -1,17 +1,65 @@
 """Phase 1 provenance-explicit analytical research outputs."""
 
+from .calibration import (
+    STDIO_STREAM_LOG_STORAGE_MODEL,
+    BoundedTreeUsage,
+    CalibrationArtifacts,
+    CalibrationDecision,
+    CalibrationDecisionReason,
+    CalibrationDistribution,
+    CalibrationEnvironment,
+    CalibrationIdentity,
+    CalibrationLatency,
+    CalibrationLimits,
+    CalibrationMeasurements,
+    CalibrationProjection,
+    CalibrationQueueMeasurement,
+    CalibrationReport,
+    CalibrationTargetIdentity,
+    bounded_tree_usage,
+    build_calibration_report,
+    project_measurement,
+    render_calibration_markdown,
+    write_calibration_artifacts,
+)
 from .outputs import Phase1AnalyticalOutputs, ResearchOutputSummary
 from .report import ScanDispositionCount, ScanReport, build_scan_report
-from .supervised import SupervisedAnalyticalOutputs
+from .supervised import (
+    AnalyticalQueueSnapshot,
+    AnalyticalRuntimeSnapshot,
+    SupervisedAnalyticalOutputs,
+)
 from .validation import DataValidationReport, validate_data
 
 __all__ = [
+    "STDIO_STREAM_LOG_STORAGE_MODEL",
+    "AnalyticalQueueSnapshot",
+    "AnalyticalRuntimeSnapshot",
+    "BoundedTreeUsage",
+    "CalibrationArtifacts",
+    "CalibrationDecision",
+    "CalibrationDecisionReason",
+    "CalibrationDistribution",
+    "CalibrationEnvironment",
+    "CalibrationIdentity",
+    "CalibrationLatency",
+    "CalibrationLimits",
+    "CalibrationMeasurements",
+    "CalibrationProjection",
+    "CalibrationQueueMeasurement",
+    "CalibrationReport",
+    "CalibrationTargetIdentity",
     "DataValidationReport",
     "Phase1AnalyticalOutputs",
     "ResearchOutputSummary",
     "ScanDispositionCount",
     "ScanReport",
     "SupervisedAnalyticalOutputs",
+    "bounded_tree_usage",
+    "build_calibration_report",
     "build_scan_report",
+    "project_measurement",
+    "render_calibration_markdown",
     "validate_data",
+    "write_calibration_artifacts",
 ]

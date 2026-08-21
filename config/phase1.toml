@@ -8,6 +8,7 @@ maximum_observation_duration_seconds = 86400.0
 root = "data"
 journal_directory = "data/raw"
 analytical_directory = "data/analytical"
+health_directory = "data/health"
 journal_segment_max_events = 10000
 journal_segment_max_uncompressed_bytes = 67108864
 journal_run_max_uncompressed_bytes = 4294967296
@@ -26,6 +27,7 @@ market_websocket_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 request_timeout_seconds = 10.0
 discovery_limit = 1
 snapshot_audit_interval_seconds = 30.0
+snapshot_audit_max_race_retries = 2
 heartbeat_interval_seconds = 10.0
 reconnect_initial_seconds = 1.0
 reconnect_max_seconds = 15.0
@@ -34,6 +36,24 @@ maximum_http_response_bytes = 8388608
 maximum_websocket_message_bytes = 1048576
 maximum_ingress_queue_bytes = 67108864
 
+[polymarket.public_reads]
+maximum_concurrency = 4
+maximum_attempts = 3
+initial_backoff_seconds = 0.25
+maximum_backoff_seconds = 2.0
+jitter_fraction = 0.2
+jitter_seed = 0
+maximum_retry_after_seconds = 10.0
+rate_limit_window_seconds = 10.0
+# Local safety budgets are deliberately below the dated external venue limits.
+gamma_general_requests_per_window = 100
+gamma_markets_requests_per_window = 30
+clob_general_requests_per_window = 100
+clob_book_requests_per_window = 100
+clob_books_requests_per_window = 50
+rate_limit_source_url = "https://docs.polymarket.com/api-reference/rate-limits"
+rate_limit_checked_on = 2026-08-21
+
 [scanner]
 enabled = true
 maximum_book_age_seconds = 5.0
@@ -41,6 +61,13 @@ maximum_interleg_skew_seconds = 1.0
 minimum_edge_thresholds = ["0", "0.0025", "0.005", "0.01"]
 quantity_increment = "0.01"
 maximum_capacity_evaluations = 4096
+
+[health]
+checkpoint_interval_seconds = 5.0
+queue_capacity = 64
+maximum_checkpoints = 8192
+maximum_file_bytes = 67108864
+minimum_free_disk_bytes = 1073741824
 
 [replay]
 clock = "RECORDED_ORDER"

@@ -10,9 +10,11 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from multi_market_arbitrage.core.config import load_phase1_config
+from multi_market_arbitrage.core.errors import ConfigurationFault
 from multi_market_arbitrage.core.health import ComponentHealth
 from multi_market_arbitrage.core.ids import CollectorRunId
 from multi_market_arbitrage.core.serialization import canonicalize
+from multi_market_arbitrage.pipeline.calibration import run_polymarket_calibration
 from multi_market_arbitrage.pipeline.observe import PolymarketObservationService
 from multi_market_arbitrage.replay import (
     ReplayTerminalHashMismatch,
@@ -26,6 +28,7 @@ EXIT_OK = 0
 EXIT_CONFIGURATION = 3
 EXIT_DATA_INVALID = 4
 EXIT_REPLAY_MISMATCH = 5
+EXIT_CALIBRATION_FAILED = 6
 EXIT_RUNTIME = 10
 
 
@@ -58,7 +61,42 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         help="hard upper bound in seconds, including bootstrap",
     )
+    polymarket.add_argument(
+        "--gamma-market-id",
+        help=(
+            "exact Gamma market ID for Gate-1 evidence; omission uses bounded "
+            "developer discovery and is not Gate-1 eligible"
+        ),
+    )
     _config_argument(polymarket)
+
+    calibrate = commands.add_parser(
+        "calibrate",
+        help="run a bounded explicit-target pre-soak workload calibration",
+    )
+    calibrate_venues = calibrate.add_subparsers(dest="venue", required=True)
+    calibrate_polymarket = calibrate_venues.add_parser(
+        "polymarket",
+        help="calibrate one exact public ordinary-binary condition",
+    )
+    calibrate_polymarket.add_argument(
+        "--gamma-market-id",
+        required=True,
+        help="exact Gamma market ID; discovery/fallback is prohibited",
+    )
+    calibrate_polymarket.add_argument(
+        "--duration",
+        type=float,
+        required=True,
+        help="bounded calibration duration in seconds (operational recommendation: 180-300)",
+    )
+    calibrate_polymarket.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="fresh output directory for bound JSON/Markdown calibration evidence",
+    )
+    _config_argument(calibrate_polymarket)
 
     replay = commands.add_parser("replay", help="deterministically replay a raw run")
     replay.add_argument("target", type=Path, help="raw journal directory")
@@ -190,9 +228,41 @@ async def _observe(args: argparse.Namespace) -> int:
         workspace_root=_workspace_root(config_path),
         code_commit=_git_commit(_workspace_root(config_path)),
     )
-    summary = await service.run(duration_seconds=args.duration)
+    summary = await service.run(
+        duration_seconds=args.duration,
+        gamma_market_id=args.gamma_market_id,
+    )
     _print(summary)
     return EXIT_OK if summary.status is ComponentHealth.HEALTHY else EXIT_RUNTIME
+
+
+async def _calibrate(args: argparse.Namespace) -> int:
+    config_path: Path = args.config
+    workspace_root = _workspace_root(config_path)
+    result = await run_polymarket_calibration(
+        config=load_phase1_config(config_path),
+        workspace_root=workspace_root,
+        code_commit=_git_commit(workspace_root),
+        gamma_market_id=args.gamma_market_id,
+        duration_seconds=args.duration,
+        output_directory=args.output,
+    )
+    _print(
+        {
+            "artifacts": {
+                "bindings_json": str(result.artifacts.bindings_json),
+                "directory": str(result.artifacts.directory),
+                "report_json": str(result.artifacts.report_json),
+                "summary_markdown": str(result.artifacts.summary_markdown),
+            },
+            "collector_run_id": result.observation.collector_run_id,
+            "decision": result.report.decision,
+            "projection": result.report.projection,
+            "report_sha256": result.report.report_sha256,
+            "target": result.report.identity.target,
+        }
+    )
+    return EXIT_OK if result.report.decision.passed else EXIT_CALIBRATION_FAILED
 
 
 def _replay(args: argparse.Namespace) -> int:
@@ -256,6 +326,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "observe":
             return asyncio.run(_observe(args))
+        if args.command == "calibrate":
+            return asyncio.run(_calibrate(args))
         if args.command == "replay":
             return _replay(args)
         if args.command == "rebuild-analytical":
@@ -264,7 +336,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _validate(args)
         if args.command == "scan-report":
             return _report(args)
-    except (ValueError, OSError) as error:
+    except (ConfigurationFault, ValueError, OSError) as error:
         print(f"configuration/data error: {error}", file=sys.stderr)
         return EXIT_CONFIGURATION
     except Exception as error:
@@ -279,6 +351,7 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "EXIT_CALIBRATION_FAILED",
     "EXIT_CONFIGURATION",
     "EXIT_DATA_INVALID",
     "EXIT_OK",

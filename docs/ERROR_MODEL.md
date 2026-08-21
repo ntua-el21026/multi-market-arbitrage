@@ -29,6 +29,25 @@ Examples:
 
 Represent with typed infrastructure errors plus health transitions and bounded retry where safe.
 
+The current public Polymarket adapter keeps HTTP and WebSocket faults distinct:
+
+```text
+PolymarketHttpTransportError
+PolymarketHttpStatusError
+PolymarketHttpProtocolError
+PolymarketWebSocketTransportError
+PolymarketWebSocketProtocolError
+PolymarketSchemaError
+```
+
+HTTP evidence carries a fixed endpoint class, finite failure category, explicit
+retryability, attempt count, optional status and bounded parsed `Retry-After`,
+and final retry-block reason. WebSocket evidence carries its own finite
+transport/protocol category and attempt. A public HTTP failure never increments
+WebSocket disconnect/reconnect counters and never creates `DISCONNECT`
+invalidation unless an independent WebSocket continuity failure actually
+occurred. Schema errors remain non-retryable adapter/validation faults.
+
 ### Permanent/configuration fault
 Examples:
 - invalid config;
@@ -86,6 +105,24 @@ Safe/idempotent reads may use:
 
 Retry attempts and final failure are observable.
 
+Phase-1 public Polymarket reads pass through a fixed-method controller; it does
+not expose a generic URL/method surface. The controller enforces one bounded
+concurrency semaphore, per-endpoint local sliding-window admissions, at most
+the configured attempts, an absolute observation deadline, reproducible
+bounded jitter, and policy-bounded `Retry-After` handling. The currently
+enumerated retryable cases are temporary timeout/network faults and HTTP `408`,
+`425`, `429`, `500`, `502`, `503`, or `504`. Other statuses, client closure,
+remote/local/response protocol violations, malformed schema, invalid
+configuration, exhausted deadline, and an over-policy parsed `Retry-After`
+fail without another attempt. `Retry-After` is classified as absent, parsed, or
+malformed so untrusted header text is neither retained nor confused with a
+valid server delay.
+
+Rate-limit source URL/check date and local endpoint budgets are configuration
+evidence. External venue numbers are not hard-coded retry invariants. Retry and
+rate waits cannot extend beyond the absolute deadline, and attempt/rate budgets
+cannot grow dynamically.
+
 ## 6. Retry discipline — writes
 
 Future mutating live requests follow Pass 3:
@@ -125,14 +162,36 @@ Repeated transient errors may degrade a component.
 
 Thresholds are configuration/observability policy, not hidden loops.
 
+REST integrity audits add a separate typed outcome layer:
+
+- `MATCH` and `MISMATCH` are permitted only after the response-boundary
+  WebSocket admission watermark has been durably processed by the canonical
+  owner and no relevant economic mutation crossed the request window;
+- `RACED` means a relevant economic mutation crossed that window and consumes
+  only the bounded race-retry policy;
+- `FAILED` means HTTP, deadline, response, watermark, generation,
+  comparability, retry-budget, or shutdown evidence could not support a safe
+  classification.
+
+`RACED`/`FAILED` never become `MATCH` by default. Only a proven `MISMATCH`
+requires audit-driven resynchronization; an isolated HTTP failure does not
+terminate a healthy WebSocket generation. The durable audit start,
+response/failure, barrier evidence, outcome, and hash chain make replay reach
+the same classification without repeating remote I/O or depending on current
+task timing.
+
 ## 10. Test requirement
 
 Fault injection must cover:
 - disconnect;
 - timeout;
+- HTTP connection fault, `429`, transient `5xx`, `Retry-After`, permanent
+  `4xx`, and retry exhaustion;
+- WebSocket close/protocol fault and HTTP/WebSocket metric isolation;
 - duplicate;
 - malformed payload;
 - queue saturation;
 - disk failure;
 - unsupported schema;
+- audit watermark ambiguity, race/retry exhaustion, and health-writer failure;
 - future live unknown command.
