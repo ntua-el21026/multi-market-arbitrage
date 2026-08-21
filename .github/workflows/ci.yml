@@ -14,13 +14,49 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
+          version: "0.12.5"
       - name: Install Python
         run: uv python install
+      - name: Check dependency lock
+        run: uv lock --check
       - name: Install locked dependencies
         run: uv sync --frozen --all-groups
+      - name: Verify exact ordinary-GIL CPython
+        run: |
+          uv run --frozen --all-groups python - <<'PY'
+          import platform
+          import sys
+          import sysconfig
+
+          assert platform.python_implementation() == "CPython"
+          assert sys.version_info[:3] == (3, 14, 7), sys.version
+          assert sysconfig.get_config_var("Py_GIL_DISABLED") == 0
+          assert sys._is_gil_enabled()
+          print(f"{platform.python_implementation()} {platform.python_version()}, ordinary GIL enabled")
+          PY
+      - name: Dependency vulnerability audit
+        shell: bash
+        run: |
+          audit_dir="${RUNNER_TEMP}/mma-pip-audit"
+          mkdir -p "${audit_dir}/cache"
+          uv export \
+            --frozen \
+            --all-groups \
+            --no-emit-project \
+            --no-header \
+            --format pylock.toml \
+            --output-file "${audit_dir}/pylock.toml" \
+            > /dev/null
+          uv run --frozen --all-groups pip-audit \
+            --locked "${audit_dir}" \
+            --strict \
+            --vulnerability-service pypi \
+            --cache-dir "${audit_dir}/cache" \
+            --progress-spinner off \
+            --timeout 30
       - name: Ruff lint
         run: uv run ruff check .
       - name: Ruff format
