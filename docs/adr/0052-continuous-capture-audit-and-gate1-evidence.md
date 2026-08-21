@@ -42,6 +42,10 @@ For every audited instrument, the implementation records enough exact state to d
 - exact raw REST response identity;
 - audit outcome.
 
+The race fence MUST cover receive-side backlog, not only already-processed canonical state. At the REST response boundary, the acquisition/coordinator records an exact WebSocket receive/admission watermark for the relevant socket generation. Audit classification is deferred until the single canonical owner has durably processed every WebSocket frame admitted through that response-boundary watermark, or an equivalent formally proven barrier. A market-data frame received before the REST response but still waiting in ingress, journal durability, or canonical processing cannot be ignored when deciding whether the audit raced.
+
+The barrier MUST NOT stop healthy WebSocket acquisition. Frames received after the response-boundary watermark may continue to be admitted while the canonical owner catches up to the barrier. After the barrier is reached, compare the request-start economic generation/hash with the barrier-time economic generation/hash. Irrelevant frames that do not mutate the audited economic book do not by themselves force `RACED`; a relevant mutation across the fenced window does. Exact REST bytes may be journaled when received, but any replay-relevant audit classification/state transition occurs only after the barrier evidence is established.
+
 Canonical audit outcomes are at least:
 
 ```text
@@ -132,6 +136,7 @@ No performance target permits weakening exact arithmetic, cost rounding, capacit
 
 - Gate-1 evidence no longer contains recurring collector-created blind windows.
 - Busy markets may produce `RACED` audits; this is preferable to false mismatch/match. Bounded retry and explicit health state handle persistent inability to obtain race-free integrity evidence.
+- Receive-side backlog cannot hide an in-window market-data mutation from the audit race fence.
 - HTTP resilience becomes safer and more observable without introducing mutation capability.
 - Long soaks gain periodic evidence that can be inspected even when the final run does not complete.
 - Explicit target and storage calibration make the six-hour run reproducible and prevent accidental selection/capacity failures.
