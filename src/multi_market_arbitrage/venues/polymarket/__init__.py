@@ -1,7 +1,7 @@
 """Current public, read-only Polymarket adapter."""
 
 from .capabilities import POLYMARKET_CAPABILITIES
-from .client import PolymarketMarketWebSocket, PolymarketPublicClient
+from .client import PolymarketMarketWebSocket, PolymarketPublicClient, ReceivedWebSocketMessage
 from .errors import (
     PolymarketAdapterError,
     PolymarketSchemaError,
@@ -38,6 +38,7 @@ __all__ = [
     "PolymarketPublicClient",
     "PolymarketSchemaError",
     "PolymarketTransportError",
+    "ReceivedWebSocketMessage",
     "RestBookSnapshot",
     "UnsupportedPolymarketEventError",
     "decode_json_exact",

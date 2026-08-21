@@ -2,9 +2,24 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from itertools import pairwise
+
 from multi_market_arbitrage.core.exact import ExactDecimal, Price, Quantity
-from multi_market_arbitrage.core.ids import CanonicalEventId, InstrumentId, VersionId
-from multi_market_arbitrage.core.provenance import Provenance
+from multi_market_arbitrage.core.ids import (
+    CanonicalEventId,
+    ConfigHash,
+    IngestId,
+    InstrumentId,
+    MarketId,
+    VersionId,
+)
+from multi_market_arbitrage.core.provenance import (
+    Provenance,
+    RawSourceConflictError,
+    RawSourceRef,
+    merge_raw_source_refs,
+)
 from multi_market_arbitrage.core.time import UtcTimestamp
 from multi_market_arbitrage.normalization import (
     BookSide,
@@ -23,6 +38,8 @@ from multi_market_arbitrage.reference import ReferenceBundle, ReferenceStatus
 from .models import (
     BookHealth,
     BookLevel,
+    BookMutation,
+    BookMutationKind,
     ImmutableOrderBookSnapshot,
     InvalidationReason,
     RestAuditStatus,
@@ -34,46 +51,237 @@ class BookStateError(RuntimeError):
     """A canonical event cannot be safely applied to this book owner."""
 
 
-def _aligned_to_tick(price: ExactDecimal, tick: ExactDecimal) -> bool:
-    return (price.as_fraction() / tick.as_fraction()).denominator == 1
+_MAX_LEVELS_PER_SIDE = 4096
+_MAX_RAW_SOURCE_REFS_PER_INPUT = 4096
+# A fully source-diverse valid book can have one distinct supplier for each
+# level on both sides plus the latest freshness boundary.
+_MAX_ACTIVE_RAW_SOURCE_REFS = 2 * _MAX_LEVELS_PER_SIDE + 1
+
+
+def _require_provenance_bound(provenance: Provenance, *, label: str) -> None:
+    if len(provenance.source_ingest_ids) > _MAX_RAW_SOURCE_REFS_PER_INPUT:
+        raise BookStateError(f"{label} exceeds 4096 raw source references")
+
+
+def _merge_raw_refs(
+    *groups: Iterable[RawSourceRef],
+    enforce_active_bound: bool,
+) -> tuple[RawSourceRef, ...]:
+    """Merge raw identities with an owner-specific typed conflict boundary."""
+
+    try:
+        result = merge_raw_source_refs(*groups)
+    except RawSourceConflictError as error:
+        raise BookStateError("state provenance raw ingest identity/hash conflict") from error
+    if enforce_active_bound and len(result) > _MAX_ACTIVE_RAW_SOURCE_REFS:
+        raise BookStateError("active book provenance exceeds 8193 raw source references")
+    return result
+
+
+def _require_raw_source_compatibility(
+    retained: Provenance | None,
+    update: Provenance,
+) -> None:
+    if retained is not None:
+        _merge_raw_refs(
+            retained.raw_source_refs,
+            update.raw_source_refs,
+            enforce_active_bound=False,
+        )
+
+
+def _provenance_metadata(
+    sources: tuple[Provenance, ...],
+) -> tuple[tuple[VersionId, ...], ConfigHash | None, str | None]:
+    """Combine non-raw provenance fields while rejecting ambiguous contexts."""
+
+    version_by_key: dict[tuple[type[VersionId], str], VersionId] = {}
+    config_hash: ConfigHash | None = None
+    code_version: str | None = None
+    for source in sources:
+        for version in source.reference_version_ids:
+            version_by_key.setdefault((type(version), version.value), version)
+        if source.config_hash is not None:
+            if config_hash is not None and config_hash != source.config_hash:
+                raise BookStateError("state provenance config hashes conflict")
+            config_hash = source.config_hash
+        if source.code_version is not None:
+            if code_version is not None and code_version != source.code_version:
+                raise BookStateError("state provenance code versions conflict")
+            code_version = source.code_version
+    return tuple(version_by_key.values()), config_hash, code_version
 
 
 def _merge_provenance(current: Provenance | None, update: Provenance) -> Provenance:
-    """Append one source to exact state lineage without losing prior evidence."""
+    """Append paired raw sources to exact state lineage without ambiguity."""
 
     if current is None:
+        if len(update.raw_source_refs) > _MAX_ACTIVE_RAW_SOURCE_REFS:
+            raise BookStateError("active book provenance exceeds 8193 raw source references")
         return update
-    if (
-        current.config_hash is not None
-        and update.config_hash is not None
-        and current.config_hash != update.config_hash
-    ):
-        raise BookStateError("state provenance config hashes conflict")
-    if (
-        current.code_version is not None
-        and update.code_version is not None
-        and current.code_version != update.code_version
-    ):
-        raise BookStateError("state provenance code versions conflict")
-    version_by_key: dict[tuple[type[VersionId], str], VersionId] = {}
-    for version in (*current.reference_version_ids, *update.reference_version_ids):
-        version_by_key[(type(version), version.value)] = version
-    return Provenance(
-        source_ingest_ids=tuple(
-            dict.fromkeys((*current.source_ingest_ids, *update.source_ingest_ids))
-        ),
-        source_payload_hashes=tuple(
-            dict.fromkeys((*current.source_payload_hashes, *update.source_payload_hashes))
-        ),
-        reference_version_ids=tuple(version_by_key.values()),
-        config_hash=update.config_hash or current.config_hash,
-        code_version=update.code_version or current.code_version,
+    sources = (current, update)
+    reference_version_ids, config_hash, code_version = _provenance_metadata(sources)
+    raw_source_refs = _merge_raw_refs(
+        current.raw_source_refs,
+        update.raw_source_refs,
+        enforce_active_bound=True,
+    )
+    return Provenance.from_raw_source_refs(
+        raw_source_refs,
+        reference_version_ids=reference_version_ids,
+        config_hash=config_hash,
+        code_version=code_version,
         attributes=(("lineage", "ordered-state-inputs"),),
     )
 
 
+def _active_provenance(
+    sources: Iterable[Provenance],
+    *,
+    previous: Provenance | None,
+) -> Provenance:
+    """Build bounded provenance from sources that still supply active L2 state.
+
+    Raw references retain their prior relative order while they remain active;
+    newly active references append in canonical level/freshness order.  This
+    avoids history-sized lineage without making serialization order dependent
+    on dictionary insertion details.
+    """
+
+    # Level-source maps deliberately share immutable Provenance instances.
+    # Deduplicate those shared objects by identity so a routine one-level
+    # update does not deep-hash the same provenance once per active level.
+    # Equal-but-distinct objects may remain here, but the paired raw-reference
+    # and metadata merges below normalize them to the identical final value.
+    unique_sources: list[Provenance] = []
+    seen_source_identities: set[int] = set()
+    for source in sources:
+        source_identity = id(source)
+        if source_identity in seen_source_identities:
+            continue
+        seen_source_identities.add(source_identity)
+        unique_sources.append(source)
+    active_sources = tuple(unique_sources)
+    reference_version_ids, config_hash, code_version = _provenance_metadata(active_sources)
+    current_refs = _merge_raw_refs(
+        *(source.raw_source_refs for source in active_sources),
+        enforce_active_bound=True,
+    )
+    if previous is not None:
+        # An ingest identity is immutable for the duration of a state epoch,
+        # even when the level it previously supplied has just been replaced.
+        _merge_raw_refs(
+            previous.raw_source_refs,
+            current_refs,
+            enforce_active_bound=False,
+        )
+    current_by_id = {source.ingest_id: source for source in current_refs}
+    ordered_refs: list[RawSourceRef] = []
+    emitted: set[IngestId] = set()
+    if previous is not None:
+        for source in previous.raw_source_refs:
+            if source.ingest_id in current_by_id:
+                ordered_refs.append(current_by_id[source.ingest_id])
+                emitted.add(source.ingest_id)
+    for source in current_refs:
+        if source.ingest_id not in emitted:
+            ordered_refs.append(source)
+            emitted.add(source.ingest_id)
+    return Provenance.from_raw_source_refs(
+        ordered_refs,
+        reference_version_ids=reference_version_ids,
+        config_hash=config_hash,
+        code_version=code_version,
+        attributes=(("lineage", "active-state-inputs"),),
+    )
+
+
+def _event_provenance(event: CanonicalEvent) -> Provenance:
+    if len(event.source_ingest_ids) > _MAX_RAW_SOURCE_REFS_PER_INPUT:
+        raise BookStateError("event provenance exceeds 4096 raw source references")
+    return Provenance.from_raw_source_refs(
+        event.raw_source_refs,
+        reference_version_ids=event.reference_version_ids,
+        attributes=(("transport", "WEBSOCKET"),),
+    )
+
+
+def _sorted_side(
+    levels: Iterable[CanonicalBookLevel],
+    *,
+    reverse: bool,
+) -> tuple[BookLevel, ...]:
+    canonical_levels = tuple(levels)
+    if len(canonical_levels) > _MAX_LEVELS_PER_SIDE:
+        raise BookStateError("book side exceeds 4096 active levels")
+    result = tuple(
+        sorted(
+            (BookLevel(level.price, level.quantity) for level in canonical_levels),
+            key=lambda level: level.price.value,
+            reverse=reverse,
+        )
+    )
+    if any(left.price == right.price for left, right in pairwise(result)):
+        raise BookStateError("snapshot has duplicate levels")
+    return result
+
+
+def _merge_side(
+    current: tuple[BookLevel, ...],
+    updates: dict[ExactDecimal, Quantity],
+    *,
+    reverse: bool,
+) -> tuple[BookLevel, ...]:
+    """Merge a small update set into one immutable sorted side transactionally."""
+
+    if not updates:
+        return current
+    ordered_updates = sorted(updates.items(), key=lambda item: item[0], reverse=reverse)
+    merged: list[BookLevel] = []
+    current_index = 0
+    update_index = 0
+
+    def precedes(left: ExactDecimal, right: ExactDecimal) -> bool:
+        return left > right if reverse else left < right
+
+    while current_index < len(current) and update_index < len(ordered_updates):
+        current_level = current[current_index]
+        update_price, update_quantity = ordered_updates[update_index]
+        current_price = current_level.price.value
+        if current_price == update_price:
+            if update_quantity.value != ExactDecimal.zero():
+                merged.append(
+                    current_level
+                    if current_level.quantity == update_quantity
+                    else BookLevel(Price(update_price), update_quantity)
+                )
+            current_index += 1
+            update_index += 1
+        elif precedes(current_price, update_price):
+            merged.append(current_level)
+            current_index += 1
+        else:
+            if update_quantity.value != ExactDecimal.zero():
+                merged.append(BookLevel(Price(update_price), update_quantity))
+            update_index += 1
+
+    merged.extend(current[current_index:])
+    for update_price, update_quantity in ordered_updates[update_index:]:
+        if update_quantity.value != ExactDecimal.zero():
+            merged.append(BookLevel(Price(update_price), update_quantity))
+    result = tuple(merged)
+    if len(result) > _MAX_LEVELS_PER_SIDE:
+        raise BookStateError("book side exceeds 4096 active levels")
+    return current if result == current else result
+
+
 class CanonicalL2BookOwner:
-    """The sole mutable owner of one instrument's exact L2 state."""
+    """The sole mutable owner of one instrument's exact L2 state.
+
+    Mutable transitions commit immutable, already-sorted side tuples. Snapshot
+    construction and both diagnostic/economic hashes are cached until a field
+    represented by the corresponding view changes.
+    """
 
     def __init__(self, bundle: ReferenceBundle, instrument_id: InstrumentId) -> None:
         instrument = next(
@@ -86,9 +294,15 @@ class CanonicalL2BookOwner:
         self._generation = 0
         self._health = BookHealth.UNINITIALIZED
         self._reason: InvalidationReason | None = None
-        self._bids: dict[ExactDecimal, Quantity] = {}
-        self._asks: dict[ExactDecimal, Quantity] = {}
+        self._bids: tuple[BookLevel, ...] = ()
+        self._asks: tuple[BookLevel, ...] = ()
+        self._bid_level_provenance: dict[ExactDecimal, Provenance] = {}
+        self._ask_level_provenance: dict[ExactDecimal, Provenance] = {}
+        self._freshness_source_provenance: Provenance | None = None
         self._last_trade_price: Price | None = None
+        self._last_trade_source_event_id: CanonicalEventId | None = None
+        self._last_trade_source_provenance: Provenance | None = None
+        self._last_trade_venue_timestamp: UtcTimestamp | None = None
         self._last_source_event_id: CanonicalEventId | None = None
         self._last_source_provenance: Provenance | None = None
         self._state_source_provenance: Provenance | None = None
@@ -101,63 +315,148 @@ class CanonicalL2BookOwner:
         self._minimum_order_size = bundle.precision.minimum_order_size
         self._neg_risk = bundle.market.neg_risk
         self._precision_verified = bundle.precision.status is ReferenceStatus.VERIFIED
+        self._snapshot_cache: ImmutableOrderBookSnapshot | None = None
+        self._content_hash_cache: str | None = None
+        self._economic_hash_cache: str | None = None
 
     @property
     def instrument_id(self) -> InstrumentId:
         return self._instrument_id
 
     @property
+    def market_id(self) -> MarketId:
+        return self._market_id
+
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    @property
     def health(self) -> BookHealth:
         return self._health
 
-    def mark_syncing(self) -> None:
+    @staticmethod
+    def _baseline_level_provenance(
+        levels: tuple[BookLevel, ...], source: Provenance
+    ) -> dict[ExactDecimal, Provenance]:
+        return {level.price.value: source for level in levels}
+
+    def _compose_active_state_provenance(
+        self,
+        *,
+        bids: tuple[BookLevel, ...],
+        asks: tuple[BookLevel, ...],
+        bid_sources: dict[ExactDecimal, Provenance],
+        ask_sources: dict[ExactDecimal, Provenance],
+        freshness_source: Provenance,
+    ) -> Provenance:
+        if len(bid_sources) != len(bids) or len(ask_sources) != len(asks):
+            raise BookStateError("level provenance does not match active book state")
+        # These maps are private and are transactionally updated from the same
+        # price deltas as the immutable sides. Equal cardinality therefore
+        # proves one source per active level; values avoid re-hashing every
+        # ExactDecimal key on every single-level update.
+        sources = tuple(bid_sources.values()) + tuple(ask_sources.values())
+        return _active_provenance(
+            (*sources, freshness_source),
+            previous=self._state_source_provenance,
+        )
+
+    def _mutation(self, kinds: BookMutationKind) -> BookMutation:
+        if kinds != BookMutationKind.NONE:
+            self._snapshot_cache = None
+            self._content_hash_cache = None
+            if kinds != BookMutationKind.LAST_TRADE_DIAGNOSTIC:
+                self._economic_hash_cache = None
+        return BookMutation(
+            instrument_id=self._instrument_id,
+            market_id=self._market_id,
+            kinds=kinds,
+        )
+
+    def _invalid_state_kinds(self, reason: InvalidationReason) -> BookMutationKind:
+        if self._health is BookHealth.CLOSED:
+            return BookMutationKind.NONE
+        kinds = BookMutationKind.NONE
+        if self._bids or self._asks:
+            kinds |= BookMutationKind.LEVELS
+        if self._last_valid_update_time is not None:
+            kinds |= BookMutationKind.FRESHNESS
+        if self._health is not BookHealth.INVALID or self._reason is not reason:
+            kinds |= BookMutationKind.HEALTH
+        self._health = BookHealth.INVALID
+        self._reason = reason
+        self._bids = ()
+        self._asks = ()
+        self._bid_level_provenance = {}
+        self._ask_level_provenance = {}
+        self._freshness_source_provenance = None
+        self._last_valid_update_time = None
+        return kinds
+
+    def mark_syncing(self) -> BookMutation:
         if self._health not in {BookHealth.UNINITIALIZED, BookHealth.RESYNCING}:
             raise BookStateError(f"cannot enter SYNCING from {self._health.value}")
         self._health = BookHealth.SYNCING
         self._reason = None
+        return self._mutation(BookMutationKind.HEALTH)
 
-    def invalidate(self, reason: InvalidationReason) -> None:
-        if self._health is BookHealth.CLOSED:
-            return
-        self._health = BookHealth.INVALID
-        self._reason = reason
-        self._bids.clear()
-        self._asks.clear()
-        self._last_valid_update_time = None
+    def invalidate(self, reason: InvalidationReason) -> BookMutation:
+        return self._mutation(self._invalid_state_kinds(reason))
 
-    def begin_resync(self) -> None:
+    def begin_resync(self) -> BookMutation:
         if self._health not in {
             BookHealth.INVALID,
             BookHealth.STALE,
             BookHealth.UNAVAILABLE,
         }:
             raise BookStateError(f"cannot enter RESYNCING from {self._health.value}")
+        kinds = BookMutationKind.HEALTH
+        if self._bids or self._asks:
+            kinds |= BookMutationKind.LEVELS
+        if self._last_valid_update_time is not None:
+            kinds |= BookMutationKind.FRESHNESS
         self._health = BookHealth.RESYNCING
         self._reason = None
-        self._bids.clear()
-        self._asks.clear()
+        self._bids = ()
+        self._asks = ()
+        self._bid_level_provenance = {}
+        self._ask_level_provenance = {}
+        self._freshness_source_provenance = None
         self._last_valid_update_time = None
+        return self._mutation(kinds)
 
-    def on_disconnect(self) -> None:
-        self.invalidate(InvalidationReason.DISCONNECT)
+    def on_disconnect(self) -> BookMutation:
+        return self.invalidate(InvalidationReason.DISCONNECT)
 
-    def on_parser_error(self) -> None:
-        self.invalidate(InvalidationReason.SCHEMA_VIOLATION)
+    def on_parser_error(self) -> BookMutation:
+        return self.invalidate(InvalidationReason.SCHEMA_VIOLATION)
 
-    def on_backpressure_loss(self) -> None:
-        self.invalidate(InvalidationReason.BACKPRESSURE_DATA_LOSS)
+    def on_backpressure_loss(self) -> BookMutation:
+        return self.invalidate(InvalidationReason.BACKPRESSURE_DATA_LOSS)
 
-    def mark_stale(self) -> None:
-        if self._health is BookHealth.HEALTHY:
-            self._health = BookHealth.STALE
-            self._reason = None
+    def mark_stale(self) -> BookMutation:
+        if self._health is not BookHealth.HEALTHY:
+            return self._mutation(BookMutationKind.NONE)
+        self._health = BookHealth.STALE
+        self._reason = None
+        return self._mutation(BookMutationKind.HEALTH)
 
-    def apply_reference_bundle(self, bundle: ReferenceBundle) -> None:
+    def apply_reference_bundle(self, bundle: ReferenceBundle) -> BookMutation:
         if bundle.market.market_id != self._market_id:
             raise BookStateError("reference bundle belongs to another market")
         if not any(item.instrument_id == self._instrument_id for item in bundle.instruments):
             self.invalidate(InvalidationReason.UNKNOWN_REFERENCE_DATA)
             raise BookStateError("updated reference bundle no longer contains this instrument")
+        previous = (
+            self._market_version_id,
+            self._precision_version_id,
+            self._cost_version_id,
+            self._tick_size,
+            self._minimum_order_size,
+            self._neg_risk,
+            self._precision_verified,
+        )
         precision_changed = bundle.precision.version_id != self._precision_version_id
         self._market_version_id = bundle.market.version_id
         self._precision_version_id = bundle.precision.version_id
@@ -166,122 +465,218 @@ class CanonicalL2BookOwner:
         self._minimum_order_size = bundle.precision.minimum_order_size
         self._neg_risk = bundle.market.neg_risk
         self._precision_verified = bundle.precision.status is ReferenceStatus.VERIFIED
+        current = (
+            self._market_version_id,
+            self._precision_version_id,
+            self._cost_version_id,
+            self._tick_size,
+            self._minimum_order_size,
+            self._neg_risk,
+            self._precision_verified,
+        )
+        kinds = BookMutationKind.REFERENCE if current != previous else BookMutationKind.NONE
         if precision_changed and self._health is BookHealth.HEALTHY:
-            self.invalidate(InvalidationReason.UNKNOWN_PRECISION)
+            kinds |= self._invalid_state_kinds(InvalidationReason.UNKNOWN_PRECISION)
+        return self._mutation(kinds)
 
-    def apply_event(self, event: CanonicalEvent) -> None:
+    def apply_event(self, event: CanonicalEvent) -> BookMutation:
         if event.event_type is CanonicalEventType.NEW_MARKET:
-            return
+            return self._mutation(BookMutationKind.NONE)
         if event.market_id != self._market_id:
             raise BookStateError("canonical event belongs to another market")
         payload = event.payload
-        provenance = Provenance(
-            source_ingest_ids=event.source_ingest_ids,
-            source_payload_hashes=event.source_payload_hashes,
-            reference_version_ids=event.reference_version_ids,
-            attributes=(("transport", "WEBSOCKET"),),
-        )
         if isinstance(payload, MarketResolvedEvent):
+            try:
+                provenance = _event_provenance(event)
+                _require_raw_source_compatibility(self._state_source_provenance, provenance)
+            except BookStateError:
+                self.invalidate(InvalidationReason.PROTOCOL_VIOLATION)
+                raise
+            previous = (
+                self._health,
+                self._reason,
+                self._bids,
+                self._asks,
+                self._last_valid_update_time,
+                self._last_source_event_id,
+                self._last_source_provenance,
+                self._state_source_provenance,
+                self._last_venue_timestamp,
+            )
+            levels_changed = bool(self._bids or self._asks)
             self._health = BookHealth.CLOSED
             self._reason = InvalidationReason.MARKET_RESOLVED_REFERENCE_REFRESH
-            self._bids.clear()
-            self._asks.clear()
+            self._bids = ()
+            self._asks = ()
+            self._bid_level_provenance = {}
+            self._ask_level_provenance = {}
+            self._freshness_source_provenance = None
             self._last_valid_update_time = None
             self._last_source_event_id = event.canonical_event_id
             self._last_source_provenance = provenance
             self._state_source_provenance = provenance
             self._last_venue_timestamp = event.venue_timestamp
-            return
+            current = (
+                self._health,
+                self._reason,
+                self._bids,
+                self._asks,
+                self._last_valid_update_time,
+                self._last_source_event_id,
+                self._last_source_provenance,
+                self._state_source_provenance,
+                self._last_venue_timestamp,
+            )
+            kinds = BookMutationKind.NONE
+            if current[:2] != previous[:2]:
+                kinds |= BookMutationKind.HEALTH
+            if levels_changed:
+                kinds |= BookMutationKind.LEVELS
+            if previous[4] is not None:
+                kinds |= BookMutationKind.FRESHNESS
+            if current[5:] != previous[5:]:
+                kinds |= BookMutationKind.PROVENANCE
+            return self._mutation(kinds)
         if event.instrument_id != self._instrument_id:
             raise BookStateError("canonical event belongs to another instrument")
         if isinstance(payload, OrderBookSnapshotEvent):
-            self.apply_snapshot(payload, event=event)
-        elif isinstance(payload, PriceChangeEvent):
-            self.apply_price_change(payload, event=event)
-        elif isinstance(payload, TickSizeChangeEvent):
-            self.apply_tick_size_change(payload, event=event)
-        elif isinstance(payload, LastTradePriceEvent):
-            self._last_trade_price = payload.price
-            self._last_source_event_id = event.canonical_event_id
-            self._last_source_provenance = provenance
-            self._state_source_provenance = _merge_provenance(
-                self._state_source_provenance, provenance
+            return self.apply_snapshot(payload, event=event)
+        if isinstance(payload, PriceChangeEvent):
+            return self.apply_price_change(payload, event=event)
+        if isinstance(payload, TickSizeChangeEvent):
+            return self.apply_tick_size_change(payload, event=event)
+        if isinstance(payload, LastTradePriceEvent):
+            provenance = _event_provenance(event)
+            previous = (
+                self._last_trade_price,
+                self._last_trade_source_event_id,
+                self._last_trade_source_provenance,
+                self._last_trade_venue_timestamp,
             )
-            self._last_venue_timestamp = event.venue_timestamp
+            self._last_trade_price = payload.price
+            self._last_trade_source_event_id = event.canonical_event_id
+            self._last_trade_source_provenance = provenance
+            self._last_trade_venue_timestamp = event.venue_timestamp
+            current = (
+                self._last_trade_price,
+                self._last_trade_source_event_id,
+                self._last_trade_source_provenance,
+                self._last_trade_venue_timestamp,
+            )
+            return self._mutation(
+                BookMutationKind.LAST_TRADE_DIAGNOSTIC
+                if current != previous
+                else BookMutationKind.NONE
+            )
+        return self._mutation(BookMutationKind.NONE)
 
     def _validate_level(self, level: CanonicalBookLevel) -> None:
         if level.price.value > ExactDecimal.one():
             raise BookStateError("prediction-market price exceeds one")
         if not self._precision_verified or self._tick_size is None:
             raise BookStateError("current precision reference is not verified")
-        if not _aligned_to_tick(level.price.value, self._tick_size):
+        if not level.price.value.is_integral_multiple_of(self._tick_size):
             raise BookStateError("book price is not aligned to the current tick")
 
     @staticmethod
-    def _crossed(bids: dict[ExactDecimal, Quantity], asks: dict[ExactDecimal, Quantity]) -> bool:
-        return bool(bids and asks and max(bids) >= min(asks))
+    def _crossed(bids: tuple[BookLevel, ...], asks: tuple[BookLevel, ...]) -> bool:
+        return bool(bids and asks and bids[0].price.value >= asks[0].price.value)
 
-    def apply_snapshot(self, payload: OrderBookSnapshotEvent, *, event: CanonicalEvent) -> None:
+    def _validated_sides(
+        self,
+        bids: Iterable[CanonicalBookLevel],
+        asks: Iterable[CanonicalBookLevel],
+    ) -> tuple[tuple[BookLevel, ...], tuple[BookLevel, ...]]:
+        bid_levels = tuple(bids)
+        ask_levels = tuple(asks)
+        if len(bid_levels) > _MAX_LEVELS_PER_SIDE or len(ask_levels) > _MAX_LEVELS_PER_SIDE:
+            self.invalidate(InvalidationReason.PROTOCOL_VIOLATION)
+            raise BookStateError("book side exceeds 4096 active levels")
+        for level in (*bid_levels, *ask_levels):
+            self._validate_level(level)
+        try:
+            sorted_bids = _sorted_side(bid_levels, reverse=True)
+            sorted_asks = _sorted_side(ask_levels, reverse=False)
+        except BookStateError:
+            self.invalidate(InvalidationReason.PROTOCOL_VIOLATION)
+            raise
+        if self._crossed(sorted_bids, sorted_asks):
+            self.invalidate(InvalidationReason.IMPOSSIBLE_STATE)
+            raise BookStateError("snapshot is crossed")
+        return sorted_bids, sorted_asks
+
+    def apply_snapshot(
+        self, payload: OrderBookSnapshotEvent, *, event: CanonicalEvent
+    ) -> BookMutation:
         if payload.instrument_id != self._instrument_id:
             raise BookStateError("snapshot belongs to another instrument")
         try:
-            for level in (*payload.bids, *payload.asks):
-                self._validate_level(level)
-            bids = {level.price.value: level.quantity for level in payload.bids}
-            asks = {level.price.value: level.quantity for level in payload.asks}
+            bids, asks = self._validated_sides(payload.bids, payload.asks)
         except BookStateError:
-            self.invalidate(InvalidationReason.UNKNOWN_PRECISION)
+            if self._health is not BookHealth.INVALID:
+                self.invalidate(InvalidationReason.UNKNOWN_PRECISION)
             raise
-        if len(bids) != len(payload.bids) or len(asks) != len(payload.asks):
+        try:
+            source_provenance = _event_provenance(event)
+            _require_raw_source_compatibility(self._state_source_provenance, source_provenance)
+        except BookStateError:
             self.invalidate(InvalidationReason.PROTOCOL_VIOLATION)
-            raise BookStateError("snapshot has duplicate levels")
-        if self._crossed(bids, asks):
-            self.invalidate(InvalidationReason.IMPOSSIBLE_STATE)
-            raise BookStateError("snapshot is crossed")
-        # Full snapshots replace state; wire array ordering never affects storage.
+            raise
+        bid_sources = self._baseline_level_provenance(bids, source_provenance)
+        ask_sources = self._baseline_level_provenance(asks, source_provenance)
         self._bids = bids
         self._asks = asks
+        self._bid_level_provenance = bid_sources
+        self._ask_level_provenance = ask_sources
+        self._freshness_source_provenance = source_provenance
         self._generation += 1
         self._health = BookHealth.HEALTHY
         self._reason = None
         self._last_source_event_id = event.canonical_event_id
-        source_provenance = Provenance(
-            source_ingest_ids=event.source_ingest_ids,
-            source_payload_hashes=event.source_payload_hashes,
-            reference_version_ids=event.reference_version_ids,
-            attributes=(("transport", "WEBSOCKET"),),
-        )
         self._last_source_provenance = source_provenance
-        # A full snapshot replaces every level, so it establishes a new exact
-        # lineage baseline rather than inheriting obsolete deltas.
         self._state_source_provenance = source_provenance
         self._last_valid_update_time = event.receive_timestamp
         self._last_venue_timestamp = event.venue_timestamp
+        return self._mutation(
+            BookMutationKind.LEVELS
+            | BookMutationKind.FRESHNESS
+            | BookMutationKind.HEALTH
+            | BookMutationKind.PROVENANCE
+        )
 
-    def apply_price_change(self, payload: PriceChangeEvent, *, event: CanonicalEvent) -> None:
+    def apply_price_change(
+        self, payload: PriceChangeEvent, *, event: CanonicalEvent
+    ) -> BookMutation:
         if self._health is not BookHealth.HEALTHY:
             raise BookStateError("price change requires a healthy snapshot baseline")
-        bids = dict(self._bids)
-        asks = dict(self._asks)
-        try:
-            for change in payload.changes:
+        bid_updates: dict[ExactDecimal, Quantity] = {}
+        ask_updates: dict[ExactDecimal, Quantity] = {}
+        for change in payload.changes:
+            try:
                 level = CanonicalBookLevel(change.price, change.new_quantity)
                 self._validate_level(level)
-                target = bids if change.side is BookSide.BID else asks
-                # Documented price_change size is the new aggregate level size.
-                if change.new_quantity.value == ExactDecimal.zero():
-                    target.pop(change.price.value, None)
-                else:
-                    target[change.price.value] = change.new_quantity
+            except BookStateError:
+                self.invalidate(InvalidationReason.UNKNOWN_PRECISION)
+                raise
+            target = bid_updates if change.side is BookSide.BID else ask_updates
+            if change.price.value not in target and len(target) >= _MAX_LEVELS_PER_SIDE:
+                self.invalidate(InvalidationReason.PROTOCOL_VIOLATION)
+                raise BookStateError(
+                    "price change contains more than 4096 distinct updates on one side"
+                )
+            target[change.price.value] = change.new_quantity
+        try:
+            bids = _merge_side(self._bids, bid_updates, reverse=True)
+            asks = _merge_side(self._asks, ask_updates, reverse=False)
         except BookStateError:
-            self.invalidate(InvalidationReason.UNKNOWN_PRECISION)
+            self.invalidate(InvalidationReason.PROTOCOL_VIOLATION)
             raise
         if self._crossed(bids, asks):
             self.invalidate(InvalidationReason.IMPOSSIBLE_STATE)
             raise BookStateError("price change creates a crossed book")
         last_change = payload.changes[-1]
-        derived_best_bid = None if not bids else Price(max(bids))
-        derived_best_ask = None if not asks else Price(min(asks))
+        derived_best_bid = None if not bids else bids[0].price
+        derived_best_ask = None if not asks else asks[0].price
         if (
             last_change.reported_best_bid is not None
             and last_change.reported_best_bid != derived_best_bid
@@ -291,50 +686,92 @@ class CanonicalL2BookOwner:
         ):
             self.invalidate(InvalidationReason.PROTOCOL_VIOLATION)
             raise BookStateError("reported best bid/ask disagrees with derived exact state")
+
+        try:
+            source_provenance = _event_provenance(event)
+            bid_sources = self._bid_level_provenance.copy()
+            ask_sources = self._ask_level_provenance.copy()
+            current_bids = {level.price.value: level.quantity for level in self._bids}
+            current_asks = {level.price.value: level.quantity for level in self._asks}
+            for price, quantity in bid_updates.items():
+                if quantity.value == ExactDecimal.zero():
+                    bid_sources.pop(price, None)
+                elif current_bids.get(price) != quantity:
+                    bid_sources[price] = source_provenance
+            for price, quantity in ask_updates.items():
+                if quantity.value == ExactDecimal.zero():
+                    ask_sources.pop(price, None)
+                elif current_asks.get(price) != quantity:
+                    ask_sources[price] = source_provenance
+            state_provenance = self._compose_active_state_provenance(
+                bids=bids,
+                asks=asks,
+                bid_sources=bid_sources,
+                ask_sources=ask_sources,
+                freshness_source=source_provenance,
+            )
+        except BookStateError:
+            self.invalidate(InvalidationReason.PROTOCOL_VIOLATION)
+            raise
+        previous_evidence = (
+            self._last_source_event_id,
+            self._last_source_provenance,
+            self._state_source_provenance,
+            self._last_valid_update_time,
+            self._last_venue_timestamp,
+        )
+        kinds = BookMutationKind.NONE
+        if bids is not self._bids or asks is not self._asks:
+            kinds |= BookMutationKind.LEVELS
         self._bids = bids
         self._asks = asks
+        self._bid_level_provenance = bid_sources
+        self._ask_level_provenance = ask_sources
+        self._freshness_source_provenance = source_provenance
         self._last_source_event_id = event.canonical_event_id
-        source_provenance = Provenance(
-            source_ingest_ids=event.source_ingest_ids,
-            source_payload_hashes=event.source_payload_hashes,
-            reference_version_ids=event.reference_version_ids,
-            attributes=(("transport", "WEBSOCKET"),),
-        )
         self._last_source_provenance = source_provenance
-        self._state_source_provenance = _merge_provenance(
-            self._state_source_provenance, source_provenance
-        )
+        self._state_source_provenance = state_provenance
         self._last_valid_update_time = event.receive_timestamp
         self._last_venue_timestamp = event.venue_timestamp
+        current_evidence = (
+            self._last_source_event_id,
+            self._last_source_provenance,
+            self._state_source_provenance,
+            self._last_valid_update_time,
+            self._last_venue_timestamp,
+        )
+        if current_evidence != previous_evidence:
+            kinds |= BookMutationKind.FRESHNESS | BookMutationKind.PROVENANCE
+        return self._mutation(kinds)
 
     def apply_tick_size_change(
         self, payload: TickSizeChangeEvent, *, event: CanonicalEvent
-    ) -> None:
+    ) -> BookMutation:
         if payload.previous_precision_rule_version_id != self._precision_version_id:
             self.invalidate(InvalidationReason.UNKNOWN_REFERENCE_DATA)
             raise BookStateError("tick event previous precision version does not match owner")
         if self._tick_size is None or payload.old_tick_size != self._tick_size:
             self.invalidate(InvalidationReason.PROTOCOL_VIOLATION)
             raise BookStateError("tick event old tick does not match current reference")
+        try:
+            source_provenance = _event_provenance(event)
+            state_provenance = _merge_provenance(self._state_source_provenance, source_provenance)
+        except BookStateError:
+            self.invalidate(InvalidationReason.PROTOCOL_VIOLATION)
+            raise
         self._precision_version_id = payload.new_precision_rule_version_id
         self._tick_size = payload.new_tick_size
         self._precision_verified = payload.cross_source_confirmed
         self._last_source_event_id = event.canonical_event_id
-        source_provenance = Provenance(
-            source_ingest_ids=event.source_ingest_ids,
-            source_payload_hashes=event.source_payload_hashes,
-            reference_version_ids=event.reference_version_ids,
-            attributes=(("transport", "WEBSOCKET"),),
-        )
         self._last_source_provenance = source_provenance
-        self._state_source_provenance = _merge_provenance(
-            self._state_source_provenance, source_provenance
-        )
+        self._state_source_provenance = state_provenance
         self._last_venue_timestamp = event.venue_timestamp
+        kinds = BookMutationKind.REFERENCE | BookMutationKind.PROVENANCE
         if not payload.cross_source_confirmed:
-            self.invalidate(InvalidationReason.UNKNOWN_PRECISION)
+            kinds |= self._invalid_state_kinds(InvalidationReason.UNKNOWN_PRECISION)
+        return self._mutation(kinds)
 
-    def apply_rest_snapshot(self, rest: NormalizedRestBook) -> None:
+    def apply_rest_snapshot(self, rest: NormalizedRestBook) -> BookMutation:
         """Initialize/resynchronize from a provenance-bearing public REST snapshot."""
 
         if self._health is BookHealth.CLOSED:
@@ -357,21 +794,24 @@ class CanonicalL2BookOwner:
             self.invalidate(InvalidationReason.UNKNOWN_REFERENCE_DATA)
             raise BookStateError("REST snapshot minimum order size or neg-risk reference differs")
         try:
-            for level in (*rest.bids, *rest.asks):
-                self._validate_level(level)
-            bids = {level.price.value: level.quantity for level in rest.bids}
-            asks = {level.price.value: level.quantity for level in rest.asks}
+            bids, asks = self._validated_sides(rest.bids, rest.asks)
         except BookStateError:
-            self.invalidate(InvalidationReason.UNKNOWN_PRECISION)
+            if self._health is not BookHealth.INVALID:
+                self.invalidate(InvalidationReason.UNKNOWN_PRECISION)
             raise
-        if len(bids) != len(rest.bids) or len(asks) != len(rest.asks):
+        try:
+            _require_provenance_bound(rest.provenance, label="REST snapshot provenance")
+            _require_raw_source_compatibility(self._state_source_provenance, rest.provenance)
+        except BookStateError:
             self.invalidate(InvalidationReason.PROTOCOL_VIOLATION)
-            raise BookStateError("REST snapshot has duplicate levels")
-        if self._crossed(bids, asks):
-            self.invalidate(InvalidationReason.IMPOSSIBLE_STATE)
-            raise BookStateError("REST snapshot is crossed")
+            raise
+        bid_sources = self._baseline_level_provenance(bids, rest.provenance)
+        ask_sources = self._baseline_level_provenance(asks, rest.provenance)
         self._bids = bids
         self._asks = asks
+        self._bid_level_provenance = bid_sources
+        self._ask_level_provenance = ask_sources
+        self._freshness_source_provenance = rest.provenance
         self._generation += 1
         self._health = BookHealth.HEALTHY
         self._reason = None
@@ -379,74 +819,103 @@ class CanonicalL2BookOwner:
         self._last_source_provenance = rest.provenance
         self._state_source_provenance = rest.provenance
         self._last_valid_update_time = rest.received_at
-        # REST timestamp units are undocumented, so no venue timestamp is fabricated.
         self._last_venue_timestamp = None
+        return self._mutation(
+            BookMutationKind.LEVELS
+            | BookMutationKind.FRESHNESS
+            | BookMutationKind.HEALTH
+            | BookMutationKind.PROVENANCE
+        )
 
     def audit_rest_snapshot(
         self, rest: NormalizedRestBook, *, checked_at: UtcTimestamp
     ) -> RestBookAuditResult:
+        no_mutation = self._mutation(BookMutationKind.NONE)
         if rest.instrument_id != self._instrument_id or rest.market_id != self._market_id:
             return RestBookAuditResult(
                 status=RestAuditStatus.NOT_COMPARABLE,
                 checked_at=checked_at,
                 reason="REST snapshot identifies a different instrument or market",
+                mutation=no_mutation,
             )
         if self._health is not BookHealth.HEALTHY:
             return RestBookAuditResult(
                 status=RestAuditStatus.NOT_COMPARABLE,
                 checked_at=checked_at,
                 reason="local book is not healthy",
+                mutation=no_mutation,
             )
-        local = self.snapshot()
-        rest_bids = tuple(BookLevel(level.price, level.quantity) for level in rest.bids)
-        rest_asks = tuple(BookLevel(level.price, level.quantity) for level in rest.asks)
-        # Venue hashes remain opaque.  Audit compares normalized exact levels and
-        # reference scalars, never undocumented hash/checksum equality.
+        try:
+            _require_provenance_bound(rest.provenance, label="REST audit provenance")
+            _require_raw_source_compatibility(self._state_source_provenance, rest.provenance)
+            rest_bids = _sorted_side(rest.bids, reverse=True)
+            rest_asks = _sorted_side(rest.asks, reverse=False)
+        except BookStateError:
+            self.invalidate(InvalidationReason.PROTOCOL_VIOLATION)
+            raise
         matches = (
-            local.bids == rest_bids
-            and local.asks == rest_asks
+            self._bids == rest_bids
+            and self._asks == rest_asks
             and self._tick_size == rest.tick_size
             and self._minimum_order_size == rest.minimum_order_size
             and self._neg_risk == rest.neg_risk
         )
+        kinds = BookMutationKind.PROVENANCE
+        if matches:
+            # A matching REST image is a new complete, authoritative baseline.
+            # It therefore replaces (rather than appends to) the accumulated
+            # delta lineage, bounding provenance growth between integrity audits.
+            bid_sources = self._baseline_level_provenance(self._bids, rest.provenance)
+            ask_sources = self._baseline_level_provenance(self._asks, rest.provenance)
+            self._last_source_event_id = None
+            self._last_source_provenance = rest.provenance
+            self._state_source_provenance = rest.provenance
+            self._bid_level_provenance = bid_sources
+            self._ask_level_provenance = ask_sources
+            self._freshness_source_provenance = rest.provenance
+            self._last_valid_update_time = checked_at
+            kinds |= BookMutationKind.FRESHNESS
+            mutation = self._mutation(kinds)
+            return RestBookAuditResult(
+                status=RestAuditStatus.MATCH,
+                checked_at=checked_at,
+                reason=None,
+                mutation=mutation,
+            )
+        try:
+            diagnostic_provenance = _merge_provenance(
+                self._state_source_provenance,
+                rest.provenance,
+            )
+        except BookStateError:
+            self.invalidate(InvalidationReason.PROTOCOL_VIOLATION)
+            raise
         self._last_source_event_id = None
         self._last_source_provenance = rest.provenance
-        self._state_source_provenance = _merge_provenance(
-            self._state_source_provenance, rest.provenance
-        )
-        if matches:
-            # An exact public REST comparison re-establishes freshness at the
-            # audit receive boundary without pretending the opaque venue hash
-            # is a checksum or changing the book generation.
-            self._last_valid_update_time = checked_at
-            return RestBookAuditResult(
-                status=RestAuditStatus.MATCH, checked_at=checked_at, reason=None
-            )
-        self.invalidate(InvalidationReason.REST_AUDIT_MISMATCH)
+        self._state_source_provenance = diagnostic_provenance
+        kinds |= self._invalid_state_kinds(InvalidationReason.REST_AUDIT_MISMATCH)
+        mutation = self._mutation(kinds)
         return RestBookAuditResult(
             status=RestAuditStatus.MISMATCH,
             checked_at=checked_at,
             reason="normalized REST levels or reference scalars differ from local state",
+            mutation=mutation,
         )
 
     def snapshot(self) -> ImmutableOrderBookSnapshot:
-        bids = tuple(
-            BookLevel(Price(price), quantity)
-            for price, quantity in sorted(self._bids.items(), reverse=True)
-        )
-        asks = tuple(
-            BookLevel(Price(price), quantity) for price, quantity in sorted(self._asks.items())
-        )
-        return ImmutableOrderBookSnapshot(
+        cached = self._snapshot_cache
+        if cached is not None:
+            return cached
+        snapshot = ImmutableOrderBookSnapshot(
             instrument_id=self._instrument_id,
             market_id=self._market_id,
             generation=self._generation,
             health=self._health,
             invalidation_reason=self._reason,
-            bids=bids,
-            asks=asks,
-            best_bid=None if not bids else bids[0],
-            best_ask=None if not asks else asks[0],
+            bids=self._bids,
+            asks=self._asks,
+            best_bid=None if not self._bids else self._bids[0],
+            best_ask=None if not self._asks else self._asks[0],
             last_trade_price=self._last_trade_price,
             last_source_event_id=self._last_source_event_id,
             last_source_provenance=self._last_source_provenance,
@@ -456,7 +925,29 @@ class CanonicalL2BookOwner:
             cost_rule_set_version_id=self._cost_version_id,
             last_valid_update_time=self._last_valid_update_time,
             last_venue_timestamp=self._last_venue_timestamp,
+            last_trade_source_event_id=self._last_trade_source_event_id,
+            last_trade_source_provenance=self._last_trade_source_provenance,
+            last_trade_venue_timestamp=self._last_trade_venue_timestamp,
         )
+        self._snapshot_cache = snapshot
+        return snapshot
+
+    def content_sha256(self) -> str:
+        cached = self._content_hash_cache
+        if cached is None:
+            cached = self.snapshot().content_sha256()
+            self._content_hash_cache = cached
+        return cached
+
+    def economic_content_sha256(self) -> str:
+        cached = self._economic_hash_cache
+        if cached is None:
+            cached = self.snapshot().economic_content_sha256()
+            self._economic_hash_cache = cached
+        return cached
+
+    def snapshot_with_economic_hash(self) -> tuple[ImmutableOrderBookSnapshot, str]:
+        return self.snapshot(), self.economic_content_sha256()
 
     def is_fresh(self, now: UtcTimestamp, *, max_age_ns: int) -> bool:
         return self.snapshot().is_fresh(now, max_age_ns=max_age_ns)

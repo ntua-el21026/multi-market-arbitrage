@@ -27,7 +27,7 @@ from .reader import (
     verify_sealed_segment,
 )
 from .recovery import recover_partial_file, recover_partial_segments
-from .writer import RawJournalWriter
+from .writer import JournalTicket, RawJournalWriter
 
 __all__ = [
     "ABSOLUTE_MAX_UNCOMPRESSED_SEGMENT_BYTES",
@@ -43,6 +43,7 @@ __all__ = [
     "JournalReader",
     "JournalReceipt",
     "JournalRecoveryError",
+    "JournalTicket",
     "JournalWriteError",
     "JournalWriterConfig",
     "RawJournalWriter",

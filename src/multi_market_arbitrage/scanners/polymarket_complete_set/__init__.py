@@ -12,6 +12,7 @@ from .scanner import (
     CompleteSetScanResult,
     DepthFill,
     LegEconomics,
+    PolymarketCompleteSetReferenceScanner,
     PolymarketCompleteSetScanner,
     ScanDisposition,
 )
@@ -25,6 +26,7 @@ __all__ = [
     "LegEconomics",
     "OpportunityLifecycle",
     "OpportunityLifecycleTracker",
+    "PolymarketCompleteSetReferenceScanner",
     "PolymarketCompleteSetScanner",
     "ScanDisposition",
     "complete_set_lifecycle_id",

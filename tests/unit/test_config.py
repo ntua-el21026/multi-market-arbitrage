@@ -30,6 +30,8 @@ def test_committed_phase1_configuration_loads_strictly() -> None:
     assert config.scanner.maximum_capacity_evaluations == 4096
     assert config.storage.journal_segment_max_uncompressed_bytes == 64 * 1024 * 1024
     assert config.storage.journal_run_max_uncompressed_bytes == 4 * 1024 * 1024 * 1024
+    assert config.storage.analytical_record_max_bytes == 8 * 1024 * 1024
+    assert config.storage.analytical_buffer_max_bytes == 64 * 1024 * 1024
     assert len(config.config_hash.value) == 64
 
 
@@ -129,12 +131,23 @@ def test_public_payload_limits_are_hard_bounded(field: str, value: int) -> None:
     [
         ("journal_segment_max_uncompressed_bytes", 512 * 1024 * 1024 + 1),
         ("journal_run_max_uncompressed_bytes", 32 * 1024 * 1024),
+        ("journal_run_max_uncompressed_bytes", 4 * 1024 * 1024 * 1024 + 1),
     ],
 )
 def test_journal_byte_limits_are_hard_bounded(field: str, value: int) -> None:
     raw = _raw_config()
     storage = _section(raw, "storage")
     storage[field] = value
+    raw["storage"] = storage
+    with pytest.raises(ValidationError):
+        Phase1Config.from_mapping(raw)
+
+
+def test_analytical_record_limit_cannot_exceed_buffer_limit() -> None:
+    raw = _raw_config()
+    storage = _section(raw, "storage")
+    storage["analytical_record_max_bytes"] = 2_048
+    storage["analytical_buffer_max_bytes"] = 1_024
     raw["storage"] = storage
     with pytest.raises(ValidationError):
         Phase1Config.from_mapping(raw)

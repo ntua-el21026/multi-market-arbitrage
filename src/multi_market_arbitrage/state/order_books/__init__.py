@@ -3,6 +3,8 @@
 from .models import (
     BookHealth,
     BookLevel,
+    BookMutation,
+    BookMutationKind,
     ImmutableOrderBookSnapshot,
     InvalidationReason,
     RestAuditStatus,
@@ -13,6 +15,8 @@ from .owner import BookStateError, CanonicalL2BookOwner
 __all__ = [
     "BookHealth",
     "BookLevel",
+    "BookMutation",
+    "BookMutationKind",
     "BookStateError",
     "CanonicalL2BookOwner",
     "ImmutableOrderBookSnapshot",

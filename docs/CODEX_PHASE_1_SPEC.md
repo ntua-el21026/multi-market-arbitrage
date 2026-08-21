@@ -53,20 +53,34 @@ If current normative documents conflict, stop and report the conflict. Do not in
 
 ## 3. Python/toolchain baseline
 
-Target Python **3.13.x** for Phase 1 unless a dependency compatibility check establishes a reason to change it.
+Target exactly **ordinary-GIL CPython 3.14.7** for the reproducible Phase 1
+runtime. A free-threaded build is unsupported. Package metadata permits
+`>=3.14.7,<3.15`, but a later 3.14 patch release is not the accepted runtime
+until it passes the same compatibility, correctness, replay, and benchmark
+evidence gate.
 
 Use:
-- `uv`;
+
+- `uv==0.12.5`;
 - Ruff;
 - strict Pyright;
 - pytest;
 - Hypothesis;
 - pre-commit;
+- pinned `pip-audit` over a frozen PEP 751 lock export;
 - GitHub Actions.
 
-Commit lock/config files.
+Disallow pre-releases. Pin every direct build/runtime/development/security
+dependency exactly and commit `uv.lock` and configuration files. “Latest stable
+compatible” is evaluated deliberately on a dated official-source review; it is
+not a floating constraint. Verify Python metadata, breaking changes, and target
+platform wheels, then regenerate the complete lock and rerun all gates.
 
 Do not add a dependency without a concrete purpose.
+
+ADR-0051 defines the accepted pin snapshot, ordinary-GIL CI assertion,
+software-composition audit, A/B evidence requirement, consequences, and atomic
+rollback policy.
 
 ## 4. Recommended package structure
 
@@ -323,13 +337,22 @@ Same fixture/run twice → identical state/opportunity hashes.
 Before completion:
 
 ```text
-ruff check
-ruff format --check
-pyright
-pytest
+uv lock --check
+uv sync --frozen --all-groups
+uv run --frozen --all-groups ruff check .
+uv run --frozen --all-groups ruff format --check .
+uv run --frozen --all-groups pyright
+uv run --frozen --all-groups pytest
+uv run --frozen --all-groups pre-commit run --all-files
+uv build --no-build-isolation
 ```
 
 must pass.
+
+The exact ordinary-GIL runtime assertion and locked `pip-audit` gate used by CI
+must also pass. Runtime or dependency changes additionally require the
+same-workload A/B and deterministic semantic/replay evidence defined by
+ADR-0051 and `PERFORMANCE.md`.
 
 No blanket ignore/suppression added merely to make gates green.
 

@@ -5,12 +5,17 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import AsyncIterator, Sequence
+import time
+from collections.abc import AsyncIterator, Callable, Sequence
+from dataclasses import dataclass
 from types import TracebackType
+from typing import Literal
 from urllib.parse import quote, urlparse
 
 import httpx
 import websockets
+
+from multi_market_arbitrage.core.time import UtcTimestamp
 
 from .errors import PolymarketTransportError
 
@@ -20,6 +25,20 @@ DEFAULT_MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 _DEFAULT_MAX_HTTP_RESPONSE_BYTES = 8 * 1024 * 1024
 _DEFAULT_MAX_WEBSOCKET_MESSAGE_BYTES = 1024 * 1024
 _MAX_WEBSOCKET_QUEUE = 1024
+
+
+@dataclass(frozen=True, slots=True)
+class ReceivedWebSocketMessage:
+    """One application frame stamped at the earliest Python receive boundary."""
+
+    payload_bytes: bytes
+    received_wall_time: UtcTimestamp
+    received_monotonic_ns: int
+    message_type: Literal["TEXT", "BINARY"]
+
+    def __post_init__(self) -> None:
+        if self.received_monotonic_ns < 0:
+            raise ValueError("received_monotonic_ns cannot be negative")
 
 
 def _validate_https_base(url: str) -> str:
@@ -73,6 +92,14 @@ def _reject_oversized_content_length(value: str | None, *, maximum: int) -> None
         )
 
 
+def _reject_encoded_response(value: str | None) -> None:
+    if value is None or value.strip().casefold() == "identity":
+        return
+    raise PolymarketTransportError(
+        "public HTTP response Content-Encoding is prohibited; identity is required"
+    )
+
+
 class PolymarketPublicClient:
     """Unauthenticated client exposing raw bytes for documented read endpoints.
 
@@ -99,7 +126,12 @@ class PolymarketPublicClient:
             timeout=httpx.Timeout(timeout_seconds),
             follow_redirects=False,
             transport=transport,
-            headers={"accept": "application/json"},
+            headers={
+                "accept": "application/json",
+                # httpx decodes compressed chunks before yielding them.  Identity
+                # encoding keeps the byte limit enforceable before materialization.
+                "accept-encoding": "identity",
+            },
         )
         self._closed = False
 
@@ -138,6 +170,7 @@ class PolymarketPublicClient:
                 headers={"content-type": "application/json"} if content is not None else None,
             ) as response:
                 response.raise_for_status()
+                _reject_encoded_response(response.headers.get("content-encoding"))
                 _reject_oversized_content_length(
                     response.headers.get("content-length"),
                     maximum=self._max_response_bytes,
@@ -290,8 +323,18 @@ class PolymarketMarketWebSocket:
 
         return hashlib.sha256(self.subscription_bytes()).hexdigest()
 
-    async def raw_messages(self) -> AsyncIterator[bytes]:
-        """Yield exact market application payload bytes before schema parsing."""
+    async def received_messages(
+        self,
+        *,
+        ready: asyncio.Event | None = None,
+    ) -> AsyncIterator[ReceivedWebSocketMessage]:
+        """Yield exact frames with wall and monotonic times captured after ``recv``.
+
+        No schema parsing or downstream persistence is performed here.  Callers
+        should drain this iterator from a dedicated acquisition task so that
+        their own bounded ingress queue, rather than the websockets library's
+        internal queue, is the observable source of downstream dwell.
+        """
 
         try:
             async with websockets.connect(
@@ -301,22 +344,89 @@ class PolymarketMarketWebSocket:
                 max_queue=self.max_queue,
             ) as socket:
                 await socket.send(self.subscription_bytes().decode("utf-8"))
+                if ready is not None:
+                    ready.set()
                 while True:
                     try:
                         async with asyncio.timeout(self.ping_interval_seconds):
                             message = await socket.recv()
+                            received_monotonic_ns = time.monotonic_ns()
+                            received_wall_time = UtcTimestamp.now()
                     except TimeoutError:
                         await socket.send("PING")
                         continue
                     if isinstance(message, bytes):
+                        if message == b"PONG":
+                            continue
                         payload = bytes(message)
+                        message_type: Literal["TEXT", "BINARY"] = "BINARY"
                     else:
                         if message == "PONG":
                             continue
                         payload = message.encode("utf-8")
-                    yield payload
+                        message_type = "TEXT"
+                    yield ReceivedWebSocketMessage(
+                        payload_bytes=payload,
+                        received_wall_time=received_wall_time,
+                        received_monotonic_ns=received_monotonic_ns,
+                        message_type=message_type,
+                    )
         except (OSError, websockets.WebSocketException) as error:
             raise PolymarketTransportError(f"public market WebSocket failed: {error}") from error
+
+    async def pump_received(
+        self,
+        admit_nowait: Callable[[ReceivedWebSocketMessage], None],
+        *,
+        ready: asyncio.Event | None = None,
+    ) -> None:
+        """Receive, timestamp, and synchronously admit frames without a yield gap."""
+
+        try:
+            async with websockets.connect(
+                self.url,
+                ping_interval=None,
+                max_size=self.max_message_bytes,
+                max_queue=self.max_queue,
+            ) as socket:
+                await socket.send(self.subscription_bytes().decode("utf-8"))
+                if ready is not None:
+                    ready.set()
+                while True:
+                    try:
+                        async with asyncio.timeout(self.ping_interval_seconds):
+                            message = await socket.recv()
+                        received_monotonic_ns = time.monotonic_ns()
+                        received_wall_time = UtcTimestamp.now()
+                    except TimeoutError:
+                        await socket.send("PING")
+                        continue
+                    if isinstance(message, bytes):
+                        if message == b"PONG":
+                            continue
+                        payload = bytes(message)
+                        message_type: Literal["TEXT", "BINARY"] = "BINARY"
+                    else:
+                        if message == "PONG":
+                            continue
+                        payload = message.encode("utf-8")
+                        message_type = "TEXT"
+                    admit_nowait(
+                        ReceivedWebSocketMessage(
+                            payload_bytes=payload,
+                            received_wall_time=received_wall_time,
+                            received_monotonic_ns=received_monotonic_ns,
+                            message_type=message_type,
+                        )
+                    )
+        except (OSError, websockets.WebSocketException) as error:
+            raise PolymarketTransportError(f"public market WebSocket failed: {error}") from error
+
+    async def raw_messages(self) -> AsyncIterator[bytes]:
+        """Compatibility iterator yielding only the exact application bytes."""
+
+        async for received in self.received_messages():
+            yield received.payload_bytes
 
 
 __all__ = [
@@ -325,4 +435,5 @@ __all__ = [
     "DEFAULT_MARKET_WS_URL",
     "PolymarketMarketWebSocket",
     "PolymarketPublicClient",
+    "ReceivedWebSocketMessage",
 ]

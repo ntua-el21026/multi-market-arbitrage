@@ -107,6 +107,20 @@ class OpportunityLifecycleTracker:
         self._lifecycles[lifecycle_id] = expired
         return expired
 
+    def get(self, lifecycle_id: OpportunityLifecycleId) -> OpportunityLifecycle | None:
+        return self._lifecycles.get(lifecycle_id)
+
+    def expire_if_active(
+        self,
+        lifecycle_id: OpportunityLifecycleId,
+        *,
+        expired_at: UtcTimestamp,
+    ) -> OpportunityLifecycle | None:
+        current = self._lifecycles.get(lifecycle_id)
+        if current is None or current.status is OpportunityLifecycleStatus.EXPIRED:
+            return None
+        return self.expire(lifecycle_id, expired_at=expired_at)
+
     def snapshot(self) -> tuple[OpportunityLifecycle, ...]:
         return tuple(
             self._lifecycles[key] for key in sorted(self._lifecycles, key=lambda item: item.value)

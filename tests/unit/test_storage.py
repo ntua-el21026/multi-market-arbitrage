@@ -11,6 +11,7 @@ import pytest
 from multi_market_arbitrage.core.ids import VenueId
 from multi_market_arbitrage.core.serialization import canonical_json_bytes, canonical_sha256
 from multi_market_arbitrage.research import validate_data
+from multi_market_arbitrage.research import validation as validation_module
 from multi_market_arbitrage.storage import (
     AnalyticalDatasetConfig,
     AnalyticalDatasetWriter,
@@ -22,6 +23,8 @@ from multi_market_arbitrage.storage import (
     rebuild_dataset_manifest,
     validate_dataset_manifest,
 )
+from multi_market_arbitrage.storage import analytical as analytical_module
+from multi_market_arbitrage.storage import query as query_module
 
 
 def provenance() -> AnalyticalProvenance:
@@ -36,7 +39,12 @@ def provenance() -> AnalyticalProvenance:
 
 
 def config(
-    tmp_path: Path, *, batch_size: int = 2, partition_date: str = "2026-08-20"
+    tmp_path: Path,
+    *,
+    batch_size: int = 2,
+    partition_date: str = "2026-08-20",
+    maximum_record_bytes: int = 8 * 1024 * 1024,
+    maximum_buffered_bytes: int = 64 * 1024 * 1024,
 ) -> AnalyticalDatasetConfig:
     return AnalyticalDatasetConfig(
         root=tmp_path,
@@ -45,6 +53,8 @@ def config(
         partition_date=partition_date,
         schema_version="opportunity-v1",
         batch_size=batch_size,
+        maximum_record_bytes=maximum_record_bytes,
+        maximum_buffered_bytes=maximum_buffered_bytes,
         zstd_level=3,
     )
 
@@ -98,6 +108,44 @@ def test_record_schema_drift_and_binary_float_fail_closed(tmp_path: Path) -> Non
         AnalyticalDatasetWriter(config(tmp_path), provenance()).append(
             {"id": "float", "price": 0.1}
         )
+
+
+def test_analytical_writer_bounds_single_records_and_flushes_on_byte_budget(
+    tmp_path: Path,
+) -> None:
+    writer = AnalyticalDatasetWriter(
+        config(
+            tmp_path,
+            batch_size=100,
+            maximum_record_bytes=2_048,
+            maximum_buffered_bytes=2_048,
+        ),
+        provenance(),
+    )
+    assert writer.append({"id": "one", "payload": "x" * 800}) is None
+    first_bytes = writer.buffered_bytes
+    source_payload = canonical_json_bytes({"id": "one", "payload": "x" * 800})
+    metadata_payload = canonical_json_bytes(
+        {
+            "_mma_schema_version": "opportunity-v1",
+            "_mma_provenance_sha256": provenance().sha256,
+            "_mma_record_sha256": "0" * 64,
+        }
+    )
+    assert first_bytes == len(source_payload) + len(metadata_payload) - 1
+    assert first_bytes <= 2_048
+
+    flushed = writer.append({"id": "two", "payload": "y" * 800})
+
+    assert flushed is not None
+    assert flushed.row_count == 1
+    assert writer.buffered_records == 1
+    assert writer.buffered_bytes == first_bytes
+    with pytest.raises(AnalyticalSchemaError, match="record exceeds"):
+        writer.append({"id": "oversized", "payload": "z" * 4_096})
+    assert writer.buffered_records == 1
+    assert writer.buffered_bytes == first_bytes
+    writer.close()
 
 
 def test_arrow_type_drift_across_fragments_fails_closed(tmp_path: Path) -> None:
@@ -176,6 +224,41 @@ def test_dataset_rebuild_detects_tampered_fragment(tmp_path: Path) -> None:
             venue_id=VenueId("polymarket"),
             schema_version="opportunity-v1",
         )
+
+
+def test_dataset_inventory_fails_closed_at_artifact_count_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    venue_root = tmp_path / "opportunities" / "venue=polymarket" / "date=2026-08-20"
+    venue_root.mkdir(parents=True)
+    (venue_root / "part-one.parquet").touch()
+    (venue_root / "part-two.parquet").touch()
+    monkeypatch.setattr(analytical_module, "_MAX_ANALYTICAL_ARTIFACT_PATHS", 1)
+
+    with pytest.raises(AnalyticalSchemaError, match="artifact count"):
+        rebuild_dataset_manifest(
+            tmp_path,
+            dataset="opportunities",
+            venue_id=VenueId("polymarket"),
+            schema_version="opportunity-v1",
+        )
+
+
+def test_validation_inventory_has_one_aggregate_artifact_count_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "one.parquet").touch()
+    (tmp_path / "two.parquet").touch()
+    monkeypatch.setattr(validation_module, "_MAX_VALIDATION_ARTIFACT_PATHS", 1)
+
+    report = validate_data(tmp_path)
+
+    assert not report.valid
+    assert report.parquet_fragments == 0
+    assert len(report.errors) == 1
+    assert "artifact inventory exceeds" in report.errors[0]
 
 
 def test_analytical_provenance_requires_config_content_hash() -> None:
@@ -267,6 +350,39 @@ def test_duckdb_rejects_parquet_symlink_escape(tmp_path: Path) -> None:
         pytest.raises(ReadOnlyQueryError, match="symbolic-link"),
     ):
         query.register_parquet_view("escaped", dataset)
+
+
+def test_duckdb_rejects_highly_compressed_parquet_before_table_materialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = AnalyticalDatasetWriter(config(tmp_path, batch_size=32), provenance())
+    repeated = "x" * (1024 * 1024)
+    writer.append_many(
+        tuple({"id": index, "public_payload": f"{index:02d}{repeated}"} for index in range(32))
+    )
+    writer.close()
+    fragment = next(tmp_path.rglob("*.parquet"))
+    assert fragment.stat().st_size < 1024 * 1024
+    table_read_attempted = False
+
+    def unexpected_read(*args: object, **kwargs: object) -> object:
+        nonlocal table_read_attempted
+        del args, kwargs
+        table_read_attempted = True
+        raise AssertionError("table materialization must not run after metadata budget exhaustion")
+
+    monkeypatch.setattr(query_module, "_read_table", unexpected_read)
+    with (
+        DuckDBReadOnlyQuery(
+            tmp_path,
+            maximum_registered_bytes=1024 * 1024,
+            maximum_materialized_bytes=1024 * 1024,
+        ) as query,
+        pytest.raises(ReadOnlyQueryError, match="materialized bytes"),
+    ):
+        query.register_parquet_view("compressed", fragment)
+    assert not table_read_attempted
 
 
 def test_duckdb_enforces_result_row_limit_and_external_access_setting(tmp_path: Path) -> None:

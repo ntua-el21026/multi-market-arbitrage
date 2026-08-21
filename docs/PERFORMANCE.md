@@ -77,17 +77,26 @@ Use versioned recorded datasets with hashes.
 
 Benchmark results record:
 - machine characteristics;
-- Python version;
+- Python implementation, exact version, build identity, and GIL mode;
+- resolver/tool version and exact direct dependency inventory;
 - dependency lock hash;
 - code commit;
 - dataset hash;
-- config.
+- benchmark-harness hash;
+- config hash;
+- operating system/filesystem and CPU-affinity controls;
+- SCA service and query time when dependency changes are evaluated.
 
 ## 8. Performance regression
 
 Define tolerated regression thresholds only after a stable baseline exists.
 
 A performance regression may be accepted if it fixes correctness, but it must be explicit.
+
+Runtime, interpreter-build, resolver, and direct-dependency changes require a
+same-machine, same-harness A/B comparison plus exact semantic/oracle parity and
+deterministic replay-hash comparison. Report every material regression; do not
+select only favorable series.
 
 ## 9. Optimization hierarchy
 
@@ -129,3 +138,72 @@ Every major optimization should report:
 - p50/p95/p99;
 - resource usage;
 - trade-offs.
+
+## 13. CPython 3.14.7 migration A/B evidence
+
+The migration decision compared:
+
+- Baseline A: commit `4d34bf8663bac2af54d229032dbb63710f0976f7`,
+  ordinary-GIL CPython 3.13.14, lock SHA-256
+  `e1473fc781ad78d0827af9516b0c713bc03599a1394f5409fa5c441817a8c739`;
+- Baseline B: migration-only commit
+  `e4a086ba01699946b998d2fd8f336009e931fbd5`, ordinary-GIL CPython
+  3.14.7, lock SHA-256
+  `104bcd3d5a00b04d1380e2d4aba46148a5a86cd458a832f13f93fc0f3cdb2506`.
+
+The same 54-series harness, fixture-set hash
+`9e52a576eb7f6874d9c494e093aee8e61fb56ab0d33e7ca302bc5a1d1d4ae70c`,
+configuration content hash
+`3561547d8128bbf05725cbedaa54289ba2573f8ee33005947f312fae740a2cf5`,
+sample counts, warmups, clocks, percentile method, and logical-CPU affinity were
+used. The Baseline A and B result JSON SHA-256 values were respectively
+`2e99ee38d0309f95abac0b228465397a9e7131429685e729edabbc628206752c`
+and `abae8e587abbb7af73c6a260647b96ee48bb0a17de0c18bcd94f3f7dfc78982b`.
+
+All scanner semantic fields matched. All six replay terminal hashes matched
+`a66e4465044e15800d7cced226343f5badb91c16e338d59ab75c6ca57e6c2da0`.
+Baseline B had a lower p50 in 46 of 54 measured series.
+
+| Representative metric | Baseline A | Baseline B | B vs A |
+|---|---:|---:|---:|
+| Sustained one-fsync journal throughput, 1,000 events | 189.638 events/s | 205.730 events/s | +8.49% |
+| Sustained journal submit-to-durable p50 | 4.982 ms | 4.650 ms | -6.66% |
+| Sustained journal submit-to-durable p95 | 5.827 ms | 5.178 ms | -11.15% |
+| Sustained journal submit-to-durable p99 | 8.809 ms | 6.754 ms | -23.32% |
+| Sustained journal submit-to-durable max | 19.738 ms | 27.734 ms | +40.52% |
+| Preserved-envelope to apparent-edge scan-complete p50 | 24.232 ms | 20.543 ms | -15.22% |
+| Worst permitted 4,096-evaluation scan p50 | 245.059 ms | 226.091 ms | -7.74% |
+| Verified 1,000-event replay p50 | 2.356 s | 2.292 s | -2.72% |
+| Canonical JSON for a 49x49 snapshot p50 | 344.615 us | 379.454 us | +10.11% |
+| Canonical SHA-256 for a 49x49 snapshot p50 | 346.301 us | 390.368 us | +12.73% |
+| Raw-envelope JSONL serialization p50 | 8.716 us | 9.842 us | +12.92% |
+| Fresh-process 4,096-evaluation scan peak RSS | 104,000 KiB | 107,664 KiB | +3.52% |
+| Fresh-process verified replay peak RSS | 117,060 KiB | 120,136 KiB | +2.63% |
+
+Negative latency deltas and positive throughput deltas are improvements. The
+migration retained exact outputs and improved many central series, but the max
+journal latency, selected serialization p50 values, and peak RSS regressed and
+remain explicit.
+
+This was one same-machine WSL2 comparison with warm filesystem caches and
+uncontrolled host scheduling. PyArrow changed from 23.0.1 to 25.0.1, websockets
+from 16.1.1 to 17.0.1, and Ruff from 0.16.3 to 0.16.4, so the results are not
+causal proof about CPython alone. No network was accessed. Socket-receive and
+ingress measurements were candidate proxies because the migration-only code did
+not yet contain the corrected dedicated receive/ingress boundary. These results
+therefore support ADR-0051's runtime decision but do not measure later
+performance-hardening implementation changes.
+
+## 14. Corrected Final-C implementation baseline
+
+The source-stable corrected Phase 1 campaign, including all 54 comparable
+series, corrected production-boundary distributions, the five-candidate
+group-commit matrix, CPU/RSS/queue evidence, deterministic hashes, material
+regressions, reproduction command, and limitations, is recorded in
+[`PHASE_1_PERFORMANCE_BASELINE.md`](PHASE_1_PERFORMANCE_BASELINE.md).
+
+The accepted production journal policy is a maximum group of 16 events with
+zero configured delay. On the measured non-sparse scenarios its throughput
+geometric mean was 1,562.57 events/s versus 164.65 events/s for one-event
+`fsync`, while sparse p50 remained 4.891 ms. Final-C live and streaming replay
+terminal hashes were identical.

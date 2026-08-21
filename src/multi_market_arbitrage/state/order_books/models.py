@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import IntFlag, StrEnum, auto
 
 from multi_market_arbitrage.core.exact import Price, Quantity
 from multi_market_arbitrage.core.health import BookHealth
@@ -41,6 +41,47 @@ class RestAuditStatus(StrEnum):
     NOT_COMPARABLE = "NOT_COMPARABLE"
 
 
+class BookMutationKind(IntFlag):
+    """Orthogonal effects of one accepted owner transition."""
+
+    NONE = 0
+    LEVELS = auto()
+    FRESHNESS = auto()
+    HEALTH = auto()
+    REFERENCE = auto()
+    PROVENANCE = auto()
+    LAST_TRADE_DIAGNOSTIC = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class BookMutation:
+    """Explicit state effects returned by the sole mutable book owner."""
+
+    instrument_id: InstrumentId
+    market_id: MarketId
+    kinds: BookMutationKind = BookMutationKind.NONE
+
+    @property
+    def changed(self) -> bool:
+        return self.kinds != BookMutationKind.NONE
+
+    @property
+    def scanner_dirty(self) -> bool:
+        return bool(
+            self.kinds
+            & (
+                BookMutationKind.LEVELS
+                | BookMutationKind.FRESHNESS
+                | BookMutationKind.HEALTH
+                | BookMutationKind.REFERENCE
+            )
+        )
+
+    @property
+    def freshness_changed(self) -> bool:
+        return bool(self.kinds & BookMutationKind.FRESHNESS)
+
+
 @dataclass(frozen=True, slots=True, order=True)
 class BookLevel:
     price: Price
@@ -52,6 +93,7 @@ class RestBookAuditResult:
     status: RestAuditStatus
     checked_at: UtcTimestamp
     reason: str | None
+    mutation: BookMutation
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +120,11 @@ class ImmutableOrderBookSnapshot:
     cost_rule_set_version_id: CostRuleSetVersionId
     last_valid_update_time: UtcTimestamp | None
     last_venue_timestamp: UtcTimestamp | None
+    # Trade prints are retained for diagnostics but are deliberately isolated
+    # from the authoritative L2 lineage and economic scanner identity.
+    last_trade_source_event_id: CanonicalEventId | None = None
+    last_trade_source_provenance: Provenance | None = None
+    last_trade_venue_timestamp: UtcTimestamp | None = None
     supports_sequence_numbers: bool = False
     supports_book_checksum: bool = False
     venue_sequence: None = None
@@ -118,13 +165,45 @@ class ImmutableOrderBookSnapshot:
         return skew <= max_receive_skew_ns
 
     def content_sha256(self) -> str:
-        """Deterministically hash economically relevant immutable state."""
-        return canonical_sha256({"schema": "mma-order-book-snapshot-v1", "snapshot": self})
+        """Deterministically hash the complete immutable diagnostic view."""
+        return canonical_sha256({"schema": "mma-order-book-snapshot-v2", "snapshot": self})
+
+    def economic_content_sha256(self) -> str:
+        """Hash only authoritative inputs consumed by the complete-set scanner."""
+
+        return canonical_sha256(
+            {
+                "schema": "mma-order-book-economic-snapshot-v1",
+                "instrument_id": self.instrument_id,
+                "market_id": self.market_id,
+                "generation": self.generation,
+                "health": self.health,
+                "invalidation_reason": self.invalidation_reason,
+                "bids": self.bids,
+                "asks": self.asks,
+                "best_bid": self.best_bid,
+                "best_ask": self.best_ask,
+                "last_source_event_id": self.last_source_event_id,
+                "last_source_provenance": self.last_source_provenance,
+                "state_source_provenance": self.state_source_provenance,
+                "market_version_id": self.market_version_id,
+                "precision_rule_version_id": self.precision_rule_version_id,
+                "cost_rule_set_version_id": self.cost_rule_set_version_id,
+                "last_valid_update_time": self.last_valid_update_time,
+                "last_venue_timestamp": self.last_venue_timestamp,
+                "supports_sequence_numbers": self.supports_sequence_numbers,
+                "supports_book_checksum": self.supports_book_checksum,
+                "venue_sequence": self.venue_sequence,
+                "validated_checksum": self.validated_checksum,
+            }
+        )
 
 
 __all__ = [
     "BookHealth",
     "BookLevel",
+    "BookMutation",
+    "BookMutationKind",
     "ImmutableOrderBookSnapshot",
     "InvalidationReason",
     "RestAuditStatus",

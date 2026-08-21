@@ -21,6 +21,7 @@ from multi_market_arbitrage.core.time import MonotonicTimestamp, UtcTimestamp
 from multi_market_arbitrage.ingestion import RawEventEnvelope
 from multi_market_arbitrage.journal import (
     JournalDurabilityState,
+    JournalMetricsSnapshot,
     JournalReader,
     JournalWriterConfig,
     RawJournalWriter,
@@ -64,6 +65,8 @@ def test_sealed_journal_round_trip_and_hash_chain(payloads: list[bytes]) -> None
                 zstd_level=3,
             )
         )
+        assert writer.config.group_commit_max_events == 1
+        assert writer.config.group_commit_max_delay_seconds == 0.0
         await writer.start()
         for sequence, payload in enumerate(payloads):
             receipt = await writer.submit(envelope(run, sequence, payload))
@@ -88,4 +91,77 @@ def test_sealed_journal_round_trip_and_hash_chain(payloads: list[bytes]) -> None
         assert writer.durability_watermark.state is JournalDurabilityState.VERIFIED
 
     with tempfile.TemporaryDirectory(prefix="mma-journal-property-", dir="/tmp") as directory:
+        asyncio.run(scenario(Path(directory)))
+
+
+@given(
+    payloads=st.lists(st.binary(max_size=128), min_size=1, max_size=8),
+    group_size=st.integers(min_value=1, max_value=8),
+    segment_events=st.integers(min_value=1, max_value=4),
+)
+@settings(max_examples=12, deadline=None)
+def test_group_commit_preserves_bytes_segment_hashes_and_receipt_coverage(
+    payloads: list[bytes], group_size: int, segment_events: int
+) -> None:
+    async def write_case(
+        root: Path, *, configured_group_size: int
+    ) -> tuple[tuple[tuple[int, int, str, str], ...], JournalMetricsSnapshot]:
+        run = CollectorRunId("group-property-run")
+        writer = RawJournalWriter(
+            JournalWriterConfig(
+                root=root,
+                collector_run_id=run,
+                venue_id=VenueId("polymarket"),
+                stream="market",
+                writer_id=WriterId("writer"),
+                writer_software_version="test-v1",
+                git_commit="abc123",
+                queue_capacity=8,
+                max_events_per_segment=segment_events,
+                group_commit_max_events=configured_group_size,
+                group_commit_max_delay_seconds=(0.0 if configured_group_size == 1 else 0.01),
+                zstd_level=3,
+            )
+        )
+        await writer.start()
+        tickets = [
+            await writer.enqueue(envelope(run, sequence, payload))
+            for sequence, payload in enumerate(payloads)
+        ]
+        receipts = await asyncio.gather(*(ticket.wait_durable() for ticket in tickets))
+        await writer.close()
+        assert [receipt.ingest_seq for receipt in receipts] == list(range(len(payloads)))
+        assert all(
+            receipt.durability_watermark is not None
+            and receipt.ingest_seq <= receipt.durability_watermark.ingest_seq
+            and 1 <= receipt.durability_group_size <= configured_group_size
+            for receipt in receipts
+        )
+        restored = JournalReader(root, run, stream="market").read_all()
+        assert [item.payload_bytes for item in restored] == payloads
+        manifests = JournalReader(root, run, stream="market").manifests()
+        identities = tuple(
+            (
+                manifest.first_ingest_seq,
+                manifest.last_ingest_seq,
+                manifest.payload_digest,
+                manifest.segment_digest,
+            )
+            for manifest in manifests
+        )
+        return identities, writer.metrics
+
+    async def scenario(root: Path) -> None:
+        baseline_identity, baseline_metrics = await write_case(
+            root / "single", configured_group_size=1
+        )
+        grouped_identity, grouped_metrics = await write_case(
+            root / "grouped", configured_group_size=group_size
+        )
+        assert grouped_identity == baseline_identity
+        assert grouped_metrics.appended == baseline_metrics.appended == len(payloads)
+        assert grouped_metrics.durable == baseline_metrics.durable == len(payloads)
+        assert grouped_metrics.data_fsyncs <= baseline_metrics.data_fsyncs
+
+    with tempfile.TemporaryDirectory(prefix="mma-journal-group-property-", dir="/tmp") as directory:
         asyncio.run(scenario(Path(directory)))

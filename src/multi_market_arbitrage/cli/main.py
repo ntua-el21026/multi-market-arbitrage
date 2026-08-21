@@ -14,7 +14,12 @@ from multi_market_arbitrage.core.health import ComponentHealth
 from multi_market_arbitrage.core.ids import CollectorRunId
 from multi_market_arbitrage.core.serialization import canonicalize
 from multi_market_arbitrage.pipeline.observe import PolymarketObservationService
-from multi_market_arbitrage.replay import replay_journal, replay_run_ids
+from multi_market_arbitrage.replay import (
+    ReplayTerminalHashMismatch,
+    rebuild_analytical_from_journal,
+    replay_journal,
+    replay_run_ids,
+)
 from multi_market_arbitrage.research import build_scan_report, validate_data
 
 EXIT_OK = 0
@@ -37,7 +42,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mma",
         description=(
-            "Read-only Multi-Market Arbitrage Phase 1 tools. "
+            "Public-data-only Multi-Market Arbitrage Phase 1 tools. "
             "Live trading and venue mutation are unavailable."
         ),
     )
@@ -68,6 +73,24 @@ def _parser() -> argparse.ArgumentParser:
         help="return exit 5 unless authoritative terminal hash matches",
     )
     _config_argument(replay)
+
+    rebuild = commands.add_parser(
+        "rebuild-analytical",
+        help="reconstruct derived datasets from one completed raw run",
+    )
+    rebuild.add_argument("target", type=Path, help="raw journal directory")
+    rebuild.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="fresh, non-existent analytical output directory",
+    )
+    rebuild.add_argument("--run-id", help="collector run ID; inferred only when unique")
+    rebuild.add_argument(
+        "--expect-terminal-hash",
+        help="publish nothing and return exit 5 unless the replay terminal hash matches",
+    )
+    _config_argument(rebuild)
 
     validate = commands.add_parser(
         "validate-data", help="read-only integrity validation of raw/Parquet data"
@@ -139,14 +162,19 @@ def _journal_root(target: Path) -> Path:
     return resolved if resolved.is_dir() else resolved.parent
 
 
-def _choose_run(root: Path, requested: str | None) -> CollectorRunId:
+def _choose_run(
+    root: Path,
+    requested: str | None,
+    *,
+    include_partial: bool,
+) -> CollectorRunId:
     if requested is not None:
         selected = CollectorRunId(requested)
-        available = replay_run_ids(root)
+        available = replay_run_ids(root, include_partial=include_partial)
         if selected not in available:
             raise ValueError(f"collector run {requested!r} is absent from {root}")
         return selected
-    available = replay_run_ids(root)
+    available = replay_run_ids(root, include_partial=include_partial)
     if len(available) != 1:
         raise ValueError(
             f"--run-id is required because {root} contains {len(available)} sealed runs"
@@ -170,7 +198,7 @@ async def _observe(args: argparse.Namespace) -> int:
 def _replay(args: argparse.Namespace) -> int:
     config = load_phase1_config(args.config)
     root = _journal_root(args.target)
-    run_id = _choose_run(root, args.run_id)
+    run_id = _choose_run(root, args.run_id, include_partial=args.include_partial)
     result = replay_journal(
         root,
         run_id,
@@ -185,6 +213,27 @@ def _replay(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return EXIT_REPLAY_MISMATCH
+    return EXIT_OK
+
+
+def _rebuild_analytical(args: argparse.Namespace) -> int:
+    config_path: Path = args.config
+    config = load_phase1_config(config_path)
+    root = _journal_root(args.target)
+    run_id = _choose_run(root, args.run_id, include_partial=False)
+    try:
+        result = rebuild_analytical_from_journal(
+            root,
+            run_id,
+            config,
+            output_root=args.output,
+            code_commit=_git_commit(_workspace_root(config_path)),
+            expect_terminal_hash=args.expect_terminal_hash,
+        )
+    except ReplayTerminalHashMismatch as error:
+        print(str(error), file=sys.stderr)
+        return EXIT_REPLAY_MISMATCH
+    _print(result)
     return EXIT_OK
 
 
@@ -209,6 +258,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return asyncio.run(_observe(args))
         if args.command == "replay":
             return _replay(args)
+        if args.command == "rebuild-analytical":
+            return _rebuild_analytical(args)
         if args.command == "validate-data":
             return _validate(args)
         if args.command == "scan-report":

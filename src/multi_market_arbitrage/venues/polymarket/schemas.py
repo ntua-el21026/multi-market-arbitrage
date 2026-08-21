@@ -27,6 +27,12 @@ class JsonNumber(str):
 JsonObject = dict[str, object]
 T = TypeVar("T")
 
+_MAX_JSON_ARRAY_ITEMS = 4_096
+_MAX_DECIMAL_CHARACTERS = 128
+_MAX_JSON_INTEGER_DIGITS = 20
+_MAX_JSON_NESTING_DEPTH = 256
+_MAX_UTC_MILLISECONDS = 253_402_300_799_999
+
 
 def _reject_constant(value: str) -> object:
     raise ValueError(f"non-finite JSON number is prohibited: {value}")
@@ -41,19 +47,46 @@ def _unique_object(pairs: list[tuple[str, object]]) -> JsonObject:
     return result
 
 
+def _validate_json_resource_shape(root: object) -> None:
+    stack: list[tuple[object, int]] = [(root, 1)]
+    while stack:
+        value, depth = stack.pop()
+        if depth > _MAX_JSON_NESTING_DEPTH:
+            raise ValueError(
+                f"JSON nesting exceeds the {_MAX_JSON_NESTING_DEPTH}-level resource limit"
+            )
+        if isinstance(value, list):
+            items = cast(list[object], value)
+            stack.extend((item, depth + 1) for item in items)
+        elif isinstance(value, dict):
+            mapping = cast(dict[object, object], value)
+            stack.extend((item, depth + 1) for item in mapping.values())
+
+
 def decode_json_exact(payload: bytes) -> object:
     """Decode UTF-8 JSON while preserving every numeric source lexeme."""
 
     try:
         text = payload.decode("utf-8", errors="strict")
-        return json.loads(
+        decoded = json.loads(
             text,
             parse_float=JsonNumber,
             parse_int=JsonNumber,
             parse_constant=_reject_constant,
             object_pairs_hook=_unique_object,
         )
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        # Nesting cannot exceed the number of structural opening delimiters.
+        # Skip the Python object-graph walk for ordinary small payloads while
+        # retaining the exact validation path at and above the safety boundary.
+        # Delimiters inside strings can only cause a conservative extra walk.
+        minimum_nested_payload_bytes = 2 * _MAX_JSON_NESTING_DEPTH + 1
+        if (
+            len(payload) >= minimum_nested_payload_bytes
+            and payload.count(b"{") + payload.count(b"[") >= _MAX_JSON_NESTING_DEPTH
+        ):
+            _validate_json_resource_shape(decoded)
+        return decoded
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as error:
         raise PolymarketSchemaError("$", f"invalid strict UTF-8 JSON: {error}") from error
 
 
@@ -69,7 +102,13 @@ def _object(value: object, path: str) -> JsonObject:
 def _array(value: object, path: str) -> list[object]:
     if not isinstance(value, list):
         raise PolymarketSchemaError(path, "expected array")
-    return cast(list[object], value)
+    result = cast(list[object], value)
+    if len(result) > _MAX_JSON_ARRAY_ITEMS:
+        raise PolymarketSchemaError(
+            path,
+            f"array exceeds the {_MAX_JSON_ARRAY_ITEMS}-item resource limit",
+        )
+    return result
 
 
 def _required(obj: Mapping[str, object], key: str, path: str) -> object:
@@ -115,8 +154,14 @@ def _optional_boolean(obj: Mapping[str, object], key: str, path: str) -> bool | 
 def _decimal(value: object, path: str) -> ExactDecimal:
     if not isinstance(value, (JsonNumber, str)):
         raise PolymarketSchemaError(path, "expected an exact JSON number or decimal string")
+    text = str(value)
+    if len(text) > _MAX_DECIMAL_CHARACTERS:
+        raise PolymarketSchemaError(
+            path,
+            f"decimal exceeds the {_MAX_DECIMAL_CHARACTERS}-character resource limit",
+        )
     try:
-        return ExactDecimal.parse(str(value))
+        return ExactDecimal.parse(text)
     except (TypeError, ValueError) as error:
         raise PolymarketSchemaError(path, f"invalid decimal: {error}") from error
 
@@ -148,11 +193,21 @@ def _integer(value: object, path: str) -> int:
     text = str(value)
     if not text.isdigit():
         raise PolymarketSchemaError(path, "expected non-negative base-10 integer")
-    return int(text)
+    if len(text) > _MAX_JSON_INTEGER_DIGITS:
+        raise PolymarketSchemaError(
+            path,
+            f"integer exceeds the {_MAX_JSON_INTEGER_DIGITS}-digit resource limit",
+        )
+    try:
+        return int(text)
+    except ValueError as error:
+        raise PolymarketSchemaError(path, f"invalid integer: {error}") from error
 
 
 def _timestamp_ms(value: object, path: str) -> UtcTimestamp:
     milliseconds = _integer(value, path)
+    if milliseconds > _MAX_UTC_MILLISECONDS:
+        raise PolymarketSchemaError(path, "timestamp lies outside the supported UTC range")
     return UtcTimestamp(milliseconds * 1_000_000)
 
 
@@ -182,7 +237,7 @@ def _parse_encoded_string_array(value: object, path: str) -> tuple[str, ...]:
         raise PolymarketSchemaError(path, "expected a JSON-encoded string array")
     try:
         decoded = json.loads(value, object_pairs_hook=_unique_object)
-    except (json.JSONDecodeError, ValueError) as error:
+    except (json.JSONDecodeError, ValueError, RecursionError) as error:
         raise PolymarketSchemaError(path, f"invalid encoded JSON array: {error}") from error
     items = _array(decoded, path)
     return tuple(_string(item, f"{path}[{index}]") for index, item in enumerate(items))
@@ -199,7 +254,7 @@ def _parse_encoded_decimal_array(value: object, path: str) -> tuple[ExactDecimal
             parse_constant=_reject_constant,
             object_pairs_hook=_unique_object,
         )
-    except (json.JSONDecodeError, ValueError) as error:
+    except (json.JSONDecodeError, ValueError, RecursionError) as error:
         raise PolymarketSchemaError(path, f"invalid encoded JSON array: {error}") from error
     items = _array(decoded, path)
     return tuple(_decimal(item, f"{path}[{index}]") for index, item in enumerate(items))
@@ -762,7 +817,7 @@ def parse_market_ws_message(payload: bytes) -> tuple[MarketWsEvent, ...]:
     """
 
     root = decode_json_exact(payload)
-    values: list[object] = cast(list[object], root) if isinstance(root, list) else [root]
+    values = _array(cast(list[object], root), "$") if isinstance(root, list) else [root]
     return tuple(_parse_ws_event(value, f"$[{index}]") for index, value in enumerate(values))
 
 

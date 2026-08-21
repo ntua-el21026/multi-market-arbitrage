@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from enum import StrEnum
@@ -16,7 +17,7 @@ from multi_market_arbitrage.core.ids import (
     is_sha256_hex,
 )
 from multi_market_arbitrage.core.serialization import canonical_sha256
-from multi_market_arbitrage.core.time import UtcTimestamp
+from multi_market_arbitrage.core.time import MonotonicTimestamp, UtcTimestamp
 
 JOURNAL_MANIFEST_VERSION: Final = "raw-journal-manifest-v1"
 JOURNAL_RUN_COMPLETION_VERSION: Final = "raw-journal-run-completion-v1"
@@ -84,6 +85,39 @@ class JournalReceipt:
     collector_run_id: CollectorRunId
     ingest_seq: int
     state: JournalDurabilityState
+    durability_watermark: DurabilityWatermark | None = None
+    enqueued_monotonic: MonotonicTimestamp | None = None
+    commit_started_monotonic: MonotonicTimestamp | None = None
+    durable_monotonic: MonotonicTimestamp | None = None
+    durability_group_size: int = 1
+
+    def __post_init__(self) -> None:
+        if self.ingest_seq < 0:
+            raise ValueError("journal receipt sequence must be non-negative")
+        if self.durability_group_size <= 0:
+            raise ValueError("journal receipt durability group size must be positive")
+        watermark = self.durability_watermark
+        if watermark is not None:
+            if watermark.collector_run_id != self.collector_run_id:
+                raise ValueError("journal receipt and durability watermark runs differ")
+            first_group_sequence = watermark.ingest_seq - self.durability_group_size + 1
+            if not first_group_sequence <= self.ingest_seq <= watermark.ingest_seq:
+                raise ValueError("journal receipt is outside its durability watermark group")
+        timestamps = (
+            self.enqueued_monotonic,
+            self.commit_started_monotonic,
+            self.durable_monotonic,
+        )
+        if any(timestamp is not None for timestamp in timestamps):
+            if any(timestamp is None for timestamp in timestamps):
+                raise ValueError("journal receipt monotonic timing fields must be all present")
+            enqueued = cast(MonotonicTimestamp, self.enqueued_monotonic)
+            commit_started = cast(MonotonicTimestamp, self.commit_started_monotonic)
+            durable = cast(MonotonicTimestamp, self.durable_monotonic)
+            if len({enqueued.epoch_id, commit_started.epoch_id, durable.epoch_id}) != 1:
+                raise ValueError("journal receipt monotonic timestamps use different epochs")
+            if not enqueued <= commit_started <= durable:
+                raise ValueError("journal receipt monotonic timestamps are out of order")
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +134,13 @@ class JournalMetricsSnapshot:
     writer_failures: int
     recovered_records: int
     truncated_tails: int
+    durability_groups: int = 0
+    data_fsyncs: int = 0
+    durability_group_size_high_water: int = 0
+    group_size_flushes: int = 0
+    group_delay_flushes: int = 0
+    group_rotation_splits: int = 0
+    group_shutdown_flushes: int = 0
 
 
 @dataclass(slots=True)
@@ -115,6 +156,13 @@ class JournalMetrics:
     writer_failures: int = 0
     recovered_records: int = 0
     truncated_tails: int = 0
+    durability_groups: int = 0
+    data_fsyncs: int = 0
+    durability_group_size_high_water: int = 0
+    group_size_flushes: int = 0
+    group_delay_flushes: int = 0
+    group_rotation_splits: int = 0
+    group_shutdown_flushes: int = 0
 
     def snapshot(self, *, queue_depth: int) -> JournalMetricsSnapshot:
         return JournalMetricsSnapshot(
@@ -130,6 +178,13 @@ class JournalMetrics:
             writer_failures=self.writer_failures,
             recovered_records=self.recovered_records,
             truncated_tails=self.truncated_tails,
+            durability_groups=self.durability_groups,
+            data_fsyncs=self.data_fsyncs,
+            durability_group_size_high_water=self.durability_group_size_high_water,
+            group_size_flushes=self.group_size_flushes,
+            group_delay_flushes=self.group_delay_flushes,
+            group_rotation_splits=self.group_rotation_splits,
+            group_shutdown_flushes=self.group_shutdown_flushes,
         )
 
 
@@ -148,6 +203,8 @@ class JournalWriterConfig:
     max_uncompressed_bytes_per_run: int = DEFAULT_MAX_UNCOMPRESSED_RUN_BYTES
     submit_timeout_seconds: float = 5.0
     zstd_level: int = 9
+    group_commit_max_events: int = 1
+    group_commit_max_delay_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.stream or _SAFE_COMPONENT.fullmatch(self.stream) is None:
@@ -174,8 +231,25 @@ class JournalWriterConfig:
             raise JournalConfigurationError(
                 "run byte limit must be at least the segment byte limit"
             )
+        if self.max_uncompressed_bytes_per_run > DEFAULT_MAX_UNCOMPRESSED_RUN_BYTES:
+            raise JournalConfigurationError(
+                "run byte limit exceeds the absolute reader verification cap"
+            )
         if self.submit_timeout_seconds < 0:
             raise JournalConfigurationError("submit timeout cannot be negative")
+        if not math.isfinite(self.submit_timeout_seconds):
+            raise JournalConfigurationError("submit timeout must be finite")
+        if not 0 < self.group_commit_max_events <= self.queue_capacity:
+            raise JournalConfigurationError(
+                "group commit event limit must be positive and within queue capacity"
+            )
+        if (
+            not math.isfinite(self.group_commit_max_delay_seconds)
+            or self.group_commit_max_delay_seconds < 0
+        ):
+            raise JournalConfigurationError(
+                "group commit maximum delay must be finite and non-negative"
+            )
         if not -131_072 <= self.zstd_level <= 22:
             raise JournalConfigurationError("zstd compression level is outside supported range")
 
@@ -362,6 +436,10 @@ class RunCompletionHead:
             raise JournalCorruptionError("journal run completion segment byte limit is invalid")
         if self.max_uncompressed_bytes_per_run < self.max_uncompressed_bytes_per_segment:
             raise JournalCorruptionError("journal run completion run byte limit is invalid")
+        if self.max_uncompressed_bytes_per_run > DEFAULT_MAX_UNCOMPRESSED_RUN_BYTES:
+            raise JournalCorruptionError(
+                "journal run completion exceeds the absolute reader verification cap"
+            )
         if self.expected_uncompressed_bytes > self.max_uncompressed_bytes_per_run:
             raise JournalCorruptionError("completed journal exceeds its declared run byte limit")
         if not self.writer_software_version or not self.git_commit:

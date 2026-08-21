@@ -9,6 +9,7 @@ from multi_market_arbitrage.core.ids import CollectorRunId
 from multi_market_arbitrage.core.provenance import Provenance
 from multi_market_arbitrage.core.serialization import canonical_json_string
 from multi_market_arbitrage.core.time import UtcTimestamp
+from multi_market_arbitrage.journal.recovery import fsync_directory
 from multi_market_arbitrage.normalization import CanonicalEvent
 from multi_market_arbitrage.reference import POLYMARKET_VENUE_ID, ReferenceBundle
 from multi_market_arbitrage.scanners.polymarket_complete_set import (
@@ -16,10 +17,14 @@ from multi_market_arbitrage.scanners.polymarket_complete_set import (
     OpportunityLifecycle,
 )
 from multi_market_arbitrage.storage import (
+    AnalyticalDatasetCompletion,
     AnalyticalDatasetConfig,
     AnalyticalDatasetWriter,
     AnalyticalProvenance,
+    AnalyticalRunCompletionHead,
     ParquetFragmentManifest,
+    analytical_run_completion_path,
+    write_analytical_run_completion,
 )
 
 _REFERENCE_SCHEMA = "phase1-reference-flat-v1"
@@ -35,6 +40,14 @@ class ResearchOutputSummary:
     reference_manifest_hashes: tuple[str, ...]
     canonical_manifest_hashes: tuple[str, ...]
     scan_manifest_hashes: tuple[str, ...]
+    health: str = "HEALTHY"
+    research_eligible: bool = True
+    accepted_records: int = 0
+    processed_records: int = 0
+    rejected_records: int = 0
+    queue_high_water: int = 0
+    failure_type: str | None = None
+    completion_sha256: str | None = None
 
 
 class Phase1AnalyticalOutputs:
@@ -51,6 +64,8 @@ class Phase1AnalyticalOutputs:
         code_version: str,
         config_hash: str,
         source_manifest_hashes: tuple[str, ...] = (),
+        maximum_record_bytes: int = 8 * 1024 * 1024,
+        maximum_buffered_bytes: int = 64 * 1024 * 1024,
     ) -> None:
         self._root = root
         provenance = AnalyticalProvenance(
@@ -69,6 +84,8 @@ class Phase1AnalyticalOutputs:
                 partition_date=partition_date,
                 schema_version=schema_version,
                 batch_size=batch_size,
+                maximum_record_bytes=maximum_record_bytes,
+                maximum_buffered_bytes=maximum_buffered_bytes,
             )
 
         self._references = AnalyticalDatasetWriter(
@@ -84,10 +101,19 @@ class Phase1AnalyticalOutputs:
             provenance,
         )
         self._collector_run_id = collector_run_id
+        self._code_commit = code_commit
+        self._code_version = code_version
+        self._config_hash = config_hash
         self._reference_fragments: list[str] = []
         self._canonical_fragments: list[str] = []
         self._scan_fragments: list[str] = []
         self._closed = False
+        self._record_counts = {
+            "reference": 0,
+            "canonical_events": 0,
+            "complete_set_scans": 0,
+        }
+        self._completion_sha256: str | None = None
 
     @staticmethod
     def _capture_fragment(target: list[str], value: ParquetFragmentManifest | None) -> None:
@@ -100,6 +126,7 @@ class Phase1AnalyticalOutputs:
         observed_at: UtcTimestamp,
         provenance: Provenance,
     ) -> None:
+        self._record_counts["reference"] += 1
         record = {
             "collector_run_id": self._collector_run_id.value,
             "observed_at_utc_ns": observed_at.nanoseconds_since_epoch,
@@ -125,6 +152,7 @@ class Phase1AnalyticalOutputs:
         self._capture_fragment(self._reference_fragments, self._references.append(record))
 
     def append_canonical(self, event: CanonicalEvent) -> None:
+        self._record_counts["canonical_events"] += 1
         record = {
             "collector_run_id": self._collector_run_id.value,
             "receive_time_utc_ns": event.receive_timestamp.nanoseconds_since_epoch,
@@ -158,6 +186,7 @@ class Phase1AnalyticalOutputs:
         *,
         lifecycle: OpportunityLifecycle | None = None,
     ) -> None:
+        self._record_counts["complete_set_scans"] += 1
         candidate = result.candidate
         opportunity = result.opportunity
         record = {
@@ -190,17 +219,86 @@ class Phase1AnalyticalOutputs:
         }
         self._capture_fragment(self._scan_fragments, self._scans.append(record))
 
-    def close(self) -> ResearchOutputSummary:
+    def close(
+        self,
+        *,
+        source_journal_completion_sha256: str | None = None,
+    ) -> ResearchOutputSummary:
         if not self._closed:
             self._capture_fragment(self._reference_fragments, self._references.close())
             self._capture_fragment(self._canonical_fragments, self._canonical.close())
             self._capture_fragment(self._scan_fragments, self._scans.close())
+            head = AnalyticalRunCompletionHead(
+                completion_version="analytical-run-completion-v1",
+                collector_run_id=self._collector_run_id,
+                venue_id=POLYMARKET_VENUE_ID,
+                code_commit=self._code_commit,
+                code_version=self._code_version,
+                config_hash=self._config_hash,
+                source_journal_completion_sha256=source_journal_completion_sha256,
+                datasets=tuple(
+                    sorted(
+                        (
+                            AnalyticalDatasetCompletion(
+                                dataset="reference",
+                                schema_version=_REFERENCE_SCHEMA,
+                                record_count=self._record_counts["reference"],
+                                fragment_manifest_sha256s=tuple(self._reference_fragments),
+                            ),
+                            AnalyticalDatasetCompletion(
+                                dataset="canonical_events",
+                                schema_version=_CANONICAL_SCHEMA,
+                                record_count=self._record_counts["canonical_events"],
+                                fragment_manifest_sha256s=tuple(self._canonical_fragments),
+                            ),
+                            AnalyticalDatasetCompletion(
+                                dataset="complete_set_scans",
+                                schema_version=_SCAN_SCHEMA,
+                                record_count=self._record_counts["complete_set_scans"],
+                                fragment_manifest_sha256s=tuple(self._scan_fragments),
+                            ),
+                        ),
+                        key=lambda item: item.dataset,
+                    )
+                ),
+            )
+            write_analytical_run_completion(self._root, head)
+            self._completion_sha256 = head.completion_sha256
             self._closed = True
         return ResearchOutputSummary(
             root=self._root,
             reference_manifest_hashes=tuple(self._reference_fragments),
             canonical_manifest_hashes=tuple(self._canonical_fragments),
             scan_manifest_hashes=tuple(self._scan_fragments),
+            accepted_records=sum(self._record_counts.values()),
+            processed_records=sum(self._record_counts.values()),
+            completion_sha256=self._completion_sha256,
+        )
+
+    def abort(self, *, failure_type: str | None = None) -> ResearchOutputSummary:
+        """Close without flushing or publishing an analytical completion head."""
+
+        if not self._closed:
+            self._references.abort()
+            self._canonical.abort()
+            self._scans.abort()
+            self._closed = True
+        completion_path = analytical_run_completion_path(self._root, self._collector_run_id)
+        if completion_path.exists():
+            completion_path.unlink()
+            fsync_directory(completion_path.parent)
+        self._completion_sha256 = None
+        processed = sum(self._record_counts.values())
+        return ResearchOutputSummary(
+            root=self._root,
+            reference_manifest_hashes=tuple(self._reference_fragments),
+            canonical_manifest_hashes=tuple(self._canonical_fragments),
+            scan_manifest_hashes=tuple(self._scan_fragments),
+            health="DEGRADED",
+            research_eligible=False,
+            accepted_records=processed,
+            processed_records=processed,
+            failure_type=failure_type,
         )
 
     def __enter__(self) -> Phase1AnalyticalOutputs:

@@ -9,7 +9,7 @@ from datetime import date
 from pathlib import Path
 from typing import Self, cast
 
-from multi_market_arbitrage.core.ids import VenueId, is_sha256_hex
+from multi_market_arbitrage.core.ids import CollectorRunId, VenueId, is_sha256_hex
 from multi_market_arbitrage.core.serialization import canonical_sha256
 
 _SAFE_DATASET_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -74,6 +74,8 @@ class AnalyticalDatasetConfig:
     partition_date: str
     schema_version: str
     batch_size: int = 1_000
+    maximum_record_bytes: int = 8 * 1024 * 1024
+    maximum_buffered_bytes: int = 64 * 1024 * 1024
     zstd_level: int = 9
 
     def __post_init__(self) -> None:
@@ -87,6 +89,12 @@ class AnalyticalDatasetConfig:
             raise AnalyticalSchemaError("partition_date must be ISO YYYY-MM-DD") from exc
         if self.batch_size <= 0:
             raise AnalyticalSchemaError("Parquet batch size must be positive")
+        if self.maximum_record_bytes <= 0 or self.maximum_buffered_bytes <= 0:
+            raise AnalyticalSchemaError("analytical byte limits must be positive")
+        if self.maximum_record_bytes > self.maximum_buffered_bytes:
+            raise AnalyticalSchemaError(
+                "analytical record byte limit cannot exceed the buffer byte limit"
+            )
         if not 1 <= self.zstd_level <= 22:
             raise AnalyticalSchemaError("Parquet zstd compression level must be between 1 and 22")
 
@@ -341,14 +349,174 @@ class DatasetManifest:
 
 
 @dataclass(frozen=True, slots=True)
+class AnalyticalDatasetCompletion:
+    """Exact fragment claims for one run-scoped analytical writer domain."""
+
+    dataset: str
+    schema_version: str
+    record_count: int
+    fragment_manifest_sha256s: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.dataset or _SAFE_DATASET_NAME.fullmatch(self.dataset) is None:
+            raise AnalyticalSchemaError("analytical completion dataset name is invalid")
+        if not self.schema_version:
+            raise AnalyticalSchemaError("analytical completion schema version is required")
+        if self.record_count < 0:
+            raise AnalyticalSchemaError("analytical completion record count cannot be negative")
+        if any(not is_sha256_hex(item) for item in self.fragment_manifest_sha256s):
+            raise AnalyticalSchemaError("analytical completion fragment identity is invalid")
+        if len(set(self.fragment_manifest_sha256s)) != len(self.fragment_manifest_sha256s):
+            raise AnalyticalSchemaError("analytical completion contains duplicate fragments")
+        if self.record_count == 0 and self.fragment_manifest_sha256s:
+            raise AnalyticalSchemaError("empty analytical dataset cannot claim fragments")
+        if self.record_count > 0 and not self.fragment_manifest_sha256s:
+            raise AnalyticalSchemaError("non-empty analytical dataset must claim fragments")
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "dataset": self.dataset,
+            "fragment_manifest_sha256s": list(self.fragment_manifest_sha256s),
+            "record_count": self.record_count,
+            "schema_version": self.schema_version,
+        }
+
+    @classmethod
+    def from_record(cls, raw: object) -> Self:
+        if not isinstance(raw, dict):
+            raise AnalyticalSchemaError("analytical dataset completion must be an object")
+        record = cast(dict[object, object], raw)
+        if set(record) != {
+            "dataset",
+            "fragment_manifest_sha256s",
+            "record_count",
+            "schema_version",
+        }:
+            raise AnalyticalSchemaError("analytical dataset completion fields differ from schema")
+        dataset = record.get("dataset")
+        schema_version = record.get("schema_version")
+        record_count = record.get("record_count")
+        fragments = record.get("fragment_manifest_sha256s")
+        if (
+            not isinstance(dataset, str)
+            or not isinstance(schema_version, str)
+            or isinstance(record_count, bool)
+            or not isinstance(record_count, int)
+            or not isinstance(fragments, list)
+        ):
+            raise AnalyticalSchemaError("analytical dataset completion is invalid")
+        fragment_items = cast(list[object], fragments)
+        if not all(isinstance(item, str) for item in fragment_items):
+            raise AnalyticalSchemaError("analytical dataset completion is invalid")
+        return cls(
+            dataset=dataset,
+            schema_version=schema_version,
+            record_count=record_count,
+            fragment_manifest_sha256s=tuple(cast(list[str], fragment_items)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AnalyticalRunCompletionHead:
+    """Fail-closed declaration that every writer domain drained successfully."""
+
+    completion_version: str
+    collector_run_id: CollectorRunId
+    venue_id: VenueId
+    code_commit: str
+    code_version: str
+    config_hash: str
+    source_journal_completion_sha256: str | None
+    datasets: tuple[AnalyticalDatasetCompletion, ...]
+
+    def __post_init__(self) -> None:
+        if self.completion_version != "analytical-run-completion-v1":
+            raise AnalyticalSchemaError("unsupported analytical run completion head")
+        if not self.code_commit or not self.code_version:
+            raise AnalyticalSchemaError("analytical completion code identity is required")
+        if not is_sha256_hex(self.config_hash):
+            raise AnalyticalSchemaError("analytical completion config hash is invalid")
+        if self.source_journal_completion_sha256 is not None and not is_sha256_hex(
+            self.source_journal_completion_sha256
+        ):
+            raise AnalyticalSchemaError("analytical completion journal identity is invalid")
+        if not self.datasets or tuple(sorted(item.dataset for item in self.datasets)) != tuple(
+            item.dataset for item in self.datasets
+        ):
+            raise AnalyticalSchemaError("analytical completion datasets must be sorted")
+        if len({item.dataset for item in self.datasets}) != len(self.datasets):
+            raise AnalyticalSchemaError("analytical completion dataset names must be unique")
+
+    def content_record(self) -> dict[str, object]:
+        return {
+            "code_commit": self.code_commit,
+            "code_version": self.code_version,
+            "collector_run_id": self.collector_run_id.value,
+            "completion_version": self.completion_version,
+            "config_hash": self.config_hash,
+            "datasets": [item.to_record() for item in self.datasets],
+            "source_journal_completion_sha256": self.source_journal_completion_sha256,
+            "venue": self.venue_id.value,
+        }
+
+    @property
+    def completion_sha256(self) -> str:
+        return canonical_sha256(self.content_record())
+
+    def to_record(self) -> dict[str, object]:
+        record = self.content_record()
+        record["completion_sha256"] = self.completion_sha256
+        return record
+
+    @classmethod
+    def from_record(cls, raw: object) -> Self:
+        if not isinstance(raw, dict):
+            raise AnalyticalSchemaError("analytical run completion must be an object")
+        record = cast(dict[object, object], raw)
+
+        def text(name: str) -> str:
+            value = record.get(name)
+            if not isinstance(value, str) or not value:
+                raise AnalyticalSchemaError(f"analytical run completion {name} is invalid")
+            return value
+
+        source = record.get("source_journal_completion_sha256")
+        if source is not None and not isinstance(source, str):
+            raise AnalyticalSchemaError("analytical run completion source identity is invalid")
+        datasets_value = record.get("datasets")
+        if not isinstance(datasets_value, list):
+            raise AnalyticalSchemaError("analytical run completion datasets are invalid")
+        head = cls(
+            completion_version=text("completion_version"),
+            collector_run_id=CollectorRunId(text("collector_run_id")),
+            venue_id=VenueId(text("venue")),
+            code_commit=text("code_commit"),
+            code_version=text("code_version"),
+            config_hash=text("config_hash"),
+            source_journal_completion_sha256=source,
+            datasets=tuple(
+                AnalyticalDatasetCompletion.from_record(item)
+                for item in cast(list[object], datasets_value)
+            ),
+        )
+        if text("completion_sha256") != head.completion_sha256:
+            raise AnalyticalSchemaError("analytical run completion SHA-256 mismatch")
+        if set(record) != set(head.to_record()):
+            raise AnalyticalSchemaError("analytical run completion fields differ from schema")
+        return head
+
+
+@dataclass(frozen=True, slots=True)
 class QueryResult:
     columns: tuple[str, ...]
     rows: tuple[tuple[object, ...], ...]
 
 
 __all__ = [
+    "AnalyticalDatasetCompletion",
     "AnalyticalDatasetConfig",
     "AnalyticalProvenance",
+    "AnalyticalRunCompletionHead",
     "AnalyticalSchemaError",
     "AnalyticalStorageError",
     "DatasetManifest",

@@ -15,8 +15,10 @@ from multi_market_arbitrage.core.ids import IngestId
 from multi_market_arbitrage.core.time import UtcTimestamp
 from multi_market_arbitrage.normalization import (
     CanonicalBookLevel,
+    CanonicalEvent,
     NormalizationContext,
     NormalizationError,
+    OrderBookSnapshotEvent,
     PolymarketNormalizer,
 )
 from multi_market_arbitrage.reference import (
@@ -24,6 +26,7 @@ from multi_market_arbitrage.reference import (
     ReferenceBundle,
 )
 from multi_market_arbitrage.state import (
+    BookMutationKind,
     BookStateError,
     CanonicalL2BookOwner,
     InvalidationReason,
@@ -89,6 +92,40 @@ def _apply_ws(
         owner.apply_event(event)
 
 
+def _price_change_event(
+    bundle: ReferenceBundle,
+    *,
+    ingest: str,
+    price: str,
+    quantity: str,
+    side: str = "BUY",
+    received_ns: int = 3_000_000_000,
+) -> CanonicalEvent:
+    payload = json.dumps(
+        {
+            "event_type": "price_change",
+            "market": "0xcondition",
+            "price_changes": [
+                {
+                    "asset_id": "token-yes",
+                    "price": price,
+                    "size": quantity,
+                    "side": side,
+                    "hash": f"hash-{ingest}",
+                }
+            ],
+            "timestamp": str(1_787_198_402_000 + received_ns // 1_000_000),
+        },
+        separators=(",", ":"),
+    ).encode()
+    events = PolymarketNormalizer().normalize(
+        payload,
+        _context(payload, bundle, ingest=ingest, received_ns=received_ns),
+    )
+    assert len(events) == 1
+    return events[0]
+
+
 def test_snapshot_replaces_state_and_sorts_independent_of_wire_order() -> None:
     bundle = _bundle()
     owner = CanonicalL2BookOwner(bundle, bundle.instruments[0].instrument_id)
@@ -111,6 +148,9 @@ def test_snapshot_replaces_state_and_sorts_independent_of_wire_order() -> None:
     assert snapshot.supports_book_checksum is False
     assert snapshot.venue_sequence is None
     assert snapshot.validated_checksum is None
+    assert owner.snapshot() is snapshot
+    assert owner.content_sha256() == snapshot.content_sha256()
+    assert owner.economic_content_sha256() == snapshot.economic_content_sha256()
 
 
 def test_price_change_size_is_absolute_and_duplicate_is_idempotent() -> None:
@@ -129,6 +169,7 @@ def test_price_change_size_is_absolute_and_duplicate_is_idempotent() -> None:
     )
     owner.apply_event(events[0])
     first = owner.snapshot()
+    first_provenance = first.state_source_provenance
     owner.apply_event(events[0])
     duplicate = owner.snapshot()
 
@@ -139,7 +180,198 @@ def test_price_change_size_is_absolute_and_duplicate_is_idempotent() -> None:
         IngestId("book"),
         IngestId("change"),
     )
+    assert duplicate.state_source_provenance == first_provenance
     assert duplicate.content_sha256() == first.content_sha256()
+
+
+def test_active_level_lineage_replaces_deletes_and_keeps_untouched_sources() -> None:
+    bundle = _bundle()
+    owner = CanonicalL2BookOwner(bundle, bundle.instruments[0].instrument_id)
+    _apply_ws(
+        owner,
+        _raw("polymarket_ws_initial_book.json"),
+        bundle,
+        ingest="book",
+        received_ns=2_000_000_000,
+    )
+
+    owner.apply_event(
+        _price_change_event(
+            bundle, ingest="bid-45", price="0.45", quantity="7", received_ns=3_000_000_000
+        )
+    )
+    owner.apply_event(
+        _price_change_event(
+            bundle, ingest="bid-40", price="0.40", quantity="8", received_ns=3_000_000_001
+        )
+    )
+    owner.apply_event(
+        _price_change_event(
+            bundle, ingest="delete-45", price="0.45", quantity="0", received_ns=3_000_000_002
+        )
+    )
+    after_delete = owner.snapshot().state_source_provenance
+    assert after_delete is not None
+    assert after_delete.source_ingest_ids == (
+        IngestId("book"),
+        IngestId("bid-40"),
+        IngestId("delete-45"),
+    )
+    assert IngestId("bid-45") not in after_delete.source_ingest_ids
+
+    # The unchanged 0.60 ask remains attributable to the baseline.  Its no-op
+    # update supplies freshness but does not replace that level's source.
+    owner.apply_event(
+        _price_change_event(
+            bundle,
+            ingest="noop-ask-60",
+            price="0.60",
+            quantity="8",
+            side="SELL",
+            received_ns=3_000_000_003,
+        )
+    )
+    after_noop = owner.snapshot().state_source_provenance
+    assert after_noop is not None
+    assert after_noop.source_ingest_ids == (
+        IngestId("book"),
+        IngestId("bid-40"),
+        IngestId("noop-ask-60"),
+    )
+    assert IngestId("delete-45") not in after_noop.source_ingest_ids
+
+
+def test_two_thousand_same_price_replacements_keep_active_lineage_bounded() -> None:
+    bundle = _bundle()
+    owner = CanonicalL2BookOwner(bundle, bundle.instruments[0].instrument_id)
+    _apply_ws(
+        owner,
+        _raw("polymarket_ws_initial_book.json"),
+        bundle,
+        ingest="book",
+        received_ns=2_000_000_000,
+    )
+
+    for index in range(2_000):
+        owner.apply_event(
+            _price_change_event(
+                bundle,
+                ingest=f"replacement-{index}",
+                price="0.45",
+                quantity=str(index + 10),
+                received_ns=3_000_000_000 + index,
+            )
+        )
+
+    provenance = owner.snapshot().state_source_provenance
+    assert provenance is not None
+    assert provenance.source_ingest_ids == (
+        IngestId("book"),
+        IngestId("replacement-1999"),
+    )
+    assert len(provenance.raw_source_refs) == 2
+
+
+def test_raw_identity_hash_conflict_invalidates_without_reassociating_source() -> None:
+    bundle = _bundle()
+    owner = CanonicalL2BookOwner(bundle, bundle.instruments[0].instrument_id)
+    _apply_ws(
+        owner,
+        _raw("polymarket_ws_initial_book.json"),
+        bundle,
+        ingest="book",
+        received_ns=2_000_000_000,
+    )
+    before = owner.snapshot()
+    conflicting = _price_change_event(
+        bundle,
+        ingest="book",
+        price="0.45",
+        quantity="7",
+        received_ns=3_000_000_000,
+    )
+
+    with pytest.raises(BookStateError, match="identity/hash conflict"):
+        owner.apply_event(conflicting)
+
+    failed = owner.snapshot()
+    assert failed.health is BookHealth.INVALID
+    assert failed.invalidation_reason is InvalidationReason.PROTOCOL_VIOLATION
+    assert failed.bids == ()
+    assert failed.asks == ()
+    assert failed.generation == before.generation
+    assert failed.state_source_provenance == before.state_source_provenance
+    assert failed.last_source_event_id == before.last_source_event_id
+
+
+def test_level_bound_rejection_is_typed_atomic_and_fail_closed() -> None:
+    bundle = _bundle()
+    owner = CanonicalL2BookOwner(bundle, bundle.instruments[0].instrument_id)
+    book_raw = _raw("polymarket_ws_initial_book.json")
+    _apply_ws(owner, book_raw, bundle, ingest="book", received_ns=2_000_000_000)
+    before = owner.snapshot()
+    events = PolymarketNormalizer().normalize(
+        book_raw,
+        _context(book_raw, bundle, ingest="oversized", received_ns=3_000_000_000),
+    )
+    assert len(events) == 1
+    event = events[0]
+    assert isinstance(event.payload, OrderBookSnapshotEvent)
+    oversized = replace(
+        event,
+        payload=replace(event.payload, bids=event.payload.bids * 2_049),
+    )
+
+    with pytest.raises(BookStateError, match="exceeds 4096 active levels"):
+        owner.apply_event(oversized)
+
+    failed = owner.snapshot()
+    assert failed.health is BookHealth.INVALID
+    assert failed.invalidation_reason is InvalidationReason.PROTOCOL_VIOLATION
+    assert failed.bids == ()
+    assert failed.asks == ()
+    assert failed.generation == before.generation
+    assert failed.state_source_provenance == before.state_source_provenance
+    assert failed.last_source_event_id == before.last_source_event_id
+
+
+def test_raw_source_bound_rejection_is_typed_atomic_and_fail_closed() -> None:
+    bundle = _bundle()
+    owner = CanonicalL2BookOwner(bundle, bundle.instruments[0].instrument_id)
+    _apply_ws(
+        owner,
+        _raw("polymarket_ws_initial_book.json"),
+        bundle,
+        ingest="book",
+        received_ns=2_000_000_000,
+    )
+    before = owner.snapshot()
+    candidate = _price_change_event(
+        bundle,
+        ingest="candidate",
+        price="0.45",
+        quantity="7",
+        received_ns=3_000_000_000,
+    )
+    oversized = replace(
+        candidate,
+        source_ingest_ids=tuple(IngestId(f"source-{index}") for index in range(4_097)),
+        source_payload_hashes=tuple(
+            hashlib.sha256(f"source-{index}".encode()).hexdigest() for index in range(4_097)
+        ),
+    )
+
+    with pytest.raises(BookStateError, match="exceeds 4096 raw source references"):
+        owner.apply_event(oversized)
+
+    failed = owner.snapshot()
+    assert failed.health is BookHealth.INVALID
+    assert failed.invalidation_reason is InvalidationReason.PROTOCOL_VIOLATION
+    assert failed.bids == ()
+    assert failed.asks == ()
+    assert failed.generation == before.generation
+    assert failed.state_source_provenance == before.state_source_provenance
+    assert failed.last_source_event_id == before.last_source_event_id
 
 
 def test_reported_best_mismatch_invalidates_exact_state() -> None:
@@ -185,6 +417,36 @@ def test_rest_snapshot_initializes_and_preserves_raw_provenance() -> None:
     assert snapshot.state_source_provenance.source_ingest_ids == (IngestId("rest"),)
     assert snapshot.last_venue_timestamp is None
     assert snapshot.last_valid_update_time == UtcTimestamp(4_000_000_000)
+
+
+def test_full_ws_and_rest_snapshots_reset_authoritative_level_lineage() -> None:
+    bundle = _bundle()
+    owner = CanonicalL2BookOwner(bundle, bundle.instruments[0].instrument_id)
+    book_raw = _raw("polymarket_ws_initial_book.json")
+    _apply_ws(owner, book_raw, bundle, ingest="book", received_ns=2_000_000_000)
+    owner.apply_event(
+        _price_change_event(
+            bundle,
+            ingest="delta",
+            price="0.45",
+            quantity="7",
+            received_ns=3_000_000_000,
+        )
+    )
+    _apply_ws(owner, book_raw, bundle, ingest="book-reset", received_ns=4_000_000_000)
+    ws_reset = owner.snapshot().state_source_provenance
+    assert ws_reset is not None
+    assert ws_reset.source_ingest_ids == (IngestId("book-reset"),)
+
+    rest_raw = _raw("polymarket_rest_book_yes.json")
+    rest = PolymarketNormalizer().normalize_rest_payload(
+        rest_raw,
+        _context(rest_raw, bundle, ingest="rest-reset", received_ns=5_000_000_000),
+    )
+    owner.apply_rest_snapshot(rest)
+    rest_reset = owner.snapshot().state_source_provenance
+    assert rest_reset is not None
+    assert rest_reset.source_ingest_ids == (IngestId("rest-reset"),)
 
 
 def test_disconnect_requires_resync_then_fresh_rest_snapshot() -> None:
@@ -256,7 +518,26 @@ def test_rest_audit_compares_levels_not_opaque_hash() -> None:
         rest_raw, _context(rest_raw, bundle, ingest="rest", received_ns=2_000_000_000)
     )
     owner.apply_rest_snapshot(rest)
-    same_levels_new_hash = replace(rest, venue_hash="completely-different-opaque-value")
+    owner.apply_event(
+        _price_change_event(
+            bundle,
+            ingest="rest-noop",
+            price=str(rest.bids[0].price),
+            quantity=str(rest.bids[0].quantity),
+            received_ns=2_500_000_000,
+        )
+    )
+    before_audit = owner.snapshot().state_source_provenance
+    assert before_audit is not None
+    assert before_audit.source_ingest_ids == (IngestId("rest"), IngestId("rest-noop"))
+    audit_raw = _raw("polymarket_rest_book_yes.json")
+    same_levels_new_hash = replace(
+        PolymarketNormalizer().normalize_rest_payload(
+            audit_raw,
+            _context(audit_raw, bundle, ingest="rest-audit", received_ns=3_000_000_000),
+        ),
+        venue_hash="completely-different-opaque-value",
+    )
 
     assert (
         owner.audit_rest_snapshot(
@@ -267,7 +548,7 @@ def test_rest_audit_compares_levels_not_opaque_hash() -> None:
     audited = owner.snapshot()
     assert audited.last_valid_update_time == UtcTimestamp(3_000_000_000)
     assert audited.state_source_provenance is not None
-    assert audited.state_source_provenance.source_ingest_ids == (IngestId("rest"),)
+    assert audited.state_source_provenance.source_ingest_ids == (IngestId("rest-audit"),)
 
     mismatched = replace(
         rest,
@@ -278,7 +559,16 @@ def test_rest_audit_compares_levels_not_opaque_hash() -> None:
     )
     result = owner.audit_rest_snapshot(mismatched, checked_at=UtcTimestamp(4_000_000_000))
     assert result.status is RestAuditStatus.MISMATCH
-    assert owner.snapshot().invalidation_reason is InvalidationReason.REST_AUDIT_MISMATCH
+    failed = owner.snapshot()
+    assert failed.invalidation_reason is InvalidationReason.REST_AUDIT_MISMATCH
+    assert failed.state_source_provenance is not None
+    assert failed.state_source_provenance.source_ingest_ids == (
+        IngestId("rest-audit"),
+        IngestId("rest"),
+    )
+    diagnostic_provenance = failed.state_source_provenance
+    owner.begin_resync()
+    assert owner.snapshot().state_source_provenance == diagnostic_provenance
 
 
 def test_malformed_and_unknown_reference_fail_typed() -> None:
@@ -367,17 +657,130 @@ def test_last_trade_is_recorded_without_refreshing_l2_freshness() -> None:
         ingest="book",
         received_ns=2_000_000_000,
     )
-    before = owner.snapshot().last_valid_update_time
+    before = owner.snapshot()
+    before_economic_hash = owner.economic_content_sha256()
+    trade_payload = _raw("polymarket_ws_last_trade.json")
+    trade_event = PolymarketNormalizer().normalize(
+        trade_payload,
+        _context(
+            trade_payload,
+            bundle,
+            ingest="trade",
+            received_ns=2_500_000_000,
+        ),
+    )[0]
+    mutation = owner.apply_event(trade_event)
+    after = owner.snapshot()
+
+    assert mutation.kinds == BookMutationKind.LAST_TRADE_DIAGNOSTIC
+    assert not mutation.scanner_dirty
+    assert after.last_trade_price == Price.parse("0.46")
+    assert after.last_valid_update_time == before.last_valid_update_time
+    assert after.last_source_event_id == before.last_source_event_id
+    assert after.last_source_provenance == before.last_source_provenance
+    assert after.state_source_provenance == before.state_source_provenance
+    assert after.last_venue_timestamp == before.last_venue_timestamp
+    assert after.last_trade_source_event_id == trade_event.canonical_event_id
+    assert after.last_trade_source_provenance is not None
+    assert owner.economic_content_sha256() == before_economic_hash
+    assert owner.content_sha256() != before.content_sha256()
+
+
+@given(
+    initial=st.dictionaries(
+        keys=st.integers(min_value=1, max_value=49),
+        values=st.integers(min_value=1, max_value=100),
+        max_size=30,
+    ),
+    updates=st.dictionaries(
+        keys=st.integers(min_value=1, max_value=49),
+        values=st.integers(min_value=0, max_value=100),
+        min_size=1,
+        max_size=12,
+    ),
+    reverse=st.booleans(),
+)
+def test_transactional_sorted_side_merge_matches_dict_oracle_and_reuses_levels(
+    initial: dict[int, int],
+    updates: dict[int, int],
+    reverse: bool,
+) -> None:
+    bundle = _bundle()
+    owner = CanonicalL2BookOwner(bundle, bundle.instruments[0].instrument_id)
+
+    def actual_tick(tick: int) -> int:
+        return tick if reverse else tick + 50
+
+    initial_levels = [
+        {
+            "price": ExactDecimal(actual_tick(tick), 2).to_canonical_string(),
+            "size": str(quantity),
+        }
+        for tick, quantity in initial.items()
+    ]
+    snapshot_payload = json.dumps(
+        {
+            "event_type": "book",
+            "asset_id": "token-yes",
+            "market": "0xcondition",
+            "bids": initial_levels if reverse else [],
+            "asks": [] if reverse else initial_levels,
+            "timestamp": "1787198401000",
+            "hash": "property-snapshot",
+        },
+        separators=(",", ":"),
+    ).encode()
     _apply_ws(
         owner,
-        _raw("polymarket_ws_last_trade.json"),
+        snapshot_payload,
         bundle,
-        ingest="trade",
-        received_ns=2_500_000_000,
+        ingest="property-snapshot",
+        received_ns=2_000_000_000,
     )
+    before = owner.snapshot()
+    update_payload = json.dumps(
+        {
+            "event_type": "price_change",
+            "market": "0xcondition",
+            "price_changes": [
+                {
+                    "asset_id": "token-yes",
+                    "price": ExactDecimal(actual_tick(tick), 2).to_canonical_string(),
+                    "size": str(quantity),
+                    "side": "BUY" if reverse else "SELL",
+                    "hash": f"property-update-{tick}",
+                }
+                for tick, quantity in updates.items()
+            ],
+            "timestamp": "1787198402000",
+        },
+        separators=(",", ":"),
+    ).encode()
+    _apply_ws(
+        owner,
+        update_payload,
+        bundle,
+        ingest="property-update",
+        received_ns=3_000_000_000,
+    )
+    result = owner.snapshot().bids if reverse else owner.snapshot().asks
+    expected = dict(initial)
+    for tick, quantity in updates.items():
+        if quantity == 0:
+            expected.pop(tick, None)
+        else:
+            expected[tick] = quantity
 
-    assert owner.snapshot().last_trade_price == Price.parse("0.46")
-    assert owner.snapshot().last_valid_update_time == before
+    assert tuple((level.price.value, level.quantity.value) for level in result) == tuple(
+        (ExactDecimal(actual_tick(tick), 2), ExactDecimal(quantity))
+        for tick, quantity in sorted(expected.items(), reverse=reverse)
+    )
+    current = before.bids if reverse else before.asks
+    original_by_price = {level.price.value: level for level in current}
+    update_prices = {ExactDecimal(actual_tick(tick), 2) for tick in updates}
+    for level in result:
+        if level.price.value in original_by_price and level.price.value not in update_prices:
+            assert level is original_by_price[level.price.value]
 
 
 @given(

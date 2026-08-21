@@ -2,6 +2,7 @@
 
 from .outputs import Phase1AnalyticalOutputs, ResearchOutputSummary
 from .report import ScanDispositionCount, ScanReport, build_scan_report
+from .supervised import SupervisedAnalyticalOutputs
 from .validation import DataValidationReport, validate_data
 
 __all__ = [
@@ -10,6 +11,7 @@ __all__ = [
     "ResearchOutputSummary",
     "ScanDispositionCount",
     "ScanReport",
+    "SupervisedAnalyticalOutputs",
     "build_scan_report",
     "validate_data",
 ]

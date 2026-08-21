@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from itertools import islice
 from pathlib import Path
 from types import TracebackType
 from typing import Protocol, Self, cast
@@ -36,9 +37,39 @@ class _ReadTable(Protocol):
     def __call__(self, source: str | Path) -> pa.Table: ...
 
 
+class _RowGroupMetadata(Protocol):
+    @property
+    def total_byte_size(self) -> int: ...
+
+
+class _FileMetadata(Protocol):
+    @property
+    def num_row_groups(self) -> int: ...
+
+    @property
+    def num_rows(self) -> int: ...
+
+    def row_group(self, index: int) -> _RowGroupMetadata: ...
+
+
+class _ParquetFile(Protocol):
+    @property
+    def metadata(self) -> _FileMetadata: ...
+
+    def close(self, *, force: bool = False) -> None: ...
+
+
+class _OpenParquetFile(Protocol):
+    def __call__(self, source: str | Path) -> _ParquetFile: ...
+
+
 _read_table = cast(
     _ReadTable,
     pq.read_table,  # pyright: ignore[reportUnknownMemberType]
+)
+_open_parquet_file = cast(
+    _OpenParquetFile,
+    pq.ParquetFile,  # pyright: ignore[reportUnknownMemberType]
 )
 
 
@@ -50,10 +81,23 @@ class DuckDBReadOnlyQuery:
         allowed_root: Path,
         *,
         maximum_registered_bytes: int = 512 * 1024 * 1024,
+        maximum_materialized_bytes: int = 512 * 1024 * 1024,
         maximum_registered_rows: int = 5_000_000,
+        maximum_registered_files: int = 4_096,
+        maximum_registered_row_groups: int = 65_536,
         maximum_result_rows: int = 100_000,
     ) -> None:
-        if min(maximum_registered_bytes, maximum_registered_rows, maximum_result_rows) <= 0:
+        if (
+            min(
+                maximum_registered_bytes,
+                maximum_materialized_bytes,
+                maximum_registered_rows,
+                maximum_registered_files,
+                maximum_registered_row_groups,
+                maximum_result_rows,
+            )
+            <= 0
+        ):
             raise ReadOnlyQueryError("DuckDB resource limits must be positive")
         self._allowed_root = allowed_root.resolve()
         self._connection = duckdb.connect(database=":memory:")
@@ -66,7 +110,10 @@ class DuckDBReadOnlyQuery:
         self._connection.execute("SET threads = 1")
         self._connection.execute("SET memory_limit = '512MB'")
         self._maximum_registered_bytes = maximum_registered_bytes
+        self._maximum_materialized_bytes = maximum_materialized_bytes
         self._maximum_registered_rows = maximum_registered_rows
+        self._maximum_registered_files = maximum_registered_files
+        self._maximum_registered_row_groups = maximum_registered_row_groups
         self._maximum_result_rows = maximum_result_rows
         self._closed = False
 
@@ -75,11 +122,15 @@ class DuckDBReadOnlyQuery:
         if not resolved.is_relative_to(self._allowed_root):
             raise ReadOnlyQueryError("Parquet path is outside the configured analytical root")
         if resolved.is_dir():
-            candidates: Sequence[Path] = sorted(resolved.rglob("*.parquet"))
+            candidates: Sequence[Path] = sorted(
+                islice(resolved.rglob("*.parquet"), self._maximum_registered_files + 1)
+            )
         elif resolved.suffix == ".parquet":
             candidates = (path,)
         else:
             raise ReadOnlyQueryError("registered path must be a Parquet file or directory")
+        if len(candidates) > self._maximum_registered_files:
+            raise ReadOnlyQueryError("registered Parquet file count exceeds the query limit")
         files: list[Path] = []
         for candidate in candidates:
             if candidate.is_symlink():
@@ -92,6 +143,27 @@ class DuckDBReadOnlyQuery:
             raise ReadOnlyQueryError("registered analytical dataset has no Parquet fragments")
         return tuple(files)
 
+    @staticmethod
+    def _parquet_resource_usage(path: Path) -> tuple[int, int, int]:
+        try:
+            parquet_file = _open_parquet_file(path)
+        except (OSError, pa.ArrowException) as error:
+            raise ReadOnlyQueryError("cannot inspect registered Parquet metadata") from error
+        try:
+            metadata = parquet_file.metadata
+            rows = metadata.num_rows
+            row_groups = metadata.num_row_groups
+            materialized_bytes = sum(
+                metadata.row_group(index).total_byte_size for index in range(row_groups)
+            )
+        except (OSError, pa.ArrowException, ValueError) as error:
+            raise ReadOnlyQueryError("cannot inspect registered Parquet metadata") from error
+        finally:
+            parquet_file.close()
+        if min(rows, row_groups, materialized_bytes) < 0:
+            raise ReadOnlyQueryError("registered Parquet metadata contains negative resource usage")
+        return rows, row_groups, materialized_bytes
+
     def register_parquet_view(self, view_name: str, path: Path) -> None:
         if self._closed:
             raise ReadOnlyQueryError("DuckDB query layer is closed")
@@ -101,13 +173,27 @@ class DuckDBReadOnlyQuery:
         total_bytes = sum(file.stat().st_size for file in files)
         if total_bytes > self._maximum_registered_bytes:
             raise ReadOnlyQueryError("registered Parquet bytes exceed the query resource limit")
-        tables: list[pa.Table] = []
         total_rows = 0
+        total_row_groups = 0
+        total_materialized_bytes = 0
         for file in files:
-            table = _read_table(file)
-            total_rows += table.num_rows
+            rows, row_groups, materialized_bytes = self._parquet_resource_usage(file)
+            total_rows += rows
+            total_row_groups += row_groups
+            total_materialized_bytes += materialized_bytes
             if total_rows > self._maximum_registered_rows:
                 raise ReadOnlyQueryError("registered Parquet rows exceed the query resource limit")
+            if total_row_groups > self._maximum_registered_row_groups:
+                raise ReadOnlyQueryError(
+                    "registered Parquet row groups exceed the query resource limit"
+                )
+            if total_materialized_bytes > self._maximum_materialized_bytes:
+                raise ReadOnlyQueryError(
+                    "registered Parquet materialized bytes exceed the query resource limit"
+                )
+        tables: list[pa.Table] = []
+        for file in files:
+            table = _read_table(file)
             tables.append(table)
         try:
             combined = pa.concat_tables(tables) if len(tables) > 1 else tables[0]

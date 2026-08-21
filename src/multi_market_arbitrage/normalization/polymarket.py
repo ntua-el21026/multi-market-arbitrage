@@ -14,7 +14,7 @@ from multi_market_arbitrage.core.ids import (
     SchemaVersion,
     is_sha256_hex,
 )
-from multi_market_arbitrage.core.provenance import Provenance
+from multi_market_arbitrage.core.provenance import Provenance, RawSourceRef
 from multi_market_arbitrage.core.time import UtcTimestamp
 from multi_market_arbitrage.reference import (
     POLYMARKET_VENUE_ID,
@@ -74,6 +74,13 @@ class NormalizationContext:
     def __post_init__(self) -> None:
         if not is_sha256_hex(self.source_payload_sha256):
             raise ValueError("source_payload_sha256 must be lowercase SHA-256 hexadecimal")
+
+    @property
+    def raw_source_ref(self) -> RawSourceRef:
+        return RawSourceRef(
+            ingest_id=self.source_ingest_id,
+            payload_sha256=self.source_payload_sha256,
+        )
 
 
 def _levels(
@@ -189,9 +196,23 @@ class PolymarketNormalizer:
     def normalize(
         self, payload_bytes: bytes, context: NormalizationContext
     ) -> tuple[CanonicalEvent, ...]:
+        return self.normalize_parsed(
+            payload_bytes,
+            parse_market_ws_message(payload_bytes),
+            context,
+        )
+
+    def normalize_parsed(
+        self,
+        payload_bytes: bytes,
+        native_events: tuple[MarketWsEvent, ...],
+        context: NormalizationContext,
+    ) -> tuple[CanonicalEvent, ...]:
+        """Normalize a previously parsed exact payload without decoding it twice."""
+
         if hashlib.sha256(payload_bytes).hexdigest() != context.source_payload_sha256:
             raise NormalizationError("raw payload SHA-256 does not match normalization context")
-        native_events = parse_market_ws_message(payload_bytes)
+        source_ref = context.raw_source_ref
         result: list[CanonicalEvent] = []
         ordinal = 0
         for native in native_events:
@@ -225,8 +246,8 @@ class PolymarketNormalizer:
                     venue_id=POLYMARKET_VENUE_ID,
                     market_id=market_id,
                     instrument_id=instrument_id,
-                    source_ingest_ids=(context.source_ingest_id,),
-                    source_payload_hashes=(context.source_payload_sha256,),
+                    source_ingest_ids=(source_ref.ingest_id,),
+                    source_payload_hashes=(source_ref.payload_sha256,),
                     reference_version_ids=reference_version_ids,
                     venue_timestamp=venue_time,
                     receive_timestamp=context.received_at,
@@ -420,9 +441,8 @@ class PolymarketNormalizer:
             venue_hash=book.venue_hash,
             timestamp_raw=book.timestamp_raw,
             received_at=context.received_at,
-            provenance=Provenance(
-                source_ingest_ids=(context.source_ingest_id,),
-                source_payload_hashes=(context.source_payload_sha256,),
+            provenance=Provenance.from_raw_source_refs(
+                (context.raw_source_ref,),
                 reference_version_ids=bundle.current_version_ids,
                 attributes=(
                     ("transport", "HTTP"),

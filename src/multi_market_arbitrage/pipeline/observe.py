@@ -7,18 +7,18 @@ import hashlib
 import logging
 import math
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import cast
 
 from multi_market_arbitrage.core.config import Phase1Config, Phase1RuntimeRole
 from multi_market_arbitrage.core.health import ComponentHealth
 from multi_market_arbitrage.core.ids import (
     CollectorRunId,
     ConnectionId,
+    InstrumentId,
     SubscriptionId,
     VenueId,
     WriterId,
@@ -29,8 +29,12 @@ from multi_market_arbitrage.ingestion import RawEventEnvelope
 from multi_market_arbitrage.journal import (
     JournalBackpressureError,
     JournalMetricsSnapshot,
+    JournalReceipt,
+    JournalTicket,
     JournalWriterConfig,
     RawJournalWriter,
+    completion_path_for_run,
+    load_run_completion_head,
 )
 from multi_market_arbitrage.normalization import CanonicalEventType
 from multi_market_arbitrage.observability import (
@@ -40,11 +44,16 @@ from multi_market_arbitrage.observability import (
     configure_json_logger,
 )
 from multi_market_arbitrage.reference import POLYMARKET_VENUE_ID
-from multi_market_arbitrage.research import Phase1AnalyticalOutputs, ResearchOutputSummary
+from multi_market_arbitrage.research import (
+    Phase1AnalyticalOutputs,
+    ResearchOutputSummary,
+    SupervisedAnalyticalOutputs,
+)
 from multi_market_arbitrage.state.order_books import InvalidationReason
 from multi_market_arbitrage.venues.polymarket import (
     PolymarketMarketWebSocket,
     PolymarketPublicClient,
+    ReceivedWebSocketMessage,
 )
 from multi_market_arbitrage.venues.polymarket.errors import PolymarketTransportError
 from multi_market_arbitrage.venues.polymarket.schemas import GammaMarket
@@ -59,6 +68,13 @@ from .channels import (
     REST_BOOK_AUDIT,
     WS_MARKET,
 )
+from .freshness import IntegrityDeadline, IntegrityDeadlineReason, next_integrity_deadline
+from .ingress import (
+    BoundedRawIngress,
+    RawIngressBackpressureError,
+    RawIngressItem,
+    RawIngressMetricsSnapshot,
+)
 from .processor import (
     CanonicalProcessor,
     ProcessedEnvelope,
@@ -72,6 +88,40 @@ class _GenerationExit(StrEnum):
     AUDIT_DUE = "AUDIT_DUE"
     RESYNC_REQUIRED = "RESYNC_REQUIRED"
     REFERENCE_REFRESH = "REFERENCE_REFRESH"
+    INGRESS_OVERFLOW = "INGRESS_OVERFLOW"
+
+
+class _ObservationDeadlineReached(RuntimeError):
+    """The finite public-observation deadline elapsed during remote I/O."""
+
+
+async def _await_remote_before_deadline[T](
+    operation: Callable[[], Awaitable[T]],
+    *,
+    deadline: float | None,
+) -> T:
+    """Bound only remote I/O, leaving returned bytes available for journaling."""
+
+    if deadline is None:
+        return await operation()
+    try:
+        async with asyncio.timeout_at(deadline):
+            return await operation()
+    except TimeoutError as error:
+        raise _ObservationDeadlineReached from error
+
+
+def _empty_ingress_metrics() -> RawIngressMetricsSnapshot:
+    return RawIngressMetricsSnapshot(
+        received=0,
+        admitted=0,
+        dequeued=0,
+        overflows=0,
+        queue_depth=0,
+        queue_high_water=0,
+        queued_bytes=0,
+        queued_bytes_high_water=0,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +129,7 @@ class _GenerationResult:
     reason: _GenerationExit
     deviations: tuple[str, ...] = ()
     refresh_requests: tuple[ReferenceRefreshRequest, ...] = ()
+    ingress_metrics: RawIngressMetricsSnapshot = field(default_factory=_empty_ingress_metrics)
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +138,29 @@ class _StreamResult:
     completed: bool
     selected_market_resolved: bool
     deviations: tuple[str, ...]
+    ingress_metrics: RawIngressMetricsSnapshot = field(default_factory=_empty_ingress_metrics)
+
+
+_EMPTY_INGRESS_METRICS = _empty_ingress_metrics()
+
+
+def _merge_ingress_metrics(
+    left: RawIngressMetricsSnapshot,
+    right: RawIngressMetricsSnapshot,
+) -> RawIngressMetricsSnapshot:
+    return RawIngressMetricsSnapshot(
+        received=left.received + right.received,
+        admitted=left.admitted + right.admitted,
+        dequeued=left.dequeued + right.dequeued,
+        overflows=left.overflows + right.overflows,
+        queue_depth=right.queue_depth,
+        queue_high_water=max(left.queue_high_water, right.queue_high_water),
+        queued_bytes=right.queued_bytes,
+        queued_bytes_high_water=max(
+            left.queued_bytes_high_water,
+            right.queued_bytes_high_water,
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +178,7 @@ class ObservationSummary:
     processor: ProcessorSummary
     analytical_outputs: ResearchOutputSummary
     observability_metrics: MetricsSnapshot
+    ingress_metrics: RawIngressMetricsSnapshot
     reconnects: int
     selected_market_resolved: bool
     protocol_deviations: tuple[str, ...]
@@ -125,6 +200,100 @@ class _RawCaptureBoundary:
         self.processor = processor
         self.metrics = metrics
         self._next_sequence = 0
+        self._book_freshness_ns: dict[InstrumentId, int] = {}
+
+    def _capture_envelope(
+        self,
+        *,
+        channel: str,
+        payload: bytes,
+        transport_type: str,
+        semantics_hash: str,
+        connection_id: ConnectionId | None,
+        subscription_id: SubscriptionId | None,
+        transport_metadata: dict[str, str | int | bool] | None,
+        received_wall_time: UtcTimestamp,
+        received_monotonic_ns: int,
+    ) -> RawEventEnvelope:
+        envelope = RawEventEnvelope.capture(
+            collector_run_id=self.collector_run_id,
+            ingest_seq=self._next_sequence,
+            venue_id=self.writer.config.venue_id,
+            connection_id=connection_id or ConnectionId.new(),
+            subscription_id=subscription_id or SubscriptionId.new(),
+            channel=channel,
+            transport_type=transport_type,
+            subscription_semantics_hash=semantics_hash,
+            received_wall_time=received_wall_time,
+            received_monotonic=MonotonicTimestamp(
+                self.collector_run_id.value,
+                received_monotonic_ns,
+            ),
+            payload_bytes=payload,
+            payload_encoding="utf-8",
+            transport_metadata=transport_metadata,
+        )
+        self._next_sequence += 1
+        return envelope
+
+    def _record_processed(
+        self,
+        envelope: RawEventEnvelope,
+        result: ProcessedEnvelope,
+        *,
+        scan_completed_monotonic_ns: int,
+    ) -> None:
+        self.metrics.increment_counter("mma_raw_processed_total")
+        if not result.success:
+            self.metrics.increment_counter("mma_parse_failures_total")
+        if result.needs_resync:
+            self._book_freshness_ns.clear()
+        for update in result.book_freshness_updates:
+            self._book_freshness_ns[update.instrument_id] = update.received_monotonic.nanoseconds
+        if result.scan_count:
+            self.metrics.observe_histogram(
+                "mma_receive_to_scan_complete_ns",
+                max(
+                    0,
+                    scan_completed_monotonic_ns - envelope.received_monotonic.nanoseconds,
+                ),
+            )
+
+    def _record_durable_receipt(
+        self,
+        envelope: RawEventEnvelope,
+        receipt: JournalReceipt,
+    ) -> None:
+        self.metrics.increment_counter("mma_raw_durable_total")
+        enqueued = receipt.enqueued_monotonic
+        commit_started = receipt.commit_started_monotonic
+        durable = receipt.durable_monotonic
+        if enqueued is not None and commit_started is not None:
+            self.metrics.observe_histogram(
+                "mma_journal_enqueue_to_commit_ns",
+                commit_started.nanoseconds - enqueued.nanoseconds,
+            )
+        if commit_started is not None and durable is not None:
+            self.metrics.observe_histogram(
+                "mma_journal_commit_to_durable_ns",
+                durable.nanoseconds - commit_started.nanoseconds,
+            )
+        self.metrics.observe_histogram(
+            "mma_journal_durability_group_size",
+            receipt.durability_group_size,
+        )
+        if durable is not None:
+            self.metrics.observe_histogram(
+                "mma_receive_to_durable_ns",
+                max(
+                    0,
+                    durable.nanoseconds - envelope.received_monotonic.nanoseconds,
+                ),
+            )
+
+    @property
+    def book_freshness_receive_ns(self) -> tuple[int, ...]:
+        return tuple(self._book_freshness_ns.values())
 
     async def preserve_then_process(
         self,
@@ -139,22 +308,18 @@ class _RawCaptureBoundary:
     ) -> ProcessedEnvelope:
         self.metrics.increment_counter("mma_raw_received_total")
         self.metrics.observe_histogram("mma_raw_payload_bytes", len(payload))
-        envelope = RawEventEnvelope.capture(
-            collector_run_id=self.collector_run_id,
-            ingest_seq=self._next_sequence,
-            venue_id=self.writer.config.venue_id,
-            connection_id=connection_id or ConnectionId.new(),
-            subscription_id=subscription_id or SubscriptionId.new(),
+        received_monotonic_ns = time.monotonic_ns()
+        envelope = self._capture_envelope(
             channel=channel,
+            payload=payload,
             transport_type=transport_type,
-            subscription_semantics_hash=semantics_hash,
-            received_wall_time=UtcTimestamp.now(),
-            received_monotonic=MonotonicTimestamp.now(self.collector_run_id.value),
-            payload_bytes=payload,
-            payload_encoding="utf-8",
+            semantics_hash=semantics_hash,
+            connection_id=connection_id,
+            subscription_id=subscription_id,
             transport_metadata=transport_metadata,
+            received_wall_time=UtcTimestamp.now(),
+            received_monotonic_ns=received_monotonic_ns,
         )
-        self._next_sequence += 1
         try:
             receipt = await self.writer.submit(envelope)
         except JournalBackpressureError:
@@ -163,13 +328,71 @@ class _RawCaptureBoundary:
             # state immediately and let the fatal journal fault abort the run.
             self.processor.on_backpressure()
             raise
-        self.metrics.increment_counter("mma_raw_durable_total")
+        self._record_durable_receipt(envelope, receipt)
         self.metrics.set_gauge("mma_journal_queue_depth", self.writer.metrics.queue_depth)
         result = self.processor.process_durable(envelope, receipt)
-        self.metrics.increment_counter("mma_raw_processed_total")
-        if not result.success:
-            self.metrics.increment_counter("mma_parse_failures_total")
+        self._record_processed(
+            envelope,
+            result,
+            scan_completed_monotonic_ns=time.monotonic_ns(),
+        )
         return result
+
+    async def preserve_websocket_batch(
+        self,
+        items: tuple[RawIngressItem, ...],
+        *,
+        semantics_hash: str,
+        connection_id: ConnectionId,
+        subscription_id: SubscriptionId,
+    ) -> tuple[ProcessedEnvelope, ...]:
+        """Admit a bounded batch, then release canonical work in exact FIFO order."""
+
+        admitted: list[tuple[RawEventEnvelope, JournalTicket]] = []
+        for item in items:
+            message = item.message
+            self.metrics.increment_counter("mma_raw_received_total")
+            self.metrics.observe_histogram("mma_raw_payload_bytes", len(message.payload_bytes))
+            self.metrics.observe_histogram(
+                "mma_socket_receive_to_ingress_ns",
+                max(0, item.admitted_monotonic_ns - message.received_monotonic_ns),
+            )
+            self.metrics.observe_histogram(
+                "mma_ingress_queue_dwell_ns",
+                item.queue_dwell_nanoseconds,
+            )
+            envelope = self._capture_envelope(
+                channel=WS_MARKET,
+                payload=message.payload_bytes,
+                transport_type="WEBSOCKET",
+                semantics_hash=semantics_hash,
+                connection_id=connection_id,
+                subscription_id=subscription_id,
+                transport_metadata={"websocket_message_type": message.message_type},
+                received_wall_time=message.received_wall_time,
+                received_monotonic_ns=message.received_monotonic_ns,
+            )
+            try:
+                ticket = await self.writer.enqueue(envelope)
+            except JournalBackpressureError:
+                self.metrics.increment_counter("mma_journal_backpressure_failures_total")
+                self.processor.on_backpressure()
+                raise
+            admitted.append((envelope, ticket))
+
+        processed: list[ProcessedEnvelope] = []
+        for envelope, ticket in admitted:
+            receipt = await ticket.wait_durable()
+            self._record_durable_receipt(envelope, receipt)
+            result = self.processor.process_durable(envelope, receipt)
+            self._record_processed(
+                envelope,
+                result,
+                scan_completed_monotonic_ns=time.monotonic_ns(),
+            )
+            processed.append(result)
+        self.metrics.set_gauge("mma_journal_queue_depth", self.writer.metrics.queue_depth)
+        return tuple(processed)
 
     async def preserve_invalidation(self, reason: InvalidationReason) -> ProcessedEnvelope:
         """Persist a local continuity fact so replay applies the same transition."""
@@ -265,7 +488,7 @@ class PolymarketObservationService:
         journal_root = self._path(self._config.storage.journal_directory)
         analytical_root = self._path(self._config.storage.analytical_directory)
         partition_date = started.to_datetime().date().isoformat()
-        outputs = Phase1AnalyticalOutputs(
+        persistent_outputs = Phase1AnalyticalOutputs(
             root=analytical_root,
             partition_date=partition_date,
             batch_size=self._config.storage.parquet_batch_size,
@@ -273,8 +496,22 @@ class PolymarketObservationService:
             code_commit=self._code_commit,
             code_version=self._config.system.code_version,
             config_hash=self._config.config_hash.value,
+            maximum_record_bytes=self._config.storage.analytical_record_max_bytes,
+            maximum_buffered_bytes=self._config.storage.analytical_buffer_max_bytes,
         )
-        processor = CanonicalProcessor(self._config, analytical_outputs=outputs)
+        outputs = SupervisedAnalyticalOutputs(
+            persistent_outputs,
+            queue_capacity=self._config.storage.analytical_queue_capacity,
+            metrics=self._metrics,
+        )
+        processor = CanonicalProcessor(
+            self._config,
+            analytical_outputs=outputs,
+            scan_latency_observer=lambda elapsed_ns: self._metrics.observe_histogram(
+                "mma_scanner_latency_ns",
+                elapsed_ns,
+            ),
+        )
         writer = RawJournalWriter(
             JournalWriterConfig(
                 root=journal_root,
@@ -293,6 +530,10 @@ class PolymarketObservationService:
                     self._config.storage.journal_run_max_uncompressed_bytes
                 ),
                 submit_timeout_seconds=self._config.storage.journal_submit_timeout_seconds,
+                group_commit_max_events=(self._config.storage.journal_group_commit_max_events),
+                group_commit_max_delay_seconds=(
+                    self._config.storage.journal_group_commit_max_delay_seconds
+                ),
             )
         )
         selected: tuple[GammaMarket, ...] = ()
@@ -307,10 +548,15 @@ class PolymarketObservationService:
         )
         run_completed = False
         logger.info("observation_started", "bounded public observation started")
+        writer_started = False
         try:
             await writer.start()
+            writer_started = True
+            await outputs.start()
         except BaseException:
-            outputs.close()
+            if writer_started:
+                await writer.close(completed=False)
+            persistent_outputs.abort(failure_type="ObservationStartupError")
             raise
         try:
             async with PolymarketPublicClient(
@@ -320,14 +566,14 @@ class PolymarketObservationService:
                 max_response_bytes=self._config.polymarket.maximum_http_response_bytes,
             ) as client:
                 try:
-                    async with asyncio.timeout(max(0.0, deadline - loop.time())):
-                        selected, selected_assets = await self._bootstrap(
-                            client=client,
-                            capture=capture,
-                            processor=processor,
-                        )
-                except TimeoutError:
-                    deviations.append("observation deadline reached during bootstrap")
+                    selected, selected_assets = await self._bootstrap(
+                        client=client,
+                        capture=capture,
+                        processor=processor,
+                        deadline=deadline,
+                    )
+                except _ObservationDeadlineReached:
+                    stream_result = _StreamResult(0, True, False, ())
                 if loop.time() < deadline and selected_assets:
                     stream_result = await self._observe_websocket(
                         client=client,
@@ -348,16 +594,29 @@ class PolymarketObservationService:
             )
             raise
         finally:
+            raw_completion_sha256: str | None = None
             try:
                 await writer.close(completed=run_completed)
+                if run_completed:
+                    raw_head_path = completion_path_for_run(
+                        journal_root,
+                        run_id,
+                        "polymarket-public",
+                    )
+                    raw_completion_sha256 = load_run_completion_head(
+                        raw_head_path
+                    ).completion_sha256
             finally:
                 journal_metrics = writer.metrics
-                analytical_summary = outputs.close()
+                analytical_summary = await outputs.close(
+                    source_journal_completion_sha256=raw_completion_sha256,
+                    completed=run_completed and raw_completion_sha256 is not None,
+                )
         ended = UtcTimestamp.now()
         actual_duration_nanoseconds = time.monotonic_ns() - started_monotonic_ns
         status = (
             ComponentHealth.HEALTHY
-            if stream_result.completed and not deviations
+            if (stream_result.completed and not deviations and analytical_summary.research_eligible)
             else ComponentHealth.DEGRADED
         )
         processor_summary = processor.summary()
@@ -384,6 +643,7 @@ class PolymarketObservationService:
             processor=processor_summary,
             analytical_outputs=analytical_summary,
             observability_metrics=self._metrics.snapshot(),
+            ingress_metrics=stream_result.ingress_metrics,
             reconnects=stream_result.reconnects,
             selected_market_resolved=stream_result.selected_market_resolved,
             protocol_deviations=tuple(deviations),
@@ -399,10 +659,14 @@ class PolymarketObservationService:
         client: PolymarketPublicClient,
         capture: _RawCaptureBoundary,
         processor: CanonicalProcessor,
+        deadline: float | None = None,
     ) -> tuple[tuple[GammaMarket, ...], tuple[str, ...]]:
-        discovery = await client.fetch_markets_keyset_raw(
-            limit=self._config.polymarket.discovery_limit,
-            closed=False,
+        discovery = await _await_remote_before_deadline(
+            lambda: client.fetch_markets_keyset_raw(
+                limit=self._config.polymarket.discovery_limit,
+                closed=False,
+            ),
+            deadline=deadline,
         )
         await capture.preserve_then_process(
             channel=GAMMA_MARKETS_KEYSET,
@@ -422,9 +686,15 @@ class PolymarketObservationService:
         # every raw message tied to one current reference scope.
         selected = eligible[:1]
         for market in selected:
-            await self._refresh_reference(client, capture, market)
+            await self._refresh_reference(client, capture, market, deadline=deadline)
             for asset_id in market.clob_token_ids:
-                await self._fetch_book(client, capture, asset_id, audit=False)
+                await self._fetch_book(
+                    client,
+                    capture,
+                    asset_id,
+                    audit=False,
+                    deadline=deadline,
+                )
         selected_assets = tuple(asset for market in selected for asset in market.clob_token_ids)
         return selected, selected_assets
 
@@ -433,12 +703,15 @@ class PolymarketObservationService:
         client: PolymarketPublicClient,
         capture: _RawCaptureBoundary,
         market: GammaMarket,
+        *,
+        deadline: float | None = None,
     ) -> None:
         await self._refresh_reference_by_id(
             client,
             capture,
             gamma_market_id=market.gamma_market_id,
             fallback=market,
+            deadline=deadline,
         )
 
     async def _refresh_reference_by_id(
@@ -448,8 +721,12 @@ class PolymarketObservationService:
         *,
         gamma_market_id: str,
         fallback: GammaMarket | None = None,
+        deadline: float | None = None,
     ) -> None:
-        gamma_payload = await client.fetch_gamma_market_raw(gamma_market_id)
+        gamma_payload = await _await_remote_before_deadline(
+            lambda: client.fetch_gamma_market_raw(gamma_market_id),
+            deadline=deadline,
+        )
         channel = f"{GAMMA_MARKET_PREFIX}{gamma_market_id}"
         await capture.preserve_then_process(
             channel=channel,
@@ -467,16 +744,23 @@ class PolymarketObservationService:
         )
         if current is None:
             raise RuntimeError("Gamma direct-market refresh did not publish its market")
-        if current.event_id is not None:
-            event_payload = await client.fetch_gamma_event_raw(current.event_id)
-            event_channel = f"{GAMMA_EVENT_PREFIX}{current.event_id}"
+        event_id = current.event_id
+        if event_id is not None:
+            event_payload = await _await_remote_before_deadline(
+                lambda: client.fetch_gamma_event_raw(event_id),
+                deadline=deadline,
+            )
+            event_channel = f"{GAMMA_EVENT_PREFIX}{event_id}"
             await capture.preserve_then_process(
                 channel=event_channel,
                 payload=event_payload,
                 transport_type="HTTP",
                 semantics_hash=_semantics(event_channel),
             )
-        clob_payload = await client.fetch_clob_market_raw(current.condition_id)
+        clob_payload = await _await_remote_before_deadline(
+            lambda: client.fetch_clob_market_raw(current.condition_id),
+            deadline=deadline,
+        )
         clob_channel = f"{CLOB_MARKET_PREFIX}{current.condition_id}"
         await capture.preserve_then_process(
             channel=clob_channel,
@@ -492,8 +776,12 @@ class PolymarketObservationService:
         asset_id: str,
         *,
         audit: bool,
+        deadline: float | None = None,
     ) -> ProcessedEnvelope:
-        payload = await client.fetch_order_book_raw(asset_id)
+        payload = await _await_remote_before_deadline(
+            lambda: client.fetch_order_book_raw(asset_id),
+            deadline=deadline,
+        )
         channel = REST_BOOK_AUDIT if audit else REST_BOOK
         return await capture.preserve_then_process(
             channel=channel,
@@ -508,11 +796,25 @@ class PolymarketObservationService:
         client: PolymarketPublicClient,
         capture: _RawCaptureBoundary,
         selected: tuple[GammaMarket, ...],
+        deadline: float | None = None,
+        refresh_reference: bool = True,
     ) -> None:
         for market in selected:
-            await self._refresh_reference(client, capture, market)
+            if refresh_reference:
+                await self._refresh_reference(
+                    client,
+                    capture,
+                    market,
+                    deadline=deadline,
+                )
             for asset_id in market.clob_token_ids:
-                await self._fetch_book(client, capture, asset_id, audit=False)
+                await self._fetch_book(
+                    client,
+                    capture,
+                    asset_id,
+                    audit=False,
+                    deadline=deadline,
+                )
 
     async def _audit_and_resnapshot(
         self,
@@ -520,21 +822,36 @@ class PolymarketObservationService:
         client: PolymarketPublicClient,
         capture: _RawCaptureBoundary,
         selected: tuple[GammaMarket, ...],
+        deadline: float | None = None,
     ) -> tuple[str, ...]:
         deviations: list[str] = []
+        mismatch_detected = False
         self._metrics.increment_counter("mma_rest_audit_cycles_total")
         for market in selected:
             for asset_id in market.clob_token_ids:
                 mismatches_before = capture.processor.summary().rest_audit_mismatches
-                result = await self._fetch_book(client, capture, asset_id, audit=True)
+                result = await self._fetch_book(
+                    client,
+                    capture,
+                    asset_id,
+                    audit=True,
+                    deadline=deadline,
+                )
                 mismatches_after = capture.processor.summary().rest_audit_mismatches
                 if mismatches_after > mismatches_before:
+                    mismatch_detected = True
                     deviations.append(f"REST audit mismatch at ingest_seq={result.ingest_seq}")
                     self._metrics.increment_counter("mma_rest_audit_mismatches_total")
-        # The stream generation is already closed. Replace audited state with
-        # fresh REST baselines before subscribing again, preventing buffered
-        # pre-snapshot messages from crossing generations.
-        await self._resnapshot(client=client, capture=capture, selected=selected)
+        # The stream generation is closed before comparison, so a matching
+        # authoritative REST view can advance freshness without a duplicate
+        # fetch. A mismatch remains fail-closed and gets a joint rebaseline.
+        if mismatch_detected:
+            await self._resnapshot(
+                client=client,
+                capture=capture,
+                selected=selected,
+                deadline=deadline,
+            )
         return tuple(deviations)
 
     async def _handle_refresh_requests(
@@ -544,26 +861,60 @@ class PolymarketObservationService:
         client: PolymarketPublicClient,
         capture: _RawCaptureBoundary,
         selected: tuple[GammaMarket, ...],
+        deadline: float | None = None,
     ) -> bool:
-        selected_conditions = {market.condition_id for market in selected}
+        selected_by_gamma_id = {market.gamma_market_id: market for market in selected}
+        selected_by_condition = {market.condition_id: market for market in selected}
+        selected_by_asset = {
+            asset_id: market for market in selected for asset_id in market.clob_token_ids
+        }
         selected_resolved = False
+        refresh_gamma_ids: set[str] = set()
         for request in requests:
             self._metrics.increment_counter(
                 "mma_reference_refresh_requests_total",
                 labels={"event_type": request.event_type.value},
             )
+            matching_market = selected_by_gamma_id.get(request.native_market_id)
+            if matching_market is None and request.native_condition_id is not None:
+                matching_market = selected_by_condition.get(request.native_condition_id)
+            if matching_market is None:
+                for asset_id in request.native_asset_ids:
+                    matching_market = selected_by_asset.get(asset_id)
+                    if matching_market is not None:
+                        break
+            if matching_market is None:
+                self._metrics.increment_counter(
+                    "mma_reference_refresh_requests_ignored_total",
+                    labels={"event_type": request.event_type.value},
+                )
+                continue
+            refresh_gamma_ids.add(matching_market.gamma_market_id)
             if (
                 request.event_type is CanonicalEventType.MARKET_RESOLVED
-                and request.native_condition_id in selected_conditions
+                and request.native_condition_id == matching_market.condition_id
             ):
                 selected_resolved = True
+        for market in selected:
+            if market.gamma_market_id not in refresh_gamma_ids:
+                continue
             await self._refresh_reference_by_id(
                 client,
                 capture,
-                gamma_market_id=request.native_market_id,
+                gamma_market_id=market.gamma_market_id,
+                fallback=market,
+                deadline=deadline,
             )
-        if requests and not selected_resolved:
-            await self._resnapshot(client=client, capture=capture, selected=selected)
+        if refresh_gamma_ids and not selected_resolved:
+            await self._resnapshot(
+                client=client,
+                capture=capture,
+                selected=tuple(
+                    market for market in selected if market.gamma_market_id in refresh_gamma_ids
+                ),
+                deadline=deadline,
+                refresh_reference=False,
+            )
         return selected_resolved
 
     async def _run_generation(
@@ -571,10 +922,11 @@ class PolymarketObservationService:
         *,
         capture: _RawCaptureBoundary,
         asset_ids: tuple[str, ...],
-        deadline: float,
-        audit_due: float,
+        deadline_ns: int,
+        periodic_audit_due_ns: int,
         connection_id: ConnectionId,
         subscription_id: SubscriptionId,
+        unavailable_started_ns: int | None,
     ) -> _GenerationResult:
         socket = PolymarketMarketWebSocket(
             asset_ids,
@@ -583,58 +935,195 @@ class PolymarketObservationService:
             max_queue=self._config.system.queue_capacity,
             max_message_bytes=self._config.polymarket.maximum_websocket_message_bytes,
         )
-        messages = cast(AsyncGenerator[bytes], socket.raw_messages())
-        message_task: asyncio.Task[bytes] | None = None
-        try:
-            while True:
-                now = asyncio.get_running_loop().time()
-                if now >= deadline:
-                    return _GenerationResult(_GenerationExit.DEADLINE)
-                if now >= audit_due:
-                    return _GenerationResult(_GenerationExit.AUDIT_DUE)
-                if message_task is None:
-                    message_task = asyncio.create_task(
-                        anext(messages),
-                        name="polymarket-public-next-message",
+        ingress = BoundedRawIngress(
+            max_items=self._config.system.queue_capacity,
+            max_bytes=self._config.polymarket.maximum_ingress_queue_bytes,
+        )
+        ready = asyncio.Event()
+
+        async def acquire() -> None:
+            # `raw_messages` is retained solely for existing adapter fixtures;
+            # production uses pump_received so stamping+admission has no yield gap.
+            if hasattr(socket, "pump_received"):
+                await socket.pump_received(ingress.admit_nowait, ready=ready)
+                return
+            ready.set()
+            async for payload in socket.raw_messages():
+                ingress.admit_nowait(
+                    ReceivedWebSocketMessage(
+                        payload_bytes=payload,
+                        received_wall_time=UtcTimestamp.now(),
+                        received_monotonic_ns=time.monotonic_ns(),
+                        message_type="BINARY",
                     )
-                done, _ = await asyncio.wait(
-                    {message_task},
-                    timeout=max(0.0, min(deadline, audit_due) - now),
                 )
-                if not done:
+
+        acquisition_task = asyncio.create_task(
+            acquire(),
+            name="polymarket-public-socket-acquisition",
+        )
+        ready_task = asyncio.create_task(
+            ready.wait(),
+            name="polymarket-public-subscription-ready",
+        )
+        maximum_book_age_ns = int(self._config.scanner.maximum_book_age_seconds * 1e9)
+        pending_exit: _GenerationExit | None = None
+        pending_transport_error: PolymarketTransportError | None = None
+        deviations: list[str] = []
+        refresh_requests: list[ReferenceRefreshRequest] = []
+
+        def current_deadline() -> IntegrityDeadline:
+            return next_integrity_deadline(
+                run_deadline_ns=deadline_ns,
+                periodic_audit_deadline_ns=periodic_audit_due_ns,
+                valid_book_receive_ns=capture.book_freshness_receive_ns,
+                required_books=len(asset_ids),
+                maximum_book_age_ns=maximum_book_age_ns,
+                now_ns=time.monotonic_ns(),
+            )
+
+        async def stop_acquisition() -> None:
+            if not acquisition_task.done():
+                acquisition_task.cancel()
+            with suppress(
+                asyncio.CancelledError,
+                PolymarketTransportError,
+                RawIngressBackpressureError,
+            ):
+                await acquisition_task
+
+        try:
+            initial_due = current_deadline()
+            done, _ = await asyncio.wait(
+                {ready_task, acquisition_task},
+                timeout=max(0.0, (initial_due.deadline_ns - time.monotonic_ns()) / 1e9),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if acquisition_task in done and ready_task not in done:
+                acquisition_task.result()
+                raise PolymarketTransportError("public market WebSocket ended before readiness")
+            if ready_task not in done:
+                await stop_acquisition()
+                reason = (
+                    _GenerationExit.DEADLINE
+                    if initial_due.reason is IntegrityDeadlineReason.RUN_DEADLINE
+                    else _GenerationExit.AUDIT_DUE
+                )
+                return _GenerationResult(reason, ingress_metrics=ingress.metrics)
+            if unavailable_started_ns is not None:
+                self._metrics.observe_histogram(
+                    "mma_socket_unavailable_ns",
+                    max(0, time.monotonic_ns() - unavailable_started_ns),
+                )
+
+            while True:
+                now_ns = time.monotonic_ns()
+                due = current_deadline()
+                due_ns = due.deadline_ns
+                if (
+                    pending_exit is None
+                    and pending_transport_error is None
+                    and acquisition_task.done()
+                ):
+                    try:
+                        acquisition_task.result()
+                    except RawIngressBackpressureError:
+                        pending_exit = _GenerationExit.INGRESS_OVERFLOW
+                        deviations.append("bounded application ingress queue exhausted")
+                        self._metrics.increment_counter("mma_ingress_overflows_total")
+                    except PolymarketTransportError as error:
+                        pending_transport_error = error
+                    else:
+                        if ingress.empty:
+                            raise PolymarketTransportError(
+                                "public market WebSocket ended without an explicit transport error"
+                            )
+                if pending_exit is None and now_ns >= due_ns:
+                    pending_exit = (
+                        _GenerationExit.DEADLINE
+                        if due.reason is IntegrityDeadlineReason.RUN_DEADLINE
+                        else _GenerationExit.AUDIT_DUE
+                    )
+                    await stop_acquisition()
+
+                first_item: RawIngressItem | None = None
+                if not ingress.empty:
+                    first_item = ingress.get_nowait()
+                elif pending_exit is not None:
+                    return _GenerationResult(
+                        pending_exit,
+                        deviations=tuple(deviations),
+                        refresh_requests=tuple(refresh_requests),
+                        ingress_metrics=ingress.metrics,
+                    )
+                elif pending_transport_error is not None:
+                    raise pending_transport_error
+                elif acquisition_task.done():
+                    try:
+                        acquisition_task.result()
+                    except RawIngressBackpressureError:
+                        pending_exit = _GenerationExit.INGRESS_OVERFLOW
+                        deviations.append("bounded application ingress queue exhausted")
+                        self._metrics.increment_counter("mma_ingress_overflows_total")
+                    else:
+                        raise PolymarketTransportError(
+                            "public market WebSocket ended without an explicit transport error"
+                        )
                     continue
-                payload = message_task.result()
-                message_task = None
-                result = await capture.preserve_then_process(
-                    channel=WS_MARKET,
-                    payload=payload,
-                    transport_type="WEBSOCKET",
+
+                if first_item is None:
+                    item_task = asyncio.create_task(
+                        ingress.get(),
+                        name="polymarket-public-ingress-dequeue",
+                    )
+                    done, _ = await asyncio.wait(
+                        {item_task, acquisition_task},
+                        timeout=max(0.0, (due_ns - time.monotonic_ns()) / 1e9),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if item_task in done:
+                        first_item = item_task.result()
+                    else:
+                        item_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await item_task
+                        continue
+
+                batch = [first_item]
+                while len(batch) < self._config.storage.journal_group_commit_max_events:
+                    try:
+                        batch.append(ingress.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+                results = await capture.preserve_websocket_batch(
+                    tuple(batch),
                     semantics_hash=socket.subscription_semantics_sha256,
                     connection_id=connection_id,
                     subscription_id=subscription_id,
-                    transport_metadata={"websocket_message_type": "TEXT_OR_BINARY"},
                 )
-                if result.reference_refresh_requests:
-                    return _GenerationResult(
-                        _GenerationExit.REFERENCE_REFRESH,
-                        refresh_requests=result.reference_refresh_requests,
-                    )
-                if result.needs_resync:
-                    return _GenerationResult(
-                        _GenerationExit.RESYNC_REQUIRED,
-                        deviations=(
+                self._metrics.set_gauge("mma_ingress_queue_depth", ingress.metrics.queue_depth)
+                self._metrics.set_gauge(
+                    "mma_ingress_queue_high_water",
+                    ingress.metrics.queue_high_water,
+                )
+                for result in results:
+                    refresh_requests.extend(result.reference_refresh_requests)
+                    if result.needs_resync:
+                        pending_exit = _GenerationExit.RESYNC_REQUIRED
+                        deviations.append(
                             f"{result.error_type or 'state-invalidation'} at "
-                            f"ingest_seq={result.ingest_seq}",
-                        ),
-                    )
+                            f"ingest_seq={result.ingest_seq}"
+                        )
+                    elif result.reference_refresh_requests and pending_exit is None:
+                        pending_exit = _GenerationExit.REFERENCE_REFRESH
+                if pending_exit is not None:
+                    await stop_acquisition()
         finally:
-            if message_task is not None and not message_task.done():
-                message_task.cancel()
-            if message_task is not None:
-                with suppress(asyncio.CancelledError, StopAsyncIteration):
-                    await message_task
-            with suppress(asyncio.CancelledError, RuntimeError):
-                await messages.aclose()
+            if not ready_task.done():
+                ready_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await ready_task
+            await stop_acquisition()
 
     async def _observe_websocket(
         self,
@@ -650,10 +1139,11 @@ class PolymarketObservationService:
         deviations: list[str] = []
         delay = self._config.polymarket.reconnect_initial_seconds
         loop = asyncio.get_running_loop()
-        integrity_interval = min(
-            self._config.polymarket.snapshot_audit_interval_seconds,
-            self._config.scanner.maximum_book_age_seconds,
-        )
+        deadline_ns = time.monotonic_ns() + int(max(0.0, deadline - loop.time()) * 1e9)
+        integrity_interval_ns = int(self._config.polymarket.snapshot_audit_interval_seconds * 1e9)
+        periodic_audit_due_ns = time.monotonic_ns() + integrity_interval_ns
+        unavailable_started_ns: int | None = None
+        ingress_metrics = _EMPTY_INGRESS_METRICS
         while loop.time() < deadline:
             connection_id = ConnectionId.new()
             subscription_id = SubscriptionId.new()
@@ -669,14 +1159,26 @@ class PolymarketObservationService:
                 generation = await self._run_generation(
                     capture=capture,
                     asset_ids=asset_ids,
-                    deadline=deadline,
-                    audit_due=min(deadline, loop.time() + integrity_interval),
+                    deadline_ns=deadline_ns,
+                    periodic_audit_due_ns=periodic_audit_due_ns,
                     connection_id=connection_id,
                     subscription_id=subscription_id,
+                    unavailable_started_ns=unavailable_started_ns,
+                )
+                ingress_metrics = _merge_ingress_metrics(
+                    ingress_metrics,
+                    generation.ingress_metrics,
                 )
                 deviations.extend(generation.deviations)
                 if generation.reason is _GenerationExit.DEADLINE:
-                    return _StreamResult(reconnects, True, False, tuple(deviations))
+                    return _StreamResult(
+                        reconnects,
+                        True,
+                        False,
+                        tuple(deviations),
+                        ingress_metrics,
+                    )
+                unavailable_started_ns = time.monotonic_ns()
                 if generation.reason is _GenerationExit.AUDIT_DUE:
                     logger.info(
                         "rest_integrity_audit",
@@ -688,8 +1190,10 @@ class PolymarketObservationService:
                             client=client,
                             capture=capture,
                             selected=selected,
+                            deadline=deadline,
                         )
                     )
+                    periodic_audit_due_ns = time.monotonic_ns() + integrity_interval_ns
                     continue
                 if generation.reason is _GenerationExit.REFERENCE_REFRESH:
                     selected_resolved = await self._handle_refresh_requests(
@@ -697,16 +1201,41 @@ class PolymarketObservationService:
                         client=client,
                         capture=capture,
                         selected=selected,
+                        deadline=deadline,
                     )
                     if selected_resolved:
-                        return _StreamResult(reconnects, True, True, tuple(deviations))
+                        return _StreamResult(
+                            reconnects,
+                            True,
+                            True,
+                            tuple(deviations),
+                            ingress_metrics,
+                        )
+                    periodic_audit_due_ns = time.monotonic_ns() + integrity_interval_ns
                     continue
+                if generation.reason is _GenerationExit.INGRESS_OVERFLOW:
+                    await capture.preserve_invalidation(InvalidationReason.BACKPRESSURE_DATA_LOSS)
                 # Parser/state uncertainty already invalidated through the
                 # journaled venue envelope. The old generator is closed; now
                 # establish a baseline before creating a new socket.
                 self._metrics.increment_counter("mma_resynchronizations_total")
-                await self._resnapshot(client=client, capture=capture, selected=selected)
+                await self._resnapshot(
+                    client=client,
+                    capture=capture,
+                    selected=selected,
+                    deadline=deadline,
+                )
+                periodic_audit_due_ns = time.monotonic_ns() + integrity_interval_ns
+            except _ObservationDeadlineReached:
+                return _StreamResult(
+                    reconnects,
+                    True,
+                    False,
+                    tuple(deviations),
+                    ingress_metrics,
+                )
             except PolymarketTransportError as error:
+                unavailable_started_ns = time.monotonic_ns()
                 await capture.preserve_invalidation(InvalidationReason.DISCONNECT)
                 deviations.append(type(error).__name__)
                 self._metrics.increment_counter("mma_websocket_disconnects_total")
@@ -719,19 +1248,43 @@ class PolymarketObservationService:
                 )
                 if reconnects >= self._config.polymarket.max_reconnect_attempts:
                     deviations.append("maximum reconnect attempts exhausted")
-                    return _StreamResult(reconnects, False, False, tuple(deviations))
+                    return _StreamResult(
+                        reconnects,
+                        False,
+                        False,
+                        tuple(deviations),
+                        ingress_metrics,
+                    )
                 reconnects += 1
                 self._metrics.increment_counter("mma_websocket_reconnects_total")
                 remaining = deadline - loop.time()
                 if remaining <= 0:
-                    return _StreamResult(reconnects, True, False, tuple(deviations))
+                    return _StreamResult(
+                        reconnects,
+                        True,
+                        False,
+                        tuple(deviations),
+                        ingress_metrics,
+                    )
                 await asyncio.sleep(min(delay, remaining))
                 delay = min(delay * 2, self._config.polymarket.reconnect_max_seconds)
                 if loop.time() < deadline:
-                    await self._resnapshot(client=client, capture=capture, selected=selected)
+                    await self._resnapshot(
+                        client=client,
+                        capture=capture,
+                        selected=selected,
+                        deadline=deadline,
+                    )
+                    periodic_audit_due_ns = time.monotonic_ns() + integrity_interval_ns
             except asyncio.CancelledError:
                 raise
-        return _StreamResult(reconnects, True, False, tuple(deviations))
+        return _StreamResult(
+            reconnects,
+            True,
+            False,
+            tuple(deviations),
+            ingress_metrics,
+        )
 
 
 __all__ = ["ObservationSummary", "PolymarketObservationService"]

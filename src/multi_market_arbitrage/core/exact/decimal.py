@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from fractions import Fraction
 from functools import total_ordering
+from math import gcd
 from typing import Self
 
 _DECIMAL_PATTERN = re.compile(r"^[+-]?\d+(?:\.\d+)?$")
@@ -152,13 +153,35 @@ class ExactDecimal:
         return self.to_canonical_string().encode("ascii")
 
     def as_fraction(self) -> Fraction:
+        """Return the exact rational value for interoperability and reference checks."""
+
         return Fraction(self.coefficient, 10**self.scale)
 
     def _aligned_coefficients(self, other: ExactDecimal) -> tuple[int, int, int]:
+        if self.scale == other.scale:
+            return self.coefficient, other.coefficient, self.scale
         scale = max(self.scale, other.scale)
         left = self.coefficient * 10 ** (scale - self.scale)
         right = other.coefficient * 10 ** (scale - other.scale)
         return left, right, scale
+
+    def _reduced_ratio(self, other: ExactDecimal) -> tuple[int, int]:
+        """Return ``self / other`` as reduced integers with a positive denominator."""
+
+        if not other:
+            raise ZeroDivisionError("division by zero")
+        numerator = self.coefficient
+        denominator = other.coefficient
+        scale_difference = other.scale - self.scale
+        if scale_difference > 0:
+            numerator *= 10**scale_difference
+        elif scale_difference < 0:
+            denominator *= 10**-scale_difference
+        if denominator < 0:
+            numerator = -numerator
+            denominator = -denominator
+        common_factor = gcd(abs(numerator), denominator)
+        return numerator // common_factor, denominator // common_factor
 
     def __str__(self) -> str:
         return self.to_canonical_string()
@@ -194,10 +217,7 @@ class ExactDecimal:
 
         if not isinstance(other, ExactDecimal):
             return NotImplemented
-        if not other:
-            raise ZeroDivisionError("division by zero")
-        fraction = self.as_fraction() / other.as_fraction()
-        denominator = fraction.denominator
+        numerator, denominator = self._reduced_ratio(other)
         twos = 0
         fives = 0
         while denominator % 2 == 0:
@@ -211,7 +231,7 @@ class ExactDecimal:
                 "division has no finite base-10 representation; use divide() with explicit scale"
             )
         scale = max(twos, fives)
-        coefficient = fraction.numerator * 2 ** (scale - twos) * 5 ** (scale - fives)
+        coefficient = numerator * 2 ** (scale - twos) * 5 ** (scale - fives)
         return ExactDecimal(coefficient, scale)
 
     def __neg__(self) -> ExactDecimal:
@@ -232,10 +252,25 @@ class ExactDecimal:
         if not other:
             raise ZeroDivisionError("division by zero")
         scale = _require_scale(scale)
-        fraction = self.as_fraction() / other.as_fraction()
-        scaled_numerator = fraction.numerator * 10**scale
-        coefficient = _rounded_quotient(scaled_numerator, fraction.denominator, rounding)
+        numerator, denominator = self._reduced_ratio(other)
+        coefficient = _rounded_quotient(numerator * 10**scale, denominator, rounding)
         return ExactDecimal(coefficient, scale)
+
+    def is_integral_multiple_of(self, increment: ExactDecimal) -> bool:
+        """Return whether this value is an exact integer multiple of ``increment``."""
+
+        value_coefficient, increment_coefficient, _ = self._aligned_coefficients(increment)
+        if increment_coefficient == 0:
+            raise ZeroDivisionError("division by zero")
+        return value_coefficient % increment_coefficient == 0
+
+    def floor_div(self, divisor: ExactDecimal) -> int:
+        """Return the mathematical floor of this value divided by ``divisor``."""
+
+        numerator, denominator, _ = self._aligned_coefficients(divisor)
+        if denominator == 0:
+            raise ZeroDivisionError("division by zero")
+        return numerator // denominator
 
     def rescale(self, scale: int, *, rounding: RoundingMode) -> ExactDecimal:
         """Round to a requested number of decimal places."""
@@ -257,8 +292,8 @@ class ExactDecimal:
 
         if increment <= ExactDecimal.zero():
             raise ValueError("increment must be positive")
-        ratio = self.as_fraction() / increment.as_fraction()
-        units = _rounded_quotient(ratio.numerator, ratio.denominator, rounding)
+        numerator, denominator, _ = self._aligned_coefficients(increment)
+        units = _rounded_quotient(numerator, denominator, rounding)
         return increment * ExactDecimal(units)
 
 

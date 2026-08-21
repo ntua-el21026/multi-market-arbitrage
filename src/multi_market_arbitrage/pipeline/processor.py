@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import cast
+from enum import StrEnum
+from typing import Protocol, cast
 
 from multi_market_arbitrage.core.config import Phase1Config
 from multi_market_arbitrage.core.errors import ProgrammingInvariantViolation
@@ -17,9 +20,14 @@ from multi_market_arbitrage.core.ids import (
     MarketId,
     VersionId,
 )
-from multi_market_arbitrage.core.provenance import Provenance
+from multi_market_arbitrage.core.provenance import (
+    Provenance,
+    RawSourceInvariantError,
+    RawSourceRef,
+    merge_raw_source_refs,
+)
 from multi_market_arbitrage.core.serialization import canonical_json_bytes, canonical_sha256
-from multi_market_arbitrage.core.time import UtcTimestamp
+from multi_market_arbitrage.core.time import MonotonicTimestamp, UtcTimestamp
 from multi_market_arbitrage.core.validation import ValidationReasonCode
 from multi_market_arbitrage.ingestion import RawEventEnvelope
 from multi_market_arbitrage.journal import JournalDurabilityState, JournalReceipt
@@ -30,7 +38,9 @@ from multi_market_arbitrage.normalization import (
     NewMarketEvent,
     NormalizationContext,
     NormalizationError,
+    OrderBookSnapshotEvent,
     PolymarketNormalizer,
+    PriceChangeEvent,
     TickSizeChangeEvent,
 )
 from multi_market_arbitrage.reference import (
@@ -39,7 +49,6 @@ from multi_market_arbitrage.reference import (
     ReferenceBundle,
     ReferenceRegistry,
 )
-from multi_market_arbitrage.research import Phase1AnalyticalOutputs
 from multi_market_arbitrage.scanners.models import OpportunityLifecycleStatus
 from multi_market_arbitrage.scanners.polymarket_complete_set import (
     CompleteSetScannerConfig,
@@ -48,9 +57,11 @@ from multi_market_arbitrage.scanners.polymarket_complete_set import (
     OpportunityLifecycleTracker,
     PolymarketCompleteSetScanner,
     ScanDisposition,
+    complete_set_lifecycle_id,
 )
-from multi_market_arbitrage.semantic import prove_binary_complement
+from multi_market_arbitrage.semantic import BinarySemanticProof, prove_binary_complement
 from multi_market_arbitrage.state.order_books import (
+    BookMutation,
     BookStateError,
     CanonicalL2BookOwner,
     ImmutableOrderBookSnapshot,
@@ -119,6 +130,32 @@ class ReferenceRefreshRequest:
     native_asset_ids: tuple[str, ...]
 
 
+class ScanTriggerReason(StrEnum):
+    """Authoritative transition categories that make a market scan-dirty."""
+
+    BOOK_UPDATE = "BOOK_UPDATE"
+    REST_SNAPSHOT = "REST_SNAPSHOT"
+    REST_AUDIT = "REST_AUDIT"
+    REFERENCE = "REFERENCE"
+    LIFECYCLE = "LIFECYCLE"
+    INVALIDATION = "INVALIDATION"
+
+
+@dataclass(frozen=True, slots=True)
+class MarketScanTrigger:
+    market_id: MarketId
+    reasons: tuple[ScanTriggerReason, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class BookFreshnessUpdate:
+    """Monotonic receive boundary that advances one book's freshness deadline."""
+
+    market_id: MarketId
+    instrument_id: InstrumentId
+    received_monotonic: MonotonicTimestamp
+
+
 @dataclass(frozen=True, slots=True)
 class ProcessedEnvelope:
     ingest_seq: int
@@ -128,6 +165,8 @@ class ProcessedEnvelope:
     needs_resync: bool
     affected_instrument_ids: tuple[InstrumentId, ...]
     reference_refresh_requests: tuple[ReferenceRefreshRequest, ...]
+    book_freshness_updates: tuple[BookFreshnessUpdate, ...]
+    scan_triggers: tuple[MarketScanTrigger, ...]
     error_type: str | None
 
 
@@ -167,6 +206,26 @@ class ProcessorSummary:
     opportunity_hashes: tuple[str, ...]
 
 
+class AnalyticalOutputSink(Protocol):
+    """Structural sink accepted by the canonical processing hot path."""
+
+    def append_reference(
+        self,
+        bundle: ReferenceBundle,
+        observed_at: UtcTimestamp,
+        provenance: Provenance,
+    ) -> None: ...
+
+    def append_canonical(self, event: CanonicalEvent) -> None: ...
+
+    def append_scan(
+        self,
+        result: CompleteSetScanResult,
+        *,
+        lifecycle: OpportunityLifecycle | None = None,
+    ) -> None: ...
+
+
 class CanonicalProcessor:
     """Stateful single-owner processing core shared without replay forks."""
 
@@ -174,7 +233,8 @@ class CanonicalProcessor:
         self,
         config: Phase1Config,
         *,
-        analytical_outputs: Phase1AnalyticalOutputs | None = None,
+        analytical_outputs: AnalyticalOutputSink | None = None,
+        scan_latency_observer: Callable[[int], None] | None = None,
     ) -> None:
         self._config = config
         self._registry = ReferenceRegistry()
@@ -191,6 +251,7 @@ class CanonicalProcessor:
         )
         self._lifecycle_tracker = OpportunityLifecycleTracker()
         self._outputs = analytical_outputs
+        self._scan_latency_observer = scan_latency_observer
         self._gamma_by_condition: dict[str, GammaMarket] = {}
         self._gamma_by_id: dict[str, GammaMarket] = {}
         self._events_by_id: dict[str, GammaEvent] = {}
@@ -202,12 +263,20 @@ class CanonicalProcessor:
         self._reference_provenance: dict[MarketId, Provenance] = {}
         self._owners: dict[InstrumentId, CanonicalL2BookOwner] = {}
         self._market_instruments: dict[MarketId, tuple[InstrumentId, ...]] = {}
+        self._semantic_proofs: dict[
+            MarketId,
+            tuple[ReferenceBundle, BinarySemanticProof],
+        ] = {}
         self._scan_results: deque[CompleteSetScanResult] = deque(maxlen=_RECENT_HISTORY_LIMIT)
         self._validated_opportunity_hashes: deque[str] = deque(maxlen=_RECENT_HISTORY_LIMIT)
         self._reference_refresh_requests: deque[ReferenceRefreshRequest] = deque(
             maxlen=_RECENT_HISTORY_LIMIT
         )
         self._active_refresh_requests: list[ReferenceRefreshRequest] | None = None
+        self._active_dirty_markets: dict[MarketId, set[ScanTriggerReason]] | None = None
+        self._active_freshness_updates: dict[InstrumentId, BookFreshnessUpdate] | None = None
+        self._active_received_monotonic: MonotonicTimestamp | None = None
+        self._last_accepted_l2_monotonic: dict[InstrumentId, MonotonicTimestamp] = {}
         self._raw_input_chain = _chain_seed("raw-input")
         self._canonical_event_chain = _chain_seed("canonical-event")
         self._error_chain = _chain_seed("expected-data-error")
@@ -287,7 +356,12 @@ class CanonicalProcessor:
         return self._process_preserved(envelope)
 
     def _process_preserved(self, envelope: RawEventEnvelope) -> ProcessedEnvelope:
-        if self._active_refresh_requests is not None:
+        if (
+            self._active_refresh_requests is not None
+            or self._active_dirty_markets is not None
+            or self._active_freshness_updates is not None
+            or self._active_received_monotonic is not None
+        ):
             raise ProgrammingInvariantViolation(
                 "canonical processor cannot process envelopes reentrantly",
                 component="canonical-processor",
@@ -301,7 +375,12 @@ class CanonicalProcessor:
         before_events = self._canonical_events
         before_scans = self._scan_count
         current_refresh_requests: list[ReferenceRefreshRequest] = []
+        current_dirty_markets: dict[MarketId, set[ScanTriggerReason]] = {}
+        current_freshness_updates: dict[InstrumentId, BookFreshnessUpdate] = {}
         self._active_refresh_requests = current_refresh_requests
+        self._active_dirty_markets = current_dirty_markets
+        self._active_freshness_updates = current_freshness_updates
+        self._active_received_monotonic = envelope.received_monotonic
         try:
             try:
                 self._route(envelope)
@@ -319,6 +398,7 @@ class CanonicalProcessor:
                     (envelope.ingest_seq, error_type),
                 )
                 affected = self.invalidate_all(InvalidationReason.SCHEMA_VIOLATION)
+                scan_triggers = self._flush_dirty_scans(envelope.received_wall_time)
                 processed = ProcessedEnvelope(
                     ingest_seq=envelope.ingest_seq,
                     success=False,
@@ -327,9 +407,15 @@ class CanonicalProcessor:
                     needs_resync=bool(affected),
                     affected_instrument_ids=affected,
                     reference_refresh_requests=tuple(current_refresh_requests),
+                    book_freshness_updates=tuple(
+                        current_freshness_updates[key]
+                        for key in sorted(current_freshness_updates, key=lambda item: item.value)
+                    ),
+                    scan_triggers=scan_triggers,
                     error_type=error_type,
                 )
             else:
+                scan_triggers = self._flush_dirty_scans(envelope.received_wall_time)
                 unhealthy = tuple(
                     owner.instrument_id
                     for owner in self.owners
@@ -343,11 +429,91 @@ class CanonicalProcessor:
                     needs_resync=bool(unhealthy),
                     affected_instrument_ids=unhealthy,
                     reference_refresh_requests=tuple(current_refresh_requests),
+                    book_freshness_updates=tuple(
+                        current_freshness_updates[key]
+                        for key in sorted(current_freshness_updates, key=lambda item: item.value)
+                    ),
+                    scan_triggers=scan_triggers,
                     error_type=None,
                 )
         finally:
             self._active_refresh_requests = None
+            self._active_dirty_markets = None
+            self._active_freshness_updates = None
+            self._active_received_monotonic = None
         return processed
+
+    def _record_book_mutation(
+        self,
+        mutation: BookMutation,
+        *,
+        reason: ScanTriggerReason,
+    ) -> None:
+        dirty = self._active_dirty_markets
+        freshness = self._active_freshness_updates
+        received_monotonic = self._active_received_monotonic
+        if dirty is None or freshness is None or received_monotonic is None:
+            return
+        if mutation.scanner_dirty:
+            dirty.setdefault(mutation.market_id, set()).add(reason)
+        owner = self._owners.get(mutation.instrument_id)
+        if mutation.freshness_changed and owner is not None:
+            if owner.health is BookHealth.HEALTHY:
+                self._last_accepted_l2_monotonic[mutation.instrument_id] = received_monotonic
+                freshness[mutation.instrument_id] = BookFreshnessUpdate(
+                    market_id=mutation.market_id,
+                    instrument_id=mutation.instrument_id,
+                    received_monotonic=received_monotonic,
+                )
+            else:
+                freshness.pop(mutation.instrument_id, None)
+
+    def _ws_l2_exceeds_freshness_window(self, instrument_id: InstrumentId) -> bool:
+        current = self._active_received_monotonic
+        if current is None:
+            raise ProgrammingInvariantViolation(
+                "WebSocket L2 freshness was checked outside envelope processing",
+                component="canonical-processor",
+            )
+        previous = self._last_accepted_l2_monotonic.get(instrument_id)
+        if previous is None:
+            return False
+        if current.epoch_id != previous.epoch_id or current.nanoseconds < previous.nanoseconds:
+            return True
+        return current.nanoseconds > (
+            previous.nanoseconds + self._scanner.config.maximum_book_age_ns
+        )
+
+    def _mark_market_dirty(self, market_id: MarketId, reason: ScanTriggerReason) -> None:
+        dirty = self._active_dirty_markets
+        if dirty is not None:
+            dirty.setdefault(market_id, set()).add(reason)
+
+    def _flush_dirty_scans(self, observed_at: UtcTimestamp) -> tuple[MarketScanTrigger, ...]:
+        dirty = self._active_dirty_markets
+        if dirty is None:
+            raise ProgrammingInvariantViolation(
+                "market scan-dirty state was flushed outside envelope processing",
+                component="canonical-processor",
+            )
+        triggers = tuple(
+            MarketScanTrigger(
+                market_id=market_id,
+                reasons=tuple(sorted(dirty[market_id], key=lambda item: item.value)),
+            )
+            for market_id in sorted(dirty, key=lambda item: item.value)
+        )
+        dirty.clear()
+        for trigger in triggers:
+            bundle = self._registry.current(trigger.market_id)
+            if bundle is not None:
+                if self._scan_latency_observer is None:
+                    self._scan_market(bundle, observed_at)
+                else:
+                    started_ns = time.perf_counter_ns()
+                    self._scan_market(bundle, observed_at)
+                    self._scan_latency_observer(time.perf_counter_ns() - started_ns)
+        return triggers
 
     def _route(self, envelope: RawEventEnvelope) -> None:
         channel = envelope.channel
@@ -400,10 +566,13 @@ class CanonicalProcessor:
             owner = self._owners[rest.instrument_id]
             was_unhealthy = owner.health is not BookHealth.HEALTHY
             self._prepare_for_rest_snapshot(owner)
-            owner.apply_rest_snapshot(rest)
+            mutation = owner.apply_rest_snapshot(rest)
+            self._record_book_mutation(
+                mutation,
+                reason=ScanTriggerReason.REST_SNAPSHOT,
+            )
             if was_unhealthy:
                 self._resyncs += 1
-            self._scan_market(bundle, envelope.received_wall_time)
             return
         if channel == REST_BOOK_AUDIT:
             native = parse_rest_book(envelope.payload_bytes)
@@ -417,15 +586,25 @@ class CanonicalProcessor:
             rest = self._normalizer.normalize_rest_book(native, context)
             owner = self._owners[rest.instrument_id]
             previous_health = owner.health
-            result = owner.audit_rest_snapshot(
-                rest,
-                checked_at=envelope.received_wall_time,
-            )
+            try:
+                result = owner.audit_rest_snapshot(
+                    rest,
+                    checked_at=envelope.received_wall_time,
+                )
+            except RawSourceInvariantError as error:
+                raise ProgrammingInvariantViolation(
+                    "REST audit provenance contains conflicting raw source pairs",
+                    component="canonical-processor",
+                ) from error
             self._rest_audits += 1
             if result.status is RestAuditStatus.MISMATCH:
                 self._rest_audit_mismatches += 1
                 if previous_health is not BookHealth.INVALID:
                     self._invalidations += 1
+            self._record_book_mutation(
+                result.mutation,
+                reason=ScanTriggerReason.REST_AUDIT,
+            )
             return
         if channel == CONTROL_BOOK_INVALIDATION:
             self.invalidate_all(self._parse_control_invalidation(envelope.payload_bytes))
@@ -523,6 +702,17 @@ class CanonicalProcessor:
         """Publish one reference observation through the sole integration boundary."""
 
         current = self._registry.current(bundle.market.market_id)
+        had_initialized_book = any(
+            self._owners[instrument_id].generation > 0
+            for instrument_id in self._market_instruments.get(bundle.market.market_id, ())
+            if instrument_id in self._owners
+        )
+        reference_changed = current is not None and (
+            current.current_version_ids != bundle.current_version_ids
+            or current.issues != bundle.issues
+            or current.payout_asset_id != bundle.payout_asset_id
+            or current.payout_per_set != bundle.payout_per_set
+        )
         if (
             current is not None
             and current.current_version_ids == bundle.current_version_ids
@@ -541,9 +731,16 @@ class CanonicalProcessor:
                 self._owners[instrument_id] = CanonicalL2BookOwner(bundle, instrument_id)
             else:
                 previous_health = owner.health
-                owner.apply_reference_bundle(bundle)
+                mutation = owner.apply_reference_bundle(bundle)
+                if had_initialized_book:
+                    self._record_book_mutation(
+                        mutation,
+                        reason=ScanTriggerReason.REFERENCE,
+                    )
                 if previous_health is BookHealth.HEALTHY and owner.health is BookHealth.INVALID:
                     self._invalidations += 1
+        if had_initialized_book and reference_changed:
+            self._mark_market_dirty(bundle.market.market_id, ScanTriggerReason.REFERENCE)
         if self._outputs is not None:
             self._outputs.append_reference(bundle, observed_at, reference_provenance)
         return bundle
@@ -599,26 +796,18 @@ class CanonicalProcessor:
                 "dynamic reference update has no prior raw reference provenance",
                 component="canonical-processor",
             )
-        paired_sources: dict[str, tuple[IngestId, str]] = {}
         try:
-            sources = (
-                *zip(prior.source_ingest_ids, prior.source_payload_hashes, strict=True),
-                *zip(event.source_ingest_ids, event.source_payload_hashes, strict=True),
+            ordered = tuple(
+                sorted(
+                    merge_raw_source_refs(prior.raw_source_refs, event.raw_source_refs),
+                    key=lambda item: item.ingest_id.value,
+                )
             )
-        except ValueError as error:
+        except RawSourceInvariantError as error:
             raise ProgrammingInvariantViolation(
-                "reference provenance ingest IDs and payload hashes are not paired",
+                "dynamic reference provenance contains conflicting raw source pairs",
                 component="canonical-processor",
             ) from error
-        for ingest_id, payload_hash in sources:
-            existing = paired_sources.get(ingest_id.value)
-            if existing is not None and existing[1] != payload_hash:
-                raise ProgrammingInvariantViolation(
-                    "one raw ingest identity maps to conflicting payload hashes",
-                    component="canonical-processor",
-                )
-            paired_sources[ingest_id.value] = (ingest_id, payload_hash)
-        ordered = tuple(paired_sources[key] for key in sorted(paired_sources))
         attributes = dict(prior.attributes)
         surfaces = tuple(
             item for item in attributes.get("reference_raw_surfaces", "").split(",") if item
@@ -628,9 +817,8 @@ class CanonicalProcessor:
             (*surfaces, *((dynamic_surface,) if dynamic_surface not in surfaces else ()))
         )
         attributes["dynamic_reference_event_id"] = event.canonical_event_id.value
-        return Provenance(
-            source_ingest_ids=tuple(item[0] for item in ordered),
-            source_payload_hashes=tuple(item[1] for item in ordered),
+        return Provenance.from_raw_source_refs(
+            ordered,
             reference_version_ids=replacement.current_version_ids,
             config_hash=self._config.config_hash,
             code_version=self._config.system.code_version,
@@ -653,13 +841,28 @@ class CanonicalProcessor:
         rest_source = self._rest_source_by_condition.get(condition_id)
         if rest_source is not None:
             named_sources.append(("clob-rest-book", rest_source))
-        by_ingest: dict[str, _RawReferenceSource] = {}
-        for _name, source in named_sources:
-            by_ingest[source.ingest_id.value] = source
-        ordered = tuple(by_ingest[key] for key in sorted(by_ingest))
-        return Provenance(
-            source_ingest_ids=tuple(item.ingest_id for item in ordered),
-            source_payload_hashes=tuple(item.payload_sha256 for item in ordered),
+        try:
+            ordered = tuple(
+                sorted(
+                    merge_raw_source_refs(
+                        (
+                            RawSourceRef(
+                                ingest_id=source.ingest_id,
+                                payload_sha256=source.payload_sha256,
+                            )
+                            for _name, source in named_sources
+                        )
+                    ),
+                    key=lambda item: item.ingest_id.value,
+                )
+            )
+        except RawSourceInvariantError as error:
+            raise ProgrammingInvariantViolation(
+                "reference surfaces contain conflicting raw source pairs",
+                component="canonical-processor",
+            ) from error
+        return Provenance.from_raw_source_refs(
+            ordered,
             reference_version_ids=bundle.current_version_ids,
             config_hash=self._config.config_hash,
             code_version=self._config.system.code_version,
@@ -698,8 +901,9 @@ class CanonicalProcessor:
                 raise NormalizationError(
                     "WebSocket message has no as-known-at-time reference bundle"
                 )
-        events = self._normalizer.normalize(
+        events = self._normalizer.normalize_parsed(
             envelope.payload_bytes,
+            native_events,
             self._normalization_context(envelope, bundle),
         )
         for event in events:
@@ -711,9 +915,6 @@ class CanonicalProcessor:
                         component="canonical-processor",
                     )
                 bundle = self._publish_dynamic_tick_reference(event, bundle)
-        if market_id is not None and bundle is not None:
-            current = self._registry.current(market_id)
-            self._scan_market(current or bundle, envelope.received_wall_time)
 
     def _apply_canonical(self, event: CanonicalEvent) -> None:
         self._canonical_events += 1
@@ -735,14 +936,39 @@ class CanonicalProcessor:
         for instrument_id in target_ids:
             owner = self._owners[instrument_id]
             previous = owner.health
+            if isinstance(event.payload, (OrderBookSnapshotEvent, PriceChangeEvent)) and (
+                self._ws_l2_exceeds_freshness_window(instrument_id)
+            ):
+                mutation = owner.invalidate(InvalidationReason.STALE_SNAPSHOT)
+                if previous is not BookHealth.INVALID:
+                    self._invalidations += 1
+                self._record_book_mutation(
+                    mutation,
+                    reason=ScanTriggerReason.INVALIDATION,
+                )
+                continue
             try:
-                owner.apply_event(event)
+                mutation = owner.apply_event(event)
+            except RawSourceInvariantError as error:
+                raise ProgrammingInvariantViolation(
+                    "book-state provenance contains conflicting raw source pairs",
+                    component="canonical-processor",
+                ) from error
             except BookStateError:
                 if previous is not BookHealth.INVALID:
                     self._invalidations += 1
                 raise
             if previous is not BookHealth.INVALID and owner.health is BookHealth.INVALID:
                 self._invalidations += 1
+            if isinstance(event.payload, MarketResolvedEvent):
+                reason = ScanTriggerReason.LIFECYCLE
+            elif isinstance(event.payload, TickSizeChangeEvent):
+                reason = ScanTriggerReason.REFERENCE
+            elif isinstance(event.payload, (OrderBookSnapshotEvent, PriceChangeEvent)):
+                reason = ScanTriggerReason.BOOK_UPDATE
+            else:
+                reason = ScanTriggerReason.BOOK_UPDATE
+            self._record_book_mutation(mutation, reason=reason)
 
     def _record_reference_refresh(self, request: ReferenceRefreshRequest) -> None:
         active = self._active_refresh_requests
@@ -804,15 +1030,37 @@ class CanonicalProcessor:
         instrument_ids = self._market_instruments.get(bundle.market.market_id, ())
         if len(instrument_ids) != 2:
             return
-        books = tuple(self._owners[item].snapshot() for item in instrument_ids)
-        provenance = self._scan_provenance(bundle, books)
-        result = self._scanner.scan(
-            bundle=bundle,
-            proof=prove_binary_complement(bundle),
-            books=books,
-            observed_at=observed_at,
-            provenance=provenance,
+        snapshot_views = tuple(
+            self._owners[item].snapshot_with_economic_hash() for item in instrument_ids
         )
+        books = tuple(item[0] for item in snapshot_views)
+        book_state_hashes = {
+            snapshot.instrument_id: state_hash for snapshot, state_hash in snapshot_views
+        }
+        provenance = self._scan_provenance(bundle, books)
+        proof_entry = self._semantic_proofs.get(bundle.market.market_id)
+        if proof_entry is None or proof_entry[0] is not bundle:
+            proof = prove_binary_complement(bundle)
+            self._semantic_proofs[bundle.market.market_id] = (
+                bundle,
+                proof,
+            )
+        else:
+            proof = proof_entry[1]
+        try:
+            result = self._scanner.scan(
+                bundle=bundle,
+                proof=proof,
+                books=books,
+                observed_at=observed_at,
+                provenance=provenance,
+                book_state_hashes=book_state_hashes,
+            )
+        except RawSourceInvariantError as error:
+            raise ProgrammingInvariantViolation(
+                "scanner provenance contains conflicting raw source pairs",
+                component="canonical-processor",
+            ) from error
         self._scan_count += 1
         self._scan_chain = _chain_extend(self._scan_chain, "scan", result.terminal_hash)
         if result.candidate is not None:
@@ -833,6 +1081,17 @@ class CanonicalProcessor:
                 opportunity_id=result.candidate.opportunity_id,
                 observed_at=observed_at,
                 status=status,
+            )
+        else:
+            lifecycle_id = complete_set_lifecycle_id(
+                strategy_id=self._scanner.strategy_id,
+                strategy_version=self._scanner.strategy_version,
+                market_id=bundle.market.market_id,
+                instrument_ids=instrument_ids,
+            )
+            lifecycle = self._lifecycle_tracker.expire_if_active(
+                lifecycle_id,
+                expired_at=observed_at,
             )
         self._scan_results.append(result)
         if self._outputs is not None:
@@ -857,26 +1116,32 @@ class CanonicalProcessor:
         bundle: ReferenceBundle,
         books: tuple[ImmutableOrderBookSnapshot, ...],
     ) -> Provenance:
-        ingest_by_value: dict[str, IngestId] = {}
-        payload_hashes: set[str] = set()
+        raw_source_groups: list[tuple[RawSourceRef, ...]] = []
         reference_provenance = self._reference_provenance.get(bundle.market.market_id)
         if reference_provenance is not None:
-            for ingest_id in reference_provenance.source_ingest_ids:
-                ingest_by_value[ingest_id.value] = ingest_id
-            payload_hashes.update(reference_provenance.source_payload_hashes)
+            raw_source_groups.append(reference_provenance.raw_source_refs)
         for book in books:
             source = book.state_source_provenance or book.last_source_provenance
             if source is None:
                 continue
-            for ingest_id in source.source_ingest_ids:
-                ingest_by_value[ingest_id.value] = ingest_id
-            payload_hashes.update(source.source_payload_hashes)
+            raw_source_groups.append(source.raw_source_refs)
+        try:
+            raw_source_refs = tuple(
+                sorted(
+                    merge_raw_source_refs(*raw_source_groups),
+                    key=lambda item: item.ingest_id.value,
+                )
+            )
+        except RawSourceInvariantError as error:
+            raise ProgrammingInvariantViolation(
+                "scan provenance contains conflicting raw source pairs",
+                component="canonical-processor",
+            ) from error
         version_by_identity: dict[tuple[type[VersionId], str], VersionId] = {}
         for version in bundle.current_version_ids:
             version_by_identity[(type(version), version.value)] = version
-        return Provenance(
-            source_ingest_ids=tuple(ingest_by_value[key] for key in sorted(ingest_by_value)),
-            source_payload_hashes=tuple(sorted(payload_hashes)),
+        return Provenance.from_raw_source_refs(
+            raw_source_refs,
             reference_version_ids=tuple(
                 version_by_identity[key]
                 for key in sorted(
@@ -895,7 +1160,11 @@ class CanonicalProcessor:
             if owner.health is BookHealth.CLOSED:
                 continue
             was_invalid = owner.health is BookHealth.INVALID
-            owner.invalidate(reason)
+            mutation = owner.invalidate(reason)
+            self._record_book_mutation(
+                mutation,
+                reason=ScanTriggerReason.INVALIDATION,
+            )
             affected.append(owner.instrument_id)
             if not was_invalid:
                 self._invalidations += 1
@@ -913,7 +1182,7 @@ class CanonicalProcessor:
     def summary(self) -> ProcessorSummary:
         snapshots = self.snapshots()
         snapshot_hashes = tuple(
-            (snapshot.instrument_id.value, snapshot.content_sha256()) for snapshot in snapshots
+            (owner.instrument_id.value, owner.content_sha256()) for owner in self.owners
         )
         reference_versions = tuple(
             (
@@ -1000,8 +1269,12 @@ class CanonicalProcessor:
 
 
 __all__ = [
+    "AnalyticalOutputSink",
+    "BookFreshnessUpdate",
     "CanonicalProcessor",
+    "MarketScanTrigger",
     "ProcessedEnvelope",
     "ProcessorSummary",
     "ReferenceRefreshRequest",
+    "ScanTriggerReason",
 ]

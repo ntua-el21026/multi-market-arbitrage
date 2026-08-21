@@ -57,6 +57,7 @@ def canonicalize(value: object, *, allow_floats: bool = False) -> CanonicalValue
         return {
             field.name: canonicalize(getattr(value, field.name), allow_floats=allow_floats)
             for field in fields(value)
+            if field.metadata.get("canonical_serialize", True)
         }
     if isinstance(value, Mapping):
         canonical_mapping: dict[str, CanonicalValue] = {}

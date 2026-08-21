@@ -19,6 +19,7 @@ from multi_market_arbitrage.core.time import MonotonicTimestamp, UtcTimestamp
 from multi_market_arbitrage.ingestion import RawEventEnvelope
 from multi_market_arbitrage.journal import JournalDurabilityState, JournalReceipt
 from multi_market_arbitrage.normalization import CanonicalEvent, CanonicalEventType
+from multi_market_arbitrage.normalization import polymarket as normalization_module
 from multi_market_arbitrage.pipeline import (
     CLOB_MARKET_PREFIX,
     CONTROL_BOOK_INVALIDATION,
@@ -27,6 +28,7 @@ from multi_market_arbitrage.pipeline import (
     REST_BOOK_AUDIT,
     WS_MARKET,
     CanonicalProcessor,
+    ScanTriggerReason,
 )
 from multi_market_arbitrage.pipeline import processor as processor_module
 from multi_market_arbitrage.reference import POLYMARKET_VENUE_ID, ReferenceBundle
@@ -77,6 +79,8 @@ def _envelope(
     sequence: int,
     channel: str,
     payload: bytes,
+    *,
+    monotonic_ns: int | None = None,
 ) -> RawEventEnvelope:
     return RawEventEnvelope.capture(
         collector_run_id=run_id,
@@ -88,7 +92,10 @@ def _envelope(
         transport_type="WEBSOCKET" if channel == WS_MARKET else "HTTP",
         subscription_semantics_hash=hashlib.sha256(channel.encode()).hexdigest(),
         received_wall_time=UtcTimestamp(_BASE_TIME_NS + sequence * 1_000_000_000),
-        received_monotonic=MonotonicTimestamp(run_id.value, 100 + sequence),
+        received_monotonic=MonotonicTimestamp(
+            run_id.value,
+            100 + sequence if monotonic_ns is None else monotonic_ns,
+        ),
         payload_bytes=payload,
         payload_encoding="utf-8",
     )
@@ -183,6 +190,44 @@ def test_new_market_without_reference_emits_exact_deterministic_refresh_request(
     assert live.summary() == replay.summary()
 
 
+def test_websocket_payload_is_strictly_parsed_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("processor-single-ws-parse")
+    envelope = _envelope(run_id, 0, WS_MARKET, _new_market_payload())
+    original = processor_module.parse_market_ws_message
+    calls = 0
+
+    def counted(payload: bytes) -> tuple[object, ...]:
+        nonlocal calls
+        calls += 1
+        return original(payload)
+
+    monkeypatch.setattr(processor_module, "parse_market_ws_message", counted)
+    monkeypatch.setattr(normalization_module, "parse_market_ws_message", counted)
+
+    result = CanonicalProcessor(config).process_replayed(envelope)
+
+    assert result.success
+    assert calls == 1
+
+
+def test_scan_latency_observer_receives_one_sample_per_dirty_market_scan() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("processor-scan-latency-observer")
+    samples: list[int] = []
+    processor = CanonicalProcessor(config, scan_latency_observer=samples.append)
+    scan_count = 0
+
+    for envelope in _bootstrap(run_id):
+        scan_count += processor.process_replayed(envelope).scan_count
+
+    assert scan_count > 0
+    assert len(samples) == scan_count
+    assert all(sample >= 0 for sample in samples)
+
+
 @pytest.mark.parametrize(
     "error",
     [
@@ -259,7 +304,14 @@ def test_rest_audit_counts_matches_and_invalidates_on_exact_mismatch() -> None:
     assert matched.generation == before.generation
     assert matched.bids == before.bids
     assert matched.asks == before.asks
-    assert processor.summary().scans == scans_before
+    assert matching_result.scan_count == 1
+    assert len(matching_result.book_freshness_updates) == 1
+    assert matching_result.book_freshness_updates[0].instrument_id == yes_instrument
+    assert matching_result.book_freshness_updates[0].received_monotonic == (
+        matching.received_monotonic
+    )
+    assert matching_result.scan_triggers[0].reasons == (ScanTriggerReason.REST_AUDIT,)
+    assert processor.summary().scans == scans_before + 1
 
     mismatched_payload = _fixture("polymarket_rest_book_yes.json").replace(
         b'"price": "0.40", "size": "10"',
@@ -271,12 +323,125 @@ def test_rest_audit_counts_matches_and_invalidates_on_exact_mismatch() -> None:
 
     assert mismatch_result.success
     assert mismatch_result.needs_resync
+    assert mismatch_result.scan_count == 1
+    assert not mismatch_result.book_freshness_updates
+    assert mismatch_result.scan_triggers[0].reasons == (ScanTriggerReason.REST_AUDIT,)
     assert owner.snapshot().health is BookHealth.INVALID
     assert owner.snapshot().invalidation_reason is InvalidationReason.REST_AUDIT_MISMATCH
     assert summary.rest_audits == 2
     assert summary.rest_audit_mismatches == 1
     assert summary.parse_failures == 0
-    assert summary.scans == scans_before
+    assert summary.scans == scans_before + 2
+
+
+def test_scan_dirty_is_coalesced_and_last_trade_is_diagnostic_only() -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId("processor-scan-dirty")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    yes_instrument = processor.current_bundles[0].instrument_for_token("token-yes").instrument_id
+    owner = next(item for item in processor.owners if item.instrument_id == yes_instrument)
+    scans_before = processor.summary().scans
+
+    update = _envelope(
+        run_id,
+        4,
+        WS_MARKET,
+        _fixture("polymarket_ws_price_change.json"),
+    )
+    updated = processor.process_replayed(update)
+
+    assert updated.success
+    assert updated.canonical_event_count == 1
+    assert updated.scan_count == 1
+    assert updated.scan_triggers[0].reasons == (ScanTriggerReason.BOOK_UPDATE,)
+    assert len(updated.book_freshness_updates) == 1
+    assert updated.book_freshness_updates[0].instrument_id == yes_instrument
+    assert updated.book_freshness_updates[0].received_monotonic == update.received_monotonic
+
+    economic_hash = owner.economic_content_sha256()
+    l2_source_event_id = owner.snapshot().last_source_event_id
+    l2_provenance = owner.snapshot().state_source_provenance
+    diagnostic_hash = owner.content_sha256()
+    trade = _envelope(
+        run_id,
+        5,
+        WS_MARKET,
+        _fixture("polymarket_ws_last_trade.json"),
+    )
+    traded = processor.process_replayed(trade)
+
+    assert traded.success
+    assert traded.canonical_event_count == 1
+    assert traded.scan_count == 0
+    assert not traded.scan_triggers
+    assert not traded.book_freshness_updates
+    assert processor.summary().scans == scans_before + 1
+    assert owner.economic_content_sha256() == economic_hash
+    assert owner.snapshot().last_source_event_id == l2_source_event_id
+    assert owner.snapshot().state_source_provenance == l2_provenance
+    assert owner.content_sha256() != diagnostic_hash
+
+
+def test_ws_l2_deadline_equality_is_accepted_and_strict_overrun_requires_rest() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    maximum_age_ns = int(config.scanner.maximum_book_age_seconds * 1_000_000_000)
+    update_payload = _fixture("polymarket_ws_price_change.json")
+
+    equality_run = CollectorRunId("processor-l2-deadline-equality")
+    equality = CanonicalProcessor(config)
+    for envelope in _bootstrap(equality_run):
+        assert equality.process_replayed(envelope).success
+    at_deadline = _envelope(
+        equality_run,
+        4,
+        WS_MARKET,
+        update_payload,
+        monotonic_ns=102 + maximum_age_ns,
+    )
+    accepted = equality.process_replayed(at_deadline)
+
+    assert accepted.success
+    assert accepted.scan_count == 1
+    assert len(accepted.book_freshness_updates) == 1
+    assert not accepted.needs_resync
+
+    overrun_run = CollectorRunId("processor-l2-deadline-overrun")
+    overrun = CanonicalProcessor(config)
+    for envelope in _bootstrap(overrun_run):
+        assert overrun.process_replayed(envelope).success
+    after_deadline = _envelope(
+        overrun_run,
+        4,
+        WS_MARKET,
+        update_payload,
+        monotonic_ns=102 + maximum_age_ns + 1,
+    )
+    rejected = overrun.process_replayed(after_deadline)
+    yes_instrument = overrun.current_bundles[0].instrument_for_token("token-yes").instrument_id
+    yes_owner = next(item for item in overrun.owners if item.instrument_id == yes_instrument)
+
+    assert rejected.success
+    assert rejected.scan_count == 1
+    assert rejected.needs_resync
+    assert not rejected.book_freshness_updates
+    assert rejected.scan_triggers[0].reasons == (ScanTriggerReason.INVALIDATION,)
+    assert yes_owner.snapshot().health is BookHealth.INVALID
+    assert yes_owner.snapshot().invalidation_reason is InvalidationReason.STALE_SNAPSHOT
+
+    rest = _envelope(
+        overrun_run,
+        5,
+        REST_BOOK,
+        _fixture("polymarket_rest_book_yes.json"),
+        monotonic_ns=102 + maximum_age_ns + 2,
+    )
+    restored = overrun.process_replayed(rest)
+
+    assert restored.success
+    assert len(restored.book_freshness_updates) == 1
+    assert restored.book_freshness_updates[0].received_monotonic == rest.received_monotonic
+    assert yes_owner.snapshot().health is BookHealth.HEALTHY
 
 
 def test_control_and_audit_channels_have_identical_live_and_replay_results() -> None:

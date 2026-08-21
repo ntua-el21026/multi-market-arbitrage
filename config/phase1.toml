@@ -12,7 +12,12 @@ journal_segment_max_events = 10000
 journal_segment_max_uncompressed_bytes = 67108864
 journal_run_max_uncompressed_bytes = 4294967296
 journal_submit_timeout_seconds = 5.0
+journal_group_commit_max_events = 16
+journal_group_commit_max_delay_seconds = 0.0
 parquet_batch_size = 1000
+analytical_queue_capacity = 1024
+analytical_record_max_bytes = 8388608
+analytical_buffer_max_bytes = 67108864
 
 [polymarket]
 gamma_base_url = "https://gamma-api.polymarket.com"
@@ -27,6 +32,7 @@ reconnect_max_seconds = 15.0
 max_reconnect_attempts = 8
 maximum_http_response_bytes = 8388608
 maximum_websocket_message_bytes = 1048576
+maximum_ingress_queue_bytes = 67108864
 
 [scanner]
 enabled = true

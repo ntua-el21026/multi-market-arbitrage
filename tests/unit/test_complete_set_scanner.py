@@ -4,6 +4,8 @@ import hashlib
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from multi_market_arbitrage.core.exact import ExactDecimal, Price, Quantity, Rate
 from multi_market_arbitrage.core.health import BookHealth
 from multi_market_arbitrage.core.ids import CanonicalEventId, IngestId
@@ -21,9 +23,11 @@ from multi_market_arbitrage.reference import (
 )
 from multi_market_arbitrage.scanners.polymarket_complete_set import (
     CompleteSetScannerConfig,
+    CompleteSetScanResult,
     PolymarketCompleteSetScanner,
     ScanDisposition,
 )
+from multi_market_arbitrage.scanners.polymarket_complete_set import scanner as scanner_module
 from multi_market_arbitrage.semantic import prove_binary_complement
 from multi_market_arbitrage.state import BookLevel, ImmutableOrderBookSnapshot
 from multi_market_arbitrage.venues.polymarket.schemas import (
@@ -332,6 +336,31 @@ def test_scanner_output_hash_is_replay_deterministic() -> None:
 
     assert first == second
     assert first.terminal_hash == second.terminal_hash
+
+
+def test_scan_result_creation_hashes_canonical_content_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = scanner_module.canonical_sha256
+    calls = 0
+
+    def counting_hash(value: object) -> str:
+        nonlocal calls
+        calls += 1
+        return original(value)
+
+    monkeypatch.setattr(scanner_module, "canonical_sha256", counting_hash)
+
+    result = CompleteSetScanResult.create(
+        disposition=ScanDisposition.BLOCKED,
+        observed_at=NOW,
+        candidate=None,
+        opportunity=None,
+        validation_results=(),
+    )
+
+    assert calls == 1
+    assert len(result.terminal_hash) == 64
 
 
 def test_rest_initialized_books_use_raw_provenance_without_synthetic_event_ids() -> None:

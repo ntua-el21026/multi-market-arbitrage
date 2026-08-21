@@ -21,6 +21,8 @@ from multi_market_arbitrage.journal import (
 )
 from multi_market_arbitrage.journal.reader import run_key_for
 from multi_market_arbitrage.storage import (
+    ParquetFragmentManifest,
+    load_analytical_run_completion,
     load_fragment_manifest,
     validate_dataset_manifest,
 )
@@ -51,6 +53,7 @@ _PARTIAL_NAME = re.compile(
     r"^run-(?P<run_key>[0-9a-f]{16})\.(?P<stream>[A-Za-z0-9_.-]+)\."
     r"(?P<first_sequence>[0-9]{20})\.jsonl\.partial$"
 )
+_MAX_VALIDATION_ARTIFACT_PATHS = 65_536
 type _JournalScope = tuple[Path, CollectorRunId, str]
 type _DatasetScope = tuple[Path, str, VenueId, str]
 
@@ -64,11 +67,73 @@ class DataValidationReport:
     partial_journal_records: int
     parquet_fragments: int
     dataset_manifests: int
+    analytical_completed_runs: int
     errors: tuple[str, ...]
 
     @property
     def valid(self) -> bool:
         return not self.errors
+
+
+@dataclass(frozen=True, slots=True)
+class _RecognizedArtifactInventory:
+    sealed_journal_segments: tuple[Path, ...]
+    partial_journal_segments: tuple[Path, ...]
+    journal_completions: tuple[Path, ...]
+    parquet_fragments: tuple[Path, ...]
+    parquet_fragment_manifests: tuple[Path, ...]
+    dataset_manifests: tuple[Path, ...]
+    analytical_completions: tuple[Path, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedPartial:
+    first: RawEventEnvelope
+    last: RawEventEnvelope
+    record_count: int
+
+
+def _recognized_artifacts(root: Path) -> _RecognizedArtifactInventory:
+    sealed: list[Path] = []
+    partials: list[Path] = []
+    journal_completions: list[Path] = []
+    parquet: list[Path] = []
+    parquet_manifests: list[Path] = []
+    dataset_manifests: list[Path] = []
+    analytical_completions: list[Path] = []
+    recognized_count = 0
+    for path in root.rglob("*"):
+        name = path.name
+        destination: list[Path] | None = None
+        if name.endswith(".jsonl.zst"):
+            destination = sealed
+        elif name.endswith(".jsonl.partial"):
+            destination = partials
+        elif name.startswith("run-") and name.endswith(".completed.json"):
+            destination = journal_completions
+        elif name.endswith(".parquet.manifest.json"):
+            destination = parquet_manifests
+        elif name.endswith(".parquet"):
+            destination = parquet
+        elif name.startswith("_dataset.") and name.endswith(".manifest.json"):
+            destination = dataset_manifests
+        elif name.startswith("_analytical-run.") and name.endswith(".completed.json"):
+            destination = analytical_completions
+        if destination is None:
+            continue
+        recognized_count += 1
+        if recognized_count > _MAX_VALIDATION_ARTIFACT_PATHS:
+            raise ValueError("recognized validation artifact inventory exceeds the supported count")
+        destination.append(path)
+    return _RecognizedArtifactInventory(
+        sealed_journal_segments=tuple(sorted(sealed)),
+        partial_journal_segments=tuple(sorted(partials)),
+        journal_completions=tuple(sorted(journal_completions)),
+        parquet_fragments=tuple(sorted(parquet)),
+        parquet_fragment_manifests=tuple(sorted(parquet_manifests)),
+        dataset_manifests=tuple(sorted(dataset_manifests)),
+        analytical_completions=tuple(sorted(analytical_completions)),
+    )
 
 
 def _require_confined_regular(path: Path, root: Path, *, artifact: str) -> None:
@@ -86,35 +151,48 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _validate_partial(path: Path, root: Path) -> tuple[RawEventEnvelope, ...]:
+def _validate_partial(path: Path, root: Path) -> _ValidatedPartial:
     _require_confined_regular(path, root, artifact="partial journal")
-    with path.open("rb") as handle:
-        payload = handle.read(ABSOLUTE_MAX_UNCOMPRESSED_SEGMENT_BYTES + 1)
-    if len(payload) > ABSOLUTE_MAX_UNCOMPRESSED_SEGMENT_BYTES:
+    if path.stat().st_size > ABSOLUTE_MAX_UNCOMPRESSED_SEGMENT_BYTES:
         raise ValueError("partial journal exceeds verification byte limit")
-    if not payload or not payload.endswith(b"\n"):
-        raise ValueError("partial journal is empty or has an incomplete trailing record")
-    envelopes: list[RawEventEnvelope] = []
-    for line in payload.splitlines(keepends=True):
-        envelope = RawEventEnvelope.from_json_line(line)
-        if envelopes:
-            previous = envelopes[-1]
-            if envelope.collector_run_id != previous.collector_run_id:
-                raise ValueError("partial journal mixes collector runs")
-            if envelope.ingest_seq != previous.ingest_seq + 1:
-                raise ValueError("partial journal ingest sequence is not contiguous")
-        envelopes.append(envelope)
-    return tuple(envelopes)
+    first: RawEventEnvelope | None = None
+    previous: RawEventEnvelope | None = None
+    record_count = 0
+    total_bytes = 0
+    with path.open("rb") as handle:
+        while True:
+            remaining = ABSOLUTE_MAX_UNCOMPRESSED_SEGMENT_BYTES - total_bytes
+            line = handle.readline(remaining + 1)
+            if len(line) > remaining:
+                raise ValueError("partial journal exceeds verification byte limit")
+            if not line:
+                break
+            total_bytes += len(line)
+            if not line.endswith(b"\n"):
+                raise ValueError("partial journal has an incomplete trailing record")
+            envelope = RawEventEnvelope.from_json_line(line)
+            if previous is not None:
+                if envelope.collector_run_id != previous.collector_run_id:
+                    raise ValueError("partial journal mixes collector runs")
+                if envelope.ingest_seq != previous.ingest_seq + 1:
+                    raise ValueError("partial journal ingest sequence is not contiguous")
+            if first is None:
+                first = envelope
+            previous = envelope
+            record_count += 1
+    if first is None or previous is None:
+        raise ValueError("partial journal is empty")
+    return _ValidatedPartial(first=first, last=previous, record_count=record_count)
 
 
-def _partial_scope(path: Path, envelopes: tuple[RawEventEnvelope, ...]) -> _JournalScope | None:
+def _partial_scope(path: Path, partial: _ValidatedPartial) -> _JournalScope | None:
     match = _PARTIAL_NAME.fullmatch(path.name)
     if match is None:
         return None
-    run_id = envelopes[0].collector_run_id
+    run_id = partial.first.collector_run_id
     if match.group("run_key") != run_key_for(run_id):
         raise ValueError("partial filename collector-run key conflicts with content")
-    if int(match.group("first_sequence")) != envelopes[0].ingest_seq:
+    if int(match.group("first_sequence")) != partial.first.ingest_seq:
         raise ValueError("partial filename first sequence conflicts with content")
     return (path.parent, run_id, match.group("stream"))
 
@@ -134,6 +212,20 @@ def validate_data(root: Path, *, allow_incomplete: bool = False) -> DataValidati
     """
 
     resolved = root.resolve()
+    try:
+        inventory = _recognized_artifacts(resolved)
+    except ValueError as error:
+        return DataValidationReport(
+            root=resolved,
+            sealed_journal_segments=0,
+            completed_journal_runs=0,
+            interrupted_journal_runs=0,
+            partial_journal_records=0,
+            parquet_fragments=0,
+            dataset_manifests=0,
+            analytical_completed_runs=0,
+            errors=(f"{resolved}: {type(error).__name__}: {error}",),
+        )
     errors: list[str] = []
     sealed_count = 0
     completed_runs = 0
@@ -141,12 +233,16 @@ def validate_data(root: Path, *, allow_incomplete: bool = False) -> DataValidati
     partial_records = 0
     parquet_count = 0
     dataset_count = 0
+    analytical_completion_count = 0
     journal_scopes: set[_JournalScope] = set()
     completion_scopes: set[_JournalScope] = set()
+    journal_completion_hashes: set[str] = set()
     unscoped_interrupted_partials: list[Path] = []
     dataset_scopes: set[_DatasetScope] = set()
+    fragment_manifests_by_sha: dict[str, ParquetFragmentManifest] = {}
+    phase1_fragment_claims: dict[str, Path] = {}
 
-    for path in sorted(resolved.rglob("*.jsonl.zst")):
+    for path in inventory.sealed_journal_segments:
         try:
             _require_confined_regular(path, resolved, artifact="sealed journal segment")
             segment = verify_sealed_segment(path)
@@ -160,21 +256,22 @@ def validate_data(root: Path, *, allow_incomplete: bool = False) -> DataValidati
             sealed_count += 1
         except Exception as error:
             errors.append(f"{path}: {type(error).__name__}: {error}")
-    for path in sorted(resolved.rglob("*.jsonl.partial")):
+    for path in inventory.partial_journal_segments:
         try:
-            envelopes = _validate_partial(path, resolved)
-            partial_records += len(envelopes)
-            scope = _partial_scope(path, envelopes)
+            partial = _validate_partial(path, resolved)
+            partial_records += partial.record_count
+            scope = _partial_scope(path, partial)
             if scope is None:
                 unscoped_interrupted_partials.append(path)
             else:
                 journal_scopes.add(scope)
         except Exception as error:
             errors.append(f"{path}: {type(error).__name__}: {error}")
-    for path in sorted(resolved.rglob("run-*.completed.json")):
+    for path in inventory.journal_completions:
         try:
             _require_confined_regular(path, resolved, artifact="journal run completion")
             head = load_run_completion_head(path)
+            journal_completion_hashes.add(head.completion_sha256)
             scope = (path.parent, head.collector_run_id, head.stream)
             completion_scopes.add(scope)
             journal_scopes.add(scope)
@@ -189,11 +286,13 @@ def validate_data(root: Path, *, allow_incomplete: bool = False) -> DataValidati
         try:
             reader = JournalReader(directory, collector_run_id, stream=stream)
             if scope in completion_scopes:
-                reader.read_all(include_partial=False)
+                for _ in reader.iter_verified(include_partial=False):
+                    pass
                 completed_runs += 1
             else:
                 interrupted_runs += 1
-                reader.read_all(include_partial=True)
+                for _ in reader.iter_verified(include_partial=True):
+                    pass
                 if not allow_incomplete:
                     raise ValueError(
                         "journal capture is interrupted because its completion head is missing"
@@ -209,8 +308,8 @@ def validate_data(root: Path, *, allow_incomplete: bool = False) -> DataValidati
             for path in unscoped_interrupted_partials
         )
 
-    parquet_paths = set(resolved.rglob("*.parquet"))
-    fragment_manifest_paths = set(resolved.rglob("*.parquet.manifest.json"))
+    parquet_paths = set(inventory.parquet_fragments)
+    fragment_manifest_paths = set(inventory.parquet_fragment_manifests)
     expected_fragment_manifests = {
         path.with_name(f"{path.name}.manifest.json") for path in parquet_paths
     }
@@ -228,6 +327,7 @@ def validate_data(root: Path, *, allow_incomplete: bool = False) -> DataValidati
         try:
             _require_confined_regular(path, resolved, artifact="Parquet fragment manifest")
             manifest = load_fragment_manifest(path)
+            fragment_manifests_by_sha[manifest.manifest_sha256] = manifest
             fragment = path.with_name(path.name.removesuffix(".manifest.json"))
             _require_confined_regular(fragment, resolved, artifact="Parquet fragment")
             if fragment.stat().st_size != manifest.file_bytes:
@@ -252,7 +352,7 @@ def validate_data(root: Path, *, allow_incomplete: bool = False) -> DataValidati
         except Exception as error:
             errors.append(f"{path}: {type(error).__name__}: {error}")
 
-    dataset_manifest_paths = set(resolved.rglob("_dataset.*.manifest.json"))
+    dataset_manifest_paths = set(inventory.dataset_manifests)
     for path in sorted(dataset_manifest_paths):
         try:
             _require_confined_regular(path, resolved, artifact="Parquet dataset manifest")
@@ -271,6 +371,52 @@ def validate_data(root: Path, *, allow_incomplete: bool = False) -> DataValidati
         if expected not in dataset_manifest_paths:
             errors.append(f"{expected}: analytical fragment inventory has no dataset manifest")
 
+    analytical_completion_paths = set(inventory.analytical_completions)
+    for path in sorted(analytical_completion_paths):
+        try:
+            _require_confined_regular(path, resolved, artifact="analytical run completion")
+            head = load_analytical_run_completion(path)
+            if (
+                head.source_journal_completion_sha256 is not None
+                and journal_completion_hashes
+                and head.source_journal_completion_sha256 not in journal_completion_hashes
+            ):
+                raise ValueError("analytical completion references an unknown raw completion")
+            for dataset in head.datasets:
+                rows = 0
+                for digest in dataset.fragment_manifest_sha256s:
+                    prior = phase1_fragment_claims.get(digest)
+                    if prior is not None:
+                        raise ValueError(
+                            f"analytical fragment is claimed by multiple runs: {prior} and {path}"
+                        )
+                    phase1_fragment_claims[digest] = path
+                    manifest_value = fragment_manifests_by_sha.get(digest)
+                    if manifest_value is None:
+                        raise ValueError(
+                            f"analytical completion claims missing fragment manifest {digest}"
+                        )
+                    if (
+                        manifest_value.dataset != dataset.dataset
+                        or manifest_value.schema_version != dataset.schema_version
+                        or manifest_value.venue_id != head.venue_id
+                    ):
+                        raise ValueError("analytical completion fragment scope mismatch")
+                    rows += manifest_value.row_count
+                if rows != dataset.record_count:
+                    raise ValueError("analytical completion record count mismatch")
+            analytical_completion_count += 1
+        except Exception as error:
+            errors.append(f"{path}: {type(error).__name__}: {error}")
+
+    if not allow_incomplete:
+        for digest, manifest_value in fragment_manifests_by_sha.items():
+            if (
+                manifest_value.schema_version.startswith("phase1-")
+                and digest not in phase1_fragment_claims
+            ):
+                errors.append(f"analytical fragment {digest} has no completed Phase 1 run claim")
+
     if not any(
         (
             sealed_count,
@@ -279,6 +425,7 @@ def validate_data(root: Path, *, allow_incomplete: bool = False) -> DataValidati
             partial_records,
             parquet_count,
             dataset_count,
+            analytical_completion_count,
             errors,
         )
     ):
@@ -291,6 +438,7 @@ def validate_data(root: Path, *, allow_incomplete: bool = False) -> DataValidati
         partial_journal_records=partial_records,
         parquet_fragments=parquet_count,
         dataset_manifests=dataset_count,
+        analytical_completed_runs=analytical_completion_count,
         errors=tuple(errors),
     )
 

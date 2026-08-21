@@ -59,6 +59,7 @@
 | 0048 | Single-owner mutable state | Accepted |
 | 0049 | Typed error/retry model | Accepted |
 | 0050 | Documentation governance / historical freeze | Accepted |
+| 0051 | Ordinary-GIL CPython 3.14.7 and reproducible toolchain | Accepted |
 
 ## Rule
 

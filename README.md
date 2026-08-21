@@ -29,33 +29,38 @@ An apparent arbitrage is not treated as executable until data health, settlement
 - [`docs/GLOSSARY.md`](docs/GLOSSARY.md) — canonical terminology
 - [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) — staged engineering plan
 - [`docs/CODEX_PHASE_1_SPEC.md`](docs/CODEX_PHASE_1_SPEC.md) — first implementation scope
+- [`docs/PHASE_1_PERFORMANCE_BASELINE.md`](docs/PHASE_1_PERFORMANCE_BASELINE.md) — measured A/B/C acceptance baseline
 - [`docs/ADR_INDEX.md`](docs/ADR_INDEX.md) — architecture decision index
 
 Historical pass reports and adversarial reviews live under `docs/design_freeze/`. They are audit evidence, not current implementation authority.
 
 ## Phase 1 development
 
-The implementation targets CPython 3.13.14 and uses a locked `uv`
-environment:
+The reproducible implementation baseline is ordinary-GIL CPython 3.14.7 with
+`uv==0.12.5`, exact direct dependency pins, and a committed transitive lock:
 
 ```bash
 uv python install
+uv lock --check
 uv sync --frozen --all-groups
-uv run mma --help
+uv run --frozen --all-groups mma --help
 ```
 
 The focused public/read-only commands are:
 
 ```bash
-uv run mma observe polymarket --duration 30 --config config/phase1.toml
-uv run mma replay data/raw --run-id <collector-run-id> --config config/phase1.toml
-uv run mma validate-data data
-uv run mma scan-report data/analytical
+uv run --frozen --all-groups mma observe polymarket --duration 30 --config config/phase1.toml
+uv run --frozen --all-groups mma replay data/raw --run-id <collector-run-id> --config config/phase1.toml
+uv run --frozen --all-groups mma rebuild-analytical data/raw --output data/rebuilt/<collector-run-id> --run-id <collector-run-id> --config config/phase1.toml
+uv run --frozen --all-groups mma validate-data data
+uv run --frozen --all-groups mma scan-report data/analytical
 ```
 
 See [`docs/PHASE_1_IMPLEMENTATION.md`](docs/PHASE_1_IMPLEMENTATION.md) for
 configuration, validation, storage, replay, official protocol evidence, and
-the explicit Phase 1 safety boundary.
+the explicit Phase 1 safety boundary. The runtime, dependency, evidence, and
+rollback decision is recorded in
+[`ADR-0051`](docs/adr/0051-cpython-3-14-7-and-reproducible-toolchain.md).
 
 ## Repository policy
 

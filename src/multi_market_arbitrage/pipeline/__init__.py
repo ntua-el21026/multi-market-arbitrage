@@ -11,10 +11,14 @@ from .channels import (
     WS_MARKET,
 )
 from .processor import (
+    AnalyticalOutputSink,
+    BookFreshnessUpdate,
     CanonicalProcessor,
+    MarketScanTrigger,
     ProcessedEnvelope,
     ProcessorSummary,
     ReferenceRefreshRequest,
+    ScanTriggerReason,
 )
 
 __all__ = [
@@ -26,8 +30,12 @@ __all__ = [
     "REST_BOOK",
     "REST_BOOK_AUDIT",
     "WS_MARKET",
+    "AnalyticalOutputSink",
+    "BookFreshnessUpdate",
     "CanonicalProcessor",
+    "MarketScanTrigger",
     "ProcessedEnvelope",
     "ProcessorSummary",
     "ReferenceRefreshRequest",
+    "ScanTriggerReason",
 ]

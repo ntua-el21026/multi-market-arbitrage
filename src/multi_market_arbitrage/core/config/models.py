@@ -31,6 +31,7 @@ from ..serialization import canonical_json_bytes, canonical_sha256
 PositiveStrictInt = Annotated[int, Field(strict=True, gt=0)]
 NonNegativeStrictInt = Annotated[int, Field(strict=True, ge=0)]
 PositiveFiniteFloat = Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)]
+NonNegativeFiniteFloat = Annotated[float, Field(strict=True, ge=0, allow_inf_nan=False)]
 StrictBoolean = Annotated[bool, Field(strict=True)]
 
 
@@ -97,7 +98,12 @@ class StorageConfig(_StrictFrozenModel):
     journal_segment_max_uncompressed_bytes: PositiveStrictInt = 64 * 1024 * 1024
     journal_run_max_uncompressed_bytes: PositiveStrictInt = 4 * 1024 * 1024 * 1024
     journal_submit_timeout_seconds: PositiveFiniteFloat
+    journal_group_commit_max_events: PositiveStrictInt = 1
+    journal_group_commit_max_delay_seconds: NonNegativeFiniteFloat = 0.0
     parquet_batch_size: PositiveStrictInt
+    analytical_queue_capacity: PositiveStrictInt = 1_024
+    analytical_record_max_bytes: PositiveStrictInt = 8 * 1024 * 1024
+    analytical_buffer_max_bytes: PositiveStrictInt = 64 * 1024 * 1024
 
     @field_validator("root", "journal_directory", "analytical_directory")
     @classmethod
@@ -125,6 +131,17 @@ class StorageConfig(_StrictFrozenModel):
         if self.journal_run_max_uncompressed_bytes < self.journal_segment_max_uncompressed_bytes:
             raise ValueError(
                 "journal_run_max_uncompressed_bytes cannot be smaller than the segment byte limit"
+            )
+        if (
+            self.journal_group_commit_max_events == 1
+            and self.journal_group_commit_max_delay_seconds != 0
+        ):
+            raise ValueError("single-event journal commits cannot configure a batching delay")
+        if self.journal_run_max_uncompressed_bytes > 4 * 1024 * 1024 * 1024:
+            raise ValueError("journal run byte limit cannot exceed the 4 GiB replay safety cap")
+        if self.analytical_record_max_bytes > self.analytical_buffer_max_bytes:
+            raise ValueError(
+                "analytical record byte limit cannot exceed the analytical buffer byte limit"
             )
         return self
 
@@ -162,6 +179,7 @@ class PolymarketConfig(_StrictFrozenModel):
     max_reconnect_attempts: NonNegativeStrictInt
     maximum_http_response_bytes: PositiveStrictInt = 8 * 1024 * 1024
     maximum_websocket_message_bytes: PositiveStrictInt = 1024 * 1024
+    maximum_ingress_queue_bytes: PositiveStrictInt = 64 * 1024 * 1024
 
     @field_validator("gamma_base_url", "clob_base_url")
     @classmethod
@@ -185,6 +203,12 @@ class PolymarketConfig(_StrictFrozenModel):
             raise ValueError("maximum_http_response_bytes cannot exceed 8 MiB")
         if self.maximum_websocket_message_bytes > 1024 * 1024:
             raise ValueError("maximum_websocket_message_bytes cannot exceed 1 MiB")
+        if self.maximum_ingress_queue_bytes > 512 * 1024 * 1024:
+            raise ValueError("maximum_ingress_queue_bytes cannot exceed 512 MiB")
+        if self.maximum_ingress_queue_bytes < self.maximum_websocket_message_bytes:
+            raise ValueError(
+                "maximum_ingress_queue_bytes cannot be smaller than one maximum message"
+            )
         return self
 
 
@@ -247,6 +271,12 @@ class Phase1Config(_StrictFrozenModel):
     scanner: ScannerConfig
     replay: ReplayConfig
     logging: LoggingConfig
+
+    @model_validator(mode="after")
+    def _queue_relationships(self) -> Self:
+        if self.storage.journal_group_commit_max_events > self.system.queue_capacity:
+            raise ValueError("journal group size cannot exceed the bounded system queue capacity")
+        return self
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> Self:

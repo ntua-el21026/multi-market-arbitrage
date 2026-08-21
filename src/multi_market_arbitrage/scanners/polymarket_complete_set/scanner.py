@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from bisect import bisect_left
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from fractions import Fraction
 from itertools import pairwise
 from typing import Self
 
@@ -25,7 +25,7 @@ from multi_market_arbitrage.core.ids import (
     ValidatorId,
     ValidatorVersion,
 )
-from multi_market_arbitrage.core.provenance import Provenance
+from multi_market_arbitrage.core.provenance import Provenance, merge_raw_source_refs
 from multi_market_arbitrage.core.serialization import canonical_sha256
 from multi_market_arbitrage.core.time import UtcTimestamp
 from multi_market_arbitrage.core.validation import (
@@ -69,7 +69,7 @@ POLYMARKET_COMPLETE_SET_STRATEGY_ID = StrategyId.from_components(
     "StrategyId", "polymarket-complete-set", "observation-only"
 )
 POLYMARKET_COMPLETE_SET_STRATEGY_VERSION = StrategyVersion.from_components(
-    "StrategyVersion", "polymarket-complete-set", "phase1-full-depth-v1"
+    "StrategyVersion", "polymarket-complete-set", "phase1-full-depth-v2"
 )
 
 _VALIDATOR_VERSION = ValidatorVersion.from_components(
@@ -183,7 +183,9 @@ class CompleteSetScanResult:
                 "validation_results": self.validation_results,
             }
         )
-        if self.terminal_hash != expected:
+        if not self.terminal_hash:
+            object.__setattr__(self, "terminal_hash", expected)
+        elif self.terminal_hash != expected:
             raise ValueError("scan-result terminal hash does not match canonical content")
 
     @classmethod
@@ -197,14 +199,6 @@ class CompleteSetScanResult:
         validation_results: tuple[ValidationResult, ...],
         capacity_curve: tuple[CapacityPoint, ...] = (),
     ) -> Self:
-        content = {
-            "candidate": candidate,
-            "capacity_curve": capacity_curve,
-            "disposition": disposition,
-            "observed_at": observed_at,
-            "opportunity": opportunity,
-            "validation_results": validation_results,
-        }
         return cls(
             disposition=disposition,
             observed_at=observed_at,
@@ -212,7 +206,7 @@ class CompleteSetScanResult:
             opportunity=opportunity,
             validation_results=validation_results,
             capacity_curve=capacity_curve,
-            terminal_hash=canonical_sha256(content),
+            terminal_hash="",
         )
 
 
@@ -236,20 +230,21 @@ class _DepthProfile:
         cumulative_quantity = ExactDecimal.zero()
         cumulative_notional = ExactDecimal.zero()
         cumulative_cost = ExactDecimal.zero()
-        self._cumulative_fractions: list[Fraction] = []
         self._cumulative_quantities: list[ExactDecimal] = []
         self._prefix_notional: list[ExactDecimal] = []
         self._prefix_cost: list[ExactDecimal] = []
+        self._fee_factors: list[ExactDecimal] = []
         for level in self.levels:
+            fee_factor = self._fee_factor(level.price)
             cumulative_quantity = cumulative_quantity + level.quantity.value
             notional = level.price.cost_for(level.quantity)
             cost = self._cost_for(level.price, level.quantity, notional)
             cumulative_notional = cumulative_notional + notional.value
             cumulative_cost = cumulative_cost + cost.value
-            self._cumulative_fractions.append(cumulative_quantity.as_fraction())
             self._cumulative_quantities.append(cumulative_quantity)
             self._prefix_notional.append(cumulative_notional)
             self._prefix_cost.append(cumulative_cost)
+            self._fee_factors.append(fee_factor)
 
     @property
     def maximum_quantity(self) -> ExactDecimal:
@@ -278,11 +273,62 @@ class _DepthProfile:
             raise _IndeterminateCostError("cost evaluation changed fee asset")
         return evaluated.amount
 
+    def _fee_factor(self, price: Price) -> ExactDecimal:
+        if (
+            self.rule.status is not CostStatus.DETERMINATE
+            or self.rule.certainty is not CostCertainty.KNOWN_DETERMINISTIC
+            or self.snapshot.instrument_id not in self.rule.applicable_instrument_ids
+            or self.rule.rate is None
+            or self.rule.exponent is None
+            or self.rule.taker_only is None
+            or price.value > ExactDecimal.one()
+        ):
+            raise _IndeterminateCostError(
+                "validated deterministic taker fee inputs are unavailable"
+            )
+        probability_factor = price.value * (ExactDecimal.one() - price.value)
+        powered = ExactDecimal.one()
+        for _ in range(self.rule.exponent):
+            powered = powered * probability_factor
+        return self.rule.rate.value * powered
+
+    def _fee_amount(self, index: int, quantity: ExactDecimal) -> ExactDecimal:
+        raw = quantity * self._fee_factors[index]
+        return (
+            ExactDecimal.zero()
+            if raw < self.rule.fee_quantum.value
+            else raw.quantize(self.rule.fee_quantum.value, rounding=RoundingMode.HALF_UP)
+        )
+
+    def index_at_or_after(self, requested: ExactDecimal, *, start: int = 0) -> int:
+        if requested <= ExactDecimal.zero() or requested > self.maximum_quantity:
+            raise ValueError("requested quantity is outside available ask depth")
+        index = start
+        while self._cumulative_quantities[index] < requested:
+            index += 1
+        return index
+
+    def scalar_totals(
+        self, requested: ExactDecimal, *, index: int
+    ) -> tuple[ExactDecimal, ExactDecimal]:
+        """Return exact acquisition and fee totals without allocating rich models."""
+
+        previous_quantity = (
+            ExactDecimal.zero() if index == 0 else self._cumulative_quantities[index - 1]
+        )
+        prefix_notional = ExactDecimal.zero() if index == 0 else self._prefix_notional[index - 1]
+        prefix_cost = ExactDecimal.zero() if index == 0 else self._prefix_cost[index - 1]
+        terminal_quantity = requested - previous_quantity
+        level = self.levels[index]
+        terminal_notional = level.price.value * terminal_quantity
+        terminal_cost = self._fee_amount(index, terminal_quantity)
+        return prefix_notional + terminal_notional, prefix_cost + terminal_cost
+
     def evaluate(self, quantity: Quantity) -> LegEconomics:
         requested = quantity.value
         if requested <= ExactDecimal.zero() or requested > self.maximum_quantity:
             raise ValueError("requested quantity is outside available ask depth")
-        index = bisect_left(self._cumulative_fractions, requested.as_fraction())
+        index = bisect_left(self._cumulative_quantities, requested)
         previous_quantity = (
             ExactDecimal.zero() if index == 0 else self._cumulative_quantities[index - 1]
         )
@@ -371,21 +417,9 @@ def _enriched_provenance(
         for book in books
         if (source := book.state_source_provenance or book.last_source_provenance) is not None
     )
-    source_ingest_ids = tuple(
-        dict.fromkeys(
-            (
-                *provenance.source_ingest_ids,
-                *(item for value in book_provenance for item in value.source_ingest_ids),
-            )
-        )
-    )
-    source_payload_hashes = tuple(
-        dict.fromkeys(
-            (
-                *provenance.source_payload_hashes,
-                *(item for value in book_provenance for item in value.source_payload_hashes),
-            )
-        )
+    raw_source_refs = merge_raw_source_refs(
+        provenance.raw_source_refs,
+        *(value.raw_source_refs for value in book_provenance),
     )
     reference_version_ids = tuple(
         dict.fromkeys(
@@ -400,9 +434,8 @@ def _enriched_provenance(
     attributes.setdefault("economic_layer", EconomicLayer.BOOK_UPPER_BOUND.value)
     attributes.setdefault("strategy_id", POLYMARKET_COMPLETE_SET_STRATEGY_ID.value)
     attributes.setdefault("strategy_version", POLYMARKET_COMPLETE_SET_STRATEGY_VERSION.value)
-    return Provenance(
-        source_ingest_ids=source_ingest_ids,
-        source_payload_hashes=source_payload_hashes,
+    return Provenance.from_raw_source_refs(
+        raw_source_refs,
         reference_version_ids=reference_version_ids,
         config_hash=provenance.config_hash,
         code_version=provenance.code_version,
@@ -427,6 +460,7 @@ class PolymarketCompleteSetScanner:
         books: tuple[ImmutableOrderBookSnapshot, ...],
         observed_at: UtcTimestamp,
         provenance: Provenance,
+        book_state_hashes: Mapping[InstrumentId, str] | None = None,
     ) -> CompleteSetScanResult:
         """Evaluate one immutable joint snapshot without I/O or hidden time."""
 
@@ -458,6 +492,7 @@ class PolymarketCompleteSetScanner:
             books=ordered_books,
             observed_at=observed_at,
             provenance=provenance,
+            book_state_hashes=book_state_hashes,
         )
         if yes_book.best_ask is None or no_book.best_ask is None:
             depth = _blocked(
@@ -504,7 +539,7 @@ class PolymarketCompleteSetScanner:
             instrument_ids=(yes_book.instrument_id, no_book.instrument_id),
         )
         opportunity_id = OpportunityId.from_components(
-            "PolymarketCompleteSetObservation-v1", lifecycle_id, input_snapshot.snapshot_id
+            "PolymarketCompleteSetObservation-v2", lifecycle_id, input_snapshot.snapshot_id
         )
         instruments = {item.instrument_id: item for item in bundle.instruments}
         candidate = OpportunityCandidate(
@@ -806,7 +841,7 @@ class PolymarketCompleteSetScanner:
                     provenance=provenance,
                 )
             if tick is None or any(
-                (level.price.value.as_fraction() / tick.as_fraction()).denominator != 1
+                not level.price.value.is_integral_multiple_of(tick)
                 for level in (*book.bids, *book.asks)
             ):
                 return _blocked(
@@ -898,6 +933,7 @@ class PolymarketCompleteSetScanner:
         books: tuple[ImmutableOrderBookSnapshot, ImmutableOrderBookSnapshot],
         observed_at: UtcTimestamp,
         provenance: Provenance,
+        book_state_hashes: Mapping[InstrumentId, str] | None,
     ) -> OpportunityInputSnapshot:
         instruments = {item.instrument_id: item for item in bundle.instruments}
         inputs: list[OpportunityBookInput] = []
@@ -910,7 +946,11 @@ class PolymarketCompleteSetScanner:
                     instrument_id=book.instrument_id,
                     outcome_id=instrument.outcome_id,
                     generation=book.generation,
-                    state_hash=book.content_sha256(),
+                    state_hash=(
+                        book.economic_content_sha256()
+                        if book_state_hashes is None
+                        else book_state_hashes[book.instrument_id]
+                    ),
                     reference_version_id=instrument.version_id,
                     last_valid_update=book.last_valid_update_time,
                     source_event_id=book.last_source_event_id,
@@ -980,9 +1020,125 @@ class PolymarketCompleteSetScanner:
         subject: object,
         provenance: Provenance,
     ) -> tuple[tuple[CapacityPoint, ...], ValidationResult]:
+        """Exhaust the exact grid using scalar totals and monotone depth cursors."""
+
         maximum = min(profiles[0].maximum_quantity, profiles[1].maximum_quantity)
-        ratio = maximum.as_fraction() / self.config.quantity_increment.value.as_fraction()
-        evaluations = ratio.numerator // ratio.denominator
+        evaluations = maximum.floor_div(self.config.quantity_increment.value)
+        zero = ExactDecimal.zero()
+        zero_points = tuple(
+            CapacityPoint(
+                minimum_net_edge=threshold,
+                maximum_quantity=Quantity(zero),
+                economics=None,
+            )
+            for threshold in self.config.minimum_edge_thresholds
+        )
+        if evaluations <= 0:
+            return zero_points, _blocked(
+                _DEPTH_VALIDATOR,
+                subject=subject,
+                observed_at=observed_at,
+                status=ValidationStatus.FAIL,
+                code=ValidationReasonCode.INSUFFICIENT_DEPTH,
+                message="common full ask depth is below one quantity increment",
+                provenance=provenance,
+            )
+        if evaluations > self.config.maximum_capacity_evaluations:
+            return zero_points, _blocked(
+                _DEPTH_VALIDATOR,
+                subject=subject,
+                observed_at=observed_at,
+                status=ValidationStatus.INDETERMINATE,
+                code=ValidationReasonCode.CAPACITY_EVALUATION_LIMIT,
+                message="capacity grid exceeds the configured deterministic work bound",
+                evidence=(("required_evaluations", str(evaluations)),),
+                provenance=provenance,
+            )
+
+        best_quantities: list[Quantity | None] = [None for _ in self.config.minimum_edge_thresholds]
+        depth_indices = [0, 0]
+        minimum_order_size = bundle.minimum_order_size
+        any_minimum_eligible = False
+        for grid_index in range(1, evaluations + 1):
+            quantity_value = self.config.quantity_increment.value * ExactDecimal(grid_index)
+            if minimum_order_size is not None and quantity_value < minimum_order_size.value:
+                continue
+            any_minimum_eligible = True
+            acquisition = ExactDecimal.zero()
+            trading_cost = ExactDecimal.zero()
+            for leg_index, profile in enumerate(profiles):
+                depth_index = profile.index_at_or_after(
+                    quantity_value,
+                    start=depth_indices[leg_index],
+                )
+                depth_indices[leg_index] = depth_index
+                leg_acquisition, leg_cost = profile.scalar_totals(
+                    quantity_value,
+                    index=depth_index,
+                )
+                acquisition = acquisition + leg_acquisition
+                trading_cost = trading_cost + leg_cost
+            net_pnl = bundle.payout_per_set.value * quantity_value - acquisition - trading_cost
+            for threshold_index, threshold in enumerate(self.config.minimum_edge_thresholds):
+                required_pnl = threshold.value * quantity_value
+                qualifies = net_pnl > zero if threshold.value == zero else net_pnl >= required_pnl
+                if qualifies:
+                    best_quantities[threshold_index] = Quantity(quantity_value)
+
+        economics_by_quantity: dict[ExactDecimal, OpportunityEconomics] = {}
+        for quantity in best_quantities:
+            if quantity is None or quantity.value in economics_by_quantity:
+                continue
+            legs = (profiles[0].evaluate(quantity), profiles[1].evaluate(quantity))
+            economics_by_quantity[quantity.value] = self._book_upper_bound_from_legs(
+                bundle=bundle,
+                quantity=quantity,
+                legs=legs,
+            )
+        curve = tuple(
+            CapacityPoint(
+                minimum_net_edge=threshold,
+                maximum_quantity=Quantity(zero) if quantity is None else quantity,
+                economics=(None if quantity is None else economics_by_quantity[quantity.value]),
+            )
+            for threshold, quantity in zip(
+                self.config.minimum_edge_thresholds,
+                best_quantities,
+                strict=True,
+            )
+        )
+        if not any_minimum_eligible:
+            return curve, _blocked(
+                _DEPTH_VALIDATOR,
+                subject=subject,
+                observed_at=observed_at,
+                status=ValidationStatus.FAIL,
+                code=ValidationReasonCode.MINIMUM_ORDER_SIZE_NOT_MET,
+                message="common executable depth is below the minimum order quantity",
+                provenance=provenance,
+            )
+        return curve, _passed(
+            _DEPTH_VALIDATOR,
+            subject=subject,
+            observed_at=observed_at,
+            evidence=(
+                ("capacity_evaluations", str(evaluations)),
+                ("maximum_common_quantity", maximum.to_canonical_string()),
+            ),
+            provenance=provenance,
+        )
+
+    def _capacity_curve_reference(
+        self,
+        *,
+        bundle: ReferenceBundle,
+        profiles: tuple[_DepthProfile, _DepthProfile],
+        observed_at: UtcTimestamp,
+        subject: object,
+        provenance: Provenance,
+    ) -> tuple[tuple[CapacityPoint, ...], ValidationResult]:
+        maximum = min(profiles[0].maximum_quantity, profiles[1].maximum_quantity)
+        evaluations = maximum.floor_div(self.config.quantity_increment.value)
         zero_points = tuple(
             CapacityPoint(
                 minimum_net_edge=threshold,
@@ -1067,6 +1223,27 @@ class PolymarketCompleteSetScanner:
         )
 
 
+class PolymarketCompleteSetReferenceScanner(PolymarketCompleteSetScanner):
+    """Slow exhaustive semantic oracle for equivalence tests and benchmarks."""
+
+    def _capacity_curve(
+        self,
+        *,
+        bundle: ReferenceBundle,
+        profiles: tuple[_DepthProfile, _DepthProfile],
+        observed_at: UtcTimestamp,
+        subject: object,
+        provenance: Provenance,
+    ) -> tuple[tuple[CapacityPoint, ...], ValidationResult]:
+        return self._capacity_curve_reference(
+            bundle=bundle,
+            profiles=profiles,
+            observed_at=observed_at,
+            subject=subject,
+            provenance=provenance,
+        )
+
+
 __all__ = [
     "POLYMARKET_COMPLETE_SET_STRATEGY_ID",
     "POLYMARKET_COMPLETE_SET_STRATEGY_VERSION",
@@ -1074,6 +1251,7 @@ __all__ = [
     "CompleteSetScannerConfig",
     "DepthFill",
     "LegEconomics",
+    "PolymarketCompleteSetReferenceScanner",
     "PolymarketCompleteSetScanner",
     "ScanDisposition",
 ]

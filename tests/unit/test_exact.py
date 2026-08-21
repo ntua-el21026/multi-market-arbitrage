@@ -122,6 +122,50 @@ def test_quantization_uses_explicit_increment_and_policy() -> None:
         value.quantize(ExactDecimal.zero(), rounding=RoundingMode.HALF_EVEN)
 
 
+@pytest.mark.parametrize(
+    ("value", "increment", "expected"),
+    [
+        ("1.2", "0.03", True),
+        ("1.21", "0.03", False),
+        ("-1.2", "0.03", True),
+        ("0", "0.00001", True),
+        ("12", "-0.5", True),
+    ],
+)
+def test_integral_multiple_uses_exact_cross_scale_ratio(
+    value: str,
+    increment: str,
+    expected: bool,
+) -> None:
+    assert (
+        ExactDecimal.parse(value).is_integral_multiple_of(ExactDecimal.parse(increment)) is expected
+    )
+
+
+def test_integral_multiple_rejects_zero_increment() -> None:
+    with pytest.raises(ZeroDivisionError, match="division by zero"):
+        ExactDecimal.one().is_integral_multiple_of(ExactDecimal.zero())
+
+
+@pytest.mark.parametrize(
+    ("value", "divisor", "expected"),
+    [
+        ("7", "2", 3),
+        ("-7", "2", -4),
+        ("7", "-2", -4),
+        ("-7", "-2", 3),
+        ("0.0009", "0.0002", 4),
+    ],
+)
+def test_floor_div_returns_mathematical_floor(value: str, divisor: str, expected: int) -> None:
+    assert ExactDecimal.parse(value).floor_div(ExactDecimal.parse(divisor)) == expected
+
+
+def test_floor_div_rejects_zero_divisor() -> None:
+    with pytest.raises(ZeroDivisionError, match="division by zero"):
+        ExactDecimal.one().floor_div(ExactDecimal.zero())
+
+
 def test_distinct_financial_wrappers_are_frozen_and_domain_checked() -> None:
     price = Price.parse("0.45")
     quantity = Quantity.parse("2")

@@ -3,6 +3,8 @@
 from .order_books import (
     BookHealth,
     BookLevel,
+    BookMutation,
+    BookMutationKind,
     BookStateError,
     CanonicalL2BookOwner,
     ImmutableOrderBookSnapshot,
@@ -14,6 +16,8 @@ from .order_books import (
 __all__ = [
     "BookHealth",
     "BookLevel",
+    "BookMutation",
+    "BookMutationKind",
     "BookStateError",
     "CanonicalL2BookOwner",
     "ImmutableOrderBookSnapshot",

@@ -18,7 +18,7 @@ from multi_market_arbitrage.core.ids import (
     VenueId,
     VersionId,
 )
-from multi_market_arbitrage.core.provenance import Provenance
+from multi_market_arbitrage.core.provenance import Provenance, RawSourceRef, pair_raw_source_refs
 from multi_market_arbitrage.core.time import UtcTimestamp
 
 
@@ -133,6 +133,28 @@ class CanonicalEvent:
     receive_timestamp: UtcTimestamp
     deduplication_key: DeduplicationKey | None
     payload: CanonicalPayload
+
+    def __post_init__(self) -> None:
+        source_refs = pair_raw_source_refs(
+            self.source_ingest_ids,
+            self.source_payload_hashes,
+        )
+        object.__setattr__(
+            self,
+            "source_ingest_ids",
+            tuple(source_ref.ingest_id for source_ref in source_refs),
+        )
+        object.__setattr__(
+            self,
+            "source_payload_hashes",
+            tuple(source_ref.payload_sha256 for source_ref in source_refs),
+        )
+
+    @property
+    def raw_source_refs(self) -> tuple[RawSourceRef, ...]:
+        """Return the event's validated raw identity/hash pairs."""
+
+        return pair_raw_source_refs(self.source_ingest_ids, self.source_payload_hashes)
 
 
 @dataclass(frozen=True, slots=True)

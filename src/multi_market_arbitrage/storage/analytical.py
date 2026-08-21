@@ -33,6 +33,7 @@ from multi_market_arbitrage.journal.recovery import atomic_write_bytes, fsync_di
 from .models import (
     AnalyticalDatasetConfig,
     AnalyticalProvenance,
+    AnalyticalRunCompletionHead,
     AnalyticalSchemaError,
     DatasetManifest,
     ParquetFragmentManifest,
@@ -42,6 +43,7 @@ _RESERVED_COLUMNS = frozenset(
     {"_mma_schema_version", "_mma_provenance_sha256", "_mma_record_sha256"}
 )
 _MAX_MANIFEST_BYTES = 8 * 1024 * 1024
+_MAX_ANALYTICAL_ARTIFACT_PATHS = 65_536
 
 
 class _WriteParquet(Protocol):
@@ -138,6 +140,48 @@ def load_dataset_manifest(path: Path) -> DatasetManifest:
     return DatasetManifest.from_record(raw)
 
 
+def analytical_run_completion_path(root: Path, collector_run_id: object) -> Path:
+    value = getattr(collector_run_id, "value", None)
+    if not isinstance(value, str) or not value:
+        raise AnalyticalSchemaError("analytical completion collector run ID is invalid")
+    run_key = hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
+    return root / f"_analytical-run.{run_key}.completed.json"
+
+
+def write_analytical_run_completion(
+    root: Path,
+    head: AnalyticalRunCompletionHead,
+) -> Path:
+    path = analytical_run_completion_path(root, head.collector_run_id)
+    content = canonical_json_bytes(head.to_record()) + b"\n"
+    if len(content) > _MAX_MANIFEST_BYTES:
+        raise AnalyticalSchemaError("analytical run completion exceeds byte limit")
+    if path.exists():
+        _require_regular_file(path, artifact="analytical run completion")
+        if path.read_bytes() != content:
+            raise AnalyticalSchemaError("existing analytical run completion conflicts with content")
+        return path
+    root.mkdir(parents=True, exist_ok=True)
+    atomic_write_bytes(path, content)
+    return path
+
+
+def load_analytical_run_completion(path: Path) -> AnalyticalRunCompletionHead:
+    _require_regular_file(path, artifact="analytical run completion")
+    try:
+        with path.open("rb") as handle:
+            content = handle.read(_MAX_MANIFEST_BYTES + 1)
+        if len(content) > _MAX_MANIFEST_BYTES:
+            raise AnalyticalSchemaError("analytical run completion exceeds byte limit")
+        raw = json.loads(content)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AnalyticalSchemaError(f"cannot decode analytical run completion: {path}") from exc
+    head = AnalyticalRunCompletionHead.from_record(raw)
+    if path != analytical_run_completion_path(path.parent, head.collector_run_id):
+        raise AnalyticalSchemaError("analytical completion conflicts with its storage location")
+    return head
+
+
 def _require_regular_file(path: Path, *, artifact: str) -> None:
     if path.is_symlink() or not path.is_file():
         raise AnalyticalSchemaError(f"{artifact} is not a regular file: {path}")
@@ -148,8 +192,21 @@ def _verified_fragment_inventory(
 ) -> tuple[tuple[Path, Path, ParquetFragmentManifest], ...]:
     """Return the exact regular-file fragment inventory below one venue root."""
 
-    parquet_paths = set(venue_root.rglob("*.parquet"))
-    manifest_paths = set(venue_root.rglob("*.parquet.manifest.json"))
+    parquet_paths: set[Path] = set()
+    manifest_paths: set[Path] = set()
+    artifact_count = 0
+    for path in venue_root.rglob("*"):
+        if path.name.endswith(".parquet.manifest.json"):
+            manifest_paths.add(path)
+        elif path.name.endswith(".parquet"):
+            parquet_paths.add(path)
+        else:
+            continue
+        artifact_count += 1
+        if artifact_count > _MAX_ANALYTICAL_ARTIFACT_PATHS:
+            raise AnalyticalSchemaError(
+                "analytical fragment inventory exceeds the supported artifact count"
+            )
     expected_manifest_paths = {
         path.with_name(f"{path.name}.manifest.json") for path in parquet_paths
     }
@@ -211,14 +268,27 @@ class AnalyticalDatasetWriter:
         self._config = config
         self._provenance = provenance
         self._buffer: list[dict[str, object]] = []
+        self._buffered_bytes = 0
         self._field_names: tuple[str, ...] | None = None
         self._arrow_schema: str | None = None
         self._arrow_schema_sha256: str | None = None
+        self._existing_schema_checked = False
+        self._wrote_fragment = False
         self._closed = False
+        metadata_template = {
+            "_mma_schema_version": self._config.schema_version,
+            "_mma_provenance_sha256": self._provenance.sha256,
+            "_mma_record_sha256": "0" * 64,
+        }
+        self._record_metadata_bytes = len(canonical_json_bytes(metadata_template))
 
     @property
     def buffered_records(self) -> int:
         return len(self._buffer)
+
+    @property
+    def buffered_bytes(self) -> int:
+        return self._buffered_bytes
 
     @property
     def partition_directory(self) -> Path:
@@ -235,20 +305,34 @@ class AnalyticalDatasetWriter:
             raise AnalyticalStorageClosedError("analytical dataset writer is closed")
         normalized = _normalize_record(record)
         field_names = tuple(normalized)
-        if self._field_names is None:
-            self._field_names = field_names
-        elif field_names != self._field_names:
+        if self._field_names is not None and field_names != self._field_names:
             raise AnalyticalSchemaError(
                 "all records in a dataset writer must have identical fields"
             )
-        record_hash = canonical_sha256(normalized)
+        record_payload = canonical_json_bytes(normalized)
+        record_hash = hashlib.sha256(record_payload).hexdigest()
         normalized["_mma_schema_version"] = self._config.schema_version
         normalized["_mma_provenance_sha256"] = self._provenance.sha256
         normalized["_mma_record_sha256"] = record_hash
+        # Both objects are non-empty. Combining their canonical JSON members
+        # removes two braces and adds one comma, so the exact encoded length is
+        # len(record) + len(metadata) - 1. The hash value is always 64 bytes.
+        record_bytes = len(record_payload) + self._record_metadata_bytes - 1
+        if record_bytes > self._config.maximum_record_bytes:
+            raise AnalyticalSchemaError("analytical record exceeds the configured byte limit")
+        flushed: ParquetFragmentManifest | None = None
+        if (
+            self._buffer
+            and self._buffered_bytes + record_bytes > self._config.maximum_buffered_bytes
+        ):
+            flushed = self.flush()
+        if self._field_names is None:
+            self._field_names = field_names
         self._buffer.append(normalized)
+        self._buffered_bytes += record_bytes
         if len(self._buffer) >= self._config.batch_size:
             return self.flush()
-        return None
+        return flushed
 
     def append_many(
         self, records: Sequence[Mapping[str, object]]
@@ -266,7 +350,9 @@ class AnalyticalDatasetWriter:
         partition = self.partition_directory
         partition.mkdir(parents=True, exist_ok=True)
         records = self._buffer
+        buffered_bytes = self._buffered_bytes
         self._buffer = []
+        self._buffered_bytes = 0
         try:
             table = pa.Table.from_pylist(records)
             metadata = {
@@ -285,14 +371,16 @@ class AnalyticalDatasetWriter:
                 raise AnalyticalSchemaError(
                     "Arrow schema drift within one dataset writer and schema version"
                 )
-            _require_matching_existing_arrow_schema(
-                self._config.root,
-                dataset=self._config.dataset,
-                venue_id=self._config.venue_id,
-                schema_version=self._config.schema_version,
-                arrow_schema=arrow_schema,
-                arrow_schema_sha256=arrow_schema_sha256,
-            )
+            if not self._existing_schema_checked:
+                _require_matching_existing_arrow_schema(
+                    self._config.root,
+                    dataset=self._config.dataset,
+                    venue_id=self._config.venue_id,
+                    schema_version=self._config.schema_version,
+                    arrow_schema=arrow_schema,
+                    arrow_schema_sha256=arrow_schema_sha256,
+                )
+                self._existing_schema_checked = True
             descriptor, temporary_name = tempfile.mkstemp(
                 prefix=".mma-parquet-", suffix=".partial", dir=partition
             )
@@ -310,11 +398,11 @@ class AnalyticalDatasetWriter:
                 )
                 with temporary.open("rb+") as handle:
                     os.fsync(handle.fileno())
-                file_content = temporary.read_bytes()
-                file_sha256 = hashlib.sha256(file_content).hexdigest()
+                file_bytes = temporary.stat().st_size
+                file_sha256 = _sha256_file(temporary)
                 final_path = partition / f"part-{file_sha256}.parquet"
                 if final_path.exists():
-                    if hashlib.sha256(final_path.read_bytes()).hexdigest() != file_sha256:
+                    if _sha256_file(final_path) != file_sha256:
                         raise AnalyticalSchemaError("Parquet content-hash collision")
                     temporary.unlink()
                 else:
@@ -332,7 +420,7 @@ class AnalyticalDatasetWriter:
                 arrow_schema_sha256=arrow_schema_sha256,
                 row_count=table.num_rows,
                 file_name=final_path.name,
-                file_bytes=len(file_content),
+                file_bytes=file_bytes,
                 file_sha256=file_sha256,
                 records_sha256=canonical_sha256(records),
                 provenance=self._provenance,
@@ -344,25 +432,35 @@ class AnalyticalDatasetWriter:
             if manifest_path.exists() and manifest_path.read_bytes() != manifest_content:
                 raise AnalyticalSchemaError("existing fragment manifest conflicts with content")
             atomic_write_bytes(manifest_path, manifest_content)
-            rebuild_dataset_manifest(
-                self._config.root,
-                dataset=self._config.dataset,
-                venue_id=self._config.venue_id,
-                schema_version=self._config.schema_version,
-            )
             self._arrow_schema = arrow_schema
             self._arrow_schema_sha256 = arrow_schema_sha256
+            self._wrote_fragment = True
             return manifest
         except Exception:
             self._buffer = records + self._buffer
+            self._buffered_bytes = buffered_bytes + self._buffered_bytes
             raise
 
     def close(self) -> ParquetFragmentManifest | None:
         if self._closed:
             return None
         fragment = self.flush()
+        if self._wrote_fragment:
+            rebuild_dataset_manifest(
+                self._config.root,
+                dataset=self._config.dataset,
+                venue_id=self._config.venue_id,
+                schema_version=self._config.schema_version,
+            )
         self._closed = True
         return fragment
+
+    def abort(self) -> None:
+        """Discard only unflushed derived records and publish no completion claim."""
+
+        self._buffer.clear()
+        self._buffered_bytes = 0
+        self._closed = True
 
     def __enter__(self) -> AnalyticalDatasetWriter:
         return self
@@ -497,8 +595,11 @@ def validate_dataset_manifest(path: Path) -> DatasetManifest:
 __all__ = [
     "AnalyticalDatasetWriter",
     "AnalyticalStorageClosedError",
+    "analytical_run_completion_path",
+    "load_analytical_run_completion",
     "load_dataset_manifest",
     "load_fragment_manifest",
     "rebuild_dataset_manifest",
     "validate_dataset_manifest",
+    "write_analytical_run_completion",
 ]

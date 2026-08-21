@@ -142,6 +142,39 @@ def test_strict_json_rejects_duplicate_keys_and_nonfinite_numbers() -> None:
         decode_json_exact(b'{"tick":NaN}')
 
 
+def test_strict_json_and_ws_schema_fail_closed_on_resource_amplification() -> None:
+    assert decode_json_exact(b"[" * 255 + b"0" + b"]" * 255) is not None
+    with pytest.raises(PolymarketSchemaError, match="nesting exceeds"):
+        decode_json_exact(b"[" * 256 + b"0" + b"]" * 256)
+
+    nested = b"[" * 2_000 + b"0" + b"]" * 2_000
+    with pytest.raises(PolymarketSchemaError, match="invalid strict UTF-8 JSON"):
+        decode_json_exact(nested)
+
+    oversized_timestamp = b"""{
+      "event_type":"new_market",
+      "id":"99",
+      "market":"new-condition",
+      "assets_ids":["yes","no"],
+      "timestamp":999999999999999999999
+    }"""
+    with pytest.raises(PolymarketSchemaError, match="integer exceeds"):
+        parse_market_ws_message(oversized_timestamp)
+
+    oversized_decimal = (
+        b'{"event_type":"tick_size_change","market":"condition","asset_id":"yes",'
+        b'"old_tick_size":"0.'
+        + b"1" * 127
+        + b'","new_tick_size":"0.01","timestamp":"1787198406000"}'
+    )
+    with pytest.raises(PolymarketSchemaError, match="128-character resource limit"):
+        parse_market_ws_message(oversized_decimal)
+
+    oversized_event_array = b"[" + b",".join(b"{}" for _ in range(4_097)) + b"]"
+    with pytest.raises(PolymarketSchemaError, match="4096-item resource limit"):
+        parse_market_ws_message(oversized_event_array)
+
+
 def test_current_compact_clob_market_schema() -> None:
     payload = b"""{
       "gst":null,
@@ -355,6 +388,7 @@ async def test_public_http_methods_return_bytes_and_cannot_add_auth() -> None:
     assert requests[3].url.path == "/books"
     assert all("authorization" not in request.headers for request in requests)
     assert all("api-key" not in request.headers for request in requests)
+    assert all(request.headers["accept-encoding"] == "identity" for request in requests)
 
 
 @pytest.mark.asyncio
@@ -406,7 +440,7 @@ async def test_public_http_rejects_oversized_chunked_decoded_body_while_streamin
 
 
 @pytest.mark.asyncio
-async def test_public_http_preserves_compressed_body_at_exact_decoded_limit() -> None:
+async def test_public_http_rejects_compressed_body_before_decoding() -> None:
     encoded = gzip.compress(b"abcdef")
     midpoint = len(encoded) // 2
     stream = _ChunkedAsyncStream((encoded[:midpoint], encoded[midpoint:]))
@@ -427,23 +461,22 @@ async def test_public_http_preserves_compressed_body_at_exact_decoded_limit() ->
         max_response_bytes=6,
         transport=httpx.MockTransport(handler),
     ) as client:
-        result = await client.fetch_markets_keyset_raw()
+        with pytest.raises(PolymarketTransportError, match="Content-Encoding is prohibited"):
+            await client.fetch_markets_keyset_raw()
 
-    assert result == b"abcdef"
+    assert stream.chunks_yielded == 0
     assert stream.closed is True
 
 
 @pytest.mark.asyncio
-async def test_public_http_applies_limit_to_decoded_compressed_bytes() -> None:
-    encoded = gzip.compress(b"abcdef")
-    midpoint = len(encoded) // 2
-    stream = _ChunkedAsyncStream((encoded[:midpoint], encoded[midpoint:]))
+async def test_public_http_accepts_explicit_identity_content_encoding() -> None:
+    stream = _ChunkedAsyncStream((b"abc", b"def"))
 
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
             headers={
-                "content-encoding": "gzip",
+                "content-encoding": "identity",
                 "transfer-encoding": "chunked",
             },
             stream=stream,
@@ -452,12 +485,12 @@ async def test_public_http_applies_limit_to_decoded_compressed_bytes() -> None:
 
     async with PolymarketPublicClient(
         gamma_url="https://gamma.example.invalid",
-        max_response_bytes=5,
+        max_response_bytes=6,
         transport=httpx.MockTransport(handler),
     ) as client:
-        with pytest.raises(PolymarketTransportError, match="decoded response exceeds 5-byte"):
-            await client.fetch_markets_keyset_raw()
+        result = await client.fetch_markets_keyset_raw()
 
+    assert result == b"abcdef"
     assert stream.closed is True
 
 

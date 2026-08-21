@@ -48,7 +48,7 @@ def build_scan_report(analytical_root: Path) -> ScanReport:
     dataset = _scan_dataset(analytical_root)
     # DuckDB is only allowed to see an inventory whose dataset head, fragment
     # heads, physical rows, hashes, and schemas reconcile exactly.
-    validation = validate_data(dataset)
+    validation = validate_data(analytical_root.resolve())
     if not validation.valid:
         raise ReadOnlyQueryError(
             "scan-report refused invalid analytical inventory: " + "; ".join(validation.errors)
