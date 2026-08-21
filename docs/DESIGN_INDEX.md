@@ -68,6 +68,9 @@ Implementation work should read:
 |---|---|
 | `IMPLEMENTATION_PLAN.md` | Engineering milestone sequence |
 | `CODEX_PHASE_1_SPEC.md` | Exact first Codex scope |
+| `PHASE_1_IMPLEMENTATION.md` | Current Phase-1 implementation behavior and operator guide |
+| `PHASE_1_PERFORMANCE_BASELINE.md` | Measured Phase-1 performance/reproducibility evidence |
+| `GATE_1_SOAK_SPEC.md` | Normative preconditions, evidence, and pass/fail criteria for the six-hour Polymarket soak |
 
 ## 6. Governance
 

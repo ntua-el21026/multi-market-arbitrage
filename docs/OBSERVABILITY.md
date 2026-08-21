@@ -150,6 +150,26 @@ PAUSED
 UNSAFE
 ```
 
+Health is scoped. A healthy process does not imply healthy market data, persistence, research eligibility, risk authority, or future live readiness.
+
+### Phase-1 Gate-1 health evidence
+
+For the Phase-1 six-hour Polymarket soak, a final summary alone is insufficient. The observer emits periodic versioned machine-readable health checkpoints as required by `GATE_1_SOAK_SPEC.md` and ADR-0052.
+
+The health-evidence path is bounded and supervised and cannot block raw acquisition. Its failure is represented explicitly: authoritative raw capture may continue, but the run loses automatic Gate-1 evidence eligibility.
+
+Gate-1 checkpoints distinguish at least:
+
+```text
+capture_healthy
+research_eligible
+gate1_eligible_so_far
+```
+
+and carry typed reason codes plus run/code/config/target identity. They include current WebSocket/book health and age, ingress/journal/analytical queues and failures, HTTP retry/rate-limit evidence, audit outcomes, reconnect/resync/data-loss state, scanner latency, raw-size/disk headroom, and the latest relevant durability/integrity evidence.
+
+Routine REST integrity auditing must not be represented as a WebSocket disconnect. HTTP and WebSocket failures are separate operational dimensions.
+
 ## 8. Alert routing
 
 Severity:
