@@ -20,7 +20,7 @@ Before the six-hour run, all of the following must be true on one exact `main` c
 
 1. ADR-0052 is implemented and current documentation describes the implementation accurately.
 2. Periodic integrity audits do not intentionally stop a healthy primary WebSocket acquisition stream.
-3. Audit outcomes are typed at least as `MATCH`, `MISMATCH`, `RACED`, and `FAILED`, with exact race-fence evidence.
+3. Audit outcomes are typed at least as `MATCH`, `MISMATCH`, `RACED`, and `FAILED`, with exact race-fence evidence including a response-boundary receive watermark/barrier.
 4. Public HTTP and WebSocket transport failures are distinct typed errors and metrics/recovery paths.
 5. Safe public read retry is bounded, observable, rate-aware, and deadline constrained.
 6. Periodic versioned machine-readable health checkpoints exist and are produced by a supervised bounded path that cannot block raw capture.
@@ -110,16 +110,23 @@ Every audit records:
 
 - endpoint/instrument;
 - request-start and response-receive times;
-- starting and comparison-time book generation/economic hash;
+- starting book generation/economic hash;
+- response-boundary WebSocket receive/admission watermark for the socket generation;
+- canonical barrier watermark reached before classification;
+- barrier-time book generation/economic hash;
 - raw response identity;
 - outcome (`MATCH`, `MISMATCH`, `RACED`, `FAILED`);
 - retry count/delay where applicable;
 - resulting health/resync action.
 
+Before `MATCH`, `MISMATCH`, or `RACED` is classified, the canonical owner must have durably processed every WebSocket frame admitted through the exact response-boundary watermark, or an equivalent formally proven barrier. The barrier must not stop healthy acquisition; later frames may continue to be admitted while the owner catches up. A frame received before the REST response but still queued in ingress, journal durability, or canonical processing cannot be excluded from the race decision.
+
+After the barrier is reached, compare the request-start economic book identity with the barrier-time identity. Irrelevant frames that do not mutate the audited economic book need not force `RACED`; a relevant mutation across the fenced window does. Exact REST bytes may be journaled at receipt, but a replay-relevant audit classification/state transition cannot precede the barrier evidence.
+
 Rules:
 
-- `MATCH`: only a race-free comparison can match.
-- `MISMATCH`: only a race-free comparison can mismatch; affected state invalidates/resynchronizes.
+- `MATCH`: only a race-free comparison after the response-boundary barrier can match.
+- `MISMATCH`: only a race-free comparison after the response-boundary barrier can mismatch; affected state invalidates/resynchronizes.
 - `RACED`: no match/mismatch claim and no authoritative freshness promotion; retry is bounded.
 - `FAILED`: no false match; required integrity/reference state eventually becomes stale/indeterminate if recovery cannot complete.
 
@@ -175,6 +182,7 @@ The six-hour run cannot automatically pass Gate 1 if any of the following occurs
 - unsupported/malformed public schema that affects required state;
 - silently dropped required event;
 - unresolved race-free REST audit mismatch;
+- an audit classified before all WebSocket frames through its response-boundary watermark have crossed the canonical durability/processing barrier;
 - an audit falsely classified despite a crossed race fence;
 - analytical writer failure/rejection/saturation that prevents a healthy original derived completion;
 - raw or analytical completion-head inconsistency;
