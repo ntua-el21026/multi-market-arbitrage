@@ -29,7 +29,8 @@ def test_committed_phase1_configuration_loads_strictly() -> None:
     assert config.polymarket.maximum_http_response_bytes == 8 * 1024 * 1024
     assert config.polymarket.maximum_websocket_message_bytes == 1024 * 1024
     assert config.polymarket.snapshot_audit_freshness_guard_seconds == 4.0
-    assert config.polymarket.snapshot_audit_max_race_retries == 2
+    assert config.polymarket.snapshot_audit_race_retry_quiet_seconds == 0.25
+    assert config.polymarket.snapshot_audit_max_race_retries == 4
     assert config.polymarket.public_reads.maximum_attempts == 3
     assert config.polymarket.public_reads.gamma_markets_requests_per_window == 30
     assert config.polymarket.public_reads.rate_limit_checked_on.isoformat() == "2026-08-22"
@@ -131,6 +132,23 @@ def test_threshold_and_timing_cross_field_validation() -> None:
     polymarket["snapshot_audit_max_race_retries"] = -1
     raw["polymarket"] = polymarket
     with pytest.raises(ValidationError):
+        Phase1Config.from_mapping(raw)
+
+    raw = _raw_config()
+    polymarket = _section(raw, "polymarket")
+    polymarket["snapshot_audit_max_race_retries"] = 17
+    raw["polymarket"] = polymarket
+    with pytest.raises(ValidationError):
+        Phase1Config.from_mapping(raw)
+
+    raw = _raw_config()
+    polymarket = _section(raw, "polymarket")
+    polymarket["snapshot_audit_race_retry_quiet_seconds"] = 4.0
+    raw["polymarket"] = polymarket
+    with pytest.raises(
+        ValidationError,
+        match="race-retry quiet interval must be below freshness guard",
+    ):
         Phase1Config.from_mapping(raw)
 
     raw = _raw_config()

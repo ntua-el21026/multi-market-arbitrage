@@ -28,6 +28,7 @@ from multi_market_arbitrage.observability import (
 )
 from multi_market_arbitrage.pipeline.audit import (
     AuditBookIdentity,
+    AuditFailureReason,
     AuditOutcome,
     AuditOutcomeEvidence,
 )
@@ -85,6 +86,15 @@ class _ScopedProcessorView:
             rest_audits=len(self._audit_outcomes),
             rest_audit_matches=sum(
                 outcome.outcome is AuditOutcome.MATCH for outcome in self._audit_outcomes
+            ),
+            rest_audit_mismatches=sum(
+                outcome.outcome is AuditOutcome.MISMATCH for outcome in self._audit_outcomes
+            ),
+            rest_audit_raced=sum(
+                outcome.outcome is AuditOutcome.RACED for outcome in self._audit_outcomes
+            ),
+            rest_audit_failed=sum(
+                outcome.outcome is AuditOutcome.FAILED for outcome in self._audit_outcomes
             ),
         )
 
@@ -324,6 +334,41 @@ def _match_outcome(
     )
 
 
+def _race_exhaustion_outcome(
+    *,
+    target: ResolvedPolymarketTarget,
+) -> AuditOutcomeEvidence:
+    connection_id = ConnectionId("pipeline-health-audit-connection")
+    identity = AuditBookIdentity(
+        instrument_id=InstrumentId.from_native(
+            POLYMARKET_VENUE_ID,
+            target.yes_token_id,
+        ),
+        generation=1,
+        economic_content_sha256="a" * 64,
+    )
+    return AuditOutcomeEvidence(
+        request_id="pipeline-health-audit-race-exhaustion",
+        connection_id=connection_id,
+        native_asset_id=target.yes_token_id,
+        attempt=3,
+        request_started_monotonic_ns=0,
+        starting_admission_ordinal=0,
+        starting_processed_ordinal=0,
+        starting_book=identity,
+        outcome=AuditOutcome.FAILED,
+        reason=AuditFailureReason.RACE_RETRY_EXHAUSTED,
+        response_ingest_id=None,
+        raw_response_sha256=None,
+        response_received_wall_time=None,
+        response_received_monotonic_ns=None,
+        response_boundary_ordinal=None,
+        barrier_processed_ordinal=None,
+        barrier_book=None,
+        requires_resync=False,
+    )
+
+
 def test_runtime_health_accumulates_generations_and_unavailable_interval() -> None:
     runtime = ObservationRuntimeHealth()
     first_id = ConnectionId.new()
@@ -395,6 +440,38 @@ def test_runtime_health_keeps_failure_domains_explicit() -> None:
     assert snapshot.protocol_deviations == 1
     assert snapshot.data_loss_count == 1
     assert snapshot.ingress.overflows == 0
+
+
+def test_checkpoint_recovers_current_capture_after_protocol_resnapshot() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    updated_at = UtcTimestamp(1_800_000_000_000_000_000)
+    processor, target = _healthy_target_processor(config, updated_at=updated_at)
+    runtime = ObservationRuntimeHealth()
+    failed_connection = ConnectionId("pipeline-health-protocol-failed")
+    runtime.begin_generation(failed_connection, _ingress(failed_connection))
+    runtime.mark_connected(now_ns=10)
+    runtime.record_protocol_deviation()
+    runtime.finish_generation(continuity_interrupted=True, now_ns=20)
+    recovered_connection = ConnectionId("pipeline-health-protocol-recovered")
+    runtime.begin_generation(recovered_connection, _ingress(recovered_connection))
+    runtime.mark_connected(now_ns=30)
+
+    checkpoint = _checkpoint(
+        config=config,
+        target=target,
+        processor=processor,
+        book_last_valid_receive_monotonic_ns=_target_receive_times(target, 30),
+        emitted_at=updated_at,
+        monotonic_now_ns=31,
+        runtime_snapshot=runtime.snapshot(now_ns=31),
+    )
+
+    assert checkpoint.recovery["protocol_deviations"] == 1
+    assert checkpoint.capture["connected"] is True
+    assert checkpoint.capture_healthy is True
+    assert checkpoint.research_eligible is True
+    assert checkpoint.gate1_eligible_so_far is False
+    assert checkpoint.reason_codes == (HealthDecisionReason.PROTOCOL_DEVIATION,)
 
 
 def test_checkpoint_builder_emits_all_scoped_groups_and_fail_closed_decision() -> None:
@@ -603,6 +680,82 @@ def test_checkpoint_audit_integrity_age_uses_monotonic_response_boundary(
     )
 
     assert checkpoint.audit["last_successful_race_free_integrity_age_nanoseconds"] == elapsed_ns
+
+
+def test_checkpoint_recovers_current_research_after_later_race_free_match() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    updated_at = UtcTimestamp(1_800_000_000_000_000_000)
+    processor, target = _healthy_target_processor(config, updated_at=updated_at)
+    response_monotonic_ns = 2_000_000_000
+    outcomes = (
+        _race_exhaustion_outcome(target=target),
+        _match_outcome(
+            target=target,
+            response_wall_ns=updated_at.nanoseconds_since_epoch,
+            response_monotonic_ns=response_monotonic_ns,
+        ),
+    )
+    recovered = cast(
+        CanonicalProcessor,
+        _ScopedProcessorView(
+            processor,
+            processor.snapshots(),
+            audit_outcomes=outcomes,
+        ),
+    )
+
+    checkpoint = _checkpoint(
+        config=config,
+        target=target,
+        processor=recovered,
+        book_last_valid_receive_monotonic_ns=_target_receive_times(
+            target,
+            response_monotonic_ns,
+        ),
+        emitted_at=updated_at,
+        monotonic_now_ns=response_monotonic_ns + 1,
+    )
+
+    assert checkpoint.audit["failed"] == 1
+    assert checkpoint.audit["race_budget_exhaustions"] == 1
+    assert checkpoint.audit["match"] == 1
+    assert checkpoint.capture_healthy is True
+    assert checkpoint.research_eligible is True
+    assert checkpoint.gate1_eligible_so_far is False
+    assert checkpoint.reason_codes == (
+        HealthDecisionReason.AUDIT_FAILED,
+        HealthDecisionReason.AUDIT_RACE_BUDGET_EXHAUSTED,
+    )
+
+    ineligible_instrument = InstrumentId.from_native(
+        POLYMARKET_VENUE_ID,
+        target.yes_token_id,
+    )
+    unresolved = cast(
+        CanonicalProcessor,
+        _ScopedProcessorView(
+            processor,
+            processor.snapshots(),
+            audit_ineligible_instruments=(ineligible_instrument,),
+            audit_outcomes=outcomes,
+        ),
+    )
+    unresolved_checkpoint = _checkpoint(
+        config=config,
+        target=target,
+        processor=unresolved,
+        book_last_valid_receive_monotonic_ns=_target_receive_times(
+            target,
+            response_monotonic_ns,
+        ),
+        emitted_at=updated_at,
+        monotonic_now_ns=response_monotonic_ns + 1,
+    )
+
+    assert unresolved_checkpoint.capture_healthy is True
+    assert unresolved_checkpoint.research_eligible is False
+    assert unresolved_checkpoint.gate1_eligible_so_far is False
+    assert HealthDecisionReason.BOOK_NOT_HEALTHY in unresolved_checkpoint.reason_codes
 
 
 def test_checkpoint_audit_integrity_age_fails_closed_on_future_monotonic_response() -> None:

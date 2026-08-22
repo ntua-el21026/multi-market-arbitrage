@@ -145,6 +145,22 @@ Unknown/unsupported venue schema:
 - alert based on impact;
 - do not coerce into old schema.
 
+The documented Polymarket market-channel `best_bid_ask` event is supported when
+the existing subscription enables `custom_feature_enabled`. Its required bid,
+ask, and spread are decoded exactly and must describe a consistent uncrossed
+top of book. Because the event carries no quantities, it never fabricates L2
+levels or extends authoritative book freshness. Agreement with the current
+book is an economic no-op; disagreement is a relevant audit-fence transition
+that blocks the affected instrument until a later exact `price_change`, full
+snapshot, or equivalent authoritative depth evidence reconciles it. A later
+quantity-free BBO, even one whose prices return to the local top, cannot clear
+the unresolved depth state. An ordinary REST audit is likewise not allowed to
+clear it: a lagging REST body equal to stale local L2 is explicitly
+non-comparable rather than false-`MATCH`.
+Invalid price/spread relationships remain typed schema/normalization failures.
+Contract source: [official market channel](https://docs.polymarket.com/api-reference/wss/market),
+checked 2026-08-22.
+
 ## 8. Error identity
 
 Operational errors should carry:
@@ -170,7 +186,10 @@ REST integrity audits add a separate typed outcome layer:
   classification control has released it, and no relevant economic mutation
   crossed the request window;
 - `RACED` means a relevant economic mutation crossed that window and consumes
-  only the bounded race-retry policy;
+  only the bounded race-retry policy. Each retry is scheduled asynchronously
+  after the configured relevant-L2 quiet interval; a newer accepted mutation
+  moves that retry boundary, while the leg hard expiry, run deadline, and
+  socket-generation boundary remain authoritative;
 - `FAILED` means HTTP, deadline, response, watermark, generation,
   comparability, retry-budget, or shutdown evidence could not support a safe
   classification.

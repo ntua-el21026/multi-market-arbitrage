@@ -223,9 +223,18 @@ analytical, health-evidence, HTTP-integrity, audit, protocol, raw-cap, and disk
 failures. These decisions are scoped: a derived analytical failure can leave
 capture evidence valid while blocking research, and a health-evidence failure
 can leave raw capture operating while making `gate1_eligible_so_far=false`.
-Likewise, public HTTP final failure or exhausted retry budget blocks research
-and Gate-1 integrity evidence without being mislabeled as raw-capture or
-WebSocket failure.
+Cumulative audit and public-HTTP final-failure/retry-exhaustion counters remain
+typed reason history and permanently block automatic Gate-1 eligibility. While
+the dependent book/reference scope is unresolved, its current book or socket
+state also blocks current research; a later proven audit/resnapshot recovery may
+restore `research_eligible` without erasing those reasons or restoring
+`gate1_eligible_so_far`. The HTTP history is never mislabeled as raw-capture or
+WebSocket failure. A protocol deviation follows the same split: its immediate
+invalidation/disconnect fails current state closed, while a successful
+resnapshot and healthy new socket generation may restore current capture and
+research. The cumulative `PROTOCOL_DEVIATION` reason remains Gate-1-sticky.
+Ingress data loss and journal durability/write failures are not recoverable
+within the run and remain capture and research blockers.
 
 The health writer has its own single owner and bounded queue. Producers use a
 non-blocking admission only; JSON serialization, append, and file `fsync` occur
@@ -258,9 +267,11 @@ disconnect. HTTP and WebSocket failures are separate operational dimensions,
 and audit HTTP failure does not create artificial socket downtime or reconnect
 counts. A successfully parsed WebSocket L2 freshness-gap invalidation is
 recorded as a resynchronization, not as a venue protocol deviation; malformed
-or unsupported WebSocket protocol input remains a protocol deviation and fails
-closed. This is distinct from a replayable REST-audit eligibility expiry, which
-blocks the affected leg from research without inventing a socket disconnect.
+or unsupported WebSocket protocol input is a protocol deviation, immediately
+invalidates the affected state, and fails closed until successful recovery.
+Recovery does not erase its Gate-1-sticky reason. This is distinct from a
+replayable REST-audit eligibility expiry, which blocks the affected leg from
+research without inventing a socket disconnect.
 
 ## 8. Alert routing
 

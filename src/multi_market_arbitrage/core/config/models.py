@@ -240,6 +240,7 @@ class PolymarketConfig(_StrictFrozenModel):
     discovery_limit: PositiveStrictInt
     snapshot_audit_interval_seconds: PositiveFiniteFloat
     snapshot_audit_freshness_guard_seconds: PositiveFiniteFloat
+    snapshot_audit_race_retry_quiet_seconds: PositiveFiniteFloat = 0.25
     heartbeat_interval_seconds: PositiveFiniteFloat
     reconnect_initial_seconds: PositiveFiniteFloat
     reconnect_max_seconds: PositiveFiniteFloat
@@ -248,7 +249,7 @@ class PolymarketConfig(_StrictFrozenModel):
     maximum_websocket_message_bytes: PositiveStrictInt = 1024 * 1024
     maximum_ingress_queue_bytes: PositiveStrictInt = 64 * 1024 * 1024
     public_reads: PublicReadConfig
-    snapshot_audit_max_race_retries: NonNegativeStrictInt = 2
+    snapshot_audit_max_race_retries: Annotated[int, Field(strict=True, ge=0, le=16)] = 4
 
     @field_validator("gamma_base_url", "clob_base_url")
     @classmethod
@@ -375,6 +376,13 @@ class Phase1Config(_StrictFrozenModel):
             >= self.scanner.maximum_book_age_seconds
         ):
             raise ValueError("snapshot audit freshness guard must be below maximum book age")
+        if (
+            self.polymarket.snapshot_audit_race_retry_quiet_seconds
+            >= self.polymarket.snapshot_audit_freshness_guard_seconds
+        ):
+            raise ValueError(
+                "snapshot audit race-retry quiet interval must be below freshness guard"
+            )
         return self
 
     @classmethod

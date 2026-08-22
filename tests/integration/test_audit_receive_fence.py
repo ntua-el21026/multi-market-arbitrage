@@ -106,6 +106,26 @@ def _second_yes_price_change() -> bytes:
     return json.dumps(payload, separators=(",", ":")).encode()
 
 
+def _yes_price_change(*, size: int, timestamp: int) -> bytes:
+    payload = cast(dict[str, object], json.loads(_fixture("polymarket_ws_price_change.json")))
+    changes = cast(list[dict[str, object]], payload["price_changes"])
+    changes[0]["size"] = str(size)
+    payload["price_changes"] = changes[:1]
+    payload["timestamp"] = str(timestamp)
+    return json.dumps(payload, separators=(",", ":")).encode()
+
+
+def _yes_book_after_price_change(*, size: int) -> bytes:
+    payload = cast(dict[str, object], json.loads(_fixture("polymarket_rest_book_yes.json")))
+    bids = cast(list[dict[str, object]], payload["bids"])
+    asks = cast(list[dict[str, object]], payload["asks"])
+    bids[1]["size"] = str(size)
+    payload["bids"] = bids
+    payload["asks"] = [level for level in asks if level["price"] != "0.55"]
+    payload["timestamp"] = "1787198406000"
+    return json.dumps(payload, separators=(",", ":")).encode()
+
+
 def _protocol_invalid_yes_price_change() -> bytes:
     return json.dumps(
         {
@@ -1368,6 +1388,431 @@ async def test_raced_retry_budget_exhaustion_is_bounded_and_replayable(
 
 
 @pytest.mark.asyncio
+async def test_four_quiet_race_retries_recover_on_fifth_attempt_without_socket_downtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    quiet_seconds = 0.02
+    config = config.model_copy(
+        update={
+            "polymarket": config.polymarket.model_copy(
+                update={
+                    "snapshot_audit_interval_seconds": 30.0,
+                    "snapshot_audit_max_race_retries": 4,
+                    "snapshot_audit_race_retry_quiet_seconds": quiet_seconds,
+                }
+            )
+        }
+    )
+    run_id = CollectorRunId("adversarial-audit-four-races-then-match")
+    writer = RawJournalWriter(
+        JournalWriterConfig(
+            root=tmp_path / "raw",
+            collector_run_id=run_id,
+            venue_id=POLYMARKET_VENUE_ID,
+            stream="polymarket-public",
+            writer_id=WriterId("writer-four-races-then-match"),
+            writer_software_version="test",
+            git_commit="fixture",
+        )
+    )
+    processor = CanonicalProcessor(config)
+    metrics = InMemoryMetrics()
+    capture = observe_module._RawCaptureBoundary(  # pyright: ignore[reportPrivateUsage]
+        collector_run_id=run_id,
+        writer=writer,
+        processor=processor,
+        metrics=metrics,
+    )
+    service = PolymarketObservationService(
+        config,
+        workspace_root=tmp_path,
+        code_commit="fixture",
+        metrics=metrics,
+    )
+    selected = parse_gamma_markets(_fixture("polymarket_gamma_market_keyset.json")).markets[0]
+    emissions: asyncio.Queue[tuple[bytes, asyncio.Event]] = asyncio.Queue()
+
+    class _CommandSocket:
+        instances = 0
+
+        def __init__(self, asset_ids: tuple[str, ...], **kwargs: object) -> None:
+            assert asset_ids == selected.clob_token_ids
+            del kwargs
+            type(self).instances += 1
+            self.subscription_semantics_sha256 = hashlib.sha256(
+                b"four-races-then-match"
+            ).hexdigest()
+
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            ready.set()
+            while True:
+                payload, admitted = await emissions.get()
+                admit(
+                    ReceivedWebSocketMessage(
+                        payload_bytes=payload,
+                        received_wall_time=UtcTimestamp.now(),
+                        received_monotonic_ns=time.monotonic_ns(),
+                        message_type="TEXT",
+                    )
+                )
+                admitted.set()
+
+    class _RacingThenMatchingClient:
+        def __init__(self) -> None:
+            self.yes_calls = 0
+            self.yes_call_started_ns: list[int] = []
+
+        async def fetch_order_book_raw_with_evidence(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+            on_response_body_complete: Callable[[UtcTimestamp, int], None] | None = None,
+        ) -> PublicReadResult:
+            del deadline
+            if asset_id == "token-no":
+                return _public_read(_no_book(), on_response_body_complete)
+            assert asset_id == "token-yes"
+            self.yes_calls += 1
+            self.yes_call_started_ns.append(time.monotonic_ns())
+            if self.yes_calls <= 4:
+                admitted = asyncio.Event()
+                payload = (
+                    _fixture("polymarket_ws_price_change.json")
+                    if self.yes_calls == 1
+                    else _yes_price_change(
+                        size=4 + self.yes_calls,
+                        timestamp=1_787_198_402_000 + self.yes_calls,
+                    )
+                )
+                await emissions.put(
+                    (
+                        payload,
+                        admitted,
+                    )
+                )
+                await admitted.wait()
+            return _public_read(
+                _yes_book_after_price_change(size=8),
+                on_response_body_complete,
+            )
+
+    monkeypatch.setattr(observe_module, "PolymarketMarketWebSocket", _CommandSocket)
+    client = _RacingThenMatchingClient()
+    runtime_health = ObservationRuntimeHealth()
+    connection_id = ConnectionId("adversarial-audit-four-races-then-match-socket")
+    await writer.start()
+    await _initialize_books(capture)
+    generation_task = asyncio.create_task(
+        service._run_generation(  # pyright: ignore[reportPrivateUsage]
+            client=cast(PolymarketPublicClient, client),
+            capture=capture,
+            selected=(selected,),
+            asset_ids=selected.clob_token_ids,
+            deadline=asyncio.get_running_loop().time() + 30.0,
+            deadline_ns=time.monotonic_ns() + 30_000_000_000,
+            periodic_audit_due_ns=time.monotonic_ns(),
+            connection_id=connection_id,
+            subscription_id=SubscriptionId("adversarial-audit-four-races-then-match-subscription"),
+            unavailable_started_ns=None,
+            runtime_health=runtime_health,
+        ),
+        name="adversarial-audit-four-races-then-match",
+    )
+    try:
+        async with asyncio.timeout(10.0):
+            while True:
+                yes_outcomes = tuple(
+                    outcome
+                    for outcome in processor.audit_outcomes
+                    if outcome.native_asset_id == "token-yes"
+                )
+                if len(yes_outcomes) == 5 and yes_outcomes[-1].outcome is AuditOutcome.MATCH:
+                    break
+                if generation_task.done():
+                    generation_task.result()
+                await asyncio.sleep(0.001)
+        runtime = runtime_health.snapshot()
+        generation_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await generation_task
+    except BaseException:
+        if not generation_task.done():
+            generation_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await generation_task
+        with suppress(Exception):
+            await writer.close(completed=False)
+        raise
+    else:
+        await writer.close()
+
+    assert _CommandSocket.instances == 1
+    assert runtime.socket_generation == 1
+    assert runtime.socket_connected
+    assert runtime.unavailable_intervals == 0
+    assert client.yes_calls == 5
+    assert all(
+        later - earlier >= int(quiet_seconds * 1e9)
+        for earlier, later in zip(
+            client.yes_call_started_ns,
+            client.yes_call_started_ns[1:],
+            strict=False,
+        )
+    )
+    live = processor.summary()
+    yes_outcomes = tuple(
+        outcome for outcome in live.audit_outcomes if outcome.native_asset_id == "token-yes"
+    )
+    assert tuple(outcome.attempt for outcome in yes_outcomes) == (1, 2, 3, 4, 5)
+    assert tuple(outcome.outcome for outcome in yes_outcomes) == (
+        AuditOutcome.RACED,
+        AuditOutcome.RACED,
+        AuditOutcome.RACED,
+        AuditOutcome.RACED,
+        AuditOutcome.MATCH,
+    )
+    assert live.rest_audit_failed == 0
+    assert live.audit_ineligible_books == 0
+    counters = {key.name: value for key, value in metrics.snapshot().counters}
+    assert counters["mma_rest_audit_retries_total"] == 4
+    assert counters.get("mma_rest_audit_race_budget_exhaustions_total", 0) == 0
+    records = JournalReader(tmp_path / "raw", run_id).read_all()
+    assert sum(record.channel == WS_MARKET for record in records) == 4
+    assert sum(record.channel == CONTROL_REST_AUDIT_FAILED for record in records) == 0
+    replayed = replay_journal(tmp_path / "raw", run_id, config).processor
+    assert replayed.audit_outcomes == live.audit_outcomes
+    assert replayed.terminal_hash == live.terminal_hash
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["hard_expiry", "run_deadline"])
+async def test_quiet_race_retry_never_crosses_deadline_boundaries(
+    boundary: Literal["hard_expiry", "run_deadline"],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    hard_expiry_case = boundary == "hard_expiry"
+    config = config.model_copy(
+        update={
+            "polymarket": config.polymarket.model_copy(
+                update={
+                    "snapshot_audit_interval_seconds": 30.0,
+                    "snapshot_audit_freshness_guard_seconds": (0.15 if hard_expiry_case else 0.4),
+                    "snapshot_audit_max_race_retries": 4,
+                    "snapshot_audit_race_retry_quiet_seconds": (0.10 if hard_expiry_case else 0.3),
+                }
+            ),
+            "scanner": config.scanner.model_copy(
+                update={
+                    "maximum_book_age_seconds": 0.20 if hard_expiry_case else 5.0,
+                    "maximum_interleg_skew_seconds": 0.01 if hard_expiry_case else 1.0,
+                }
+            ),
+        }
+    )
+    run_id = CollectorRunId(f"adversarial-audit-race-retry-{boundary}")
+    writer = RawJournalWriter(
+        JournalWriterConfig(
+            root=tmp_path / "raw",
+            collector_run_id=run_id,
+            venue_id=POLYMARKET_VENUE_ID,
+            stream="polymarket-public",
+            writer_id=WriterId(f"writer-race-retry-{boundary}"),
+            writer_software_version="test",
+            git_commit="fixture",
+        )
+    )
+    processor = CanonicalProcessor(config)
+    metrics = InMemoryMetrics()
+    capture = observe_module._RawCaptureBoundary(  # pyright: ignore[reportPrivateUsage]
+        collector_run_id=run_id,
+        writer=writer,
+        processor=processor,
+        metrics=metrics,
+    )
+    service = PolymarketObservationService(
+        config,
+        workspace_root=tmp_path,
+        code_commit="fixture",
+        metrics=metrics,
+    )
+    selected = parse_gamma_markets(_fixture("polymarket_gamma_market_keyset.json")).markets[0]
+    emissions: asyncio.Queue[tuple[bytes, asyncio.Event]] = asyncio.Queue()
+    expired = asyncio.Event()
+
+    class _CommandSocket:
+        instances = 0
+
+        def __init__(self, asset_ids: tuple[str, ...], **kwargs: object) -> None:
+            assert asset_ids == selected.clob_token_ids
+            del kwargs
+            type(self).instances += 1
+            self.subscription_semantics_sha256 = hashlib.sha256(
+                f"race-retry-{boundary}".encode()
+            ).hexdigest()
+
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            ready.set()
+            while True:
+                payload, admitted = await emissions.get()
+                admit(
+                    ReceivedWebSocketMessage(
+                        payload_bytes=payload,
+                        received_wall_time=UtcTimestamp.now(),
+                        received_monotonic_ns=time.monotonic_ns(),
+                        message_type="TEXT",
+                    )
+                )
+                admitted.set()
+
+    class _OneRaceClient:
+        def __init__(self) -> None:
+            self.yes_calls = 0
+
+        async def fetch_order_book_raw_with_evidence(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+            on_response_body_complete: Callable[[UtcTimestamp, int], None] | None = None,
+        ) -> PublicReadResult:
+            del deadline
+            if asset_id == "token-no":
+                return _public_read(_no_book(), on_response_body_complete)
+            assert asset_id == "token-yes"
+            self.yes_calls += 1
+            assert self.yes_calls == 1, "deadline-crossing retry issued HTTP"
+            admitted = asyncio.Event()
+            await emissions.put((_fixture("polymarket_ws_price_change.json"), admitted))
+            await admitted.wait()
+            # Classify safely before the selected boundary, but late enough
+            # that the valid quiet interval cannot finish before it.
+            await asyncio.sleep(0.12 if hard_expiry_case else 0.30)
+            return _public_read(
+                _fixture("polymarket_rest_book_yes.json"),
+                on_response_body_complete,
+            )
+
+    original_expiry = service._preserve_audit_expiry  # pyright: ignore[reportPrivateUsage]
+
+    async def observe_expiry(
+        *,
+        capture: observe_module._RawCaptureBoundary,  # pyright: ignore[reportPrivateUsage]
+        native_asset_id: str,
+        last_accepted_receive_monotonic_ns: int | None,
+        connection_id: ConnectionId,
+        subscription_id: SubscriptionId,
+    ) -> ProcessedEnvelope:
+        result = await original_expiry(
+            capture=capture,
+            native_asset_id=native_asset_id,
+            last_accepted_receive_monotonic_ns=last_accepted_receive_monotonic_ns,
+            connection_id=connection_id,
+            subscription_id=subscription_id,
+        )
+        if native_asset_id == "token-yes":
+            expired.set()
+        return result
+
+    monkeypatch.setattr(observe_module, "PolymarketMarketWebSocket", _CommandSocket)
+    monkeypatch.setattr(service, "_preserve_audit_expiry", observe_expiry)
+    client = _OneRaceClient()
+    await writer.start()
+    await _initialize_books(capture)
+    run_seconds = 1.0 if hard_expiry_case else 0.5
+    generation_task = asyncio.create_task(
+        service._run_generation(  # pyright: ignore[reportPrivateUsage]
+            client=cast(PolymarketPublicClient, client),
+            capture=capture,
+            selected=(selected,),
+            asset_ids=selected.clob_token_ids,
+            deadline=asyncio.get_running_loop().time() + run_seconds,
+            deadline_ns=time.monotonic_ns() + int(run_seconds * 1e9),
+            periodic_audit_due_ns=time.monotonic_ns(),
+            connection_id=ConnectionId(f"race-retry-{boundary}-socket"),
+            subscription_id=SubscriptionId(f"race-retry-{boundary}-subscription"),
+            unavailable_started_ns=None,
+            runtime_health=ObservationRuntimeHealth(),
+        ),
+        name=f"race-retry-{boundary}",
+    )
+    try:
+        async with asyncio.timeout(5.0):
+            if hard_expiry_case:
+                await expired.wait()
+                await asyncio.sleep(0.02)
+                generation_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await generation_task
+            else:
+                generation = await generation_task
+                assert generation.reason is observe_module._GenerationExit.DEADLINE  # pyright: ignore[reportPrivateUsage]
+    except BaseException:
+        if not generation_task.done():
+            generation_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await generation_task
+        with suppress(Exception):
+            await writer.close(completed=False)
+        raise
+    else:
+        await writer.close()
+
+    assert _CommandSocket.instances == 1
+    assert client.yes_calls == 1
+    live = processor.summary()
+    yes_outcomes = tuple(
+        outcome for outcome in live.audit_outcomes if outcome.native_asset_id == "token-yes"
+    )
+    assert tuple(outcome.outcome for outcome in yes_outcomes) == (AuditOutcome.RACED,)
+    records = JournalReader(tmp_path / "raw", run_id).read_all()
+    assert sum(record.channel == CONTROL_REST_AUDIT_START for record in records) == 2
+    assert sum(record.channel == CONTROL_REST_AUDIT_FAILED for record in records) == 0
+    expiry_records = tuple(
+        record for record in records if record.channel == CONTROL_REST_AUDIT_EXPIRED
+    )
+    if hard_expiry_case:
+        assert (
+            sum(
+                cast(dict[str, object], json.loads(record.payload_bytes))["native_asset_id"]
+                == "token-yes"
+                for record in expiry_records
+            )
+            >= 1
+        )
+    else:
+        assert expiry_records == ()
+    labeled_counters = {
+        (key.name, dict(key.labels).get("reason")): value
+        for key, value in metrics.snapshot().counters
+    }
+    expected_reason = "race_retry_quiet_interval_expired" if hard_expiry_case else "run_deadline"
+    expected_metric = (
+        "mma_rest_audit_legs_suppressed_total"
+        if hard_expiry_case
+        else "mma_rest_audit_retries_suppressed_total"
+    )
+    assert labeled_counters[(expected_metric, expected_reason)] == 1
+    replayed = replay_journal(tmp_path / "raw", run_id, config).processor
+    assert replayed.audit_outcomes == live.audit_outcomes
+    assert replayed.terminal_hash == live.terminal_hash
+
+
+@pytest.mark.asyncio
 async def test_raced_audit_does_not_retry_after_protocol_resync_is_pending(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1550,6 +1995,11 @@ async def test_raced_audit_does_not_retry_after_protocol_resync_is_pending(
     assert runtime_health.snapshot().protocol_deviations == 1
     counters = {key.name: value for key, value in metrics.snapshot().counters}
     assert counters.get("mma_rest_audit_retries_total", 0) == 0
+    labeled_counters = {
+        (key.name, dict(key.labels).get("reason")): value
+        for key, value in metrics.snapshot().counters
+    }
+    assert labeled_counters[("mma_rest_audit_retries_suppressed_total", "generation_exit")] == 1
 
     records = JournalReader(tmp_path / "raw", run_id).read_all()
     assert sum(record.channel == CONTROL_REST_AUDIT_START for record in records) == 2

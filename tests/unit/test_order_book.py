@@ -14,8 +14,12 @@ from multi_market_arbitrage.core.health import BookHealth
 from multi_market_arbitrage.core.ids import IngestId
 from multi_market_arbitrage.core.time import UtcTimestamp
 from multi_market_arbitrage.normalization import (
+    POLYMARKET_NORMALIZER_VERSION,
+    POLYMARKET_SCHEMA_VERSION,
+    BestBidAskEvent,
     CanonicalBookLevel,
     CanonicalEvent,
+    CanonicalEventType,
     NormalizationContext,
     NormalizationError,
     OrderBookSnapshotEvent,
@@ -34,6 +38,7 @@ from multi_market_arbitrage.state import (
 )
 from multi_market_arbitrage.venues.polymarket import PolymarketSchemaError
 from multi_market_arbitrage.venues.polymarket.schemas import (
+    WsBestBidAskEvent,
     parse_clob_market_info,
     parse_gamma_markets,
     parse_market_ws_message,
@@ -124,6 +129,51 @@ def _price_change_event(
     )
     assert len(events) == 1
     return events[0]
+
+
+def test_best_bid_ask_is_parsed_and_normalized_as_an_exact_canonical_signal() -> None:
+    bundle = _bundle()
+    payload = b"""{
+      "event_type":"best_bid_ask",
+      "market":"0xcondition",
+      "asset_id":"token-yes",
+      "best_bid":"0.45",
+      "best_ask":"0.55",
+      "spread":"0.10",
+      "timestamp":"1787198402000"
+    }"""
+
+    (native,) = parse_market_ws_message(payload)
+    (event,) = PolymarketNormalizer().normalize(payload, _context(payload, bundle))
+
+    assert isinstance(native, WsBestBidAskEvent)
+    assert native.best_bid == ExactDecimal.parse("0.45")
+    assert native.best_ask == ExactDecimal.parse("0.55")
+    assert native.spread == ExactDecimal.parse("0.10")
+    assert event.event_type is CanonicalEventType.BEST_BID_ASK
+    assert event.schema_version is POLYMARKET_SCHEMA_VERSION
+    assert event.normalizer_version is POLYMARKET_NORMALIZER_VERSION
+    assert isinstance(event.payload, BestBidAskEvent)
+    assert event.payload.instrument_id == bundle.instruments[0].instrument_id
+    assert event.payload.best_bid == Price.parse("0.45")
+    assert event.payload.best_ask == Price.parse("0.55")
+    assert event.payload.spread == ExactDecimal.parse("0.10")
+
+
+def test_best_bid_ask_rejects_inconsistent_exact_spread() -> None:
+    bundle = _bundle()
+    payload = b"""{
+      "event_type":"best_bid_ask",
+      "market":"0xcondition",
+      "asset_id":"token-yes",
+      "best_bid":"0.45",
+      "best_ask":"0.55",
+      "spread":"0.09",
+      "timestamp":"1787198402000"
+    }"""
+
+    with pytest.raises(NormalizationError, match="spread disagrees"):
+        PolymarketNormalizer().normalize(payload, _context(payload, bundle))
 
 
 def test_snapshot_replaces_state_and_sorts_independent_of_wire_order() -> None:

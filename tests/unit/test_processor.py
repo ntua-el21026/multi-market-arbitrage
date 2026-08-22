@@ -138,6 +138,47 @@ def _price_change_payload(
     )
 
 
+def _best_bid_ask_payload(
+    *,
+    best_bid: str,
+    best_ask: str,
+    spread: str,
+    timestamp: str,
+) -> bytes:
+    return canonical_json_bytes(
+        {
+            "asset_id": "token-yes",
+            "best_ask": best_ask,
+            "best_bid": best_bid,
+            "event_type": "best_bid_ask",
+            "market": "0xcondition",
+            "spread": spread,
+            "timestamp": timestamp,
+        }
+    )
+
+
+def _top_bid_change_payload(*, timestamp: str) -> bytes:
+    return canonical_json_bytes(
+        {
+            "event_type": "price_change",
+            "market": "0xcondition",
+            "price_changes": [
+                {
+                    "asset_id": "token-yes",
+                    "best_ask": "0.55",
+                    "best_bid": "0.46",
+                    "hash": f"new-top-{timestamp}",
+                    "price": "0.46",
+                    "side": "BUY",
+                    "size": "5",
+                }
+            ],
+            "timestamp": timestamp,
+        }
+    )
+
+
 def _new_market_payload(market_id: str = "99") -> bytes:
     return canonical_json_bytes(
         {
@@ -1605,6 +1646,242 @@ def test_rest_audit_failure_blocks_eligibility_without_forcing_socket_resync() -
 
     assert recovered.audit_outcomes[0].outcome is AuditOutcome.MATCH
     assert explicit.summary().audit_ineligible_books == 0
+
+
+def test_changed_best_bid_ask_blocks_until_ordered_price_change_reconciles_l2() -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId("processor-best-bid-ask-ordering")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    owner = next(
+        item
+        for item in processor.owners
+        if item.instrument_id
+        == processor.current_bundles[0].instrument_for_token("token-yes").instrument_id
+    )
+    before = owner.snapshot()
+    before_audit = processor.audit_book_identity("token-yes")
+
+    reported = processor.process_replayed(
+        _envelope(
+            run_id,
+            4,
+            WS_MARKET,
+            _best_bid_ask_payload(
+                best_bid="0.46",
+                best_ask="0.55",
+                spread="0.09",
+                timestamp="1787198402000",
+            ),
+        )
+    )
+
+    assert reported.success
+    assert not reported.needs_resync
+    assert reported.canonical_event_count == 1
+    assert reported.scan_count == 1
+    assert not reported.book_freshness_updates
+    assert reported.scan_triggers[0].reasons == (ScanTriggerReason.BOOK_UPDATE,)
+    assert processor.scan_results[-1].disposition is ScanDisposition.BLOCKED
+    assert processor.audit_ineligible_instruments == (owner.instrument_id,)
+    assert owner.snapshot().economic_content_sha256() == before.economic_content_sha256()
+    after_report = processor.audit_book_identity("token-yes")
+    assert after_report.economic_content_sha256 == before_audit.economic_content_sha256
+    assert after_report.generation == before_audit.generation + 1
+
+    reconciled = processor.process_replayed(
+        _envelope(
+            run_id,
+            5,
+            WS_MARKET,
+            _top_bid_change_payload(timestamp="1787198402000"),
+        )
+    )
+
+    assert reconciled.success
+    assert not reconciled.needs_resync
+    assert reconciled.scan_count == 1
+    assert len(reconciled.book_freshness_updates) == 1
+    assert processor.audit_ineligible_instruments == ()
+    best_bid = owner.snapshot().best_bid
+    assert best_bid is not None
+    assert str(best_bid.price) == "0.46"
+    assert processor.audit_book_identity("token-yes").generation == before_audit.generation + 2
+
+
+def test_matching_prices_cannot_clear_preexisting_unresolved_best_bid_ask() -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId("processor-best-bid-ask-out-and-back")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    owner = next(
+        item
+        for item in processor.owners
+        if item.instrument_id
+        == processor.current_bundles[0].instrument_for_token("token-yes").instrument_id
+    )
+    before = owner.snapshot()
+    before_audit = processor.audit_book_identity("token-yes")
+
+    for sequence, (best_bid, best_ask, spread) in enumerate(
+        (("0.46", "0.54", "0.08"), ("0.45", "0.55", "0.10")),
+        start=4,
+    ):
+        result = processor.process_replayed(
+            _envelope(
+                run_id,
+                sequence,
+                WS_MARKET,
+                _best_bid_ask_payload(
+                    best_bid=best_bid,
+                    best_ask=best_ask,
+                    spread=spread,
+                    timestamp=str(1_787_198_402_000 + sequence),
+                ),
+            )
+        )
+        assert result.success
+        assert not result.book_freshness_updates
+        assert processor.audit_ineligible_instruments == (owner.instrument_id,)
+        assert owner.snapshot() == before
+
+    after_bbo = processor.audit_book_identity("token-yes")
+    assert after_bbo.generation == before_audit.generation + 2
+
+    reconciled = processor.process_replayed(
+        _envelope(
+            run_id,
+            6,
+            WS_MARKET,
+            _price_change_payload(
+                bid_size="4",
+                timestamp="1787198403000",
+            ),
+        )
+    )
+
+    assert reconciled.success
+    assert processor.audit_ineligible_instruments == ()
+    assert processor.audit_book_identity("token-yes").generation == before_audit.generation + 3
+
+
+def test_best_bid_ask_is_a_relevant_rest_audit_fence_transition() -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId("processor-best-bid-ask-audit-fence")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="best-bid-ask-race",
+        admitted_ordinal=0,
+    )
+    assert processor.process_replayed(intent).success
+    bbo = _envelope(
+        run_id,
+        5,
+        WS_MARKET,
+        _best_bid_ask_payload(
+            best_bid="0.46",
+            best_ask="0.55",
+            spread="0.09",
+            timestamp="1787198402000",
+        ),
+        transport_metadata={"websocket_admission_ordinal": 1},
+    )
+    assert processor.process_replayed(bbo).success
+
+    raced = processor.process_replayed(
+        _audit_response(
+            run_id,
+            6,
+            start,
+            _fixture("polymarket_rest_book_yes.json"),
+            boundary=1,
+        )
+    )
+
+    outcome = raced.audit_outcomes[0]
+    assert outcome.outcome is AuditOutcome.RACED
+    assert outcome.barrier_book is not None
+    assert outcome.barrier_book.economic_content_sha256 == (
+        outcome.starting_book.economic_content_sha256
+    )
+    assert outcome.barrier_book.generation == outcome.starting_book.generation + 1
+
+
+def test_lagging_rest_match_cannot_clear_a_contradictory_pending_best_bid_ask() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    processor = CanonicalProcessor(config)
+    run_id = CollectorRunId("processor-best-bid-ask-stale-rest-match")
+    bootstrap = _bootstrap(run_id)
+    for envelope in bootstrap:
+        assert processor.process_replayed(envelope).success
+    owner = next(
+        item
+        for item in processor.owners
+        if item.instrument_id
+        == processor.current_bundles[0].instrument_for_token("token-yes").instrument_id
+    )
+    before = owner.snapshot()
+    bbo = _envelope(
+        run_id,
+        4,
+        WS_MARKET,
+        _best_bid_ask_payload(
+            best_bid="0.46",
+            best_ask="0.55",
+            spread="0.09",
+            timestamp="1787198402000",
+        ),
+        transport_metadata={"websocket_admission_ordinal": 1},
+    )
+    assert processor.process_replayed(bbo).success
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        5,
+        request_id="best-bid-ask-stale-rest-match",
+    )
+    assert processor.process_replayed(intent).success
+    response = _audit_response(
+        run_id,
+        6,
+        start,
+        _fixture("polymarket_rest_book_yes.json"),
+        boundary=1,
+    )
+
+    refused = processor.process_replayed(response)
+
+    assert refused.success
+    assert not refused.needs_resync
+    assert not refused.book_freshness_updates
+    assert refused.scan_count == 1
+    assert owner.snapshot() == before
+    assert len(refused.audit_outcomes) == 1
+    outcome = refused.audit_outcomes[0]
+    assert outcome.outcome is AuditOutcome.FAILED
+    assert outcome.reason is AuditFailureReason.LOCAL_STATE_NOT_COMPARABLE
+    assert processor.audit_ineligible_instruments == (owner.instrument_id,)
+
+    price_change = _envelope(
+        run_id,
+        7,
+        WS_MARKET,
+        _top_bid_change_payload(timestamp="1787198403000"),
+        transport_metadata={"websocket_admission_ordinal": 2},
+    )
+    reconciled = processor.process_replayed(price_change)
+    assert reconciled.success
+    assert processor.audit_ineligible_instruments == ()
+
+    replayed = CanonicalProcessor(config)
+    for envelope in (*bootstrap, bbo, intent, response, price_change):
+        assert replayed.process_replayed(envelope).success
+    assert replayed.audit_outcomes == processor.audit_outcomes
+    assert replayed.summary().terminal_hash == processor.summary().terminal_hash
 
 
 def test_scan_dirty_is_coalesced_and_last_trade_is_diagnostic_only() -> None:

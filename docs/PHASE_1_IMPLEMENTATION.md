@@ -115,6 +115,13 @@ strictly smaller than the unchanged five-second hard book-age limit. It creates
 time for both bounded binary-leg public reads, their independent receive fences,
 and serialized canonical classification without adding any acceptance
 tolerance: an L2 message beyond the hard age still invalidates fail closed.
+After a fenced `RACED` result, the coordinator waits for the configured
+`snapshot_audit_race_retry_quiet_seconds` without blocking WebSocket admission.
+The committed 250 ms interval restarts from each newly accepted relevant L2
+receive, so correlated activity bursts are not sampled repeatedly without a
+quiet boundary. At most four retries (five real attempts) are allowed; the run
+deadline, current leg hard expiry, or socket-generation exit always suppresses
+later work, and exhaustion remains a durable fail-closed outcome.
 
 ## CLI
 
@@ -254,6 +261,23 @@ level/freshness/health/reference/lifecycle changes are dirty. A last-trade-only
 diagnostic is not scanner-dirty because the Phase 1 complete-set economics do
 not consume last trade. No periodic blind scan loop exists.
 
+The documented custom-feature `best_bid_ask` message is normalized as its own
+canonical economic event. It has exact best-bid, best-ask, and spread values but
+no quantities, so it cannot authoritatively create, resize, or remove depth and
+does not refresh the scanner's L2 age. A matching report is retained as
+canonical evidence without a book mutation. A changed report advances the
+REST-audit fence and temporarily makes that instrument audit-ineligible until
+an ordered exact quantity-bearing `price_change`, full snapshot, or equivalent
+authoritative depth evidence reconciles the signal. A later quantity-free BBO
+cannot clear the unresolved state even if its prices return to the local top.
+An ordinary REST audit cannot clear it either: a lagging REST body equal to
+stale local L2 is classified as non-comparable instead of `MATCH`. This
+accommodates the observed
+BBO-before-`price_change` delivery order without allowing an unresolved
+top-of-book change into research. Accepted BBO messages update a separate
+relevant-L2 receive clock used only to restart the audit race-retry quiet
+interval; they do not extend the leg hard expiry.
+
 Scan triggers and reasons are included in deterministic processing results.
 Invalid, stale, unresolved, reference-indeterminate, or cost-indeterminate
 books remain ineligible even when another mutation marks the market dirty.
@@ -349,10 +373,11 @@ The typed outcomes are:
   comparability, race-budget, or run-end evidence could not establish a safe
   result.
 
-The audit generation advances only for level, health, or reference mutations;
-its comparison hash excludes receive freshness, timestamps, lineage, and
-last-trade diagnostics. Consequently, duplicate price changes that leave the
-audited state unchanged do not force `RACED`, while a changed-then-restored book
+The audit generation advances for level, health, or reference mutations and for
+changed/unresolved top-of-book signals; its comparison hash excludes receive
+freshness, timestamps, lineage, and last-trade diagnostics. Consequently,
+duplicate price changes and matching BBO reports that leave the audited state
+unchanged do not force `RACED`, while a changed-then-restored book or BBO signal
 still races because its relevant-mutation generation advanced. An ambiguous or
 non-contiguous watermark fails closed.
 Only a proven `MISMATCH` requests socket resynchronization; `RACED` and
@@ -537,12 +562,19 @@ history of typed Gate-1 blockers observed so far, even when a checkpoint-current
 condition later recovers. For example, an analytical or audit-integrity failure
 can block research without falsifying raw-journal durability, while a
 health-writer failure leaves authoritative capture independent but blocks
-automatic Gate-1 evidence eligibility. A public-HTTP final failure or exhausted
-retry budget likewise blocks research and Gate-1 integrity evidence without
-being relabeled as raw-capture or WebSocket failure. Queue saturation,
-count/file exhaustion, storage failure, missing explicit target, book/integrity
-problems, ingress loss, persistence faults, protocol deviations, raw-cap
-pressure, and insufficient disk are never silently treated as healthy.
+automatic Gate-1 evidence eligibility. Audit and public-HTTP failure counters
+are cumulative history: while their dependent book/reference scope remains
+unresolved, current book/socket state blocks research; a later proven
+audit/resnapshot recovery can restore current research but cannot erase the
+typed reasons or restore Gate-1 eligibility. A protocol deviation likewise
+invalidates/disconnects current state immediately, but successful resnapshot
+and a healthy new socket generation can restore current capture and research
+while `PROTOCOL_DEVIATION` remains Gate-1-sticky. Public-HTTP history is not
+relabeled as raw-capture or WebSocket failure. Ingress loss and journal
+durability/write failures remain capture-blocking for the run. Queue
+saturation, count/file exhaustion, storage failure, missing explicit target,
+book/integrity problems, persistence faults, raw-cap pressure, and insufficient
+disk are never silently treated as healthy.
 
 The health path is derived diagnostic evidence. It never mutates canonical
 state and is not permitted to block socket acquisition or raw durability.
@@ -634,7 +666,11 @@ Current protocol conclusions:
   the scanner applies it to each equal-quantity complete-set leg.
 - `price_change.size` is the replacement aggregate quantity for a level; zero
   deletes the level.
-- Lifecycle events require `custom_feature_enabled=true`.
+- `best_bid_ask` and lifecycle events require `custom_feature_enabled=true`.
+  The former is a quantity-free top-of-book update, not an authoritative depth
+  delta; the adapter preserves it canonically and reconciles disagreements as
+  described above. The official market-channel contract was checked on
+  2026-08-22.
 - The public market channel documents no sequence number or continuity field,
   so `supports_sequence_numbers` is `false`.
 - `price_change.hash` identifies the causing order. Although `book.hash` is

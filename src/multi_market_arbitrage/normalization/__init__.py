@@ -1,6 +1,7 @@
 """Canonical event normalization."""
 
 from .models import (
+    BestBidAskEvent,
     BookSide,
     CanonicalBookLevel,
     CanonicalEvent,
@@ -25,6 +26,7 @@ from .polymarket import (
 __all__ = [
     "POLYMARKET_NORMALIZER_VERSION",
     "POLYMARKET_SCHEMA_VERSION",
+    "BestBidAskEvent",
     "BookSide",
     "CanonicalBookLevel",
     "CanonicalEvent",

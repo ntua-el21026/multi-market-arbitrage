@@ -84,6 +84,37 @@ from multi_market_arbitrage.venues.polymarket.schemas import GammaMarket, parse_
 
 FIXTURES = Path(__file__).parents[1] / "golden" / "fixtures"
 
+_CALIBRATION_CONDITION_ID = "0x39ea1503427df7f1439e7dd6567aad5ed72284ed49c58d09e5b917a24389fab7"
+_CALIBRATION_YES_ASSET_ID = (
+    "18258395755041392118198940898057846234774760894152262988568951221464458542850"
+)
+_CALIBRATION_NO_ASSET_ID = (
+    "114727316628172873125190766157418606846347212023742363393254518987604640648589"
+)
+_CALIBRATION_BBO_YES = (
+    b'{"market":"0x39ea1503427df7f1439e7dd6567aad5ed72284ed49c58d09e5b917a24389fab7", '
+    b'"asset_id":"18258395755041392118198940898057846234774760894152262988568951221464'
+    b'458542850", "best_bid":"0.014", "best_ask":"0.015", "spread":"0.001", '
+    b'"timestamp":"1787430801823", "event_type":"best_bid_ask"}'
+)
+_CALIBRATION_BBO_NO = (
+    b'{"market":"0x39ea1503427df7f1439e7dd6567aad5ed72284ed49c58d09e5b917a24389fab7", '
+    b'"asset_id":"11472731662817287312519076615741860684634721202374236339325451898760'
+    b'4640648589", "best_bid":"0.985", "best_ask":"0.986", "spread":"0.001", '
+    b'"timestamp":"1787430801823", "event_type":"best_bid_ask"}'
+)
+_CALIBRATION_PRICE_CHANGE = (
+    b'{"market":"0x39ea1503427df7f1439e7dd6567aad5ed72284ed49c58d09e5b917a24389fab7", '
+    b'"price_changes":[{"asset_id":"182583957550413921181989408980578462347747608941522'
+    b'62988568951221464458542850", "price":"0.015", "size":"3492.31", "side":"SELL", '
+    b'"hash":"1f2c7ba0fe2bdfa345aea237d2c49f6af8d2c19c", "best_bid":"0.014", '
+    b'"best_ask":"0.015"}, {"asset_id":"1147273166281728731251907661574186068463472120'
+    b'23742363393254518987604640648589", "price":"0.985", "size":"3492.31", '
+    b'"side":"BUY", "hash":"9f0ad839d3406c2818ae5da598e435f52b99dc7d", '
+    b'"best_bid":"0.985", "best_ask":"0.986"}], "timestamp":"1787430801823", '
+    b'"event_type":"price_change"}'
+)
+
 
 def _fixture(name: str) -> bytes:
     return (FIXTURES / name).read_bytes()
@@ -105,6 +136,70 @@ def _no_book() -> bytes:
         },
         separators=(",", ":"),
     ).encode()
+
+
+def _calibration_gamma() -> bytes:
+    return (
+        _fixture("polymarket_gamma_market_keyset.json")
+        .replace(b"0xcondition", _CALIBRATION_CONDITION_ID.encode())
+        .replace(b"token-yes", _CALIBRATION_YES_ASSET_ID.encode())
+        .replace(b"token-no", _CALIBRATION_NO_ASSET_ID.encode())
+        .replace(b"0.0100", b"0.0010")
+    )
+
+
+def _calibration_clob() -> bytes:
+    return (
+        _fixture("polymarket_clob_market_info.json")
+        .replace(b"token-yes", _CALIBRATION_YES_ASSET_ID.encode())
+        .replace(b"token-no", _CALIBRATION_NO_ASSET_ID.encode())
+        .replace(b'"mts": 0.01', b'"mts": 0.001')
+    )
+
+
+def _calibration_book(*, yes: bool) -> bytes:
+    if yes:
+        asset_id = _CALIBRATION_YES_ASSET_ID
+        bids = [("0.013", "10"), ("0.014", "4")]
+        asks = [("0.015", "3"), ("0.016", "8")]
+        last_trade_price = "0.015"
+    else:
+        asset_id = _CALIBRATION_NO_ASSET_ID
+        bids = [("0.984", "8"), ("0.985", "3")]
+        asks = [("0.986", "4"), ("0.987", "10")]
+        last_trade_price = "0.985"
+    return json.dumps(
+        {
+            "market": _CALIBRATION_CONDITION_ID,
+            "asset_id": asset_id,
+            "timestamp": "1787430801000",
+            "hash": f"calibration-{'yes' if yes else 'no'}-rest",
+            "bids": [{"price": price, "size": size} for price, size in bids],
+            "asks": [{"price": price, "size": size} for price, size in asks],
+            "min_order_size": "5",
+            "tick_size": "0.001",
+            "neg_risk": False,
+            "last_trade_price": last_trade_price,
+        },
+        separators=(",", ":"),
+    ).encode()
+
+
+def _calibration_bbo_inputs(run_id: CollectorRunId) -> tuple[RawEventEnvelope, ...]:
+    return tuple(
+        _envelope(run_id, sequence, channel, payload)
+        for sequence, (channel, payload) in enumerate(
+            (
+                (GAMMA_MARKETS_KEYSET, _calibration_gamma()),
+                (f"{CLOB_MARKET_PREFIX}{_CALIBRATION_CONDITION_ID}", _calibration_clob()),
+                (REST_BOOK, _calibration_book(yes=True)),
+                (REST_BOOK, _calibration_book(yes=False)),
+                (WS_MARKET, _CALIBRATION_BBO_YES),
+                (WS_MARKET, _CALIBRATION_BBO_NO),
+                (WS_MARKET, _CALIBRATION_PRICE_CHANGE),
+            )
+        )
+    )
 
 
 def _envelope(
@@ -235,6 +330,59 @@ async def test_live_durable_path_and_replay_have_identical_terminal_hash(
     assert replay_run_ids(tmp_path / "raw", include_partial=True) == (run_id,)
     with pytest.raises(JournalCorruptionError, match="completion head is missing"):
         replay_journal(tmp_path / "raw", run_id, config)
+
+
+@pytest.mark.asyncio
+async def test_failed_calibration_best_bid_ask_frames_replay_without_protocol_failure(
+    tmp_path: Path,
+) -> None:
+    assert hashlib.sha256(_CALIBRATION_BBO_YES).hexdigest() == (
+        "cbd97c429b9f510c2373f8dabff9e097e2c771d9e5746546ebd0ddce70d015a3"
+    )
+    assert hashlib.sha256(_CALIBRATION_BBO_NO).hexdigest() == (
+        "1545fcfcfbfaeb9381faa528ba2c5dba15f35943ee9e4dd6ba59e75dc63ba6f3"
+    )
+    assert hashlib.sha256(_CALIBRATION_PRICE_CHANGE).hexdigest() == (
+        "d7978e95f12f06f749953a38a6959b1ee32135854a579fbc61b3ec405eff32d6"
+    )
+    run_id = CollectorRunId("failed-calibration-best-bid-ask-replay")
+    config = load_phase1_config(Path("config/phase1.toml"))
+    processor = CanonicalProcessor(config)
+    writer = RawJournalWriter(
+        JournalWriterConfig(
+            root=tmp_path / "raw",
+            collector_run_id=run_id,
+            venue_id=POLYMARKET_VENUE_ID,
+            stream="polymarket-public",
+            writer_id=WriterId("writer-failed-calibration-bbo"),
+            writer_software_version="test",
+            git_commit="failed-calibration-bbo-fixture",
+            max_events_per_segment=3,
+        )
+    )
+    await writer.start()
+    live_results: list[ProcessedEnvelope] = []
+    for envelope in _calibration_bbo_inputs(run_id):
+        receipt = await writer.submit(envelope)
+        live_results.append(processor.process_durable(envelope, receipt))
+    await writer.close()
+
+    live = processor.summary()
+    first = replay_journal(tmp_path / "raw", run_id, config)
+    second = replay_journal(tmp_path / "raw", run_id, config)
+
+    assert all(result.success for result in live_results)
+    assert all(not result.book_freshness_updates for result in live_results[4:6])
+    assert all(len(result.relevant_l2_receive_updates) == 1 for result in live_results[4:6])
+    assert len(live_results[6].relevant_l2_receive_updates) == 2
+    assert live.parse_failures == 0
+    assert live.canonical_events == 4
+    assert live.invalidations == 0
+    assert live.healthy_books == 2
+    assert live.audit_ineligible_books == 0
+    assert live.terminal_hash == first.processor.terminal_hash
+    assert first == second
+    assert first.raw_record_count == 7
 
 
 @pytest.mark.asyncio
@@ -781,6 +929,7 @@ async def test_continuous_audit_fences_response_without_replacing_socket_generat
                 update={
                     "snapshot_audit_freshness_guard_seconds": 0.01,
                     "snapshot_audit_interval_seconds": 0.05,
+                    "snapshot_audit_race_retry_quiet_seconds": 0.005,
                 }
             )
         }

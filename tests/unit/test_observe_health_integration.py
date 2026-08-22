@@ -15,12 +15,13 @@ import pytest
 
 from multi_market_arbitrage.core.config import Phase1Config, load_phase1_config
 from multi_market_arbitrage.core.health import ComponentHealth
-from multi_market_arbitrage.core.ids import ConnectionId, InstrumentId
+from multi_market_arbitrage.core.ids import CollectorRunId, ConnectionId, InstrumentId
 from multi_market_arbitrage.core.time import UtcTimestamp
 from multi_market_arbitrage.journal import RawJournalWriter
 from multi_market_arbitrage.observability import (
     HealthDecision,
     HealthDecisionReason,
+    HealthEvidenceSummary,
 )
 from multi_market_arbitrage.pipeline import health as health_module
 from multi_market_arbitrage.pipeline import observe as observe_module
@@ -36,7 +37,7 @@ from multi_market_arbitrage.pipeline.targeting import (
     ObservationTargetMode,
     ResolvedPolymarketTarget,
 )
-from multi_market_arbitrage.research import SupervisedAnalyticalOutputs
+from multi_market_arbitrage.research import ResearchOutputSummary, SupervisedAnalyticalOutputs
 from multi_market_arbitrage.venues.polymarket import (
     PublicReadMetricsSnapshot,
     PublicReadPolicy,
@@ -69,6 +70,128 @@ def test_gate1_checkpoint_decision_is_sticky_after_transient_staleness() -> None
     assert restored.research_eligible is True
     assert restored.gate1_eligible_so_far is False
     assert restored.reason_codes == (HealthDecisionReason.BOOK_NOT_HEALTHY,)
+
+
+def test_recovered_audit_history_restores_current_research_but_not_gate1() -> None:
+    failed = HealthDecision(
+        capture_healthy=True,
+        research_eligible=False,
+        gate1_eligible_so_far=False,
+        reason_codes=(
+            HealthDecisionReason.AUDIT_FAILED,
+            HealthDecisionReason.AUDIT_RACE_BUDGET_EXHAUSTED,
+            HealthDecisionReason.BOOK_NOT_HEALTHY,
+        ),
+    )
+    recovered = HealthDecision(
+        capture_healthy=True,
+        research_eligible=True,
+        gate1_eligible_so_far=False,
+        reason_codes=(
+            HealthDecisionReason.AUDIT_FAILED,
+            HealthDecisionReason.AUDIT_RACE_BUDGET_EXHAUSTED,
+        ),
+    )
+
+    accumulated = observe_module._accumulate_gate1_decision(  # pyright: ignore[reportPrivateUsage]
+        recovered,
+        failed,
+    )
+
+    assert accumulated.capture_healthy is True
+    assert accumulated.research_eligible is True
+    assert accumulated.gate1_eligible_so_far is False
+    assert accumulated.reason_codes == (
+        HealthDecisionReason.AUDIT_FAILED,
+        HealthDecisionReason.AUDIT_RACE_BUDGET_EXHAUSTED,
+        HealthDecisionReason.BOOK_NOT_HEALTHY,
+    )
+
+
+def test_recovered_protocol_history_restores_current_capture_but_not_gate1() -> None:
+    failed = HealthDecision(
+        capture_healthy=False,
+        research_eligible=False,
+        gate1_eligible_so_far=False,
+        reason_codes=(
+            HealthDecisionReason.BOOK_NOT_HEALTHY,
+            HealthDecisionReason.PROTOCOL_DEVIATION,
+            HealthDecisionReason.SOCKET_DISCONNECTED,
+        ),
+    )
+    recovered = HealthDecision(
+        capture_healthy=True,
+        research_eligible=True,
+        gate1_eligible_so_far=False,
+        reason_codes=(HealthDecisionReason.PROTOCOL_DEVIATION,),
+    )
+
+    accumulated = observe_module._accumulate_gate1_decision(  # pyright: ignore[reportPrivateUsage]
+        recovered,
+        failed,
+    )
+
+    assert accumulated.capture_healthy is True
+    assert accumulated.research_eligible is True
+    assert accumulated.gate1_eligible_so_far is False
+    assert accumulated.reason_codes == (
+        HealthDecisionReason.BOOK_NOT_HEALTHY,
+        HealthDecisionReason.PROTOCOL_DEVIATION,
+        HealthDecisionReason.SOCKET_DISCONNECTED,
+    )
+
+
+def test_terminal_protocol_history_does_not_reblock_recovered_current_state() -> None:
+    run_id = CollectorRunId("terminal-protocol-recovery")
+    evidence = HealthEvidenceSummary(
+        schema_version="gate1-health-evidence-summary-v1",
+        collector_run_id=run_id,
+        path=Path("health.jsonl"),
+        completed=True,
+        gate1_evidence_eligible=True,
+        accepted=1,
+        written=1,
+        rejected=0,
+        queue_high_water=1,
+        file_bytes=1,
+        content_sha256="a" * 64,
+        failure_type=None,
+    )
+    analytical = ResearchOutputSummary(
+        root=Path("analytical"),
+        reference_manifest_hashes=(),
+        canonical_manifest_hashes=(),
+        scan_manifest_hashes=(),
+    )
+    recovered = HealthDecision(
+        capture_healthy=True,
+        research_eligible=True,
+        gate1_eligible_so_far=False,
+        reason_codes=(HealthDecisionReason.PROTOCOL_DEVIATION,),
+    )
+
+    final = observe_module._final_health_decision(  # pyright: ignore[reportPrivateUsage]
+        recovered,
+        evidence=evidence,
+        analytical_outputs=analytical,
+        terminal_runtime_reasons=(HealthDecisionReason.PROTOCOL_DEVIATION,),
+    )
+
+    assert final.capture_healthy is True
+    assert final.research_eligible is True
+    assert final.gate1_eligible_so_far is False
+    assert final.reason_codes == (HealthDecisionReason.PROTOCOL_DEVIATION,)
+
+    lost = observe_module._final_health_decision(  # pyright: ignore[reportPrivateUsage]
+        recovered,
+        evidence=evidence,
+        analytical_outputs=analytical,
+        terminal_runtime_reasons=(HealthDecisionReason.INGRESS_DATA_LOSS,),
+    )
+    assert lost.capture_healthy is False
+    assert lost.research_eligible is False
+    assert lost.gate1_eligible_so_far is False
+    assert HealthDecisionReason.INGRESS_DATA_LOSS in lost.reason_codes
 
 
 class _PublicClient:

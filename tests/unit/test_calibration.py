@@ -393,6 +393,21 @@ def test_calibration_health_failure_is_explicit_and_fail_closed() -> None:
     assert CalibrationDecisionReason.GATE1_INELIGIBLE in report.decision.reasons
 
 
+def test_calibration_recovered_audit_history_is_gate_only_ineligible() -> None:
+    measured = replace(
+        _measurements(),
+        audit_failed=1,
+        research_eligible=True,
+        gate1_eligible_so_far=False,
+    )
+
+    report = build_calibration_report(_identity(), measured, _limits())
+
+    assert report.decision.passed is False
+    assert report.decision.reasons == (CalibrationDecisionReason.GATE1_INELIGIBLE,)
+    assert CalibrationDecisionReason.RESEARCH_INELIGIBLE not in report.decision.reasons
+
+
 def test_bounded_tree_usage_counts_regular_files_and_rejects_symlinks(tmp_path: Path) -> None:
     nested = tmp_path / "nested"
     nested.mkdir()

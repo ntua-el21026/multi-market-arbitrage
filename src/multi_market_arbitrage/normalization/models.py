@@ -25,6 +25,7 @@ from multi_market_arbitrage.core.time import UtcTimestamp
 class CanonicalEventType(StrEnum):
     ORDER_BOOK_SNAPSHOT = "ORDER_BOOK_SNAPSHOT"
     PRICE_CHANGE = "PRICE_CHANGE"
+    BEST_BID_ASK = "BEST_BID_ASK"
     TICK_SIZE_CHANGE = "TICK_SIZE_CHANGE"
     LAST_TRADE_PRICE = "LAST_TRADE_PRICE"
     NEW_MARKET = "NEW_MARKET"
@@ -69,6 +70,17 @@ class PriceChangeEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class BestBidAskEvent:
+    """Exact top-of-book notification without invented L2 quantities."""
+
+    instrument_id: InstrumentId
+    market_id: MarketId
+    best_bid: Price
+    best_ask: Price
+    spread: ExactDecimal
+
+
+@dataclass(frozen=True, slots=True)
 class TickSizeChangeEvent:
     instrument_id: InstrumentId
     market_id: MarketId
@@ -110,6 +122,7 @@ class MarketResolvedEvent:
 type CanonicalPayload = (
     OrderBookSnapshotEvent
     | PriceChangeEvent
+    | BestBidAskEvent
     | TickSizeChangeEvent
     | LastTradePriceEvent
     | NewMarketEvent
@@ -173,6 +186,7 @@ class NormalizedRestBook:
 
 
 __all__ = [
+    "BestBidAskEvent",
     "BookSide",
     "CanonicalBookLevel",
     "CanonicalEvent",

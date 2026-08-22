@@ -279,6 +279,15 @@ class _StagedAuditRequest:
     asset_order: int
 
 
+@dataclass(frozen=True, slots=True)
+class _DeferredRaceRetry:
+    """One bounded retry that becomes eligible only after a quiet interval."""
+
+    attempt: int
+    terminal: bool
+    ready_after_monotonic_ns: int
+
+
 _EMPTY_INGRESS_METRICS = _empty_ingress_metrics()
 
 
@@ -362,6 +371,7 @@ class _RawCaptureBoundary:
         self.metrics = metrics
         self._next_sequence = 0
         self._book_freshness_ns: dict[InstrumentId, int] = {}
+        self._relevant_l2_receive_ns: dict[InstrumentId, int] = {}
 
     def _capture_envelope(
         self,
@@ -409,8 +419,13 @@ class _RawCaptureBoundary:
             self.metrics.increment_counter("mma_parse_failures_total")
         if result.needs_resync:
             self._book_freshness_ns.clear()
+            self._relevant_l2_receive_ns.clear()
         for update in result.book_freshness_updates:
             self._book_freshness_ns[update.instrument_id] = update.received_monotonic.nanoseconds
+        for update in result.relevant_l2_receive_updates:
+            self._relevant_l2_receive_ns[update.instrument_id] = (
+                update.received_monotonic.nanoseconds
+            )
         if result.scan_count:
             scan_source_received_ns = (
                 envelope.received_monotonic.nanoseconds
@@ -466,6 +481,12 @@ class _RawCaptureBoundary:
         """Return a detached typed view of accepted L2 monotonic receive times."""
 
         return dict(self._book_freshness_ns)
+
+    @property
+    def relevant_l2_receive_ns_by_instrument(self) -> dict[InstrumentId, int]:
+        """Return activity clocks without promoting authoritative freshness."""
+
+        return dict(self._relevant_l2_receive_ns)
 
     async def preserve_then_process(
         self,
@@ -685,8 +706,13 @@ def _final_health_decision(
         )
     reasons = set(checkpoint_decision.reason_codes)
     reasons.update(terminal_runtime_reasons)
-    capture_healthy = checkpoint_decision.capture_healthy and not terminal_runtime_reasons
-    research_eligible = checkpoint_decision.research_eligible and not terminal_runtime_reasons
+    terminal_current_blockers = tuple(
+        reason
+        for reason in terminal_runtime_reasons
+        if reason is not HealthDecisionReason.PROTOCOL_DEVIATION
+    )
+    capture_healthy = checkpoint_decision.capture_healthy and not terminal_current_blockers
+    research_eligible = checkpoint_decision.research_eligible and not terminal_current_blockers
     if not evidence.gate1_evidence_eligible:
         reasons.add(HealthDecisionReason.HEALTH_EVIDENCE_UNHEALTHY)
     if not analytical_outputs.research_eligible:
@@ -2097,6 +2123,9 @@ class PolymarketObservationService:
         freshness_audit_guard_ns = int(
             self._config.polymarket.snapshot_audit_freshness_guard_seconds * 1e9
         )
+        race_retry_quiet_ns = int(
+            self._config.polymarket.snapshot_audit_race_retry_quiet_seconds * 1e9
+        )
         integrity_interval_ns = int(self._config.polymarket.snapshot_audit_interval_seconds * 1e9)
         pending_exit: _GenerationExit | None = None
         capture_cutoff: _CaptureCutoffMoment | None = None
@@ -2115,7 +2144,7 @@ class PolymarketObservationService:
         audit_cycle_active = False
         cycle_unfinished_assets: set[str] = set()
         first_attempts_pending: set[str] = set()
-        deferred_retry_actions: dict[str, tuple[int, bool]] = {}
+        deferred_retry_actions: dict[str, _DeferredRaceRetry] = {}
         expired_freshness_markers: dict[str, int | None] = {}
         maximum_race_retries = self._config.polymarket.snapshot_audit_max_race_retries
         stable_asset_order = {asset_id: index for index, asset_id in enumerate(asset_ids)}
@@ -2150,9 +2179,27 @@ class PolymarketObservationService:
             instrument_id = capture.processor.audit_book_identity(native_asset_id).instrument_id
             return capture.book_freshness_receive_ns_by_instrument.get(instrument_id)
 
+        def leg_relevant_l2_receive_ns(native_asset_id: str) -> int | None:
+            instrument_id = capture.processor.audit_book_identity(native_asset_id).instrument_id
+            return capture.relevant_l2_receive_ns_by_instrument.get(instrument_id)
+
         def leg_hard_expiry_ns(native_asset_id: str, *, now_ns: int) -> int:
             freshness_ns = leg_freshness_ns(native_asset_id)
             return now_ns if freshness_ns is None else freshness_ns + maximum_book_age_ns
+
+        def race_retry_due_ns(
+            native_asset_id: str,
+            action: _DeferredRaceRetry,
+        ) -> int:
+            freshness_ns = leg_relevant_l2_receive_ns(native_asset_id)
+            return max(
+                action.ready_after_monotonic_ns,
+                (
+                    action.ready_after_monotonic_ns
+                    if freshness_ns is None
+                    else freshness_ns + race_retry_quiet_ns
+                ),
+            )
 
         def ordered_cycle_assets(*, now_ns: int) -> tuple[str, ...]:
             return tuple(
@@ -2167,9 +2214,27 @@ class PolymarketObservationService:
 
         def current_deadline(*, now_ns: int) -> IntegrityDeadline:
             if audit_cycle_active:
+                retry_deadlines: list[int] = []
+                if not first_attempts_pending:
+                    for asset_id, action in deferred_retry_actions.items():
+                        if action.terminal:
+                            retry_deadlines.append(now_ns)
+                            continue
+                        retry_deadlines.extend(
+                            (
+                                race_retry_due_ns(asset_id, action),
+                                leg_hard_expiry_ns(asset_id, now_ns=now_ns),
+                            )
+                        )
+                retry_deadline_ns = min(retry_deadlines, default=deadline_ns)
+                next_ns = min(deadline_ns, retry_deadline_ns)
                 return IntegrityDeadline(
-                    deadline_ns=deadline_ns,
-                    reason=IntegrityDeadlineReason.RUN_DEADLINE,
+                    deadline_ns=next_ns,
+                    reason=(
+                        IntegrityDeadlineReason.RUN_DEADLINE
+                        if next_ns == deadline_ns
+                        else IntegrityDeadlineReason.RACE_RETRY
+                    ),
                 )
             freshness_deadlines: list[int] = []
             hard_expiries: list[int] = []
@@ -2213,6 +2278,15 @@ class PolymarketObservationService:
             if not cycle_unfinished_assets:
                 audit_cycle_active = False
                 periodic_audit_due_ns = time.monotonic_ns() + integrity_interval_ns
+
+        def suppress_deferred_race_retries(*, reason: str) -> None:
+            for asset_id, action in tuple(deferred_retry_actions.items()):
+                if not action.terminal:
+                    self._metrics.increment_counter(
+                        "mma_rest_audit_retries_suppressed_total",
+                        labels={"reason": reason},
+                    )
+                finish_cycle_leg(asset_id)
 
         async def mark_expired_leg(native_asset_id: str, *, reason: str) -> None:
             nonlocal pending_exit
@@ -2894,17 +2968,20 @@ class PolymarketObservationService:
                             finish_cycle_leg(start.native_asset_id)
                         elif start.attempt <= maximum_race_retries:
                             self._metrics.increment_counter("mma_rest_audit_retries_total")
-                            deferred_retry_actions[start.native_asset_id] = (
-                                start.attempt + 1,
-                                False,
+                            classified_ns = time.monotonic_ns()
+                            deferred_retry_actions[start.native_asset_id] = _DeferredRaceRetry(
+                                attempt=start.attempt + 1,
+                                terminal=False,
+                                ready_after_monotonic_ns=(classified_ns + race_retry_quiet_ns),
                             )
                         else:
                             self._metrics.increment_counter(
                                 "mma_rest_audit_race_budget_exhaustions_total"
                             )
-                            deferred_retry_actions[start.native_asset_id] = (
-                                start.attempt + 1,
-                                True,
+                            deferred_retry_actions[start.native_asset_id] = _DeferredRaceRetry(
+                                attempt=start.attempt + 1,
+                                terminal=True,
+                                ready_after_monotonic_ns=time.monotonic_ns(),
                             )
                         continue
                     expired_freshness_markers.pop(start.native_asset_id, None)
@@ -2925,21 +3002,59 @@ class PolymarketObservationService:
                     ):
                         if len(pending_audits) >= 2:
                             break
-                        attempt, terminal = deferred_retry_actions.pop(asset_id)
-                        if terminal:
+                        action = deferred_retry_actions[asset_id]
+                        retry_now_ns = time.monotonic_ns()
+                        if not action.terminal:
+                            hard_expiry_ns = leg_hard_expiry_ns(
+                                asset_id,
+                                now_ns=retry_now_ns,
+                            )
+                            if retry_now_ns >= deadline_ns:
+                                deferred_retry_actions.pop(asset_id)
+                                self._metrics.increment_counter(
+                                    "mma_rest_audit_retries_suppressed_total",
+                                    labels={"reason": "run_deadline"},
+                                )
+                                finish_cycle_leg(asset_id)
+                                continue
+                            if retry_now_ns >= hard_expiry_ns:
+                                deferred_retry_actions.pop(asset_id)
+                                await mark_expired_leg(
+                                    asset_id,
+                                    reason="race_retry_quiet_interval_expired",
+                                )
+                                continue
+                            if retry_now_ns < race_retry_due_ns(asset_id, action):
+                                continue
+                        deferred_retry_actions.pop(asset_id)
+                        if action.terminal:
                             launched = await stage_failed_leg(
                                 asset_id,
-                                attempt=attempt,
+                                attempt=action.attempt,
                                 reason=AuditFailureReason.RACE_RETRY_EXHAUSTED,
                             )
                             if launched is not _AuditLaunchResult.RUN_ENDED:
                                 deviations.append("REST audit race retry budget exhausted")
                         else:
-                            launched = await launch_audit(asset_id, attempt=attempt)
+                            self._metrics.observe_histogram(
+                                "mma_rest_audit_race_retry_wait_ns",
+                                max(
+                                    0,
+                                    retry_now_ns
+                                    - (action.ready_after_monotonic_ns - race_retry_quiet_ns),
+                                ),
+                            )
+                            launched = await launch_audit(asset_id, attempt=action.attempt)
                             if launched is _AuditLaunchResult.FAILED_CLOSED:
                                 pending_exit = _GenerationExit.RESYNC_REQUIRED
                                 await stop_acquisition()
                                 break
+                            if launched is _AuditLaunchResult.RUN_ENDED:
+                                self._metrics.increment_counter(
+                                    "mma_rest_audit_retries_suppressed_total",
+                                    labels={"reason": "run_deadline"},
+                                )
+                                finish_cycle_leg(asset_id)
 
                 now_ns = time.monotonic_ns()
                 due = current_deadline(now_ns=now_ns)
@@ -2970,12 +3085,17 @@ class PolymarketObservationService:
                             )
                 if pending_exit is None and now_ns >= due_ns:
                     if due.reason is IntegrityDeadlineReason.RUN_DEADLINE:
+                        suppress_deferred_race_retries(reason="run_deadline")
                         pending_exit = _GenerationExit.DEADLINE
                         capture_cutoff = _CaptureCutoffMoment(
                             wall_time=UtcTimestamp.now(),
                             monotonic_ns=now_ns,
                         )
                         await stop_acquisition()
+                    elif due.reason is IntegrityDeadlineReason.RACE_RETRY:
+                        # The next coordinator turn either launches a quiet
+                        # retry or records that its leg hard expiry won.
+                        continue
                     else:
                         audit_cycle_active = True
                         self._metrics.increment_counter("mma_rest_audit_cycles_total")
@@ -3088,8 +3208,12 @@ class PolymarketObservationService:
                         AuditFailureReason.SOCKET_GENERATION_CHANGED
                     ):
                         continue
+                    if not isinstance(pending_exit, _GenerationExit):  # pragma: no cover
+                        raise AssertionError("generation exit reason disappeared")
+                    exit_reason: _GenerationExit = pending_exit
+                    suppress_deferred_race_retries(reason="generation_exit")
                     return _GenerationResult(
-                        pending_exit,
+                        exit_reason,
                         deviations=tuple(deviations),
                         refresh_requests=tuple(refresh_requests),
                         ingress_metrics=ingress.metrics,
@@ -3102,8 +3226,10 @@ class PolymarketObservationService:
                         AuditFailureReason.SOCKET_GENERATION_CHANGED
                     ):
                         continue
+                    suppress_deferred_race_retries(reason="generation_exit")
                     raise pending_transport_error
                 elif acquisition_task.done():
+                    suppress_deferred_race_retries(reason="generation_exit")
                     try:
                         acquisition_task.result()
                     except RawIngressBackpressureError:

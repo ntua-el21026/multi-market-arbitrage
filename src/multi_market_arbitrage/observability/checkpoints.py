@@ -151,7 +151,6 @@ def evaluate_health_decision(inputs: HealthDecisionInputs) -> HealthDecision:
         HealthDecisionReason.INGRESS_QUEUE_SATURATED,
         HealthDecisionReason.JOURNAL_UNHEALTHY,
         HealthDecisionReason.JOURNAL_BACKPRESSURE,
-        HealthDecisionReason.PROTOCOL_DEVIATION,
         HealthDecisionReason.RAW_RUN_CAP_REACHED,
         HealthDecisionReason.DISK_HEADROOM_LOW,
     }
@@ -159,12 +158,12 @@ def evaluate_health_decision(inputs: HealthDecisionInputs) -> HealthDecision:
         HealthDecisionReason.BOOK_NOT_HEALTHY,
         HealthDecisionReason.ANALYTICAL_UNHEALTHY,
         HealthDecisionReason.ANALYTICAL_QUEUE_SATURATED,
-        HealthDecisionReason.AUDIT_MISMATCH,
-        HealthDecisionReason.AUDIT_FAILED,
-        HealthDecisionReason.AUDIT_RACE_BUDGET_EXHAUSTED,
-        HealthDecisionReason.HTTP_FINAL_FAILURE,
-        HealthDecisionReason.HTTP_INTEGRITY_UNAVAILABLE,
     }
+    # Audit, HTTP, and protocol counters are cumulative evidence, not
+    # current-state flags.
+    # Their typed reasons remain Gate-1-sticky, while current dependent-scope
+    # eligibility is represented by ``all_required_books_healthy`` (including
+    # the processor's audit-ineligible set) and current capture state.
     ordered = tuple(sorted(reasons, key=str))
     capture_healthy = not reasons.intersection(capture_blockers)
     research_eligible = not reasons.intersection(research_blockers)

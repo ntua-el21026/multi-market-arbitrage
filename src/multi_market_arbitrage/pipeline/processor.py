@@ -33,6 +33,7 @@ from multi_market_arbitrage.core.validation import ValidationReasonCode
 from multi_market_arbitrage.ingestion import RawEventEnvelope
 from multi_market_arbitrage.journal import JournalDurabilityState, JournalReceipt
 from multi_market_arbitrage.normalization import (
+    BestBidAskEvent,
     CanonicalEvent,
     CanonicalEventType,
     MarketResolvedEvent,
@@ -195,6 +196,10 @@ class ProcessedEnvelope:
     book_freshness_updates: tuple[BookFreshnessUpdate, ...]
     scan_triggers: tuple[MarketScanTrigger, ...]
     error_type: str | None
+    # Receive activity relevant to audit-race quiet windows.  This is separate
+    # from authoritative book freshness because quantity-free BBO messages must
+    # not extend scanner eligibility or REST-audit hard-expiry deadlines.
+    relevant_l2_receive_updates: tuple[BookFreshnessUpdate, ...] = ()
     audit_outcomes: tuple[AuditOutcomeEvidence, ...] = ()
     scan_source_received_monotonic_ns: int | None = None
 
@@ -321,11 +326,16 @@ class CanonicalProcessor:
         self._rest_audit_run_deadline_epoch_id: str | None = None
         self._rest_audit_run_deadline_ns: int | None = None
         self._audit_ineligible_instruments: set[InstrumentId] = set()
+        # A changed BBO notification can precede its authoritative L2 delta.
+        # Keep that ordering window separate from durable REST-audit failures so
+        # an accepted delta cannot accidentally clear another fail-closed cause.
+        self._pending_best_bid_ask: dict[InstrumentId, BestBidAskEvent] = {}
         self._audit_economic_generations: dict[InstrumentId, int] = {}
         self._processed_ws_watermarks: dict[ConnectionId, int] = {}
         self._active_refresh_requests: list[ReferenceRefreshRequest] | None = None
         self._active_dirty_markets: dict[MarketId, set[ScanTriggerReason]] | None = None
         self._active_freshness_updates: dict[InstrumentId, BookFreshnessUpdate] | None = None
+        self._active_relevant_l2_updates: dict[InstrumentId, BookFreshnessUpdate] | None = None
         self._active_received_monotonic: MonotonicTimestamp | None = None
         self._active_scan_observed_at: UtcTimestamp | None = None
         self._active_audit_outcomes: list[AuditOutcomeEvidence] | None = None
@@ -391,7 +401,12 @@ class CanonicalProcessor:
     def audit_ineligible_instruments(self) -> tuple[InstrumentId, ...]:
         """Books excluded from opportunity eligibility after an unproven audit."""
 
-        return tuple(sorted(self._audit_ineligible_instruments, key=lambda item: item.value))
+        return tuple(
+            sorted(
+                self._audit_ineligible_instruments | self._pending_best_bid_ask.keys(),
+                key=lambda item: item.value,
+            )
+        )
 
     def processed_websocket_watermark(
         self, connection_id: ConnectionId
@@ -462,6 +477,7 @@ class CanonicalProcessor:
             self._active_refresh_requests is not None
             or self._active_dirty_markets is not None
             or self._active_freshness_updates is not None
+            or self._active_relevant_l2_updates is not None
             or self._active_received_monotonic is not None
             or self._active_scan_observed_at is not None
             or self._active_audit_outcomes is not None
@@ -481,10 +497,12 @@ class CanonicalProcessor:
         current_refresh_requests: list[ReferenceRefreshRequest] = []
         current_dirty_markets: dict[MarketId, set[ScanTriggerReason]] = {}
         current_freshness_updates: dict[InstrumentId, BookFreshnessUpdate] = {}
+        current_relevant_l2_updates: dict[InstrumentId, BookFreshnessUpdate] = {}
         current_audit_outcomes: list[AuditOutcomeEvidence] = []
         self._active_refresh_requests = current_refresh_requests
         self._active_dirty_markets = current_dirty_markets
         self._active_freshness_updates = current_freshness_updates
+        self._active_relevant_l2_updates = current_relevant_l2_updates
         self._active_received_monotonic = envelope.received_monotonic
         self._active_scan_observed_at = None
         self._active_audit_outcomes = current_audit_outcomes
@@ -529,6 +547,13 @@ class CanonicalProcessor:
                     ),
                     scan_triggers=scan_triggers,
                     error_type=error_type,
+                    relevant_l2_receive_updates=tuple(
+                        current_relevant_l2_updates[key]
+                        for key in sorted(
+                            current_relevant_l2_updates,
+                            key=lambda item: item.value,
+                        )
+                    ),
                     audit_outcomes=tuple(current_audit_outcomes),
                     scan_source_received_monotonic_ns=(
                         min(audit_response_receive_times) if audit_response_receive_times else None
@@ -564,6 +589,13 @@ class CanonicalProcessor:
                     ),
                     scan_triggers=scan_triggers,
                     error_type=None,
+                    relevant_l2_receive_updates=tuple(
+                        current_relevant_l2_updates[key]
+                        for key in sorted(
+                            current_relevant_l2_updates,
+                            key=lambda item: item.value,
+                        )
+                    ),
                     audit_outcomes=tuple(current_audit_outcomes),
                     scan_source_received_monotonic_ns=(
                         min(audit_response_receive_times) if audit_response_receive_times else None
@@ -573,6 +605,7 @@ class CanonicalProcessor:
             self._active_refresh_requests = None
             self._active_dirty_markets = None
             self._active_freshness_updates = None
+            self._active_relevant_l2_updates = None
             self._active_received_monotonic = None
             self._active_scan_observed_at = None
             self._active_audit_outcomes = None
@@ -586,9 +619,7 @@ class CanonicalProcessor:
         freshness_received_monotonic: MonotonicTimestamp | None = None,
     ) -> None:
         if mutation.audit_economic_changed:
-            self._audit_economic_generations[mutation.instrument_id] = (
-                self._audit_economic_generations.get(mutation.instrument_id, 0) + 1
-            )
+            self._advance_audit_economic_generation(mutation.instrument_id)
         dirty = self._active_dirty_markets
         freshness = self._active_freshness_updates
         received_monotonic = (
@@ -604,13 +635,111 @@ class CanonicalProcessor:
         if mutation.freshness_changed and owner is not None:
             if owner.health is BookHealth.HEALTHY:
                 self._last_accepted_l2_monotonic[mutation.instrument_id] = received_monotonic
-                freshness[mutation.instrument_id] = BookFreshnessUpdate(
+                update = BookFreshnessUpdate(
                     market_id=mutation.market_id,
                     instrument_id=mutation.instrument_id,
                     received_monotonic=received_monotonic,
                 )
+                freshness[mutation.instrument_id] = update
+                relevant = self._active_relevant_l2_updates
+                if relevant is not None:
+                    relevant[mutation.instrument_id] = update
             else:
                 freshness.pop(mutation.instrument_id, None)
+
+    def _record_relevant_l2_receive(
+        self,
+        *,
+        market_id: MarketId,
+        instrument_id: InstrumentId,
+    ) -> None:
+        relevant = self._active_relevant_l2_updates
+        received_monotonic = self._active_received_monotonic
+        if relevant is None or received_monotonic is None:
+            return
+        relevant[instrument_id] = BookFreshnessUpdate(
+            market_id=market_id,
+            instrument_id=instrument_id,
+            received_monotonic=received_monotonic,
+        )
+
+    def _advance_audit_economic_generation(self, instrument_id: InstrumentId) -> None:
+        self._audit_economic_generations[instrument_id] = (
+            self._audit_economic_generations.get(instrument_id, 0) + 1
+        )
+
+    @staticmethod
+    def _owner_matches_best_bid_ask(
+        owner: CanonicalL2BookOwner,
+        reported: BestBidAskEvent,
+    ) -> bool:
+        snapshot = owner.snapshot()
+        if snapshot.health is not BookHealth.HEALTHY:
+            return False
+        best_bid = None if snapshot.best_bid is None else snapshot.best_bid.price
+        best_ask = None if snapshot.best_ask is None else snapshot.best_ask.price
+        return best_bid == reported.best_bid and best_ask == reported.best_ask
+
+    def _apply_best_bid_ask(self, event: CanonicalEvent) -> None:
+        payload = event.payload
+        if not isinstance(payload, BestBidAskEvent):
+            raise ProgrammingInvariantViolation(
+                "best-bid/ask route received another canonical payload",
+                component="canonical-processor",
+            )
+        owner = self._owners[payload.instrument_id]
+        self._record_relevant_l2_receive(
+            market_id=payload.market_id,
+            instrument_id=payload.instrument_id,
+        )
+        previous = self._pending_best_bid_ask.get(payload.instrument_id)
+        if self._owner_matches_best_bid_ask(owner, payload):
+            if previous is None:
+                return
+            if previous == payload:
+                return
+            # Returning top prices do not prove that quantity-bearing depth was
+            # restored. Preserve the unresolved marker, but advance the fence
+            # so an out-and-back BBO transition cannot disappear inside an
+            # audit window.
+            self._pending_best_bid_ask[payload.instrument_id] = payload
+            self._advance_audit_economic_generation(payload.instrument_id)
+            self._mark_market_dirty(payload.market_id, ScanTriggerReason.BOOK_UPDATE)
+            return
+        if previous == payload:
+            return
+        # BBO has no quantities, so fabricating/removing L2 levels would be
+        # unsafe. Block opportunity eligibility until an ordered exact
+        # quantity-bearing price_change or authoritative full snapshot/new
+        # baseline establishes the exact book.
+        self._pending_best_bid_ask[payload.instrument_id] = payload
+        self._advance_audit_economic_generation(payload.instrument_id)
+        self._mark_market_dirty(payload.market_id, ScanTriggerReason.BOOK_UPDATE)
+
+    def _reconcile_best_bid_ask_after_l2(
+        self,
+        payload: OrderBookSnapshotEvent | PriceChangeEvent,
+        owner: CanonicalL2BookOwner,
+        mutation: BookMutation,
+    ) -> None:
+        pending = self._pending_best_bid_ask.get(owner.instrument_id)
+        if pending is None:
+            return
+        superseded = isinstance(payload, OrderBookSnapshotEvent)
+        if isinstance(payload, PriceChangeEvent):
+            final_change = payload.changes[-1]
+            superseded = (
+                final_change.reported_best_bid is not None
+                and final_change.reported_best_ask is not None
+            )
+        if not superseded:
+            return
+        self._pending_best_bid_ask.pop(owner.instrument_id)
+        if not mutation.audit_economic_changed:
+            # Exact quantity-bearing reconciliation changed eligibility even
+            # when its level update was an economic no-op. This remains a
+            # relevant transition for an audit already in flight.
+            self._advance_audit_economic_generation(owner.instrument_id)
 
     def _ws_l2_exceeds_freshness_window(self, instrument_id: InstrumentId) -> bool:
         current = self._active_received_monotonic
@@ -766,6 +895,7 @@ class CanonicalProcessor:
             was_unhealthy = owner.health is not BookHealth.HEALTHY
             self._prepare_for_rest_snapshot(owner)
             mutation = owner.apply_rest_snapshot(rest)
+            self._pending_best_bid_ask.pop(rest.instrument_id, None)
             self._record_book_mutation(
                 mutation,
                 reason=ScanTriggerReason.REST_SNAPSHOT,
@@ -1134,11 +1264,13 @@ class CanonicalProcessor:
         reason: AuditFailureReason,
         response: RawEventEnvelope | None = None,
         response_boundary_ordinal: int | None = None,
+        mark_audit_ineligible: bool = True,
     ) -> AuditOutcomeEvidence:
         owner = self._owners[start.starting_book.instrument_id]
         barrier = self.audit_book_identity(start.native_asset_id)
         processed = self.processed_websocket_watermark(start.connection_id).ordinal
-        self._audit_ineligible_instruments.add(owner.instrument_id)
+        if mark_audit_ineligible:
+            self._audit_ineligible_instruments.add(owner.instrument_id)
         self._mark_market_dirty(owner.market_id, ScanTriggerReason.REST_AUDIT)
         return AuditOutcomeEvidence(
             request_id=start.request_id,
@@ -1467,6 +1599,24 @@ class CanonicalProcessor:
             return
 
         owner = self._owners[start.starting_book.instrument_id]
+        if owner.instrument_id in self._pending_best_bid_ask:
+            # A quantity-free BBO that contradicts local depth proves that the
+            # local L2 image is unresolved.  A REST body equal to that stale
+            # image does not prove venue-side causal freshness, so it must not
+            # become MATCH evidence or refresh/clear the pending signal.
+            self._record_audit_outcome(
+                self._failed_audit_outcome(
+                    start,
+                    reason=AuditFailureReason.LOCAL_STATE_NOT_COMPARABLE,
+                    response=envelope,
+                    response_boundary_ordinal=boundary,
+                    # The pending BBO already owns current ineligibility.  Keep
+                    # it separate so its later ordered reconciliation cannot
+                    # erase an unrelated durable audit-failure cause.
+                    mark_audit_ineligible=False,
+                )
+            )
+            return
         previous_health = owner.health
         try:
             result = owner.audit_rest_snapshot(rest, checked_at=envelope.received_wall_time)
@@ -1855,6 +2005,9 @@ class CanonicalProcessor:
             self._record_reference_refresh(refresh_request)
         if event.market_id is None:
             return
+        if isinstance(event.payload, BestBidAskEvent):
+            self._apply_best_bid_ask(event)
+            return
         target_ids = self._market_instruments.get(event.market_id, ())
         if event.instrument_id is not None:
             target_ids = (event.instrument_id,)
@@ -1885,6 +2038,10 @@ class CanonicalProcessor:
                 raise
             if previous is not BookHealth.INVALID and owner.health is BookHealth.INVALID:
                 self._invalidations += 1
+            if isinstance(event.payload, (OrderBookSnapshotEvent, PriceChangeEvent)):
+                self._reconcile_best_bid_ask_after_l2(event.payload, owner, mutation)
+            elif isinstance(event.payload, MarketResolvedEvent):
+                self._pending_best_bid_ask.pop(owner.instrument_id, None)
             if isinstance(event.payload, MarketResolvedEvent):
                 reason = ScanTriggerReason.LIFECYCLE
             elif isinstance(event.payload, TickSizeChangeEvent):
@@ -1955,10 +2112,11 @@ class CanonicalProcessor:
         instrument_ids = self._market_instruments.get(bundle.market.market_id, ())
         if len(instrument_ids) != 2:
             return
+        audit_ineligible = set(self.audit_ineligible_instruments)
         snapshot_views_list: list[tuple[ImmutableOrderBookSnapshot, str]] = []
         for instrument_id in instrument_ids:
             owner = self._owners[instrument_id]
-            if instrument_id in self._audit_ineligible_instruments:
+            if instrument_id in audit_ineligible:
                 snapshot = replace(
                     owner.snapshot(),
                     health=BookHealth.STALE,
@@ -2164,6 +2322,13 @@ class CanonicalProcessor:
             }
             for request_id in sorted(self._pending_rest_audits)
         )
+        pending_best_bid_ask_state = tuple(
+            self._pending_best_bid_ask[instrument_id]
+            for instrument_id in sorted(
+                self._pending_best_bid_ask,
+                key=lambda item: item.value,
+            )
+        )
         terminal_hash = canonical_sha256(
             {
                 "config_hash": self._config.config_hash.value,
@@ -2203,6 +2368,7 @@ class CanonicalProcessor:
                 "lifecycle_state_sha256": lifecycle_state_sha256,
                 "audit_ineligible_instrument_ids": audit_ineligible_instrument_ids,
                 "pending_rest_audits": pending_rest_audit_state,
+                "pending_best_bid_ask": pending_best_bid_ask_state,
                 "rest_audit_protocol_mode": self._rest_audit_protocol_mode,
                 "rest_audit_run_deadline": (
                     None

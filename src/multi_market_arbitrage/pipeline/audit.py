@@ -57,9 +57,10 @@ class WebSocketAdmissionWatermark:
 class AuditBookIdentity:
     """Relevant canonical identity captured by the single book owner.
 
-    ``generation`` counts only levels, health, and reference transitions that
-    can change or invalidate the audited economic book.  Diagnostic provenance,
-    freshness, and last-trade-only changes do not advance it.
+    ``generation`` counts levels, health, reference transitions, and unresolved
+    or restored quantity-free BBO signals that can change or invalidate the
+    audited economic book. Diagnostic provenance, freshness, and
+    last-trade-only changes do not advance it.
     """
 
     instrument_id: InstrumentId

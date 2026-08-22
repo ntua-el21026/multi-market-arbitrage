@@ -10,6 +10,7 @@ class IntegrityDeadlineReason(StrEnum):
     RUN_DEADLINE = "RUN_DEADLINE"
     PERIODIC_AUDIT = "PERIODIC_AUDIT"
     BOOK_FRESHNESS = "BOOK_FRESHNESS"
+    RACE_RETRY = "RACE_RETRY"
 
 
 @dataclass(frozen=True, slots=True)

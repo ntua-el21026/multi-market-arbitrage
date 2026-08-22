@@ -100,29 +100,114 @@ def test_scoped_health_decision_keeps_writer_failure_off_capture_path() -> None:
     )
 
 
-def test_http_audit_failure_does_not_become_socket_failure() -> None:
-    decision = evaluate_health_decision(_decision_inputs(audit_failures=1))
+@pytest.mark.parametrize(
+    ("counter", "reason"),
+    [
+        ("audit_mismatches", HealthDecisionReason.AUDIT_MISMATCH),
+        ("audit_failures", HealthDecisionReason.AUDIT_FAILED),
+        (
+            "audit_race_budget_exhaustions",
+            HealthDecisionReason.AUDIT_RACE_BUDGET_EXHAUSTED,
+        ),
+        ("http_final_failures", HealthDecisionReason.HTTP_FINAL_FAILURE),
+        (
+            "http_retry_budget_exhaustions",
+            HealthDecisionReason.HTTP_INTEGRITY_UNAVAILABLE,
+        ),
+    ],
+)
+def test_recovered_integrity_history_is_gate_sticky_but_not_current_research_blocker(
+    counter: str,
+    reason: HealthDecisionReason,
+) -> None:
+    decision = evaluate_health_decision(_decision_inputs(**{counter: 1}))
 
     assert decision.capture_healthy is True
-    assert decision.research_eligible is False
-    assert HealthDecisionReason.AUDIT_FAILED in decision.reason_codes
-    assert HealthDecisionReason.SOCKET_DISCONNECTED not in decision.reason_codes
+    assert decision.research_eligible is True
+    assert decision.gate1_eligible_so_far is False
+    assert decision.reason_codes == (reason,)
 
 
-def test_http_final_failure_is_research_and_gate_ineligible_not_capture_failure() -> None:
+@pytest.mark.parametrize(
+    ("counter", "reason"),
+    [
+        ("audit_mismatches", HealthDecisionReason.AUDIT_MISMATCH),
+        ("audit_failures", HealthDecisionReason.AUDIT_FAILED),
+        (
+            "audit_race_budget_exhaustions",
+            HealthDecisionReason.AUDIT_RACE_BUDGET_EXHAUSTED,
+        ),
+        ("http_final_failures", HealthDecisionReason.HTTP_FINAL_FAILURE),
+        (
+            "http_retry_budget_exhaustions",
+            HealthDecisionReason.HTTP_INTEGRITY_UNAVAILABLE,
+        ),
+    ],
+)
+def test_integrity_history_still_fails_closed_while_required_scope_is_ineligible(
+    counter: str,
+    reason: HealthDecisionReason,
+) -> None:
     decision = evaluate_health_decision(
         _decision_inputs(
-            http_final_failures=1,
-            http_retry_budget_exhaustions=1,
+            all_required_books_healthy=False,
+            **{counter: 1},
         )
     )
 
     assert decision.capture_healthy is True
     assert decision.research_eligible is False
     assert decision.gate1_eligible_so_far is False
-    assert HealthDecisionReason.HTTP_FINAL_FAILURE in decision.reason_codes
-    assert HealthDecisionReason.HTTP_INTEGRITY_UNAVAILABLE in decision.reason_codes
+    assert set(decision.reason_codes) == {
+        HealthDecisionReason.BOOK_NOT_HEALTHY,
+        reason,
+    }
     assert HealthDecisionReason.SOCKET_DISCONNECTED not in decision.reason_codes
+
+
+def test_recovered_protocol_deviation_is_gate_sticky_not_current_capture_blocker() -> None:
+    decision = evaluate_health_decision(_decision_inputs(protocol_deviations=1))
+
+    assert decision.capture_healthy is True
+    assert decision.research_eligible is True
+    assert decision.gate1_eligible_so_far is False
+    assert decision.reason_codes == (HealthDecisionReason.PROTOCOL_DEVIATION,)
+
+
+def test_protocol_deviation_fails_closed_while_current_socket_is_unavailable() -> None:
+    decision = evaluate_health_decision(
+        _decision_inputs(
+            protocol_deviations=1,
+            socket_connected=False,
+        )
+    )
+
+    assert decision.capture_healthy is False
+    assert decision.research_eligible is False
+    assert decision.gate1_eligible_so_far is False
+    assert set(decision.reason_codes) == {
+        HealthDecisionReason.PROTOCOL_DEVIATION,
+        HealthDecisionReason.SOCKET_DISCONNECTED,
+    }
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        ({"ingress_data_loss": 1}, HealthDecisionReason.INGRESS_DATA_LOSS),
+        ({"journal_healthy": False}, HealthDecisionReason.JOURNAL_UNHEALTHY),
+    ],
+)
+def test_irreversible_capture_failures_remain_current_blockers(
+    changes: dict[str, object],
+    reason: HealthDecisionReason,
+) -> None:
+    decision = evaluate_health_decision(_decision_inputs(**changes))
+
+    assert decision.capture_healthy is False
+    assert decision.research_eligible is False
+    assert decision.gate1_eligible_so_far is False
+    assert reason in decision.reason_codes
 
 
 def test_developer_discovery_is_research_capable_but_not_gate1_eligible() -> None:

@@ -671,6 +671,17 @@ class WsPriceChangeEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class WsBestBidAskEvent:
+    event_type: str
+    condition_id: str
+    asset_id: str
+    best_bid: ExactDecimal
+    best_ask: ExactDecimal
+    spread: ExactDecimal
+    venue_timestamp: UtcTimestamp
+
+
+@dataclass(frozen=True, slots=True)
 class WsTickSizeChangeEvent:
     event_type: str
     condition_id: str
@@ -716,6 +727,7 @@ class WsMarketResolvedEvent:
 MarketWsEvent = (
     WsBookEvent
     | WsPriceChangeEvent
+    | WsBestBidAskEvent
     | WsTickSizeChangeEvent
     | WsLastTradePriceEvent
     | WsNewMarketEvent
@@ -782,6 +794,16 @@ def _parse_ws_event(value: object, path: str) -> MarketWsEvent:
             event_type=event_type,
             condition_id=_string(_required(obj, "market", path), f"{path}.market"),
             changes=tuple(changes),
+            venue_timestamp=timestamp,
+        )
+    if event_type == "best_bid_ask":
+        return WsBestBidAskEvent(
+            event_type=event_type,
+            condition_id=_string(_required(obj, "market", path), f"{path}.market"),
+            asset_id=_string(_required(obj, "asset_id", path), f"{path}.asset_id"),
+            best_bid=_decimal(_required(obj, "best_bid", path), f"{path}.best_bid"),
+            best_ask=_decimal(_required(obj, "best_ask", path), f"{path}.best_ask"),
+            spread=_decimal(_required(obj, "spread", path), f"{path}.spread"),
             venue_timestamp=timestamp,
         )
     if event_type == "tick_size_change":
@@ -862,6 +884,7 @@ __all__ = [
     "NativeBookLevel",
     "NativeSide",
     "RestBookSnapshot",
+    "WsBestBidAskEvent",
     "WsBookEvent",
     "WsLastTradePriceEvent",
     "WsMarketResolvedEvent",

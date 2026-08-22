@@ -55,7 +55,7 @@ RACED
 FAILED
 ```
 
-`RACED` means a relevant local book mutation crossed the audit window. It is indeterminate evidence, not a mismatch and not a match. It does not mutate or refresh authoritative state. The audit is retried only under a bounded policy and absolute deadline.
+`RACED` means a relevant local book mutation crossed the audit window. It is indeterminate evidence, not a mismatch and not a match. It does not mutate or refresh authoritative state. The audit is retried only under a bounded policy and absolute deadline. A retry is non-blockingly deferred until the configured quiet interval has elapsed since both classification and the latest accepted relevant L2 receive; later relevant mutations move that eligibility boundary without pausing acquisition. The committed policy permits four retries (five real attempts) before durable fail-closed exhaustion.
 
 A race-free `MISMATCH` invalidates the affected scope and requires an authoritative resynchronization. A race-free `MATCH` may refresh the integrity/freshness evidence only if the implementation documents and tests the exact state/provenance transition. Unknown timing or ordering never becomes a match by assumption.
 

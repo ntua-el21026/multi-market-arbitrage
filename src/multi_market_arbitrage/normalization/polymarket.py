@@ -27,6 +27,7 @@ from multi_market_arbitrage.venues.polymarket.schemas import (
     NativeBookLevel,
     NativeSide,
     RestBookSnapshot,
+    WsBestBidAskEvent,
     WsBookEvent,
     WsLastTradePriceEvent,
     WsNewMarketEvent,
@@ -37,6 +38,7 @@ from multi_market_arbitrage.venues.polymarket.schemas import (
 )
 
 from .models import (
+    BestBidAskEvent,
     BookSide,
     CanonicalBookLevel,
     CanonicalEvent,
@@ -53,10 +55,10 @@ from .models import (
 )
 
 POLYMARKET_SCHEMA_VERSION = SchemaVersion.from_components(
-    "SchemaVersion", "polymarket-public-market-v2", "2026-08-20"
+    "SchemaVersion", "polymarket-public-market-v3", "2026-08-22"
 )
 POLYMARKET_NORMALIZER_VERSION = NormalizerVersion.from_components(
-    "NormalizerVersion", "polymarket-public-normalizer", "2"
+    "NormalizerVersion", "polymarket-public-normalizer", "3"
 )
 
 
@@ -122,6 +124,14 @@ def _canonical_payload_components(payload: CanonicalPayload) -> tuple[str, ...]:
                 f"{item.reported_best_bid}:{item.reported_best_ask}"
                 for item in payload.changes
             ),
+        )
+    if isinstance(payload, BestBidAskEvent):
+        return (
+            str(payload.instrument_id),
+            str(payload.market_id),
+            str(payload.best_bid),
+            str(payload.best_ask),
+            str(payload.spread),
         )
     if isinstance(payload, TickSizeChangeEvent):
         return (
@@ -334,6 +344,35 @@ class PolymarketNormalizer:
                     bundle.market.market_id,
                 )
                 for token_id in order
+            )
+        if isinstance(native, WsBestBidAskEvent):
+            self._condition(native.condition_id, bundle)
+            instrument = self._instrument(bundle, native.asset_id)
+            try:
+                best_bid = Price(native.best_bid)
+                best_ask = Price(native.best_ask)
+            except (TypeError, ValueError) as error:
+                raise NormalizationError(f"invalid best_bid_ask scalar: {error}") from error
+            if best_bid.value > ExactDecimal.one() or best_ask.value > ExactDecimal.one():
+                raise NormalizationError("prediction-market best_bid_ask price exceeds one")
+            if best_bid.value >= best_ask.value:
+                raise NormalizationError("best_bid_ask must describe a strictly uncrossed book")
+            if native.spread != best_ask.value - best_bid.value:
+                raise NormalizationError("best_bid_ask spread disagrees with its exact best prices")
+            payload = BestBidAskEvent(
+                instrument_id=instrument.instrument_id,
+                market_id=bundle.market.market_id,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                spread=native.spread,
+            )
+            return (
+                (
+                    CanonicalEventType.BEST_BID_ASK,
+                    payload,
+                    native.venue_timestamp,
+                    bundle.market.market_id,
+                ),
             )
         if isinstance(native, WsTickSizeChangeEvent):
             self._condition(native.condition_id, bundle)
