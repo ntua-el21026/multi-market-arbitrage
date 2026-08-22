@@ -4,6 +4,7 @@ from __future__ import annotations
 
 GAMMA_MARKETS_KEYSET = "polymarket.gamma.markets.keyset.v1"
 GAMMA_MARKET_PREFIX = "polymarket.gamma.market.v1/"
+GAMMA_MARKET_RELATIONSHIP_PREFIX = "polymarket.gamma.market-relationship.v1/"
 GAMMA_EVENT_PREFIX = "polymarket.gamma.event.v1/"
 CLOB_MARKET_PREFIX = "polymarket.clob.market.v2/"
 REST_BOOK = "polymarket.clob.rest-book.v1"
@@ -31,6 +32,7 @@ __all__ = [
     "GAMMA_EVENT_PREFIX",
     "GAMMA_MARKETS_KEYSET",
     "GAMMA_MARKET_PREFIX",
+    "GAMMA_MARKET_RELATIONSHIP_PREFIX",
     "REST_BOOK",
     "REST_BOOK_AUDIT",
     "WS_MARKET",

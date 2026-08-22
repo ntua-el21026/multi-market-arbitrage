@@ -513,9 +513,10 @@ async def _run(output: Path) -> dict[str, object]:
             ),
         },
         "selection_rationale": (
-            "5s gives twelve reconstruction points per minute and remains below both "
-            "the 8192-checkpoint and 64MiB six-hour bounds after the mandatory final "
-            "checkpoint; 1s exceeds the count bound"
+            "10s gives six reconstruction points per minute plus the mandatory final "
+            "checkpoint; bounded public calibration rejected 5s because its conservative "
+            "six-hour health-evidence projection exceeded 64MiB, while 1s exceeds the "
+            "configured count bound"
         ),
         "process_peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
     }

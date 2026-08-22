@@ -81,6 +81,7 @@ from multi_market_arbitrage.venues.polymarket.schemas import (
     parse_clob_market_info,
     parse_gamma_event,
     parse_gamma_market,
+    parse_gamma_market_relationship,
     parse_gamma_markets,
     parse_market_ws_message,
     parse_rest_book,
@@ -103,6 +104,7 @@ from .channels import (
     CONTROL_REST_AUDIT_START,
     GAMMA_EVENT_PREFIX,
     GAMMA_MARKET_PREFIX,
+    GAMMA_MARKET_RELATIONSHIP_PREFIX,
     GAMMA_MARKETS_KEYSET,
     REST_BOOK,
     REST_BOOK_AUDIT,
@@ -281,6 +283,8 @@ class CanonicalProcessor:
         self._events_by_id: dict[str, GammaEvent] = {}
         self._clob_by_condition: dict[str, ClobMarketInfo] = {}
         self._gamma_source_by_condition: dict[str, _RawReferenceSource] = {}
+        self._gamma_relationship_source_by_condition: dict[str, _RawReferenceSource] = {}
+        self._gamma_parent_binding_by_id: dict[str, str | None] = {}
         self._event_source_by_id: dict[str, _RawReferenceSource] = {}
         self._clob_source_by_condition: dict[str, _RawReferenceSource] = {}
         self._rest_source_by_condition: dict[str, _RawReferenceSource] = {}
@@ -617,9 +621,63 @@ class CanonicalProcessor:
             market = parse_gamma_market(envelope.payload_bytes)
             if market.gamma_market_id != expected:
                 raise NormalizationError("Gamma direct-market response ID differs from raw channel")
+            prior = self._gamma_by_id.get(expected)
+            self._validate_gamma_identity(market)
+            carried_relationship = (
+                market.event_id is None
+                and expected in self._gamma_parent_binding_by_id
+                and prior is not None
+                and market.condition_id == prior.condition_id
+                and market.clob_token_ids == prior.clob_token_ids
+            )
+            if carried_relationship:
+                # The direct Gamma surface is known to omit the embedded
+                # relationship for some markets.  Preserve an already proven
+                # binding until the immediately following exact-ID
+                # relationship response revalidates it.
+                market = replace(
+                    market,
+                    event_id=self._gamma_parent_binding_by_id[expected],
+                )
+            else:
+                self._gamma_relationship_source_by_condition.pop(market.condition_id, None)
+                if prior is not None and prior.condition_id != market.condition_id:
+                    self._gamma_relationship_source_by_condition.pop(prior.condition_id, None)
             self._remember_gamma(market)
             self._gamma_source_by_condition[market.condition_id] = self._raw_source(envelope)
             self._try_publish_bundle(market.condition_id, envelope.received_wall_time)
+            return
+        if channel.startswith(GAMMA_MARKET_RELATIONSHIP_PREFIX):
+            expected = channel_native_id(channel, GAMMA_MARKET_RELATIONSHIP_PREFIX)
+            relationship = parse_gamma_market_relationship(envelope.payload_bytes)
+            if relationship.gamma_market_id != expected:
+                raise NormalizationError("Gamma relationship response ID differs from raw channel")
+            direct = self._gamma_by_id.get(expected)
+            if direct is None:
+                raise NormalizationError(
+                    "Gamma relationship response has no preceding direct-market response"
+                )
+            if (
+                relationship.condition_id != direct.condition_id
+                or relationship.clob_token_ids != direct.clob_token_ids
+            ):
+                raise NormalizationError(
+                    "Gamma relationship response differs from the direct market identity"
+                )
+            if (
+                expected in self._gamma_parent_binding_by_id
+                and relationship.event_id != self._gamma_parent_binding_by_id[expected]
+            ):
+                raise NormalizationError(
+                    "Gamma relationship response changes the frozen parent event identity"
+                )
+            enriched = replace(direct, event_id=relationship.event_id)
+            self._remember_gamma(enriched)
+            self._gamma_parent_binding_by_id[expected] = relationship.event_id
+            self._gamma_relationship_source_by_condition[enriched.condition_id] = self._raw_source(
+                envelope
+            )
+            self._try_publish_bundle(enriched.condition_id, envelope.received_wall_time)
             return
         if channel.startswith(GAMMA_EVENT_PREFIX):
             expected = channel_native_id(channel, GAMMA_EVENT_PREFIX)
@@ -1136,9 +1194,39 @@ class CanonicalProcessor:
             payload_sha256=envelope.payload_sha256,
         )
 
+    def _validate_gamma_identity(self, market: GammaMarket) -> None:
+        prior_by_id = self._gamma_by_id.get(market.gamma_market_id)
+        if prior_by_id is not None and (
+            prior_by_id.condition_id != market.condition_id
+            or prior_by_id.clob_token_ids != market.clob_token_ids
+        ):
+            raise NormalizationError(
+                "Gamma market refresh changes the frozen condition/token identity"
+            )
+        prior_by_condition = self._gamma_by_condition.get(market.condition_id)
+        if prior_by_condition is not None and (
+            prior_by_condition.gamma_market_id != market.gamma_market_id
+            or prior_by_condition.clob_token_ids != market.clob_token_ids
+        ):
+            raise NormalizationError(
+                "Gamma condition refresh changes the frozen market/token identity"
+            )
+        if (
+            market.event_id is not None
+            and market.gamma_market_id in self._gamma_parent_binding_by_id
+            and self._gamma_parent_binding_by_id[market.gamma_market_id] != market.event_id
+        ):
+            raise NormalizationError("Gamma market refresh changes the frozen parent event")
+
     def _remember_gamma(self, market: GammaMarket) -> None:
+        self._validate_gamma_identity(market)
         self._gamma_by_condition[market.condition_id] = market
         self._gamma_by_id[market.gamma_market_id] = market
+        if market.event_id is not None:
+            self._gamma_parent_binding_by_id.setdefault(
+                market.gamma_market_id,
+                market.event_id,
+            )
 
     def _try_publish_bundle(
         self,
@@ -1305,6 +1393,9 @@ class CanonicalProcessor:
         gamma_source = self._gamma_source_by_condition.get(condition_id)
         if gamma_source is not None:
             named_sources.append(("gamma-market", gamma_source))
+        relationship_source = self._gamma_relationship_source_by_condition.get(condition_id)
+        if relationship_source is not None:
+            named_sources.append(("gamma-market-relationship", relationship_source))
         if gamma.event_id is not None:
             event_source = self._event_source_by_id.get(gamma.event_id)
             if event_source is not None:

@@ -27,6 +27,7 @@ market_websocket_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 request_timeout_seconds = 10.0
 discovery_limit = 1
 snapshot_audit_interval_seconds = 30.0
+snapshot_audit_freshness_guard_seconds = 1.0
 snapshot_audit_max_race_retries = 2
 heartbeat_interval_seconds = 10.0
 reconnect_initial_seconds = 1.0
@@ -63,7 +64,7 @@ quantity_increment = "0.01"
 maximum_capacity_evaluations = 4096
 
 [health]
-checkpoint_interval_seconds = 5.0
+checkpoint_interval_seconds = 10.0
 queue_capacity = 64
 maximum_checkpoints = 8192
 maximum_file_bytes = 67108864

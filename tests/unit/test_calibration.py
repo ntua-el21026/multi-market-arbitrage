@@ -251,7 +251,7 @@ def test_calibration_under_cap_passes_with_all_disk_workloads() -> None:
     assert report.projection.duration_seconds == 21_600
     assert report.projection.uncompressed_raw_bytes == 288_000_000
     assert report.projection.replay_rebuild_bytes > report.projection.uncompressed_raw_bytes
-    assert report.projection.health_checkpoints == 4_321
+    assert report.projection.health_checkpoints == 2_161
     assert report.projection.health_checkpoints < report.limits.health_maximum_checkpoints
     assert report.projection.health_bytes < report.limits.health_maximum_file_bytes
     assert report.projection.total_required_disk_bytes < report.projection.free_disk_bytes
@@ -274,7 +274,7 @@ def test_calibration_binds_health_bounds_and_stdio_stream_log_model() -> None:
         "p99": 3_000_000,
         "unit": "nanoseconds",
     }
-    assert limits_record["health_checkpoint_interval_nanoseconds"] == 5_000_000_000
+    assert limits_record["health_checkpoint_interval_nanoseconds"] == 10_000_000_000
     assert limits_record["health_maximum_checkpoints"] == 8_192
     assert limits_record["health_maximum_file_bytes"] == 64 * 1024 * 1024
     assert set(queue_record) == {"capacity", "high_water", "name", "threat_basis_points"}

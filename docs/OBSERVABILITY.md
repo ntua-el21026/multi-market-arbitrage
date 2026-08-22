@@ -174,7 +174,8 @@ Health is scoped. A healthy process does not imply healthy market data, persiste
 
 For the Phase-1 six-hour Polymarket soak, a final summary alone is insufficient.
 The observer emits `gate1-health-checkpoint-v1` JSONL records at the configured
-five-second cadence and at finalization, as required by
+ten-second cadence and at finalization. This benchmark-selected bounded cadence
+satisfies the periodic-evidence requirements in
 [`GATE_1_SOAK_SPEC.md`](GATE_1_SOAK_SPEC.md) and
 [`ADR-0052`](adr/0052-continuous-capture-audit-and-gate1-evidence.md). Each
 record binds collector run, UTC timestamp, runtime role, full Git commit, code
@@ -234,7 +235,9 @@ failure.
 Routine REST integrity auditing must not be represented as a WebSocket
 disconnect. HTTP and WebSocket failures are separate operational dimensions,
 and audit HTTP failure does not create artificial socket downtime or reconnect
-counts.
+counts. A successfully parsed freshness-expiry invalidation is recorded as a
+resynchronization, not as a venue protocol deviation; malformed or unsupported
+WebSocket protocol input remains a protocol deviation and fails closed.
 
 ## 8. Alert routing
 

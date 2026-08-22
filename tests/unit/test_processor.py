@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,9 @@ from multi_market_arbitrage.pipeline import (
     CONTROL_BOOK_INVALIDATION,
     CONTROL_REST_AUDIT_FAILED,
     CONTROL_REST_AUDIT_START,
+    GAMMA_EVENT_PREFIX,
+    GAMMA_MARKET_PREFIX,
+    GAMMA_MARKET_RELATIONSHIP_PREFIX,
     GAMMA_MARKETS_KEYSET,
     REST_BOOK,
     REST_BOOK_AUDIT,
@@ -68,6 +72,26 @@ def _no_book() -> bytes:
       "neg_risk":false,
       "last_trade_price":"0.34"
     }"""
+
+
+def _direct_gamma_without_events(*, gamma_market_id: int = 3257332) -> bytes:
+    page = json.loads(_fixture("polymarket_gamma_market_keyset.json"))
+    market = page["markets"][0]
+    market["id"] = gamma_market_id
+    market.pop("events", None)
+    return json.dumps(market, separators=(",", ":")).encode()
+
+
+def _gamma_relationship(
+    direct: bytes,
+    *,
+    event_ids: tuple[int, ...] = (780132,),
+    **changes: object,
+) -> bytes:
+    market = json.loads(direct)
+    market.update(changes)
+    market["events"] = [{"id": event_id} for event_id in event_ids]
+    return json.dumps([market], separators=(",", ":")).encode()
 
 
 def _price_change_payload(
@@ -273,6 +297,193 @@ class _FailingCanonicalOutputs(_RecordingOutputs):
     def append_canonical(self, event: CanonicalEvent) -> None:
         del event
         raise self._error
+
+
+def test_exact_id_parent_relationship_is_replayable_and_preserves_all_raw_provenance() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    outputs = _RecordingOutputs()
+    processor = CanonicalProcessor(config, analytical_outputs=outputs)
+    run_id = CollectorRunId("processor-gamma-parent-relationship")
+    direct = _direct_gamma_without_events()
+    inputs = (
+        _envelope(run_id, 0, f"{GAMMA_MARKET_PREFIX}3257332", direct),
+        _envelope(
+            run_id,
+            1,
+            f"{GAMMA_MARKET_RELATIONSHIP_PREFIX}3257332",
+            _gamma_relationship(direct),
+        ),
+        _envelope(
+            run_id,
+            2,
+            f"{GAMMA_EVENT_PREFIX}780132",
+            b'{"id":780132,"enableNegRisk":false,"negRiskAugmented":false}',
+        ),
+        _envelope(
+            run_id,
+            3,
+            f"{CLOB_MARKET_PREFIX}0xcondition",
+            _fixture("polymarket_clob_market_info.json"),
+        ),
+        _envelope(run_id, 4, REST_BOOK, _fixture("polymarket_rest_book_yes.json")),
+        _envelope(run_id, 5, REST_BOOK, _no_book()),
+    )
+
+    assert all(processor.process_replayed(envelope).success for envelope in inputs)
+
+    bundle = processor.current_bundles[0]
+    provenance = processor.reference_provenance(bundle.market.market_id)
+    assert bundle.market.gamma_market_id == "3257332"
+    assert bundle.market.gamma_event_id == "780132"
+    assert provenance is not None
+    assert inputs[0].ingest_id in provenance.source_ingest_ids
+    assert inputs[1].ingest_id in provenance.source_ingest_ids
+    assert inputs[2].ingest_id in provenance.source_ingest_ids
+    assert dict(provenance.attributes)["reference_raw_surfaces"] == (
+        "gamma-market,gamma-market-relationship,gamma-parent-event,clob-market-info,clob-rest-book"
+    )
+    assert outputs.references[-1][2] == provenance
+
+
+def test_exact_id_parent_relationship_identity_mismatch_is_expected_data_failure() -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId("processor-gamma-parent-mismatch")
+    direct = _direct_gamma_without_events()
+    direct_envelope = _envelope(
+        run_id,
+        0,
+        f"{GAMMA_MARKET_PREFIX}3257332",
+        direct,
+    )
+    mismatch_envelope = _envelope(
+        run_id,
+        1,
+        f"{GAMMA_MARKET_RELATIONSHIP_PREFIX}3257332",
+        _gamma_relationship(direct, conditionId="different-condition"),
+    )
+
+    assert processor.process_replayed(direct_envelope).success
+    mismatch = processor.process_replayed(mismatch_envelope)
+
+    assert not mismatch.success
+    assert mismatch.error_type == "NormalizationError"
+    assert processor.discovered_markets[0].condition_id == "0xcondition"
+    assert processor.discovered_markets[0].event_id is None
+
+
+def test_direct_refresh_retains_only_deliberately_carried_relationship_provenance() -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId("processor-gamma-parent-refresh")
+    direct = _direct_gamma_without_events()
+    relationship = _envelope(
+        run_id,
+        1,
+        f"{GAMMA_MARKET_RELATIONSHIP_PREFIX}3257332",
+        _gamma_relationship(direct),
+    )
+    bootstrap = (
+        _envelope(run_id, 0, f"{GAMMA_MARKET_PREFIX}3257332", direct),
+        relationship,
+        _envelope(
+            run_id,
+            2,
+            f"{GAMMA_EVENT_PREFIX}780132",
+            b'{"id":780132,"enableNegRisk":false,"negRiskAugmented":false}',
+        ),
+        _envelope(
+            run_id,
+            3,
+            f"{CLOB_MARKET_PREFIX}0xcondition",
+            _fixture("polymarket_clob_market_info.json"),
+        ),
+        _envelope(run_id, 4, REST_BOOK, _fixture("polymarket_rest_book_yes.json")),
+    )
+    assert all(processor.process_replayed(envelope).success for envelope in bootstrap)
+
+    omitted_refresh = _envelope(run_id, 5, f"{GAMMA_MARKET_PREFIX}3257332", direct)
+    assert processor.process_replayed(omitted_refresh).success
+    carried = processor.reference_provenance(processor.current_bundles[0].market.market_id)
+    assert carried is not None
+    assert relationship.ingest_id in carried.source_ingest_ids
+
+    changed_relationship = _envelope(
+        run_id,
+        6,
+        f"{GAMMA_MARKET_RELATIONSHIP_PREFIX}3257332",
+        _gamma_relationship(direct, event_ids=()),
+    )
+    changed_result = processor.process_replayed(changed_relationship)
+    assert not changed_result.success
+    assert changed_result.error_type == "NormalizationError"
+    assert processor.discovered_markets[0].event_id == "780132"
+    unchanged = processor.reference_provenance(processor.current_bundles[0].market.market_id)
+    assert unchanged is not None
+    assert relationship.ingest_id in unchanged.source_ingest_ids
+
+    embedded_value = json.loads(direct)
+    embedded_value["events"] = [{"id": 780132}]
+    embedded_refresh = _envelope(
+        run_id,
+        7,
+        f"{GAMMA_MARKET_PREFIX}3257332",
+        json.dumps(embedded_value, separators=(",", ":")).encode(),
+    )
+    assert processor.process_replayed(embedded_refresh).success
+    direct_provenance = processor.reference_provenance(
+        processor.current_bundles[0].market.market_id
+    )
+    assert direct_provenance is not None
+    assert relationship.ingest_id not in direct_provenance.source_ingest_ids
+    assert changed_relationship.ingest_id not in direct_provenance.source_ingest_ids
+    assert "gamma-market-relationship" not in dict(direct_provenance.attributes)[
+        "reference_raw_surfaces"
+    ].split(",")
+
+
+@pytest.mark.parametrize(
+    "identity_change",
+    [
+        {"conditionId": "changed-condition"},
+        {"clobTokenIds": '["changed-yes","changed-no"]'},
+        {"events": [{"id": 780133}]},
+    ],
+)
+def test_direct_refresh_cannot_change_frozen_target_identity(
+    identity_change: dict[str, object],
+) -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId("processor-frozen-target-refresh")
+    direct = _direct_gamma_without_events()
+    relationship = _envelope(
+        run_id,
+        1,
+        f"{GAMMA_MARKET_RELATIONSHIP_PREFIX}3257332",
+        _gamma_relationship(direct),
+    )
+    assert processor.process_replayed(
+        _envelope(run_id, 0, f"{GAMMA_MARKET_PREFIX}3257332", direct)
+    ).success
+    assert processor.process_replayed(relationship).success
+
+    changed_value = json.loads(direct)
+    changed_value.update(identity_change)
+    changed = processor.process_replayed(
+        _envelope(
+            run_id,
+            2,
+            f"{GAMMA_MARKET_PREFIX}3257332",
+            json.dumps(changed_value, separators=(",", ":")).encode(),
+        )
+    )
+
+    assert not changed.success
+    assert changed.error_type == "NormalizationError"
+    assert len(processor.discovered_markets) == 1
+    frozen = processor.discovered_markets[0]
+    assert frozen.gamma_market_id == "3257332"
+    assert frozen.condition_id == "0xcondition"
+    assert frozen.clob_token_ids == ("token-yes", "token-no")
+    assert frozen.event_id == "780132"
 
 
 def test_new_market_without_reference_emits_exact_deterministic_refresh_request() -> None:

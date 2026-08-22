@@ -58,8 +58,10 @@ uv run --frozen --all-groups mma scan-report data/analytical
 ```
 
 Gate-1 evidence requires `--gamma-market-id`; the resolved Gamma, condition,
-event, YES/NO token, reference-version, and semantic identities are frozen into
-the run evidence. Omitting the flag retains bounded discovery only for
+event-where-applicable, YES/NO token, reference-version, and semantic identities
+are frozen into the run evidence. An omitted direct parent-event relation is
+resolved by one bounded exact-ID Gamma list read and fails closed if that
+relationship is missing or ambiguous. Omitting the flag retains bounded discovery only for
 developer smoke work and is explicitly ineligible for Gate-1. The recommended
 pre-soak calibration is 180–300 seconds against the same explicit target; it
 requires an exact clean Git checkout, projects the six-hour workload

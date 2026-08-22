@@ -651,6 +651,7 @@ async def test_pre_response_update_cannot_false_match_across_receive_fence(
         service._run_generation(  # pyright: ignore[reportPrivateUsage]
             client=cast(PolymarketPublicClient, client),
             capture=capture,
+            selected=(selected,),
             asset_ids=selected.clob_token_ids,
             deadline=loop.time() + 30.0,
             deadline_ns=time.monotonic_ns() + 30_000_000_000,
@@ -912,6 +913,7 @@ async def test_post_response_economic_update_is_excluded_from_current_audit_fenc
             service._run_generation(  # pyright: ignore[reportPrivateUsage]
                 client=client,
                 capture=capture,
+                selected=(selected,),
                 asset_ids=selected.clob_token_ids,
                 deadline=loop.time() + 30.0,
                 deadline_ns=time.monotonic_ns() + 30_000_000_000,
@@ -1118,6 +1120,7 @@ async def test_raced_retry_budget_exhaustion_is_bounded_and_replayable(
         service._run_generation(  # pyright: ignore[reportPrivateUsage]
             client=cast(PolymarketPublicClient, client),
             capture=capture,
+            selected=(selected,),
             asset_ids=selected.clob_token_ids,
             deadline=asyncio.get_running_loop().time() + 30.0,
             deadline_ns=time.monotonic_ns() + 30_000_000_000,
@@ -1313,10 +1316,12 @@ async def test_raced_audit_does_not_retry_after_protocol_resync_is_pending(
     connection_id = ConnectionId("adversarial-audit-race-protocol-resync-socket")
     await writer.start()
     await _initialize_books(capture)
+    runtime_health = ObservationRuntimeHealth()
     generation_task = asyncio.create_task(
         service._run_generation(  # pyright: ignore[reportPrivateUsage]
             client=cast(PolymarketPublicClient, client),
             capture=capture,
+            selected=(selected,),
             asset_ids=selected.clob_token_ids,
             deadline=asyncio.get_running_loop().time() + 30.0,
             deadline_ns=time.monotonic_ns() + 30_000_000_000,
@@ -1324,7 +1329,7 @@ async def test_raced_audit_does_not_retry_after_protocol_resync_is_pending(
             connection_id=connection_id,
             subscription_id=SubscriptionId("adversarial-audit-race-protocol-resync-subscription"),
             unavailable_started_ns=None,
-            runtime_health=ObservationRuntimeHealth(),
+            runtime_health=runtime_health,
         ),
         name="adversarial-audit-race-during-protocol-resync",
     )
@@ -1353,6 +1358,7 @@ async def test_raced_audit_does_not_retry_after_protocol_resync_is_pending(
     assert tuple(outcome.outcome for outcome in live.audit_outcomes) == (AuditOutcome.RACED,)
     assert live.pending_rest_audits == 0
     assert live.parse_failures == 1
+    assert runtime_health.snapshot().protocol_deviations == 1
     counters = {key.name: value for key, value in metrics.snapshot().counters}
     assert counters.get("mma_rest_audit_retries_total", 0) == 0
 
@@ -1363,6 +1369,142 @@ async def test_raced_audit_does_not_retry_after_protocol_resync_is_pending(
     assert replayed.audit_outcomes == live.audit_outcomes
     assert replayed.pending_rest_audits == 0
     assert replayed.terminal_hash == live.terminal_hash
+
+
+@pytest.mark.asyncio
+async def test_matching_audit_does_not_start_second_leg_after_selected_refresh_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finish the fenced response, then leave without staging doomed audit work."""
+
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("audit-match-during-selected-refresh")
+    writer = RawJournalWriter(
+        JournalWriterConfig(
+            root=tmp_path / "raw",
+            collector_run_id=run_id,
+            venue_id=POLYMARKET_VENUE_ID,
+            stream="polymarket-public",
+            writer_id=WriterId("writer-audit-match-selected-refresh"),
+            writer_software_version="test",
+            git_commit="fixture",
+        )
+    )
+    processor = CanonicalProcessor(config)
+    metrics = InMemoryMetrics()
+    capture = observe_module._RawCaptureBoundary(  # pyright: ignore[reportPrivateUsage]
+        collector_run_id=run_id,
+        writer=writer,
+        processor=processor,
+        metrics=metrics,
+    )
+    service = PolymarketObservationService(
+        config,
+        workspace_root=tmp_path,
+        code_commit="fixture",
+        metrics=metrics,
+    )
+    selected = parse_gamma_markets(_fixture("polymarket_gamma_market_keyset.json")).markets[0]
+    emissions: asyncio.Queue[tuple[bytes, asyncio.Event]] = asyncio.Queue()
+    selected_new_market = json.dumps(
+        {
+            "assets_ids": list(selected.clob_token_ids),
+            "event_type": "new_market",
+            "id": selected.gamma_market_id,
+            "market": selected.condition_id,
+            "timestamp": "1787198406000",
+        },
+        separators=(",", ":"),
+    ).encode()
+
+    class _CommandSocket:
+        instances = 0
+
+        def __init__(self, asset_ids: tuple[str, ...], **kwargs: object) -> None:
+            assert asset_ids == selected.clob_token_ids
+            del kwargs
+            type(self).instances += 1
+            self.subscription_semantics_sha256 = hashlib.sha256(
+                b"audit-match-selected-refresh"
+            ).hexdigest()
+
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            ready.set()
+            while True:
+                payload, admitted = await emissions.get()
+                admit(
+                    ReceivedWebSocketMessage(
+                        payload_bytes=payload,
+                        received_wall_time=UtcTimestamp.now(),
+                        received_monotonic_ns=time.monotonic_ns(),
+                        message_type="TEXT",
+                    )
+                )
+                admitted.set()
+
+    class _AuditClient:
+        def __init__(self) -> None:
+            self.assets: list[str] = []
+
+        async def fetch_order_book_raw_with_evidence(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+            on_response_body_complete: Callable[[UtcTimestamp, int], None] | None = None,
+        ) -> PublicReadResult:
+            del deadline
+            self.assets.append(asset_id)
+            if len(self.assets) > 1:
+                raise AssertionError("generation exit must suppress the second audit leg")
+            admitted = asyncio.Event()
+            await emissions.put((selected_new_market, admitted))
+            await admitted.wait()
+            return _public_read(
+                _fixture("polymarket_rest_book_yes.json"),
+                on_response_body_complete,
+            )
+
+    monkeypatch.setattr(observe_module, "PolymarketMarketWebSocket", _CommandSocket)
+    client = _AuditClient()
+    await writer.start()
+    await _initialize_books(capture)
+    runtime_health = ObservationRuntimeHealth()
+    generation = await service._run_generation(  # pyright: ignore[reportPrivateUsage]
+        client=cast(PolymarketPublicClient, client),
+        capture=capture,
+        selected=(selected,),
+        asset_ids=selected.clob_token_ids,
+        deadline=asyncio.get_running_loop().time() + 30.0,
+        deadline_ns=time.monotonic_ns() + 30_000_000_000,
+        periodic_audit_due_ns=time.monotonic_ns(),
+        connection_id=ConnectionId("audit-match-selected-refresh-socket"),
+        subscription_id=SubscriptionId("audit-match-selected-refresh-subscription"),
+        unavailable_started_ns=None,
+        runtime_health=runtime_health,
+    )
+    await writer.close()
+
+    live = processor.summary()
+    counters = {key.name: value for key, value in metrics.snapshot().counters}
+    records = JournalReader(tmp_path / "raw", run_id).read_all()
+    replayed = replay_journal(tmp_path / "raw", run_id, config).processor
+    assert generation.reason.value == "REFERENCE_REFRESH"
+    assert len(generation.refresh_requests) == 1
+    assert client.assets == ["token-yes"]
+    assert _CommandSocket.instances == 1
+    assert tuple(outcome.outcome for outcome in live.audit_outcomes) == (AuditOutcome.MATCH,)
+    assert live.pending_rest_audits == 0
+    assert live.terminal_hash == replayed.terminal_hash
+    assert counters["mma_rest_audit_legs_suppressed_total"] == 1
+    assert sum(record.channel == CONTROL_REST_AUDIT_START for record in records) == 1
+    assert sum(record.channel == REST_BOOK_AUDIT for record in records) == 1
 
 
 @pytest.mark.asyncio
@@ -1452,6 +1594,7 @@ async def test_audit_start_on_unhealthy_generation_is_durably_failed_without_htt
             generation = await service._run_generation(  # pyright: ignore[reportPrivateUsage]
                 client=cast(PolymarketPublicClient, client),
                 capture=capture,
+                selected=(selected,),
                 asset_ids=selected.clob_token_ids,
                 deadline=asyncio.get_running_loop().time() + 30.0,
                 deadline_ns=time.monotonic_ns() + 30_000_000_000,
@@ -1624,3 +1767,127 @@ async def test_websocket_disconnect_during_active_audit_fails_generation_and_onl
     replayed = replay_journal(tmp_path / "raw", run_id, config).processor
     assert replayed.audit_outcomes == live.audit_outcomes
     assert replayed.terminal_hash == live.terminal_hash
+
+
+@pytest.mark.asyncio
+async def test_matching_audit_suppresses_next_leg_when_socket_ends_at_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Never stage a second audit leg after acquisition has already ended."""
+
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("audit-match-simultaneous-socket-end")
+    writer = RawJournalWriter(
+        JournalWriterConfig(
+            root=tmp_path / "raw",
+            collector_run_id=run_id,
+            venue_id=POLYMARKET_VENUE_ID,
+            stream="polymarket-public",
+            writer_id=WriterId("writer-audit-match-socket-end"),
+            writer_software_version="test",
+            git_commit="fixture",
+        )
+    )
+    processor = CanonicalProcessor(config)
+    metrics = InMemoryMetrics()
+    capture = observe_module._RawCaptureBoundary(  # pyright: ignore[reportPrivateUsage]
+        collector_run_id=run_id,
+        writer=writer,
+        processor=processor,
+        metrics=metrics,
+    )
+    service = PolymarketObservationService(
+        config,
+        workspace_root=tmp_path,
+        code_commit="fixture",
+        metrics=metrics,
+    )
+    selected = parse_gamma_markets(_fixture("polymarket_gamma_market_keyset.json")).markets[0]
+    request_started = asyncio.Event()
+    frame_admitted = asyncio.Event()
+
+    class _EndingSocket:
+        def __init__(self, asset_ids: tuple[str, ...], **kwargs: object) -> None:
+            assert asset_ids == selected.clob_token_ids
+            del kwargs
+            self.subscription_semantics_sha256 = hashlib.sha256(
+                b"audit-match-simultaneous-socket-end"
+            ).hexdigest()
+
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            ready.set()
+            await request_started.wait()
+            admit(
+                ReceivedWebSocketMessage(
+                    payload_bytes=_fixture("polymarket_ws_last_trade.json"),
+                    received_wall_time=UtcTimestamp.now(),
+                    received_monotonic_ns=time.monotonic_ns(),
+                    message_type="TEXT",
+                )
+            )
+            frame_admitted.set()
+            raise PolymarketWebSocketTransportError(
+                category=PolymarketWebSocketFailureCategory.CONNECTION_CLOSED,
+                retryable=True,
+                detail="fixture socket ended at the audit response boundary",
+            )
+
+    class _AuditClient:
+        def __init__(self) -> None:
+            self.assets: list[str] = []
+
+        async def fetch_order_book_raw_with_evidence(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+            on_response_body_complete: Callable[[UtcTimestamp, int], None] | None = None,
+        ) -> PublicReadResult:
+            del deadline
+            self.assets.append(asset_id)
+            if len(self.assets) > 1:
+                raise AssertionError("ended socket must suppress the second audit leg")
+            request_started.set()
+            await frame_admitted.wait()
+            return _public_read(
+                _fixture("polymarket_rest_book_yes.json"),
+                on_response_body_complete,
+            )
+
+    monkeypatch.setattr(observe_module, "PolymarketMarketWebSocket", _EndingSocket)
+    client = _AuditClient()
+    await writer.start()
+    await _initialize_books(capture)
+    with pytest.raises(PolymarketWebSocketTransportError):
+        await service._run_generation(  # pyright: ignore[reportPrivateUsage]
+            client=cast(PolymarketPublicClient, client),
+            capture=capture,
+            selected=(selected,),
+            asset_ids=selected.clob_token_ids,
+            deadline=asyncio.get_running_loop().time() + 30.0,
+            deadline_ns=time.monotonic_ns() + 30_000_000_000,
+            periodic_audit_due_ns=time.monotonic_ns(),
+            connection_id=ConnectionId("audit-match-socket-end"),
+            subscription_id=SubscriptionId("audit-match-socket-end-subscription"),
+            unavailable_started_ns=None,
+            runtime_health=ObservationRuntimeHealth(),
+        )
+    await writer.close()
+
+    live = processor.summary()
+    counters = {key.name: value for key, value in metrics.snapshot().counters}
+    records = JournalReader(tmp_path / "raw", run_id).read_all()
+    replayed = replay_journal(tmp_path / "raw", run_id, config).processor
+    assert client.assets == ["token-yes"]
+    assert tuple(outcome.outcome for outcome in live.audit_outcomes) == (AuditOutcome.MATCH,)
+    assert live.pending_rest_audits == 0
+    assert live.terminal_hash == replayed.terminal_hash
+    assert counters["mma_rest_audit_legs_suppressed_total"] == 1
+    assert sum(record.channel == CONTROL_REST_AUDIT_START for record in records) == 1
+    assert sum(record.channel == REST_BOOK_AUDIT for record in records) == 1

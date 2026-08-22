@@ -239,6 +239,7 @@ class PolymarketConfig(_StrictFrozenModel):
     request_timeout_seconds: PositiveFiniteFloat
     discovery_limit: PositiveStrictInt
     snapshot_audit_interval_seconds: PositiveFiniteFloat
+    snapshot_audit_freshness_guard_seconds: PositiveFiniteFloat
     heartbeat_interval_seconds: PositiveFiniteFloat
     reconnect_initial_seconds: PositiveFiniteFloat
     reconnect_max_seconds: PositiveFiniteFloat
@@ -325,7 +326,7 @@ class ScannerConfig(_StrictFrozenModel):
 
 
 class HealthConfig(_StrictFrozenModel):
-    checkpoint_interval_seconds: PositiveFiniteFloat = 5.0
+    checkpoint_interval_seconds: PositiveFiniteFloat = 10.0
     queue_capacity: PositiveStrictInt = 64
     maximum_checkpoints: PositiveStrictInt = 8_192
     maximum_file_bytes: PositiveStrictInt = 64 * 1024 * 1024
@@ -365,6 +366,15 @@ class Phase1Config(_StrictFrozenModel):
     def _queue_relationships(self) -> Self:
         if self.storage.journal_group_commit_max_events > self.system.queue_capacity:
             raise ValueError("journal group size cannot exceed the bounded system queue capacity")
+        return self
+
+    @model_validator(mode="after")
+    def _audit_freshness_guard(self) -> Self:
+        if (
+            self.polymarket.snapshot_audit_freshness_guard_seconds
+            >= self.scanner.maximum_book_age_seconds
+        ):
+            raise ValueError("snapshot audit freshness guard must be below maximum book age")
         return self
 
     @classmethod

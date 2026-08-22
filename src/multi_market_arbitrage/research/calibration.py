@@ -397,7 +397,7 @@ class CalibrationLimits:
     journal_segment_max_uncompressed_bytes: int = 64 * 1024 * 1024
     free_disk_bytes: int = 0
     minimum_free_disk_reserve_bytes: int = 0
-    health_checkpoint_interval_nanoseconds: int = 5_000_000_000
+    health_checkpoint_interval_nanoseconds: int = 10_000_000_000
     health_maximum_checkpoints: int = 8_192
     health_maximum_file_bytes: int = 64 * 1024 * 1024
     artifact_path_limit: int = MAX_ARTIFACT_PATHS_PER_ROOT

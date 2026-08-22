@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -14,6 +15,7 @@ from multi_market_arbitrage.pipeline.channels import (
     CLOB_MARKET_PREFIX,
     GAMMA_EVENT_PREFIX,
     GAMMA_MARKET_PREFIX,
+    GAMMA_MARKET_RELATIONSHIP_PREFIX,
     GAMMA_MARKETS_KEYSET,
     REST_BOOK,
 )
@@ -28,10 +30,13 @@ from multi_market_arbitrage.pipeline.targeting import (
 )
 from multi_market_arbitrage.reference import PolymarketReferenceBuilder
 from multi_market_arbitrage.venues.polymarket import (
+    GammaMarket,
     PolymarketPublicClient,
+    PolymarketSchemaError,
     parse_clob_market_info,
     parse_gamma_event,
     parse_gamma_market,
+    parse_gamma_market_relationship,
     parse_gamma_markets,
     parse_rest_book,
 )
@@ -44,11 +49,25 @@ def _fixture(name: str) -> bytes:
     return (FIXTURES / name).read_bytes()
 
 
-def _direct_gamma_payload(**changes: object) -> bytes:
+def _direct_gamma_payload(*, omit_events: bool = False, **changes: object) -> bytes:
     page = json.loads(_fixture("polymarket_gamma_market_keyset.json"))
     market = page["markets"][0]
     market.update(changes)
+    if omit_events:
+        market.pop("events", None)
     return json.dumps(market, separators=(",", ":")).encode()
+
+
+def _relationship_payload(
+    direct_payload: bytes,
+    *,
+    event_ids: tuple[int, ...] = (780132,),
+    **changes: object,
+) -> bytes:
+    market = json.loads(direct_payload)
+    market.update(changes)
+    market["events"] = [{"id": event_id} for event_id in event_ids]
+    return json.dumps([market], separators=(",", ":")).encode()
 
 
 def _no_book() -> bytes:
@@ -58,10 +77,15 @@ def _no_book() -> bytes:
     return json.dumps(value, separators=(",", ":")).encode()
 
 
-def _processed(ingest_seq: int) -> ProcessedEnvelope:
+def _processed(
+    ingest_seq: int,
+    *,
+    success: bool = True,
+    error_type: str | None = None,
+) -> ProcessedEnvelope:
     return ProcessedEnvelope(
         ingest_seq=ingest_seq,
-        success=True,
+        success=success,
         canonical_event_count=0,
         scan_count=0,
         needs_resync=False,
@@ -69,13 +93,13 @@ def _processed(ingest_seq: int) -> ProcessedEnvelope:
         reference_refresh_requests=(),
         book_freshness_updates=(),
         scan_triggers=(),
-        error_type=None,
+        error_type=error_type,
     )
 
 
 class _ProcessorFixture:
     def __init__(self, *, bundle: object | None = None) -> None:
-        self.discovered_markets: tuple[object, ...] = ()
+        self.discovered_markets: tuple[GammaMarket, ...] = ()
         self.current_bundles: tuple[object, ...] = ()
         self.bundle = bundle
 
@@ -98,6 +122,33 @@ class _CaptureFixture:
         self.channels.append(channel)
         if channel == GAMMA_MARKETS_KEYSET:
             self.processor.discovered_markets = parse_gamma_markets(payload).markets
+        elif channel.startswith(GAMMA_MARKET_RELATIONSHIP_PREFIX):
+            try:
+                relationship = parse_gamma_market_relationship(payload)
+                direct = next(
+                    (
+                        market
+                        for market in self.processor.discovered_markets
+                        if market.gamma_market_id == relationship.gamma_market_id
+                    ),
+                    None,
+                )
+                if direct is None:
+                    raise LookupError("relationship has no matching direct market")
+                if (
+                    relationship.condition_id != direct.condition_id
+                    or relationship.clob_token_ids != direct.clob_token_ids
+                ):
+                    raise ValueError("relationship identity mismatch")
+                self.processor.discovered_markets = (
+                    replace(direct, event_id=relationship.event_id),
+                )
+            except (LookupError, PolymarketSchemaError, TypeError, ValueError) as error:
+                return _processed(
+                    len(self.channels) - 1,
+                    success=False,
+                    error_type=type(error).__name__,
+                )
         elif channel.startswith(GAMMA_MARKET_PREFIX):
             self.processor.discovered_markets = (parse_gamma_market(payload),)
         elif channel == REST_BOOK:
@@ -108,9 +159,18 @@ class _CaptureFixture:
 
 
 class _ClientFixture:
-    def __init__(self, *, gamma_payload: bytes, fail_direct: BaseException | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        gamma_payload: bytes,
+        relationship_payload: bytes | None = None,
+        fail_direct: BaseException | None = None,
+        fail_relationship: BaseException | None = None,
+    ) -> None:
         self.gamma_payload = gamma_payload
+        self.relationship_payload = relationship_payload
         self.fail_direct = fail_direct
+        self.fail_relationship = fail_relationship
         self.calls: list[tuple[str, str]] = []
 
     async def fetch_gamma_market_raw(
@@ -125,6 +185,20 @@ class _ClientFixture:
             raise self.fail_direct
         return self.gamma_payload
 
+    async def fetch_gamma_market_relationship_raw(
+        self,
+        gamma_market_id: str,
+        *,
+        deadline: float | None = None,
+    ) -> bytes:
+        del deadline
+        self.calls.append(("gamma-market-relationship", gamma_market_id))
+        if self.fail_relationship is not None:
+            raise self.fail_relationship
+        if self.relationship_payload is None:
+            raise AssertionError("unexpected Gamma relationship lookup")
+        return self.relationship_payload
+
     async def fetch_gamma_event_raw(
         self,
         event_id: str,
@@ -133,7 +207,14 @@ class _ClientFixture:
     ) -> bytes:
         del deadline
         self.calls.append(("gamma-event", event_id))
-        return b'{"id":501,"enableNegRisk":false,"negRiskAugmented":false}'
+        return json.dumps(
+            {
+                "id": int(event_id),
+                "enableNegRisk": False,
+                "negRiskAugmented": False,
+            },
+            separators=(",", ":"),
+        ).encode()
 
     async def fetch_clob_market_raw(
         self,
@@ -179,9 +260,25 @@ def _service(tmp_path: Path) -> PolymarketObservationService:
     )
 
 
-def _bundle_for(gamma_payload: bytes):
+def _bundle_for(gamma_payload: bytes, *, event_id: str | None = None):
     gamma = parse_gamma_market(gamma_payload)
-    event = parse_gamma_event(b'{"id":501,"enableNegRisk":false,"negRiskAugmented":false}')
+    if event_id is not None:
+        gamma = replace(gamma, event_id=event_id)
+    resolved_event_id = gamma.event_id
+    event = (
+        None
+        if resolved_event_id is None
+        else parse_gamma_event(
+            json.dumps(
+                {
+                    "id": int(resolved_event_id),
+                    "enableNegRisk": False,
+                    "negRiskAugmented": False,
+                },
+                separators=(",", ":"),
+            ).encode()
+        )
+    )
     clob = parse_clob_market_info(
         _fixture("polymarket_clob_market_info.json"),
         condition_id=gamma.condition_id,
@@ -240,6 +337,82 @@ async def test_explicit_bootstrap_never_discovers_and_binds_canonical_target(
 
 
 @pytest.mark.asyncio
+async def test_explicit_bootstrap_resolves_omitted_parent_via_exact_id_relationship(
+    tmp_path: Path,
+) -> None:
+    gamma_payload = _direct_gamma_payload(id=3257332, omit_events=True)
+    relationship_payload = _relationship_payload(gamma_payload, event_ids=(780132,))
+    bundle = _bundle_for(gamma_payload, event_id="780132")
+    processor = _ProcessorFixture(bundle=bundle)
+    capture = _CaptureFixture(processor)
+    client = _ClientFixture(
+        gamma_payload=gamma_payload,
+        relationship_payload=relationship_payload,
+    )
+
+    selected, assets, target = await _service(tmp_path)._bootstrap_explicit(  # pyright: ignore[reportPrivateUsage]
+        client=cast(PolymarketPublicClient, client),
+        capture=cast(_RawCaptureBoundary, capture),
+        processor=cast(CanonicalProcessor, processor),
+        gamma_market_id="3257332",
+    )
+
+    assert selected[0].gamma_market_id == "3257332"
+    assert selected[0].event_id == "780132"
+    assert assets == ("token-yes", "token-no")
+    assert target.requested_gamma_market_id == "3257332"
+    assert target.resolved_gamma_market_id == "3257332"
+    assert target.event_id == "780132"
+    assert client.calls == [
+        ("gamma-market", "3257332"),
+        ("gamma-market-relationship", "3257332"),
+        ("gamma-event", "780132"),
+        ("clob-market", "0xcondition"),
+        ("book", "token-yes"),
+        ("book", "token-no"),
+    ]
+    assert capture.channels == [
+        f"{GAMMA_MARKET_PREFIX}3257332",
+        f"{GAMMA_MARKET_RELATIONSHIP_PREFIX}3257332",
+        f"{GAMMA_EVENT_PREFIX}780132",
+        f"{CLOB_MARKET_PREFIX}0xcondition",
+        REST_BOOK,
+        REST_BOOK,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_explicit_bootstrap_accepts_proven_standalone_market_without_parent(
+    tmp_path: Path,
+) -> None:
+    gamma_payload = _direct_gamma_payload(id=3257332, omit_events=True)
+    bundle = _bundle_for(gamma_payload)
+    processor = _ProcessorFixture(bundle=bundle)
+    capture = _CaptureFixture(processor)
+    client = _ClientFixture(
+        gamma_payload=gamma_payload,
+        relationship_payload=_relationship_payload(gamma_payload, event_ids=()),
+    )
+
+    selected, _assets, target = await _service(tmp_path)._bootstrap_explicit(  # pyright: ignore[reportPrivateUsage]
+        client=cast(PolymarketPublicClient, client),
+        capture=cast(_RawCaptureBoundary, capture),
+        processor=cast(CanonicalProcessor, processor),
+        gamma_market_id="3257332",
+    )
+
+    assert selected[0].event_id is None
+    assert target.event_id is None
+    assert client.calls == [
+        ("gamma-market", "3257332"),
+        ("gamma-market-relationship", "3257332"),
+        ("clob-market", "0xcondition"),
+        ("book", "token-yes"),
+        ("book", "token-no"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_developer_bootstrap_records_resolved_non_gate1_target(tmp_path: Path) -> None:
     gamma_payload = _direct_gamma_payload()
     bundle = _bundle_for(gamma_payload)
@@ -287,7 +460,9 @@ async def test_explicit_invalid_target_fails_before_related_fetches_without_fall
     tmp_path: Path,
     changes: dict[str, object],
 ) -> None:
-    gamma_payload = _direct_gamma_payload(**changes)
+    market_value = json.loads(_direct_gamma_payload())
+    market_value.update(changes)
+    gamma_payload = json.dumps(market_value, separators=(",", ":")).encode()
     processor = _ProcessorFixture()
     capture = _CaptureFixture(processor)
     client = _ClientFixture(gamma_payload=gamma_payload)
@@ -325,6 +500,143 @@ async def test_explicit_nonexistent_target_propagates_without_discovery_fallback
 
     assert client.calls == [("gamma-market", "does-not-exist")]
     assert capture.channels == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_kind",
+    [
+        "zero-markets",
+        "multiple-markets",
+        "mismatched-id",
+        "mismatched-condition",
+        "mismatched-tokens",
+        "missing-events",
+        "multiple-events",
+        "malformed",
+    ],
+)
+async def test_explicit_parent_relationship_failures_are_closed_and_never_fall_back(
+    tmp_path: Path,
+    failure_kind: str,
+) -> None:
+    gamma_payload = _direct_gamma_payload(id=3257332, omit_events=True)
+    valid = _relationship_payload(gamma_payload)
+    if failure_kind == "zero-markets":
+        relationship_payload = b"[]"
+    elif failure_kind == "multiple-markets":
+        market = json.loads(valid)[0]
+        relationship_payload = json.dumps([market, market], separators=(",", ":")).encode()
+    elif failure_kind == "mismatched-id":
+        relationship_payload = _relationship_payload(gamma_payload, id=3257333)
+    elif failure_kind == "mismatched-condition":
+        relationship_payload = _relationship_payload(
+            gamma_payload,
+            conditionId="different-condition",
+        )
+    elif failure_kind == "mismatched-tokens":
+        relationship_payload = _relationship_payload(
+            gamma_payload,
+            clobTokenIds='["different-yes","different-no"]',
+        )
+    elif failure_kind == "missing-events":
+        relationship_payload = json.dumps(
+            [json.loads(gamma_payload)],
+            separators=(",", ":"),
+        ).encode()
+    elif failure_kind == "multiple-events":
+        relationship_payload = _relationship_payload(
+            gamma_payload,
+            event_ids=(780132, 780133),
+        )
+    elif failure_kind == "malformed":
+        relationship_payload = b'{"not":"an array"}'
+    else:  # pragma: no cover - exhaustive parameter guard
+        raise AssertionError(f"unhandled fixture kind: {failure_kind}")
+    processor = _ProcessorFixture()
+    capture = _CaptureFixture(processor)
+    client = _ClientFixture(
+        gamma_payload=gamma_payload,
+        relationship_payload=relationship_payload,
+    )
+
+    with pytest.raises(TargetSelectionError):
+        await _service(tmp_path)._bootstrap_explicit(  # pyright: ignore[reportPrivateUsage]
+            client=cast(PolymarketPublicClient, client),
+            capture=cast(_RawCaptureBoundary, capture),
+            processor=cast(CanonicalProcessor, processor),
+            gamma_market_id="3257332",
+        )
+
+    assert client.calls == [
+        ("gamma-market", "3257332"),
+        ("gamma-market-relationship", "3257332"),
+    ]
+    assert capture.channels == [
+        f"{GAMMA_MARKET_PREFIX}3257332",
+        f"{GAMMA_MARKET_RELATIONSHIP_PREFIX}3257332",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_explicit_parent_relationship_http_failure_propagates_without_fallback(
+    tmp_path: Path,
+) -> None:
+    gamma_payload = _direct_gamma_payload(id=3257332, omit_events=True)
+    processor = _ProcessorFixture()
+    capture = _CaptureFixture(processor)
+    client = _ClientFixture(
+        gamma_payload=gamma_payload,
+        fail_relationship=RuntimeError("exact-ID relationship 503"),
+    )
+
+    with pytest.raises(RuntimeError, match="503"):
+        await _service(tmp_path)._bootstrap_explicit(  # pyright: ignore[reportPrivateUsage]
+            client=cast(PolymarketPublicClient, client),
+            capture=cast(_RawCaptureBoundary, capture),
+            processor=cast(CanonicalProcessor, processor),
+            gamma_market_id="3257332",
+        )
+
+    assert client.calls == [
+        ("gamma-market", "3257332"),
+        ("gamma-market-relationship", "3257332"),
+    ]
+    assert capture.channels == [f"{GAMMA_MARKET_PREFIX}3257332"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "gamma_changes",
+    [
+        {"conditionId": "changed-condition"},
+        {"clobTokenIds": '["changed-yes","changed-no"]'},
+        {"events": [{"id": 502}]},
+    ],
+)
+async def test_reference_refresh_rejects_frozen_target_identity_drift(
+    tmp_path: Path,
+    gamma_changes: dict[str, object],
+) -> None:
+    frozen_payload = _direct_gamma_payload()
+    frozen = parse_gamma_market(frozen_payload)
+    changed_value = json.loads(frozen_payload)
+    changed_value.update(gamma_changes)
+    changed_payload = json.dumps(changed_value, separators=(",", ":")).encode()
+    processor = _ProcessorFixture()
+    capture = _CaptureFixture(processor)
+    client = _ClientFixture(gamma_payload=changed_payload)
+
+    with pytest.raises(TargetSelectionError, match="frozen selected"):
+        await _service(tmp_path)._refresh_reference_by_id(  # pyright: ignore[reportPrivateUsage]
+            cast(PolymarketPublicClient, client),
+            cast(_RawCaptureBoundary, capture),
+            gamma_market_id=frozen.gamma_market_id,
+            fallback=frozen,
+        )
+
+    assert client.calls == [("gamma-market", frozen.gamma_market_id)]
+    assert capture.channels == [f"{GAMMA_MARKET_PREFIX}{frozen.gamma_market_id}"]
 
 
 def test_cli_forwards_explicit_gamma_market_id(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -662,6 +662,29 @@ class PolymarketPublicClient:
             deadline=deadline,
         )
 
+    async def fetch_gamma_market_relationship_raw(
+        self, gamma_market_id: str, *, deadline: float | None = None
+    ) -> bytes:
+        """Fetch the exact-ID list surface that carries parent-event relationships."""
+
+        return (
+            await self.fetch_gamma_market_relationship_raw_with_evidence(
+                gamma_market_id,
+                deadline=deadline,
+            )
+        ).payload_bytes
+
+    async def fetch_gamma_market_relationship_raw_with_evidence(
+        self, gamma_market_id: str, *, deadline: float | None = None
+    ) -> PublicReadResult:
+        return await self._request_raw_result(
+            "GET",
+            f"{self._gamma_url}/markets",
+            endpoint_class=PolymarketEndpointClass.GAMMA_MARKETS,
+            params={"id": gamma_market_id, "limit": 2},
+            deadline=deadline,
+        )
+
     async def fetch_gamma_event_raw(self, event_id: str, *, deadline: float | None = None) -> bytes:
         return (
             await self.fetch_gamma_event_raw_with_evidence(event_id, deadline=deadline)

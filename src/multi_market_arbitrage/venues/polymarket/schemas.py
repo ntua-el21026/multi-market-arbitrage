@@ -340,10 +340,17 @@ def _gamma_market(value: object, path: str) -> GammaMarket:
     events = obj.get("events")
     if events is not None:
         event_items = _array(events, f"{path}.events")
+        if len(event_items) > 1:
+            raise PolymarketSchemaError(
+                f"{path}.events",
+                "market must have at most one parent event",
+            )
         if event_items:
             event_obj = _object(event_items[0], f"{path}.events[0]")
-            if "id" in event_obj:
-                event_id = _native_id(event_obj["id"], f"{path}.events[0].id")
+            event_id = _native_id(
+                _required(event_obj, "id", f"{path}.events[0]"),
+                f"{path}.events[0].id",
+            )
 
     return GammaMarket(
         gamma_market_id=_native_id(_required(obj, "id", path), f"{path}.id"),
@@ -415,6 +422,27 @@ def parse_gamma_market(payload: bytes) -> GammaMarket:
     """Parse the direct ``GET /markets/{id}`` response."""
 
     return _gamma_market(decode_json_exact(payload), "$")
+
+
+def parse_gamma_market_relationship(payload: bytes) -> GammaMarket:
+    """Parse the exact-ID ``GET /markets?id={id}`` relationship response.
+
+    Gamma's direct market surface can omit the embedded parent-event
+    relationship.  The relationship surface is intentionally narrower than a
+    general market-list parser: only a legacy array containing exactly one
+    market and an explicit zero-or-one parent-event relationship is admissible.
+    """
+
+    root = decode_json_exact(payload)
+    values = _array(root, "$")
+    if len(values) != 1:
+        raise PolymarketSchemaError(
+            "$",
+            "exact-ID market relationship response must contain exactly one market",
+        )
+    relationship = _object(values[0], "$[0]")
+    _array(_required(relationship, "events", "$[0]"), "$[0].events")
+    return _gamma_market(relationship, "$[0]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -846,6 +874,7 @@ __all__ = [
     "parse_gamma_event",
     "parse_gamma_events",
     "parse_gamma_market",
+    "parse_gamma_market_relationship",
     "parse_gamma_markets",
     "parse_market_ws_message",
     "parse_rest_book",

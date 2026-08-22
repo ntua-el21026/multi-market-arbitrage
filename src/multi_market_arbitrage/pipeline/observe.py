@@ -69,6 +69,7 @@ from multi_market_arbitrage.venues.polymarket import (
     PublicReadMetricsSnapshot,
     PublicReadPolicy,
     ReceivedWebSocketMessage,
+    parse_gamma_market,
 )
 from multi_market_arbitrage.venues.polymarket.schemas import GammaMarket
 
@@ -89,6 +90,7 @@ from .channels import (
     CONTROL_REST_AUDIT_START,
     GAMMA_EVENT_PREFIX,
     GAMMA_MARKET_PREFIX,
+    GAMMA_MARKET_RELATIONSHIP_PREFIX,
     GAMMA_MARKETS_KEYSET,
     REST_BOOK,
     REST_BOOK_AUDIT,
@@ -1147,6 +1149,14 @@ class PolymarketObservationService:
             requested_gamma_market_id=gamma_market_id,
         )
 
+        if market.event_id is None:
+            market = await self._bind_parent_event_relationship(
+                client=client,
+                capture=capture,
+                direct_market=market,
+                deadline=deadline,
+            )
+
         event_id = market.event_id
         if event_id is not None:
             event_payload = await client.fetch_gamma_event_raw(
@@ -1194,6 +1204,51 @@ class PolymarketObservationService:
             requested_gamma_market_id=gamma_market_id,
         )
         return (market,), market.clob_token_ids, target
+
+    async def _bind_parent_event_relationship(
+        self,
+        *,
+        client: PolymarketPublicClient,
+        capture: _RawCaptureBoundary,
+        direct_market: GammaMarket,
+        deadline: float | None,
+    ) -> GammaMarket:
+        """Resolve an exact zero-or-one parent relationship omitted by the direct surface."""
+
+        gamma_market_id = direct_market.gamma_market_id
+        relationship_payload = await client.fetch_gamma_market_relationship_raw(
+            gamma_market_id,
+            deadline=deadline,
+        )
+        relationship_channel = f"{GAMMA_MARKET_RELATIONSHIP_PREFIX}{gamma_market_id}"
+        relationship_result = await capture.preserve_then_process(
+            channel=relationship_channel,
+            payload=relationship_payload,
+            transport_type="HTTP",
+            semantics_hash=_semantics(relationship_channel),
+        )
+        self._require_target_surface(
+            relationship_result,
+            surface="Gamma exact-ID market relationship",
+        )
+        matching_markets = tuple(
+            market
+            for market in capture.processor.discovered_markets
+            if market.gamma_market_id == gamma_market_id
+        )
+        if len(matching_markets) != 1:
+            raise TargetSelectionError(
+                "Gamma relationship response did not resolve exactly the requested market ID"
+            )
+        resolved = matching_markets[0]
+        if (
+            resolved.condition_id != direct_market.condition_id
+            or resolved.clob_token_ids != direct_market.clob_token_ids
+        ):
+            raise TargetSelectionError(
+                "Gamma relationship response differs from the direct market identity"
+            )
+        return resolved
 
     @staticmethod
     def _resolve_target(
@@ -1257,12 +1312,22 @@ class PolymarketObservationService:
             deadline=deadline,
         )
         channel = f"{GAMMA_MARKET_PREFIX}{gamma_market_id}"
-        await capture.preserve_then_process(
+        gamma_result = await capture.preserve_then_process(
             channel=channel,
             payload=gamma_payload,
             transport_type="HTTP",
             semantics_hash=_semantics(channel),
         )
+        self._require_target_surface(gamma_result, surface="Gamma market")
+        direct_market = parse_gamma_market(gamma_payload)
+        if fallback is not None and (
+            direct_market.gamma_market_id != fallback.gamma_market_id
+            or direct_market.condition_id != fallback.condition_id
+            or direct_market.clob_token_ids != fallback.clob_token_ids
+        ):
+            raise TargetSelectionError(
+                "Gamma refresh differs from the frozen selected market identity"
+            )
         current = next(
             (
                 item
@@ -1273,6 +1338,17 @@ class PolymarketObservationService:
         )
         if current is None:
             raise RuntimeError("Gamma direct-market refresh did not publish its market")
+        if direct_market.event_id is None:
+            current = await self._bind_parent_event_relationship(
+                client=client,
+                capture=capture,
+                direct_market=direct_market,
+                deadline=deadline,
+            )
+        if fallback is not None and current.event_id != fallback.event_id:
+            raise TargetSelectionError(
+                "Gamma refresh differs from the frozen selected parent event"
+            )
         event_id = current.event_id
         if event_id is not None:
             event_payload = await client.fetch_gamma_event_raw(
@@ -1280,12 +1356,13 @@ class PolymarketObservationService:
                 deadline=deadline,
             )
             event_channel = f"{GAMMA_EVENT_PREFIX}{event_id}"
-            await capture.preserve_then_process(
+            event_result = await capture.preserve_then_process(
                 channel=event_channel,
                 payload=event_payload,
                 transport_type="HTTP",
                 semantics_hash=_semantics(event_channel),
             )
+            self._require_target_surface(event_result, surface="Gamma event")
         clob_payload = await client.fetch_clob_market_raw(
             current.condition_id,
             deadline=deadline,
@@ -1531,6 +1608,7 @@ class PolymarketObservationService:
         selected: tuple[GammaMarket, ...],
         deadline: float | None = None,
         runtime_health: ObservationRuntimeHealth | None = None,
+        metrics_already_recorded: bool = False,
     ) -> bool:
         selected_by_gamma_id = {market.gamma_market_id: market for market in selected}
         selected_by_condition = {market.condition_id: market for market in selected}
@@ -1540,10 +1618,11 @@ class PolymarketObservationService:
         selected_resolved = False
         refresh_gamma_ids: set[str] = set()
         for request in requests:
-            self._metrics.increment_counter(
-                "mma_reference_refresh_requests_total",
-                labels={"event_type": request.event_type.value},
-            )
+            if not metrics_already_recorded:
+                self._metrics.increment_counter(
+                    "mma_reference_refresh_requests_total",
+                    labels={"event_type": request.event_type.value},
+                )
             matching_market = selected_by_gamma_id.get(request.native_market_id)
             if matching_market is None and request.native_condition_id is not None:
                 matching_market = selected_by_condition.get(request.native_condition_id)
@@ -1553,10 +1632,11 @@ class PolymarketObservationService:
                     if matching_market is not None:
                         break
             if matching_market is None:
-                self._metrics.increment_counter(
-                    "mma_reference_refresh_requests_ignored_total",
-                    labels={"event_type": request.event_type.value},
-                )
+                if not metrics_already_recorded:
+                    self._metrics.increment_counter(
+                        "mma_reference_refresh_requests_ignored_total",
+                        labels={"event_type": request.event_type.value},
+                    )
                 continue
             refresh_gamma_ids.add(matching_market.gamma_market_id)
             if (
@@ -1593,6 +1673,7 @@ class PolymarketObservationService:
         *,
         client: PolymarketPublicClient,
         capture: _RawCaptureBoundary,
+        selected: tuple[GammaMarket, ...],
         asset_ids: tuple[str, ...],
         deadline: float,
         deadline_ns: int,
@@ -1645,6 +1726,9 @@ class PolymarketObservationService:
             name="polymarket-public-subscription-ready",
         )
         maximum_book_age_ns = int(self._config.scanner.maximum_book_age_seconds * 1e9)
+        freshness_audit_guard_ns = int(
+            self._config.polymarket.snapshot_audit_freshness_guard_seconds * 1e9
+        )
         integrity_interval_ns = int(self._config.polymarket.snapshot_audit_interval_seconds * 1e9)
         pending_exit: _GenerationExit | None = None
         pending_transport_error: PolymarketWebSocketError | None = None
@@ -1660,6 +1744,26 @@ class PolymarketObservationService:
         audit_asset_index = 0
         audit_attempt = 0
         maximum_race_retries = self._config.polymarket.snapshot_audit_max_race_retries
+        selected_gamma_ids = {market.gamma_market_id for market in selected}
+        selected_condition_ids = {market.condition_id for market in selected}
+        selected_asset_ids = {asset_id for market in selected for asset_id in market.clob_token_ids}
+
+        def refresh_matches_selected(request: ReferenceRefreshRequest) -> bool:
+            return (
+                request.native_market_id in selected_gamma_ids
+                or (
+                    request.native_condition_id is not None
+                    and request.native_condition_id in selected_condition_ids
+                )
+                or any(asset_id in selected_asset_ids for asset_id in request.native_asset_ids)
+            )
+
+        def generation_is_exiting() -> bool:
+            return (
+                pending_exit is not None
+                or pending_transport_error is not None
+                or acquisition_task.done()
+            )
 
         def current_deadline() -> IntegrityDeadline:
             if audit_cycle_active:
@@ -1674,6 +1778,7 @@ class PolymarketObservationService:
                 required_books=len(asset_ids),
                 maximum_book_age_ns=maximum_book_age_ns,
                 now_ns=time.monotonic_ns(),
+                freshness_audit_guard_ns=freshness_audit_guard_ns,
             )
 
         async def launch_audit(
@@ -1905,12 +2010,12 @@ class PolymarketObservationService:
                                 f"REST audit FAILED isolated at ingest_seq={result.ingest_seq}"
                             )
                         elif outcome.outcome is AuditOutcome.RACED:
-                            if pending_exit is not None:
+                            if generation_is_exiting():
                                 audit_cycle_active = False
                                 periodic_audit_due_ns = time.monotonic_ns() + integrity_interval_ns
-                                deviations.append(
-                                    "REST audit RACED while socket generation was already "
-                                    "exiting; retry suppressed"
+                                self._metrics.increment_counter(
+                                    "mma_rest_audit_retries_suppressed_total",
+                                    labels={"reason": "generation_exit"},
                                 )
                             elif start.attempt <= maximum_race_retries:
                                 self._metrics.increment_counter("mma_rest_audit_retries_total")
@@ -1936,18 +2041,28 @@ class PolymarketObservationService:
                                 periodic_audit_due_ns = time.monotonic_ns() + integrity_interval_ns
                                 deviations.append("REST audit race retry budget exhausted")
                         else:
-                            audit_asset_index += 1
-                            if audit_asset_index < len(asset_ids):
-                                audit_attempt = 1
-                                if not await launch_audit(
-                                    asset_ids[audit_asset_index],
-                                    attempt=audit_attempt,
-                                ):
-                                    pending_exit = _GenerationExit.RESYNC_REQUIRED
-                                    await stop_acquisition()
-                            else:
+                            if generation_is_exiting():
                                 audit_cycle_active = False
                                 periodic_audit_due_ns = time.monotonic_ns() + integrity_interval_ns
+                                self._metrics.increment_counter(
+                                    "mma_rest_audit_legs_suppressed_total",
+                                    labels={"reason": "generation_exit"},
+                                )
+                            else:
+                                audit_asset_index += 1
+                                if audit_asset_index < len(asset_ids):
+                                    audit_attempt = 1
+                                    if not await launch_audit(
+                                        asset_ids[audit_asset_index],
+                                        attempt=audit_attempt,
+                                    ):
+                                        pending_exit = _GenerationExit.RESYNC_REQUIRED
+                                        await stop_acquisition()
+                                else:
+                                    audit_cycle_active = False
+                                    periodic_audit_due_ns = (
+                                        time.monotonic_ns() + integrity_interval_ns
+                                    )
 
                 now_ns = time.monotonic_ns()
                 due = current_deadline()
@@ -2099,15 +2214,29 @@ class PolymarketObservationService:
                     ingress.metrics.queue_high_water,
                 )
                 for result in results:
-                    refresh_requests.extend(result.reference_refresh_requests)
-                    if result.needs_resync:
-                        pending_exit = _GenerationExit.RESYNC_REQUIRED
+                    relevant_refresh = False
+                    for request in result.reference_refresh_requests:
+                        self._metrics.increment_counter(
+                            "mma_reference_refresh_requests_total",
+                            labels={"event_type": request.event_type.value},
+                        )
+                        if refresh_matches_selected(request):
+                            refresh_requests.append(request)
+                            relevant_refresh = True
+                        else:
+                            self._metrics.increment_counter(
+                                "mma_reference_refresh_requests_ignored_total",
+                                labels={"event_type": request.event_type.value},
+                            )
+                    if not result.success:
                         runtime_health.record_protocol_deviation()
                         deviations.append(
-                            f"{result.error_type or 'state-invalidation'} at "
+                            f"{result.error_type or 'processing-failure'} at "
                             f"ingest_seq={result.ingest_seq}"
                         )
-                    elif result.reference_refresh_requests and pending_exit is None:
+                    if result.needs_resync:
+                        pending_exit = _GenerationExit.RESYNC_REQUIRED
+                    elif relevant_refresh and pending_exit is None:
                         pending_exit = _GenerationExit.REFERENCE_REFRESH
                 if pending_exit is not None:
                     await stop_acquisition()
@@ -2157,6 +2286,7 @@ class PolymarketObservationService:
                     generation = await self._run_generation(
                         client=client,
                         capture=capture,
+                        selected=selected,
                         asset_ids=asset_ids,
                         deadline=deadline,
                         deadline_ns=deadline_ns,
@@ -2198,6 +2328,7 @@ class PolymarketObservationService:
                         selected=selected,
                         deadline=deadline,
                         runtime_health=runtime_health,
+                        metrics_already_recorded=True,
                     )
                     if selected_resolved:
                         return _StreamResult(

@@ -20,6 +20,7 @@ from multi_market_arbitrage.venues.polymarket import (
     parse_clob_market_info,
     parse_gamma_events,
     parse_gamma_market,
+    parse_gamma_market_relationship,
     parse_gamma_markets,
     parse_market_ws_message,
     parse_rest_book,
@@ -133,6 +134,40 @@ def test_direct_market_and_event_keyset_parsers_cover_discovery_routes() -> None
     assert page.events[0].neg_risk_augmented is True
     assert page.next_cursor == "more"
     assert legacy.keyset is False
+
+
+def test_exact_id_market_relationship_parser_requires_one_market_and_parent() -> None:
+    market_value = {
+        "id": "3257332",
+        "conditionId": "condition",
+        "question": "Question?",
+        "outcomes": '["Yes","No"]',
+        "clobTokenIds": '["yes","no"]',
+        "events": [{"id": 780132}],
+    }
+    market = json.dumps(market_value, separators=(",", ":")).encode()
+
+    assert parse_gamma_market_relationship(b"[" + market + b"]").event_id == "780132"
+    standalone = json.dumps(
+        {**market_value, "events": []},
+        separators=(",", ":"),
+    ).encode()
+    assert parse_gamma_market_relationship(b"[" + standalone + b"]").event_id is None
+    missing_relationship = dict(market_value)
+    missing_relationship.pop("events")
+    missing = json.dumps(missing_relationship, separators=(",", ":")).encode()
+    ambiguous = json.dumps(
+        {**market_value, "events": [{"id": 780132}, {"id": 780133}]},
+        separators=(",", ":"),
+    ).encode()
+    for payload in (
+        b"[]",
+        b"[" + market + b"," + market + b"]",
+        b"[" + missing + b"]",
+        b"[" + ambiguous + b"]",
+    ):
+        with pytest.raises(PolymarketSchemaError):
+            parse_gamma_market_relationship(payload)
 
 
 def test_strict_json_rejects_duplicate_keys_and_nonfinite_numbers() -> None:
@@ -412,6 +447,27 @@ async def test_public_http_methods_return_bytes_and_cannot_add_auth() -> None:
     assert all("authorization" not in request.headers for request in requests)
     assert all("api-key" not in request.headers for request in requests)
     assert all(request.headers["accept-encoding"] == "identity" for request in requests)
+
+
+@pytest.mark.asyncio
+async def test_exact_id_relationship_read_uses_one_bounded_gamma_markets_request() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, content=b"[]", request=request)
+
+    async with PolymarketPublicClient(
+        gamma_url="https://gamma.example.invalid",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        assert await client.fetch_gamma_market_relationship_raw("3257332") == b"[]"
+
+    assert len(requests) == 1
+    assert requests[0].method == "GET"
+    assert requests[0].url.path == "/markets"
+    assert dict(requests[0].url.params) == {"id": "3257332", "limit": "2"}
+    assert "authorization" not in requests[0].headers
 
 
 @pytest.mark.asyncio

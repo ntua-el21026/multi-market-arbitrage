@@ -935,6 +935,7 @@ async def test_continuous_audit_fences_response_without_replacing_socket_generat
     generation = await service._run_generation(  # pyright: ignore[reportPrivateUsage]
         client=cast(PolymarketPublicClient, client),
         capture=capture,
+        selected=(selected,),
         asset_ids=selected.clob_token_ids,
         deadline=deadline,
         deadline_ns=observe_module.time.monotonic_ns() + 200_000_000,
@@ -974,6 +975,244 @@ async def test_continuous_audit_fences_response_without_replacing_socket_generat
     assert runtime_health.snapshot().reconnects == 0
     assert [record.channel for record in records].count(CONTROL_REST_AUDIT_START) >= 3
     assert [record.channel for record in records].count(REST_BOOK_AUDIT) >= 2
+
+
+@pytest.mark.asyncio
+async def test_unrelated_new_market_is_preserved_without_rotating_selected_socket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("unrelated-new-market-continuity")
+    writer = RawJournalWriter(
+        JournalWriterConfig(
+            root=tmp_path / "raw",
+            collector_run_id=run_id,
+            venue_id=POLYMARKET_VENUE_ID,
+            stream="polymarket-public",
+            writer_id=WriterId("writer-unrelated-new-market"),
+            writer_software_version="test",
+            git_commit="fixture",
+        )
+    )
+    processor = CanonicalProcessor(config)
+    metrics = InMemoryMetrics()
+    capture = observe_module._RawCaptureBoundary(  # pyright: ignore[reportPrivateUsage]
+        collector_run_id=run_id,
+        writer=writer,
+        processor=processor,
+        metrics=metrics,
+    )
+    selected = parse_gamma_markets(_fixture("polymarket_gamma_market_keyset.json")).markets[0]
+    unrelated_payload = json.dumps(
+        {
+            "assets_ids": ["unrelated-yes", "unrelated-no"],
+            "event_type": "new_market",
+            "id": "unrelated-gamma-id",
+            "market": "unrelated-condition",
+            "timestamp": "1787198406000",
+        },
+        separators=(",", ":"),
+    ).encode()
+
+    class _UnrelatedThenSelectedSocket:
+        instances = 0
+
+        def __init__(self, asset_ids: tuple[str, ...], **kwargs: object) -> None:
+            assert asset_ids == selected.clob_token_ids
+            del kwargs
+            type(self).instances += 1
+            self.subscription_semantics_sha256 = hashlib.sha256(
+                b"unrelated-new-market-continuity"
+            ).hexdigest()
+
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            ready.set()
+            for payload in (
+                unrelated_payload,
+                _fixture("polymarket_ws_price_change.json"),
+            ):
+                admit(
+                    ReceivedWebSocketMessage(
+                        payload_bytes=payload,
+                        received_wall_time=UtcTimestamp.now(),
+                        received_monotonic_ns=observe_module.time.monotonic_ns(),
+                        message_type="TEXT",
+                    )
+                )
+                await asyncio.sleep(0)
+            await asyncio.Event().wait()
+
+    class _NoAuditClient:
+        async def fetch_order_book_raw_with_evidence(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise AssertionError("short continuity fixture must not launch an audit")
+
+    monkeypatch.setattr(
+        observe_module,
+        "PolymarketMarketWebSocket",
+        _UnrelatedThenSelectedSocket,
+    )
+    service = PolymarketObservationService(
+        config,
+        workspace_root=tmp_path,
+        code_commit="fixture",
+        metrics=metrics,
+    )
+    await writer.start()
+    for channel, payload in (
+        (GAMMA_MARKETS_KEYSET, _fixture("polymarket_gamma_market_keyset.json")),
+        (
+            f"{CLOB_MARKET_PREFIX}0xcondition",
+            _fixture("polymarket_clob_market_info.json"),
+        ),
+        (REST_BOOK, _fixture("polymarket_rest_book_yes.json")),
+        (REST_BOOK, _no_book()),
+    ):
+        result = await capture.preserve_then_process(
+            channel=channel,
+            payload=payload,
+            transport_type="HTTP",
+            semantics_hash=hashlib.sha256(channel.encode()).hexdigest(),
+        )
+        assert result.success
+
+    runtime_health = ObservationRuntimeHealth()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 0.1
+    generation = await service._run_generation(  # pyright: ignore[reportPrivateUsage]
+        client=cast(PolymarketPublicClient, _NoAuditClient()),
+        capture=capture,
+        selected=(selected,),
+        asset_ids=selected.clob_token_ids,
+        deadline=deadline,
+        deadline_ns=observe_module.time.monotonic_ns() + 100_000_000,
+        periodic_audit_due_ns=observe_module.time.monotonic_ns() + 10_000_000_000,
+        connection_id=ConnectionId("unrelated-new-market-socket"),
+        subscription_id=SubscriptionId("unrelated-new-market-subscription"),
+        unavailable_started_ns=None,
+        runtime_health=runtime_health,
+    )
+    runtime_health.finish_generation(
+        continuity_interrupted=False,
+        now_ns=observe_module.time.monotonic_ns(),
+    )
+    await writer.close()
+
+    records = JournalReader(tmp_path / "raw", run_id).read_all()
+    live = processor.summary()
+    replayed = replay_journal(tmp_path / "raw", run_id, config).processor
+    counters = {key.name: value for key, value in metrics.snapshot().counters}
+    runtime = runtime_health.snapshot()
+    assert generation.reason.value == "DEADLINE"
+    assert generation.refresh_requests == ()
+    assert _UnrelatedThenSelectedSocket.instances == 1
+    assert [json.loads(record.payload_bytes)["event_type"] for record in records[-2:]] == [
+        "new_market",
+        "price_change",
+    ]
+    assert live.reference_refresh_requests == 1
+    assert live.terminal_hash == replayed.terminal_hash
+    assert counters["mma_reference_refresh_requests_total"] == 1
+    assert counters["mma_reference_refresh_requests_ignored_total"] == 1
+    assert runtime.socket_connected
+    assert runtime.unavailable_intervals == 0
+    assert runtime.reconnects == 0
+    assert runtime.protocol_deviations == 0
+
+
+@pytest.mark.asyncio
+async def test_successful_state_invalidation_resync_is_not_a_protocol_deviation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    selected = parse_gamma_markets(_fixture("polymarket_gamma_market_keyset.json")).markets[0]
+
+    class _OneFrameSocket:
+        def __init__(self, asset_ids: tuple[str, ...], **kwargs: object) -> None:
+            assert asset_ids == selected.clob_token_ids
+            del kwargs
+            self.subscription_semantics_sha256 = hashlib.sha256(
+                b"successful-state-invalidation"
+            ).hexdigest()
+
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            ready.set()
+            admit(
+                ReceivedWebSocketMessage(
+                    payload_bytes=b"preserved-state-invalidation",
+                    received_wall_time=UtcTimestamp.now(),
+                    received_monotonic_ns=observe_module.time.monotonic_ns(),
+                    message_type="BINARY",
+                )
+            )
+            await asyncio.Event().wait()
+
+    class _SuccessfulInvalidationCapture:
+        def __init__(self) -> None:
+            now_ns = observe_module.time.monotonic_ns()
+            self.book_freshness_receive_ns = (now_ns, now_ns)
+
+        async def preserve_websocket_batch(
+            self,
+            items: tuple[object, ...],
+            **kwargs: object,
+        ) -> tuple[ProcessedEnvelope, ...]:
+            assert len(items) == 1
+            del kwargs
+            return (
+                ProcessedEnvelope(
+                    ingest_seq=7,
+                    success=True,
+                    canonical_event_count=1,
+                    scan_count=1,
+                    needs_resync=True,
+                    affected_instrument_ids=(),
+                    reference_refresh_requests=(),
+                    book_freshness_updates=(),
+                    scan_triggers=(),
+                    error_type=None,
+                ),
+            )
+
+    monkeypatch.setattr(observe_module, "PolymarketMarketWebSocket", _OneFrameSocket)
+    metrics = InMemoryMetrics()
+    service = PolymarketObservationService(
+        config,
+        workspace_root=tmp_path,
+        code_commit="fixture",
+        metrics=metrics,
+    )
+    runtime_health = ObservationRuntimeHealth()
+    loop = asyncio.get_running_loop()
+    generation = await service._run_generation(  # pyright: ignore[reportPrivateUsage]
+        client=cast(PolymarketPublicClient, object()),
+        capture=cast(observe_module._RawCaptureBoundary, _SuccessfulInvalidationCapture()),  # pyright: ignore[reportPrivateUsage]
+        selected=(selected,),
+        asset_ids=selected.clob_token_ids,
+        deadline=loop.time() + 1.0,
+        deadline_ns=observe_module.time.monotonic_ns() + 1_000_000_000,
+        periodic_audit_due_ns=observe_module.time.monotonic_ns() + 30_000_000_000,
+        connection_id=ConnectionId("successful-state-invalidation-socket"),
+        subscription_id=SubscriptionId("successful-state-invalidation-subscription"),
+        unavailable_started_ns=None,
+        runtime_health=runtime_health,
+    )
+
+    assert generation.reason.value == "RESYNC_REQUIRED"
+    assert generation.deviations == ()
+    assert runtime_health.snapshot().protocol_deviations == 0
 
 
 @pytest.mark.asyncio

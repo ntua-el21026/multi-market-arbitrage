@@ -106,7 +106,14 @@ per-endpoint sliding-window policy. Its source URL and `rate_limit_checked_on`
 date make the external venue evidence reviewable rather than an architectural
 constant. `[health]` independently bounds checkpoint cadence, queue capacity,
 checkpoint count, file size, and minimum free-disk headroom. The committed
-checkpoint cadence is five seconds.
+checkpoint cadence is ten seconds. A bounded live calibration rejected the
+initial five-second choice because its conservative six-hour projection
+threatened the 64 MiB health-evidence limit; the ten-second cadence preserves
+incident reconstruction while retaining strict file and count headroom.
+`snapshot_audit_freshness_guard_seconds` is a one-second audit-launch guard,
+strictly smaller than the unchanged five-second hard book-age limit. It creates
+time for the bounded public read without adding any acceptance tolerance: an L2
+message beyond the hard age still invalidates and resynchronizes fail closed.
 
 ## CLI
 
@@ -131,11 +138,25 @@ service fetches that market directly and fails closed unless it is active,
 open, unarchived, accepting orders, order-book enabled, non-negative-risk, and
 an ordinary ordered YES/NO binary whose token/reference mapping has a proven
 complement semantic relation. It records the requested and resolved Gamma IDs,
-condition/event IDs, YES/NO token IDs, reference versions, semantic version,
+condition ID, event ID where applicable, YES/NO token IDs, reference versions,
+semantic version,
 and selection rationale. It never falls back to another market. Omitting
 `--gamma-market-id` keeps the bounded listing-order discovery path for
 developer smoke tests only; its evidence is marked `DEVELOPER_DISCOVERY` and is
 not Gate-1 eligible.
+
+Some direct Gamma market responses omit their embedded parent-event relation.
+In that case the public-read controller performs one bounded exact-ID
+`GET /markets?id=<id>&limit=2` read. Its legacy array must contain exactly one
+market with the same ID, condition, and ordered token IDs and an explicit
+zero-or-one `events` relation. Missing, malformed, multiple, or mismatched data
+fails closed. An explicit empty relation proves a standalone market; one parent
+is fetched and preserved by event ID. The direct, relationship, and parent-event
+raw surfaces participate in deterministic reference provenance and replay.
+Once selected, the Gamma ID, condition, ordered token IDs, and zero-or-one
+parent-event binding are frozen for the run. A refresh that remaps any of those
+identities is preserved as failed input and aborts the refresh rather than
+silently changing the target behind the socket subscription or run evidence.
 
 The recommended calibration duration is 180–300 seconds against the exact
 explicit target and a fresh output directory. It fails before acquisition
@@ -244,8 +265,12 @@ the next integrity deadline as the minimum of:
 
 - the absolute operator run deadline;
 - the next configured periodic REST audit; and
-- the earliest actual receive-time freshness expiry among required healthy
-  books.
+- the guarded audit-launch time before the earliest actual receive-time
+  freshness expiry among required healthy books.
+
+The guard is only a scheduling lead. The canonical processor retains the exact
+hard maximum-book-age comparison, so a slow audit that crosses the five-second
+boundary cannot make a late WebSocket L2 update acceptable.
 
 Routine audit HTTP I/O does not close or cancel a healthy WebSocket generation.
 The dedicated acquisition task continues to receive, timestamp, and admit
@@ -301,10 +326,13 @@ task scheduling.
 
 Reference refresh requests are accepted only for the selected market's Gamma
 market/event and condition/assets. Requests are coalesced to one selected-market
-refresh per generation; unrelated fanout is ignored and counted. All public
-HTTP reads use the observation's absolute deadline. Deadline cancellation can
-cancel only the remote await: bounded bytes that already reached the adapter's
-response handoff remain available for journaling and processing.
+refresh per generation. Unrelated `new_market` fanout is still durably
+journaled, canonically processed, replayable, and counted as ignored, but it is
+filtered before the generation-exit decision and therefore cannot rotate the
+selected market's healthy socket. All public HTTP reads use the observation's
+absolute deadline. Deadline cancellation can cancel only the remote await:
+bounded bytes that already reached the adapter's response handoff remain
+available for journaling and processing.
 
 The adapter exposes fixed unauthenticated read methods only. The public-read
 controller applies one bounded concurrency semaphore, per-endpoint local
@@ -439,7 +467,7 @@ economic state.
 ## Supervised Gate-1 health evidence
 
 The observer emits versioned `gate1-health-checkpoint-v1` JSONL evidence at the
-configured five-second cadence and once at finalization. The producer creates
+configured ten-second cadence and once at finalization. The producer creates
 an immutable point-in-time snapshot and performs one `put_nowait`; a dedicated
 single-owner task performs canonical serialization, append, and file `fsync`.
 The queue, checkpoint count, and file bytes are bounded. Output starts as a
