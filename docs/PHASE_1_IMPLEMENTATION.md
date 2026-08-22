@@ -278,6 +278,18 @@ top-of-book change into research. Accepted BBO messages update a separate
 relevant-L2 receive clock used only to restart the audit race-retry quiet
 interval; they do not extend the leg hard expiry.
 
+Live evidence also shows that a single announced top can be realized across
+successive exact `price_change` frames: the venue can first add the new top
+level while the old top still exists, then delete the old level. The owner may
+defer only the reported-top equality check for such an intermediate mutation,
+and only when its complete reported bid/ask exactly equals the unresolved BBO.
+The exact quantity and raw/canonical provenance are still applied, while the
+pending marker continues to block audits and research. Reconciliation occurs
+only after derived L2 reaches the announced top (or a later full snapshot or a
+different, ordinarily validated complete top supersedes it). With no exact
+pending BBO, every reported-top disagreement remains a protocol violation;
+precision, crossed-book, bounds, and provenance checks are unchanged.
+
 Scan triggers and reasons are included in deterministic processing results.
 Invalid, stale, unresolved, reference-indeterminate, or cost-indeterminate
 books remain ineligible even when another mutation marks the market dirty.
@@ -389,8 +401,10 @@ hash chain are replay evidence, so classification does not depend on replay
 task scheduling. Pending deferred responses, including their complete bound
 start state and raw identity, are also terminal-hash inputs. The run-wide audit
 mode and bound run-deadline epoch/value remain terminal-hash inputs even after
-all requests close. Replay consumes the
-durable classification time and never substitutes the current clock or the
+all requests close. The sorted per-instrument audit-economic generations are
+committed as well because they determine the identity and race fence of the
+next audit even when current L2 and pending markers are otherwise equal. Replay
+consumes the durable classification time and never substitutes the current clock or the
 wall-clock schedule. Historical all-inline runs remain supported for old
 datasets, but a run cannot upgrade or downgrade between inline and bound
 deferred modes. A bound start cannot be completed by an inline response or
@@ -678,7 +692,10 @@ Current protocol conclusions:
   full-book hashing, incremental events do not carry a documented recomputable
   post-update book checksum. That is insufficient for continuous authoritative
   WebSocket integrity validation. `supports_book_checksum` is therefore
-  `false`; received hashes remain opaque provenance in canonical state.
+  `false`; received hashes remain opaque provenance in canonical state. A
+  repeated causing-order hash or timestamp across successive frames is observed
+  evidence only, not an ordering precondition for the narrow pending-BBO
+  reconciliation rule.
 - Live REST level arrays have been observed in an order different from the
   examples; canonical books sort exact levels rather than trusting wire order.
 - Disconnect, parser ambiguity, backpressure loss, and state uncertainty

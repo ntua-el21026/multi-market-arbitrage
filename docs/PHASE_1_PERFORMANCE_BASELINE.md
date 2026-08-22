@@ -291,9 +291,26 @@ reference oracle remains mandatory.
 
 The scoped scanner suite comprised 17 unit/property tests, including the 2,000
 differential examples, and passed with Ruff, Pyright, and whitespace/diff checks.
-These correctness results support the implementation change. The focused
-timings remain one-machine spot evidence and require a sealed full-campaign
-rerun before they can become a new general Phase 1 performance baseline.
+These correctness results support the implementation change.
+
+### Exact full comparable rerun at `e20f23f`
+
+A later clean-worktree run executed the complete preserved 54-series comparable
+suite on commit `e20f23fee099caf5b98c556793d09218da466685`. Its source snapshot was
+`6890f3cae3e4fe4754ad0a528c51daf3bb570de420aae8af912e88eb951338fe`.
+This is historical pre-final-correction evidence, not a result attributed to a
+later commit.
+
+The 4,096-point scanner measured p50 `1.138056 ms` and
+p95/p99/maximum `1.371230 ms`, approximately 94.6 times faster at p50 than
+the sealed historical `107.691 ms` result. The 30-point apparent-edge path
+measured p50 `1.184777 ms`, p95 `1.508870 ms`, p99/maximum `1.796097 ms`.
+The 4,096-point diagnostics retained 3,597 minimum-size-eligible lattice points
+but required four affine-root solves, four rounded-fee runs, one exact fee
+evaluation, one rich economics evaluation, and one selected quantity. All 54
+semantic-result hashes satisfied the harness contract; the embedded 132-record
+live/replay fixture ended at the same terminal hash. Exact final-commit evidence
+must still be produced whenever later processor semantics change.
 
 ## Reproduction
 

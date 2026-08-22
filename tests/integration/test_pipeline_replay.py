@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -115,6 +116,99 @@ _CALIBRATION_PRICE_CHANGE = (
     b'"event_type":"price_change"}'
 )
 
+# Exact payload bytes preserved from sealed calibration run
+# 01a02b58-1a43-7a91-b4ff-357a7ec582c5.  The sequence 480-484 transition
+# demonstrates the venue's BBO -> add-new-top -> remove-old-top framing; the
+# later sequence 620-621 transition repeats it on the opposite book sides.
+_SEALED_CALIBRATION_SEQ_480 = base64.b64decode(
+    "eyJtYXJrZXQiOiIweDM5ZWExNTAzNDI3ZGY3ZjE0MzllN2RkNjU2N2FhZDVlZDcyMjg0ZWQ0OWM1OGQwOWU1"
+    "YjkxN2EyNDM4OWZhYjciLCAiYXNzZXRfaWQiOiIxODI1ODM5NTc1NTA0MTM5MjExODE5ODk0MDg5ODA1Nzg0"
+    "NjIzNDc3NDc2MDg5NDE1MjI2Mjk4ODU2ODk1MTIyMTQ2NDQ1ODU0Mjg1MCIsICJiZXN0X2JpZCI6IjAuMDEz"
+    "IiwgImJlc3RfYXNrIjoiMC4wMTUiLCAic3ByZWFkIjoiMC4wMDIiLCAidGltZXN0YW1wIjoiMTc4NzQzMzY5"
+    "MDE0NiIsICJldmVudF90eXBlIjoiYmVzdF9iaWRfYXNrIn0="
+)
+_SEALED_CALIBRATION_SEQ_481 = base64.b64decode(
+    "eyJtYXJrZXQiOiIweDM5ZWExNTAzNDI3ZGY3ZjE0MzllN2RkNjU2N2FhZDVlZDcyMjg0ZWQ0OWM1OGQwOWU1"
+    "YjkxN2EyNDM4OWZhYjciLCAiYXNzZXRfaWQiOiIxMTQ3MjczMTY2MjgxNzI4NzMxMjUxOTA3NjYxNTc0MTg2"
+    "MDY4NDYzNDcyMTIwMjM3NDIzNjMzOTMyNTQ1MTg5ODc2MDQ2NDA2NDg1ODkiLCAiYmVzdF9iaWQiOiIwLjk4"
+    "NSIsICJiZXN0X2FzayI6IjAuOTg3IiwgInNwcmVhZCI6IjAuMDAyIiwgInRpbWVzdGFtcCI6IjE3ODc0MzM2"
+    "OTAxNDYiLCAiZXZlbnRfdHlwZSI6ImJlc3RfYmlkX2FzayJ9"
+)
+_SEALED_CALIBRATION_SEQ_482 = base64.b64decode(
+    "eyJtYXJrZXQiOiIweDM5ZWExNTAzNDI3ZGY3ZjE0MzllN2RkNjU2N2FhZDVlZDcyMjg0ZWQ0OWM1OGQwOWU1"
+    "YjkxN2EyNDM4OWZhYjciLCAicHJpY2VfY2hhbmdlcyI6W3siYXNzZXRfaWQiOiIxMTQ3MjczMTY2MjgxNzI4"
+    "NzMxMjUxOTA3NjYxNTc0MTg2MDY4NDYzNDcyMTIwMjM3NDIzNjMzOTMyNTQ1MTg5ODc2MDQ2NDA2NDg1ODki"
+    "LCAicHJpY2UiOiIwLjk4NyIsICJzaXplIjoiNTkzLjM5IiwgInNpZGUiOiJTRUxMIiwgImhhc2giOiJjNDQ5"
+    "Y2U0YzQ2ODAxMGRiM2EwZjA2MzE4NmE2OTQ2YmIyZGNmY2JiIiwgImJlc3RfYmlkIjoiMC45ODUiLCAiYmVz"
+    "dF9hc2siOiIwLjk4NyJ9LCB7ImFzc2V0X2lkIjoiMTgyNTgzOTU3NTUwNDEzOTIxMTgxOTg5NDA4OTgwNTc4"
+    "NDYyMzQ3NzQ3NjA4OTQxNTIyNjI5ODg1Njg5NTEyMjE0NjQ0NTg1NDI4NTAiLCAicHJpY2UiOiIwLjAxMyIs"
+    "ICJzaXplIjoiNTkzLjM5IiwgInNpZGUiOiJCVVkiLCAiaGFzaCI6IjJhYjZiYzM1NjFjY2IwNGY4MmU0M2Vi"
+    "ZmY4ZDZhZTk1NDM2MWNmZmMiLCAiYmVzdF9iaWQiOiIwLjAxMyIsICJiZXN0X2FzayI6IjAuMDE1In1dLCAi"
+    "dGltZXN0YW1wIjoiMTc4NzQzMzY5MDE0NiIsICJldmVudF90eXBlIjoicHJpY2VfY2hhbmdlIn0="
+)
+_SEALED_CALIBRATION_SEQ_483 = base64.b64decode(
+    "eyJtYXJrZXQiOiIweDM5ZWExNTAzNDI3ZGY3ZjE0MzllN2RkNjU2N2FhZDVlZDcyMjg0ZWQ0OWM1OGQwOWU1"
+    "YjkxN2EyNDM4OWZhYjciLCAicHJpY2VfY2hhbmdlcyI6W3siYXNzZXRfaWQiOiIxMTQ3MjczMTY2MjgxNzI4"
+    "NzMxMjUxOTA3NjYxNTc0MTg2MDY4NDYzNDcyMTIwMjM3NDIzNjMzOTMyNTQ1MTg5ODc2MDQ2NDA2NDg1ODki"
+    "LCAicHJpY2UiOiIwLjk4NiIsICJzaXplIjoiMCIsICJzaWRlIjoiU0VMTCIsICJoYXNoIjoiYzQ0OWNlNGM0"
+    "NjgwMTBkYjNhMGYwNjMxODZhNjk0NmJiMmRjZmNiYiIsICJiZXN0X2JpZCI6IjAuOTg1IiwgImJlc3RfYXNr"
+    "IjoiMC45ODcifSwgeyJhc3NldF9pZCI6IjE4MjU4Mzk1NzU1MDQxMzkyMTE4MTk4OTQwODk4MDU3ODQ2MjM0"
+    "Nzc0NzYwODk0MTUyMjYyOTg4NTY4OTUxMjIxNDY0NDU4NTQyODUwIiwgInByaWNlIjoiMC4wMTQiLCAic2l6"
+    "ZSI6IjAiLCAic2lkZSI6IkJVWSIsICJoYXNoIjoiMmFiNmJjMzU2MWNjYjA0ZjgyZTQzZWJmZjhkNmFlOTU0"
+    "MzYxY2ZmYyIsICJiZXN0X2JpZCI6IjAuMDEzIiwgImJlc3RfYXNrIjoiMC4wMTUifV0sICJ0aW1lc3RhbXAi"
+    "OiIxNzg3NDMzNjkwMTQ2IiwgImV2ZW50X3R5cGUiOiJwcmljZV9jaGFuZ2UifQ=="
+)
+_SEALED_CALIBRATION_SEQ_484 = base64.b64decode(
+    "eyJtYXJrZXQiOiIweDM5ZWExNTAzNDI3ZGY3ZjE0MzllN2RkNjU2N2FhZDVlZDcyMjg0ZWQ0OWM1OGQwOWU1"
+    "YjkxN2EyNDM4OWZhYjciLCAicHJpY2VfY2hhbmdlcyI6W3siYXNzZXRfaWQiOiIxODI1ODM5NTc1NTA0MTM5"
+    "MjExODE5ODk0MDg5ODA1Nzg0NjIzNDc3NDc2MDg5NDE1MjI2Mjk4ODU2ODk1MTIyMTQ2NDQ1ODU0Mjg1MCIs"
+    "ICJwcmljZSI6IjAuMDE0IiwgInNpemUiOiIwIiwgInNpZGUiOiJCVVkiLCAiaGFzaCI6IjJhYjZiYzM1NjFj"
+    "Y2IwNGY4MmU0M2ViZmY4ZDZhZTk1NDM2MWNmZmMiLCAiYmVzdF9iaWQiOiIwLjAxMyIsICJiZXN0X2FzayI6"
+    "IjAuMDE1In0sIHsiYXNzZXRfaWQiOiIxMTQ3MjczMTY2MjgxNzI4NzMxMjUxOTA3NjYxNTc0MTg2MDY4NDYz"
+    "NDcyMTIwMjM3NDIzNjMzOTMyNTQ1MTg5ODc2MDQ2NDA2NDg1ODkiLCAicHJpY2UiOiIwLjk4NiIsICJzaXpl"
+    "IjoiMCIsICJzaWRlIjoiU0VMTCIsICJoYXNoIjoiYzQ0OWNlNGM0NjgwMTBkYjNhMGYwNjMxODZhNjk0NmJi"
+    "MmRjZmNiYiIsICJiZXN0X2JpZCI6IjAuOTg1IiwgImJlc3RfYXNrIjoiMC45ODcifV0sICJ0aW1lc3RhbXAi"
+    "OiIxNzg3NDMzNjkwMTQ2IiwgImV2ZW50X3R5cGUiOiJwcmljZV9jaGFuZ2UifQ=="
+)
+_SEALED_CALIBRATION_SEQ_618 = base64.b64decode(
+    "eyJtYXJrZXQiOiIweDM5ZWExNTAzNDI3ZGY3ZjE0MzllN2RkNjU2N2FhZDVlZDcyMjg0ZWQ0OWM1OGQwOWU1"
+    "YjkxN2EyNDM4OWZhYjciLCAiYXNzZXRfaWQiOiIxODI1ODM5NTc1NTA0MTM5MjExODE5ODk0MDg5ODA1Nzg0"
+    "NjIzNDc3NDc2MDg5NDE1MjI2Mjk4ODU2ODk1MTIyMTQ2NDQ1ODU0Mjg1MCIsICJiZXN0X2JpZCI6IjAuMDE0"
+    "IiwgImJlc3RfYXNrIjoiMC4wMTgiLCAic3ByZWFkIjoiMC4wMDQiLCAidGltZXN0YW1wIjoiMTc4NzQzMzY5"
+    "ODczNCIsICJldmVudF90eXBlIjoiYmVzdF9iaWRfYXNrIn0="
+)
+_SEALED_CALIBRATION_SEQ_619 = base64.b64decode(
+    "eyJtYXJrZXQiOiIweDM5ZWExNTAzNDI3ZGY3ZjE0MzllN2RkNjU2N2FhZDVlZDcyMjg0ZWQ0OWM1OGQwOWU1"
+    "YjkxN2EyNDM4OWZhYjciLCAiYXNzZXRfaWQiOiIxMTQ3MjczMTY2MjgxNzI4NzMxMjUxOTA3NjYxNTc0MTg2"
+    "MDY4NDYzNDcyMTIwMjM3NDIzNjMzOTMyNTQ1MTg5ODc2MDQ2NDA2NDg1ODkiLCAiYmVzdF9iaWQiOiIwLjk4"
+    "MiIsICJiZXN0X2FzayI6IjAuOTg2IiwgInNwcmVhZCI6IjAuMDA0IiwgInRpbWVzdGFtcCI6IjE3ODc0MzM2"
+    "OTg3MzQiLCAiZXZlbnRfdHlwZSI6ImJlc3RfYmlkX2FzayJ9"
+)
+_SEALED_CALIBRATION_SEQ_620 = base64.b64decode(
+    "eyJtYXJrZXQiOiIweDM5ZWExNTAzNDI3ZGY3ZjE0MzllN2RkNjU2N2FhZDVlZDcyMjg0ZWQ0OWM1OGQwOWU1"
+    "YjkxN2EyNDM4OWZhYjciLCAicHJpY2VfY2hhbmdlcyI6W3siYXNzZXRfaWQiOiIxMTQ3MjczMTY2MjgxNzI4"
+    "NzMxMjUxOTA3NjYxNTc0MTg2MDY4NDYzNDcyMTIwMjM3NDIzNjMzOTMyNTQ1MTg5ODc2MDQ2NDA2NDg1ODki"
+    "LCAicHJpY2UiOiIwLjk4MiIsICJzaXplIjoiOTYxLjAzIiwgInNpZGUiOiJCVVkiLCAiaGFzaCI6ImY4Y2Ix"
+    "ZWJiZTFjNDdkNDI4YjNmMjQ4YWNkZTY0ZmQyYzA3MWJjMmYiLCAiYmVzdF9iaWQiOiIwLjk4MiIsICJiZXN0"
+    "X2FzayI6IjAuOTg2In0sIHsiYXNzZXRfaWQiOiIxODI1ODM5NTc1NTA0MTM5MjExODE5ODk0MDg5ODA1Nzg0"
+    "NjIzNDc3NDc2MDg5NDE1MjI2Mjk4ODU2ODk1MTIyMTQ2NDQ1ODU0Mjg1MCIsICJwcmljZSI6IjAuMDE4Iiwg"
+    "InNpemUiOiI5NjEuMDMiLCAic2lkZSI6IlNFTEwiLCAiaGFzaCI6IjFhYzhkMmJjYjY2YTYyNWZiMTgxZWIz"
+    "ZTVmMTQ4ZWZkMzk0NWMyNjAiLCAiYmVzdF9iaWQiOiIwLjAxNCIsICJiZXN0X2FzayI6IjAuMDE4In1dLCAi"
+    "dGltZXN0YW1wIjoiMTc4NzQzMzY5ODczNCIsICJldmVudF90eXBlIjoicHJpY2VfY2hhbmdlIn0="
+)
+_SEALED_CALIBRATION_SEQ_621 = base64.b64decode(
+    "eyJtYXJrZXQiOiIweDM5ZWExNTAzNDI3ZGY3ZjE0MzllN2RkNjU2N2FhZDVlZDcyMjg0ZWQ0OWM1OGQwOWU1"
+    "YjkxN2EyNDM4OWZhYjciLCAicHJpY2VfY2hhbmdlcyI6W3siYXNzZXRfaWQiOiIxMTQ3MjczMTY2MjgxNzI4"
+    "NzMxMjUxOTA3NjYxNTc0MTg2MDY4NDYzNDcyMTIwMjM3NDIzNjMzOTMyNTQ1MTg5ODc2MDQ2NDA2NDg1ODki"
+    "LCAicHJpY2UiOiIwLjk4NSIsICJzaXplIjoiMCIsICJzaWRlIjoiQlVZIiwgImhhc2giOiJmOGNiMWViYmUx"
+    "YzQ3ZDQyOGIzZjI0OGFjZGU2NGZkMmMwNzFiYzJmIiwgImJlc3RfYmlkIjoiMC45ODIiLCAiYmVzdF9hc2si"
+    "OiIwLjk4NiJ9LCB7ImFzc2V0X2lkIjoiMTgyNTgzOTU3NTUwNDEzOTIxMTgxOTg5NDA4OTgwNTc4NDYyMzQ3"
+    "NzQ3NjA4OTQxNTIyNjI5ODg1Njg5NTEyMjE0NjQ0NTg1NDI4NTAiLCAicHJpY2UiOiIwLjAxNSIsICJzaXpl"
+    "IjoiMCIsICJzaWRlIjoiU0VMTCIsICJoYXNoIjoiMWFjOGQyYmNiNjZhNjI1ZmIxODFlYjNlNWYxNDhlZmQz"
+    "OTQ1YzI2MCIsICJiZXN0X2JpZCI6IjAuMDE0IiwgImJlc3RfYXNrIjoiMC4wMTgifV0sICJ0aW1lc3RhbXAi"
+    "OiIxNzg3NDMzNjk4NzM0IiwgImV2ZW50X3R5cGUiOiJwcmljZV9jaGFuZ2UifQ=="
+)
+
 
 def _fixture(name: str) -> bytes:
     return (FIXTURES / name).read_bytes()
@@ -185,6 +279,34 @@ def _calibration_book(*, yes: bool) -> bytes:
     ).encode()
 
 
+def _calibration_second_multiframe_book(*, yes: bool) -> bytes:
+    if yes:
+        asset_id = _CALIBRATION_YES_ASSET_ID
+        bids = [("0.013", "10"), ("0.014", "4")]
+        asks = [("0.015", "3"), ("0.019", "8")]
+        last_trade_price = "0.015"
+    else:
+        asset_id = _CALIBRATION_NO_ASSET_ID
+        bids = [("0.981", "8"), ("0.985", "3")]
+        asks = [("0.986", "4"), ("0.987", "10")]
+        last_trade_price = "0.985"
+    return json.dumps(
+        {
+            "market": _CALIBRATION_CONDITION_ID,
+            "asset_id": asset_id,
+            "timestamp": "1787433698000",
+            "hash": f"calibration-second-multiframe-{'yes' if yes else 'no'}-rest",
+            "bids": [{"price": price, "size": size} for price, size in bids],
+            "asks": [{"price": price, "size": size} for price, size in asks],
+            "min_order_size": "5",
+            "tick_size": "0.001",
+            "neg_risk": False,
+            "last_trade_price": last_trade_price,
+        },
+        separators=(",", ":"),
+    ).encode()
+
+
 def _calibration_bbo_inputs(run_id: CollectorRunId) -> tuple[RawEventEnvelope, ...]:
     return tuple(
         _envelope(run_id, sequence, channel, payload)
@@ -199,6 +321,43 @@ def _calibration_bbo_inputs(run_id: CollectorRunId) -> tuple[RawEventEnvelope, .
                 (WS_MARKET, _CALIBRATION_PRICE_CHANGE),
             )
         )
+    )
+
+
+def _sealed_calibration_multiframe_inputs(
+    run_id: CollectorRunId,
+    *,
+    later_transition: bool,
+) -> tuple[RawEventEnvelope, ...]:
+    if later_transition:
+        yes_book = _calibration_second_multiframe_book(yes=True)
+        no_book = _calibration_second_multiframe_book(yes=False)
+        websocket_payloads = (
+            _SEALED_CALIBRATION_SEQ_618,
+            _SEALED_CALIBRATION_SEQ_619,
+            _SEALED_CALIBRATION_SEQ_620,
+            _SEALED_CALIBRATION_SEQ_621,
+        )
+    else:
+        yes_book = _calibration_book(yes=True)
+        no_book = _calibration_book(yes=False)
+        websocket_payloads = (
+            _SEALED_CALIBRATION_SEQ_480,
+            _SEALED_CALIBRATION_SEQ_481,
+            _SEALED_CALIBRATION_SEQ_482,
+            _SEALED_CALIBRATION_SEQ_483,
+            _SEALED_CALIBRATION_SEQ_484,
+        )
+    channel_payloads = (
+        (GAMMA_MARKETS_KEYSET, _calibration_gamma()),
+        (f"{CLOB_MARKET_PREFIX}{_CALIBRATION_CONDITION_ID}", _calibration_clob()),
+        (REST_BOOK, yes_book),
+        (REST_BOOK, no_book),
+        *((WS_MARKET, payload) for payload in websocket_payloads),
+    )
+    return tuple(
+        _envelope(run_id, sequence, channel, payload)
+        for sequence, (channel, payload) in enumerate(channel_payloads)
     )
 
 
@@ -383,6 +542,137 @@ async def test_failed_calibration_best_bid_ask_frames_replay_without_protocol_fa
     assert live.terminal_hash == first.processor.terminal_hash
     assert first == second
     assert first.raw_record_count == 7
+
+
+@pytest.mark.parametrize(
+    ("later_transition", "expected_pending_counts", "expected_tops"),
+    [
+        (False, (1, 2, 2, 0, 0), (("0.013", "0.015"), ("0.985", "0.987"))),
+        (True, (1, 2, 2, 0), (("0.014", "0.018"), ("0.982", "0.986"))),
+    ],
+)
+@pytest.mark.asyncio
+async def test_sealed_calibration_multiframe_bbo_transition_replays_deterministically(
+    tmp_path: Path,
+    *,
+    later_transition: bool,
+    expected_pending_counts: tuple[int, ...],
+    expected_tops: tuple[tuple[str, str], tuple[str, str]],
+) -> None:
+    source_hashes = {
+        480: "154657379e0197e2f793cf10a55db8117a00cf8eef1c3e9d2585218c1d5812ef",
+        481: "df5d8506ca80652898f8849496eced222af02b8e9989c7f096ada080f8d5ff4b",
+        482: "5977ded27c66ca542e0e9b45ab5827c61564abb152685a2df11501b5ce14d0d7",
+        483: "aa5c4577df6431c85c15811efae18bcbd7ec46555ae23d034705fdb3585bb8c1",
+        484: "ba49ffa4feae8a97bdb0008a20d41196e1830d6b98dc4b1cf2e7787eb505f57c",
+        618: "cf7db880b08e3c6dc541caadce4c1bba48a37cce4c1b93d4497e0bc2b957ce90",
+        619: "3510a77611db584b6860d65cad6a2f07d7fe0f944cec97723b2939fe53d4fc6d",
+        620: "77fedc3bb596641d6847a62282c24864d0ebfdc412c47e114d0e3e6872f4aa79",
+        621: "5e2d3fcdc73b0c8b2f917b4b9778ca5dfa2b2d2346c3aa41ac5972cc5ca4419f",
+    }
+    exact_frames = {
+        480: _SEALED_CALIBRATION_SEQ_480,
+        481: _SEALED_CALIBRATION_SEQ_481,
+        482: _SEALED_CALIBRATION_SEQ_482,
+        483: _SEALED_CALIBRATION_SEQ_483,
+        484: _SEALED_CALIBRATION_SEQ_484,
+        618: _SEALED_CALIBRATION_SEQ_618,
+        619: _SEALED_CALIBRATION_SEQ_619,
+        620: _SEALED_CALIBRATION_SEQ_620,
+        621: _SEALED_CALIBRATION_SEQ_621,
+    }
+    assert {
+        sequence: hashlib.sha256(payload).hexdigest() for sequence, payload in exact_frames.items()
+    } == source_hashes
+
+    suffix = "620-621" if later_transition else "480-484"
+    run_id = CollectorRunId(f"sealed-calibration-multiframe-{suffix}")
+    config = load_phase1_config(Path("config/phase1.toml"))
+    processor = CanonicalProcessor(config)
+    writer = RawJournalWriter(
+        JournalWriterConfig(
+            root=tmp_path / "raw",
+            collector_run_id=run_id,
+            venue_id=POLYMARKET_VENUE_ID,
+            stream="polymarket-public",
+            writer_id=WriterId(f"writer-sealed-multiframe-{suffix}"),
+            writer_software_version="test",
+            git_commit="sealed-calibration-multiframe-fixture",
+            max_events_per_segment=3,
+        )
+    )
+    await writer.start()
+    live_results: list[ProcessedEnvelope] = []
+    pending_counts: list[int] = []
+    envelopes = _sealed_calibration_multiframe_inputs(
+        run_id,
+        later_transition=later_transition,
+    )
+    for index, envelope in enumerate(envelopes):
+        receipt = await writer.submit(envelope)
+        live_results.append(processor.process_durable(envelope, receipt))
+        if index >= 4:
+            pending_counts.append(len(processor.audit_ineligible_instruments))
+    await writer.close()
+
+    assert all(result.success for result in live_results)
+    assert pending_counts == list(expected_pending_counts)
+    assert not live_results[4].book_freshness_updates
+    assert not live_results[5].book_freshness_updates
+    assert len(live_results[6].book_freshness_updates) == 2
+    assert len(live_results[6].relevant_l2_receive_updates) == 2
+    assert len(live_results[7].book_freshness_updates) == 2
+    live = processor.summary()
+    assert live.parse_failures == 0
+    assert live.invalidations == 0
+    assert live.healthy_books == 2
+    assert live.audit_ineligible_books == 0
+
+    bundle = processor.current_bundles[0]
+    for native_asset_id, expected_top in zip(
+        (_CALIBRATION_YES_ASSET_ID, _CALIBRATION_NO_ASSET_ID),
+        expected_tops,
+        strict=True,
+    ):
+        instrument_id = bundle.instrument_for_token(native_asset_id).instrument_id
+        owner = next(item for item in processor.owners if item.instrument_id == instrument_id)
+        snapshot = owner.snapshot()
+        assert snapshot.best_bid is not None
+        assert snapshot.best_ask is not None
+        assert (str(snapshot.best_bid.price), str(snapshot.best_ask.price)) == expected_top
+        assert snapshot.last_source_provenance is not None
+        expected_last_sequence = 621 if later_transition else 484
+        assert snapshot.last_source_provenance.source_payload_hashes == (
+            source_hashes[expected_last_sequence],
+        )
+
+    first = replay_journal(tmp_path / "raw", run_id, config)
+    second = replay_journal(tmp_path / "raw", run_id, config)
+    assert live.terminal_hash == first.processor.terminal_hash
+    assert live.canonical_event_chain_sha256 == first.processor.canonical_event_chain_sha256
+    assert first == second
+    assert first.raw_record_count == len(envelopes)
+
+
+def test_sealed_multiframe_intermediate_without_pending_bbo_remains_fail_closed() -> None:
+    run_id = CollectorRunId("sealed-multiframe-without-pending-bbo")
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    bootstrap = _sealed_calibration_multiframe_inputs(run_id, later_transition=False)[:4]
+    for envelope in bootstrap:
+        assert processor.process_replayed(envelope).success
+
+    rejected = processor.process_replayed(
+        _envelope(run_id, 4, WS_MARKET, _SEALED_CALIBRATION_SEQ_482)
+    )
+
+    assert not rejected.success
+    assert rejected.needs_resync
+    assert rejected.error_type == "BookStateError"
+    assert processor.summary().parse_failures == 1
+    assert processor.summary().invalidations == 2
+    assert processor.summary().healthy_books == 0
+    assert len(rejected.affected_instrument_ids) == 2
+    assert processor.audit_ineligible_instruments == ()
 
 
 @pytest.mark.asyncio

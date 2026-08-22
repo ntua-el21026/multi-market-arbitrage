@@ -4,6 +4,7 @@ import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -13,6 +14,7 @@ from multi_market_arbitrage.core.health import BookHealth
 from multi_market_arbitrage.core.ids import (
     CollectorRunId,
     ConnectionId,
+    InstrumentId,
     SubscriptionId,
 )
 from multi_market_arbitrage.core.provenance import Provenance
@@ -2118,3 +2120,27 @@ def test_processor_history_retention_is_bounded_without_losing_exact_counts(
     assert len(summary.raw_input_chain_sha256) == 64
     assert len(summary.canonical_event_chain_sha256) == 64
     assert len(summary.scan_chain_sha256) == 64
+
+
+def test_terminal_hash_binds_hidden_audit_economic_generation_state() -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId("processor-terminal-audit-generation-binding")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    before = processor.summary()
+    before_identity = processor.audit_book_identity("token-yes")
+
+    # Simulate an otherwise invisible corruption of the dedicated generation
+    # that fences audit requests. The terminal commitment must detect it even
+    # though ProcessorSummary exposes no separate mutable-state field for it.
+    generations = cast(
+        dict[InstrumentId, int],
+        vars(processor)["_audit_economic_generations"],
+    )
+    generations[before_identity.instrument_id] += 1
+
+    after = processor.summary()
+    after_identity = processor.audit_book_identity("token-yes")
+    assert after_identity.generation == before_identity.generation + 1
+    assert after.terminal_hash != before.terminal_hash
+    assert replace(after, terminal_hash=before.terminal_hash) == before

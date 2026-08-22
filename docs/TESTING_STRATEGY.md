@@ -111,7 +111,8 @@ classification control releases them. Historical inline records replay in
 their all-legacy mode, while legacy-to-bound and bound-to-legacy run changes,
 mismatched ingest-sequence, repeated-classification, and malformed bound-control
 records fail closed. The terminal hash binds the locked mode and the bound
-run-deadline monotonic epoch/value after requests complete.
+run-deadline monotonic epoch/value after requests complete, plus the sorted
+audit-economic generation map that determines the next fenced audit identity.
 Adversarial starts include no accepted freshness and a forged future hard
 expiry followed by classification after the true freshness boundary; neither
 may produce an audit outcome or refresh eligibility. A START earlier than its
@@ -151,6 +152,12 @@ the two eligible first attempts then coexist in flight; another case crosses a
 staged leg's deadline and proves no late HTTP launch. A pre-response economic
 update must never yield a false `MATCH`, and routine audit must not cancel or
 replace a healthy socket generation.
+
+Byte-exact captured regressions cover the observed multi-frame BBO transition:
+announce the new top, add its exact level while the old top remains, then delete
+the old level. They require audit/research ineligibility until derived L2
+converges, exact provenance retention, strict rejection without the matching
+pending BBO, and identical live/replay terminal state.
 
 Public-read faults cover timeout, connection failure, `429`, temporary `5xx`,
 delta-seconds and HTTP-date `Retry-After`, over-policy `Retry-After`, permanent

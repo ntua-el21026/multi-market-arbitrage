@@ -728,9 +728,22 @@ class CanonicalProcessor:
         superseded = isinstance(payload, OrderBookSnapshotEvent)
         if isinstance(payload, PriceChangeEvent):
             final_change = payload.changes[-1]
-            superseded = (
+            reports_complete_top = (
                 final_change.reported_best_bid is not None
                 and final_change.reported_best_ask is not None
+            )
+            reports_pending_top = (
+                final_change.reported_best_bid == pending.best_bid
+                and final_change.reported_best_ask == pending.best_ask
+            )
+            # A venue update can publish the final BBO before several exact
+            # level-change frames. The first exact mutation may therefore
+            # leave an older top level in place. Keep the BBO
+            # unresolved until a later exact mutation produces that announced
+            # top.  A different complete reported top has passed the owner's
+            # ordinary strict validation and supersedes the older BBO.
+            superseded = reports_complete_top and (
+                not reports_pending_top or self._owner_matches_best_bid_ask(owner, pending)
             )
         if not superseded:
             return
@@ -2026,7 +2039,14 @@ class CanonicalProcessor:
                 )
                 continue
             try:
-                mutation = owner.apply_event(event)
+                if isinstance(event.payload, PriceChangeEvent):
+                    mutation = owner.apply_price_change(
+                        event.payload,
+                        event=event,
+                        pending_best_bid_ask=self._pending_best_bid_ask.get(instrument_id),
+                    )
+                else:
+                    mutation = owner.apply_event(event)
             except RawSourceInvariantError as error:
                 raise ProgrammingInvariantViolation(
                     "book-state provenance contains conflicting raw source pairs",
@@ -2329,6 +2349,13 @@ class CanonicalProcessor:
                 key=lambda item: item.value,
             )
         )
+        audit_economic_generation_state = tuple(
+            (instrument_id.value, self._audit_economic_generations[instrument_id])
+            for instrument_id in sorted(
+                self._audit_economic_generations,
+                key=lambda item: item.value,
+            )
+        )
         terminal_hash = canonical_sha256(
             {
                 "config_hash": self._config.config_hash.value,
@@ -2367,6 +2394,7 @@ class CanonicalProcessor:
                 "reference_versions": reference_versions,
                 "lifecycle_state_sha256": lifecycle_state_sha256,
                 "audit_ineligible_instrument_ids": audit_ineligible_instrument_ids,
+                "audit_economic_generations": audit_economic_generation_state,
                 "pending_rest_audits": pending_rest_audit_state,
                 "pending_best_bid_ask": pending_best_bid_ask_state,
                 "rest_audit_protocol_mode": self._rest_audit_protocol_mode,

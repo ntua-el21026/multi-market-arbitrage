@@ -23,6 +23,7 @@ from multi_market_arbitrage.core.provenance import (
 from multi_market_arbitrage.core.serialization import canonical_sha256
 from multi_market_arbitrage.core.time import UtcTimestamp
 from multi_market_arbitrage.normalization import (
+    BestBidAskEvent,
     BookSide,
     CanonicalBookLevel,
     CanonicalEvent,
@@ -646,7 +647,11 @@ class CanonicalL2BookOwner:
         )
 
     def apply_price_change(
-        self, payload: PriceChangeEvent, *, event: CanonicalEvent
+        self,
+        payload: PriceChangeEvent,
+        *,
+        event: CanonicalEvent,
+        pending_best_bid_ask: BestBidAskEvent | None = None,
     ) -> BookMutation:
         if self._health is not BookHealth.HEALTHY:
             raise BookStateError("price change requires a healthy snapshot baseline")
@@ -678,13 +683,21 @@ class CanonicalL2BookOwner:
         last_change = payload.changes[-1]
         derived_best_bid = None if not bids else bids[0].price
         derived_best_ask = None if not asks else asks[0].price
-        if (
+        reported_top_disagrees = (
             last_change.reported_best_bid is not None
             and last_change.reported_best_bid != derived_best_bid
         ) or (
             last_change.reported_best_ask is not None
             and last_change.reported_best_ask != derived_best_ask
-        ):
+        )
+        may_defer_reported_top_validation = (
+            pending_best_bid_ask is not None
+            and pending_best_bid_ask.instrument_id == self._instrument_id
+            and pending_best_bid_ask.market_id == self._market_id
+            and last_change.reported_best_bid == pending_best_bid_ask.best_bid
+            and last_change.reported_best_ask == pending_best_bid_ask.best_ask
+        )
+        if reported_top_disagrees and not may_defer_reported_top_validation:
             self.invalidate(InvalidationReason.PROTOCOL_VIOLATION)
             raise BookStateError("reported best bid/ask disagrees with derived exact state")
 

@@ -157,6 +157,15 @@ quantity-free BBO, even one whose prices return to the local top, cannot clear
 the unresolved depth state. An ordinary REST audit is likewise not allowed to
 clear it: a lagging REST body equal to stale local L2 is explicitly
 non-comparable rather than false-`MATCH`.
+The venue may realize one announced BBO through successive quantity-bearing
+frames (for example, adding the new top level before deleting the old top).
+An intermediate frame whose derived top has not converged is accepted only
+when an already-pending BBO exactly equals that frame's complete reported bid
+and ask. The exact level mutation and provenance are retained, but the
+instrument remains audit- and research-ineligible until a later exact mutation
+derives the pending BBO. Without that exact pending announcement, reported-top
+disagreement keeps the ordinary fail-closed protocol invalidation. Tick,
+crossing, quantity, and provenance validation are never deferred.
 Invalid price/spread relationships remain typed schema/normalization failures.
 Contract source: [official market channel](https://docs.polymarket.com/api-reference/wss/market),
 checked 2026-08-22.
@@ -228,7 +237,9 @@ the same classification without repeating remote I/O or depending on current
 task timing. The deferred raw response and complete bound start state remain
 pending deterministic state until the classification control arrives and are
 included in terminal hashing. The locked audit mode and bound run cutoff remain
-in that hash even after requests complete. Replay uses the durable
+in that hash even after requests complete. The sorted audit-economic generation
+map is also terminal state because it fences the next audit independently of
+the current book hash. Replay uses the durable
 classification timestamp, never the current clock. Historical all-inline audit
 runs remain replayable, but mode upgrades/downgrades or inline completion or
 expiry in a deferred-bound run are protocol errors and are rejected.
