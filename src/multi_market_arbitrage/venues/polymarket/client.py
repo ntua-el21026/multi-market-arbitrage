@@ -280,14 +280,20 @@ class PolymarketPublicClient:
         self._wall_clock = wall_clock
         self._monotonic_ns = monotonic_ns
         self._utc_now = utc_now
+        effective_public_read_policy = (
+            public_read_policy if public_read_policy is not None else PublicReadPolicy()
+        )
         self._public_reads = _SafePublicReadController(
-            public_read_policy if public_read_policy is not None else PublicReadPolicy(),
+            effective_public_read_policy,
             metrics=metrics,
             jitter_source=jitter_source,
             sleeper=sleeper,
             monotonic=monotonic,
             monotonic_ns=monotonic_ns,
         )
+        self._maximum_response_cleanup_tasks = effective_public_read_policy.maximum_concurrency
+        self._response_cleanup_tasks: dict[asyncio.Task[None], None] = {}
+        self._close_task: asyncio.Task[None] | None = None
         self._closed = False
 
     async def __aenter__(self) -> PolymarketPublicClient:
@@ -302,9 +308,71 @@ class PolymarketPublicClient:
         await self.aclose()
 
     async def aclose(self) -> None:
-        if not self._closed:
+        close_task = self._close_task
+        if close_task is None:
+            # Establish the close linearization point before yielding. The
+            # independently owned task survives cancellation of any one caller,
+            # and all concurrent/subsequent callers await the same close.
             self._closed = True
-            await self._client.aclose()
+            close_task = asyncio.create_task(
+                self._close_owner(),
+                name="polymarket-public-client-close",
+            )
+
+            def consume_close_result(completed: asyncio.Task[None]) -> None:
+                if not completed.cancelled():
+                    completed.exception()
+
+            close_task.add_done_callback(consume_close_result)
+            self._close_task = close_task
+        await asyncio.shield(close_task)
+
+    async def _close_owner(self) -> None:
+        cleanup_tasks = tuple(self._response_cleanup_tasks)
+        for task in cleanup_tasks:
+            if not task.done():
+                task.cancel()
+        if cleanup_tasks:
+            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+        await self._client.aclose()
+
+    def _supervise_completed_response_cleanup(self, response: httpx.Response) -> None:
+        """Finish connection cleanup without revoking an already-complete body."""
+
+        if self._closed:
+            # The client close owner has already taken responsibility for all
+            # transport resources. Never create a task after its cleanup snapshot.
+            return
+        stream = response.stream
+        if not isinstance(stream, httpx.AsyncByteStream):
+            return
+        if len(self._response_cleanup_tasks) >= self._maximum_response_cleanup_tasks:
+            # This is a best-effort second close after the response context's
+            # own close was interrupted. Never create an untracked task merely
+            # to replace a cleanup that may itself resist cancellation.
+            return
+
+        async def bounded_cleanup() -> None:
+            try:
+                async with asyncio.timeout(self._timeout_seconds):
+                    await stream.aclose()
+            except TimeoutError, httpx.HTTPError, RuntimeError:
+                # The exact bounded body is already complete. Cleanup cannot
+                # revoke it, retry the public read, or grow supervision state.
+                return
+
+        task = asyncio.create_task(
+            bounded_cleanup(),
+            name="polymarket-public-completed-response-cleanup",
+        )
+        self._response_cleanup_tasks[task] = None
+
+        def consume_cleanup_result(completed: asyncio.Task[None]) -> None:
+            self._response_cleanup_tasks.pop(completed, None)
+            if not completed.cancelled():
+                completed.exception()
+
+        task.add_done_callback(consume_cleanup_result)
 
     def public_read_metrics_snapshot(self) -> PublicReadMetricsSnapshot:
         """Return a bounded point-in-time snapshot of public HTTP evidence."""
@@ -374,7 +442,16 @@ class PolymarketPublicClient:
     ) -> _PublicReadAttemptSuccess:
         response_status_code: int | None = None
         abandon_response_boundary: Callable[[], None] | None = None
-        completed = False
+        response: httpx.Response | None = None
+        result: _PublicReadAttemptSuccess | None = None
+
+        def preserve_completed_body() -> _PublicReadAttemptSuccess | None:
+            if result is None:
+                return None
+            if response is not None:
+                self._supervise_completed_response_cleanup(response)
+            return result
+
         try:
             async with self._client.stream(
                 method,
@@ -447,6 +524,7 @@ class PolymarketPublicClient:
                 # The optional observer is deliberately synchronous and runs before
                 # leaving the response context: httpx may await response cleanup in
                 # ``__aexit__``, which must not widen an audit's receive fence.
+                response_received_loop_time = asyncio.get_running_loop().time()
                 response_received_wall_time = self._utc_now()
                 response_received_monotonic_ns = self._monotonic_ns()
                 if on_response_body_complete is not None:
@@ -459,12 +537,31 @@ class PolymarketPublicClient:
                     status_code=response.status_code,
                     response_received_wall_time=response_received_wall_time,
                     response_received_monotonic_ns=response_received_monotonic_ns,
+                    response_received_loop_time=response_received_loop_time,
+                    abandon_response_boundary=abandon_response_boundary,
                 )
+        except asyncio.CancelledError:
+            completed_body = preserve_completed_body()
+            if completed_body is not None:
+                # Body completion is the adapter's commit point. Cancellation
+                # before it still propagates; afterward the exact bytes win and
+                # connection cleanup continues under the separate bounded cap.
+                return completed_body
+            raise
         except PolymarketHttpProtocolError:
+            completed_body = preserve_completed_body()
+            if completed_body is not None:
+                return completed_body
             raise
         except PolymarketHttpStatusError:
+            completed_body = preserve_completed_body()
+            if completed_body is not None:
+                return completed_body
             raise
         except httpx.TimeoutException as error:
+            completed_body = preserve_completed_body()
+            if completed_body is not None:
+                return completed_body
             raise PolymarketHttpTransportError(
                 endpoint_class=endpoint_class,
                 category=PolymarketHttpFailureCategory.TIMEOUT,
@@ -474,6 +571,9 @@ class PolymarketPublicClient:
                 detail="temporary public HTTP timeout",
             ) from error
         except httpx.NetworkError as error:
+            completed_body = preserve_completed_body()
+            if completed_body is not None:
+                return completed_body
             raise PolymarketHttpTransportError(
                 endpoint_class=endpoint_class,
                 category=PolymarketHttpFailureCategory.NETWORK,
@@ -483,6 +583,9 @@ class PolymarketPublicClient:
                 detail="temporary public HTTP network failure",
             ) from error
         except httpx.RemoteProtocolError as error:
+            completed_body = preserve_completed_body()
+            if completed_body is not None:
+                return completed_body
             raise PolymarketHttpTransportError(
                 endpoint_class=endpoint_class,
                 category=PolymarketHttpFailureCategory.REMOTE_PROTOCOL,
@@ -492,6 +595,9 @@ class PolymarketPublicClient:
                 detail="remote HTTP protocol failure",
             ) from error
         except httpx.LocalProtocolError as error:
+            completed_body = preserve_completed_body()
+            if completed_body is not None:
+                return completed_body
             raise PolymarketHttpTransportError(
                 endpoint_class=endpoint_class,
                 category=PolymarketHttpFailureCategory.LOCAL_PROTOCOL,
@@ -501,6 +607,9 @@ class PolymarketPublicClient:
                 detail="local HTTP protocol failure",
             ) from error
         except httpx.HTTPError as error:
+            completed_body = preserve_completed_body()
+            if completed_body is not None:
+                return completed_body
             raise PolymarketHttpTransportError(
                 endpoint_class=endpoint_class,
                 category=PolymarketHttpFailureCategory.NETWORK,
@@ -510,6 +619,9 @@ class PolymarketPublicClient:
                 detail="unclassified public HTTP transport failure",
             ) from error
         except RuntimeError as error:
+            completed_body = preserve_completed_body()
+            if completed_body is not None:
+                return completed_body
             if not (self._closed or self._client.is_closed):
                 raise
             raise PolymarketHttpTransportError(
@@ -520,11 +632,19 @@ class PolymarketPublicClient:
                 status_code=response_status_code,
                 detail="public HTTP client closed during the request",
             ) from error
+        except Exception:
+            completed_body = preserve_completed_body()
+            if completed_body is not None:
+                # Transport implementations may surface non-httpx exceptions
+                # while closing a response. Once the exact bounded body is
+                # complete, those cleanup failures cannot leave a live fence
+                # attached to a failed operation.
+                return completed_body
+            raise
         else:
-            completed = True
             return result
         finally:
-            if not completed and abandon_response_boundary is not None:
+            if result is None and abandon_response_boundary is not None:
                 abandon_response_boundary()
 
     async def fetch_markets_keyset_raw(

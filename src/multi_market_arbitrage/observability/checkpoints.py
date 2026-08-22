@@ -550,6 +550,8 @@ class PeriodicHealthCheckpointEmitter:
         self._enabled = enabled if enabled is not None else lambda: True
         self._final_enabled = final_enabled if final_enabled is not None else self._enabled
         self._task: asyncio.Task[None] | None = None
+        self._periodic_emission_stopped = False
+        self._terminal_emission_attempted = False
         self._closed = False
 
     async def start(self) -> None:
@@ -566,8 +568,11 @@ class PeriodicHealthCheckpointEmitter:
     def emit_now(self) -> bool:
         """Construct and admit one checkpoint without waiting for persistence."""
 
-        if self._closed:
+        if self._closed or self._terminal_emission_attempted:
             return False
+        return self._build_and_enqueue()
+
+    def _build_and_enqueue(self) -> bool:
         try:
             checkpoint = self._build()
         except BaseException as error:
@@ -581,21 +586,58 @@ class PeriodicHealthCheckpointEmitter:
             if self._enabled():
                 self.emit_now()
 
-    async def close(self, *, completed: bool) -> HealthEvidenceSummary:
+    def stop_periodic_emission_nowait(self) -> None:
+        """Cancel periodic production synchronously at an external cutoff."""
+
         if self._closed:
             raise RuntimeError("periodic health emitter is already closed")
-        self._closed = True
         task = self._task
         if task is None:
             raise RuntimeError("periodic health emitter was not started")
+        if self._periodic_emission_stopped:
+            return
+        self._periodic_emission_stopped = True
         task.cancel()
+
+    async def stop_periodic_emission(self) -> None:
+        """Stop periodic producers while leaving the evidence writer open."""
+
+        self.stop_periodic_emission_nowait()
+        task = self._task
+        if task is None:
+            raise RuntimeError("periodic health emitter was not started")
         with suppress(asyncio.CancelledError):
             await task
-        if completed and self._final_enabled():
-            # Temporarily permit the final producer call while future periodic
-            # emissions remain stopped.
+
+    def emit_terminal_now(self) -> bool:
+        """Attempt exactly one terminal checkpoint after periodic production stops."""
+
+        if self._closed:
+            raise RuntimeError("periodic health emitter is already closed")
+        if not self._periodic_emission_stopped:
+            raise RuntimeError("periodic health emission must stop before terminal emission")
+        if self._terminal_emission_attempted:
+            raise RuntimeError("terminal health checkpoint was already attempted")
+        self._terminal_emission_attempted = True
+        return self._build_and_enqueue()
+
+    async def close(self, *, completed: bool) -> HealthEvidenceSummary:
+        if self._closed:
+            raise RuntimeError("periodic health emitter is already closed")
+        task = self._task
+        if task is None:
+            raise RuntimeError("periodic health emitter was not started")
+        if not self._periodic_emission_stopped:
+            self._periodic_emission_stopped = True
+            task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        self._closed = True
+        if completed and not self._terminal_emission_attempted and self._final_enabled():
+            # Preserve the legacy close-time final checkpoint for callers that
+            # did not explicitly seal a terminal capture boundary.
             self._closed = False
-            self.emit_now()
+            self._build_and_enqueue()
             self._closed = True
         return await self._writer.close(completed=completed)
 

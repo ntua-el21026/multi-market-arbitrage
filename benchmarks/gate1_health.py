@@ -26,6 +26,7 @@ from multi_market_arbitrage.core.ids import (  # noqa: E402
     CollectorRunId,
     ConnectionId,
     IngestId,
+    InstrumentId,
     SubscriptionId,
 )
 from multi_market_arbitrage.core.serialization import canonical_json_bytes  # noqa: E402
@@ -175,10 +176,15 @@ def _production_checkpoint_builder(
         (REST_BOOK, _fixture("polymarket_rest_book_yes.json")),
         (REST_BOOK, _no_book_payload()),
     )
+    book_last_valid_receive_monotonic_ns: dict[InstrumentId, int] = {}
     for sequence, (channel, payload) in enumerate(bootstrap):
         processed = processor.process_replayed(_envelope(run_id, sequence, channel, payload))
         if not processed.success:
             raise RuntimeError("health benchmark processor bootstrap failed")
+        for update in processed.book_freshness_updates:
+            book_last_valid_receive_monotonic_ns[update.instrument_id] = (
+                update.received_monotonic.nanoseconds
+            )
     market = processor.discovered_markets[0]
     target = resolve_polymarket_target(
         market,
@@ -323,6 +329,7 @@ def _production_checkpoint_builder(
             public_reads=public_reads,
             metrics=metrics,
             resources=resources,
+            book_last_valid_receive_monotonic_ns=book_last_valid_receive_monotonic_ns,
             emitted_at=UtcTimestamp(1_787_198_410_000_000_000),
             monotonic_now_ns=5_000_000_000,
         )

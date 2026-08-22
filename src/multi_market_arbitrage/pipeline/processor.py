@@ -88,9 +88,13 @@ from multi_market_arbitrage.venues.polymarket.schemas import (
 )
 
 from .audit import (
+    AUDIT_CLASSIFICATION_SCHEMA,
+    AUDIT_EXPIRY_SCHEMA,
     AUDIT_FAILURE_SCHEMA,
     AUDIT_START_SCHEMA,
     AuditBookIdentity,
+    AuditClassificationCommand,
+    AuditExpiryCommand,
     AuditFailureReason,
     AuditOutcome,
     AuditOutcomeEvidence,
@@ -100,6 +104,8 @@ from .audit import (
 from .channels import (
     CLOB_MARKET_PREFIX,
     CONTROL_BOOK_INVALIDATION,
+    CONTROL_REST_AUDIT_CLASSIFY,
+    CONTROL_REST_AUDIT_EXPIRED,
     CONTROL_REST_AUDIT_FAILED,
     CONTROL_REST_AUDIT_START,
     GAMMA_EVENT_PREFIX,
@@ -157,6 +163,11 @@ class ScanTriggerReason(StrEnum):
     INVALIDATION = "INVALIDATION"
 
 
+class _RestAuditProtocolMode(StrEnum):
+    LEGACY = "LEGACY"
+    DEFERRED_BOUND = "DEFERRED_BOUND"
+
+
 @dataclass(frozen=True, slots=True)
 class MarketScanTrigger:
     market_id: MarketId
@@ -185,6 +196,7 @@ class ProcessedEnvelope:
     scan_triggers: tuple[MarketScanTrigger, ...]
     error_type: str | None
     audit_outcomes: tuple[AuditOutcomeEvidence, ...] = ()
+    scan_source_received_monotonic_ns: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,6 +314,12 @@ class CanonicalProcessor:
         )
         self._audit_outcomes: deque[AuditOutcomeEvidence] = deque(maxlen=_RECENT_HISTORY_LIMIT)
         self._pending_rest_audits: dict[str, AuditStartEvidence] = {}
+        self._pending_rest_audit_responses: dict[str, RawEventEnvelope] = {}
+        self._pending_rest_audit_hard_expiries: dict[str, int] = {}
+        self._pending_rest_audit_response_deadlines: dict[str, int] = {}
+        self._rest_audit_protocol_mode: _RestAuditProtocolMode | None = None
+        self._rest_audit_run_deadline_epoch_id: str | None = None
+        self._rest_audit_run_deadline_ns: int | None = None
         self._audit_ineligible_instruments: set[InstrumentId] = set()
         self._audit_economic_generations: dict[InstrumentId, int] = {}
         self._processed_ws_watermarks: dict[ConnectionId, int] = {}
@@ -309,6 +327,7 @@ class CanonicalProcessor:
         self._active_dirty_markets: dict[MarketId, set[ScanTriggerReason]] | None = None
         self._active_freshness_updates: dict[InstrumentId, BookFreshnessUpdate] | None = None
         self._active_received_monotonic: MonotonicTimestamp | None = None
+        self._active_scan_observed_at: UtcTimestamp | None = None
         self._active_audit_outcomes: list[AuditOutcomeEvidence] | None = None
         self._last_accepted_l2_monotonic: dict[InstrumentId, MonotonicTimestamp] = {}
         self._raw_input_chain = _chain_seed("raw-input")
@@ -444,6 +463,7 @@ class CanonicalProcessor:
             or self._active_dirty_markets is not None
             or self._active_freshness_updates is not None
             or self._active_received_monotonic is not None
+            or self._active_scan_observed_at is not None
             or self._active_audit_outcomes is not None
         ):
             raise ProgrammingInvariantViolation(
@@ -466,6 +486,7 @@ class CanonicalProcessor:
         self._active_dirty_markets = current_dirty_markets
         self._active_freshness_updates = current_freshness_updates
         self._active_received_monotonic = envelope.received_monotonic
+        self._active_scan_observed_at = None
         self._active_audit_outcomes = current_audit_outcomes
         try:
             try:
@@ -484,7 +505,16 @@ class CanonicalProcessor:
                     (envelope.ingest_seq, error_type),
                 )
                 affected = self.invalidate_all(InvalidationReason.SCHEMA_VIOLATION)
-                scan_triggers = self._flush_dirty_scans(envelope.received_wall_time)
+                scan_triggers = self._flush_dirty_scans(
+                    envelope.received_wall_time
+                    if self._active_scan_observed_at is None
+                    else self._active_scan_observed_at
+                )
+                audit_response_receive_times = tuple(
+                    outcome.response_received_monotonic_ns
+                    for outcome in current_audit_outcomes
+                    if outcome.response_received_monotonic_ns is not None
+                )
                 processed = ProcessedEnvelope(
                     ingest_seq=envelope.ingest_seq,
                     success=False,
@@ -500,9 +530,21 @@ class CanonicalProcessor:
                     scan_triggers=scan_triggers,
                     error_type=error_type,
                     audit_outcomes=tuple(current_audit_outcomes),
+                    scan_source_received_monotonic_ns=(
+                        min(audit_response_receive_times) if audit_response_receive_times else None
+                    ),
                 )
             else:
-                scan_triggers = self._flush_dirty_scans(envelope.received_wall_time)
+                scan_triggers = self._flush_dirty_scans(
+                    envelope.received_wall_time
+                    if self._active_scan_observed_at is None
+                    else self._active_scan_observed_at
+                )
+                audit_response_receive_times = tuple(
+                    outcome.response_received_monotonic_ns
+                    for outcome in current_audit_outcomes
+                    if outcome.response_received_monotonic_ns is not None
+                )
                 unhealthy = tuple(
                     owner.instrument_id
                     for owner in self.owners
@@ -523,12 +565,16 @@ class CanonicalProcessor:
                     scan_triggers=scan_triggers,
                     error_type=None,
                     audit_outcomes=tuple(current_audit_outcomes),
+                    scan_source_received_monotonic_ns=(
+                        min(audit_response_receive_times) if audit_response_receive_times else None
+                    ),
                 )
         finally:
             self._active_refresh_requests = None
             self._active_dirty_markets = None
             self._active_freshness_updates = None
             self._active_received_monotonic = None
+            self._active_scan_observed_at = None
             self._active_audit_outcomes = None
         return processed
 
@@ -537,6 +583,7 @@ class CanonicalProcessor:
         mutation: BookMutation,
         *,
         reason: ScanTriggerReason,
+        freshness_received_monotonic: MonotonicTimestamp | None = None,
     ) -> None:
         if mutation.audit_economic_changed:
             self._audit_economic_generations[mutation.instrument_id] = (
@@ -544,7 +591,11 @@ class CanonicalProcessor:
             )
         dirty = self._active_dirty_markets
         freshness = self._active_freshness_updates
-        received_monotonic = self._active_received_monotonic
+        received_monotonic = (
+            self._active_received_monotonic
+            if freshness_received_monotonic is None
+            else freshness_received_monotonic
+        )
         if dirty is None or freshness is None or received_monotonic is None:
             return
         if mutation.scanner_dirty:
@@ -728,12 +779,28 @@ class CanonicalProcessor:
         if channel == CONTROL_REST_AUDIT_FAILED:
             self._fail_rest_audit_from_control(envelope)
             return
+        if channel == CONTROL_REST_AUDIT_EXPIRED:
+            self._expire_rest_audit_eligibility(envelope)
+            return
+        if channel == CONTROL_REST_AUDIT_CLASSIFY:
+            self._classify_staged_rest_audit_response(envelope)
+            return
         if channel == REST_BOOK_AUDIT:
-            self._complete_rest_audit_response(envelope)
+            if "classification_deferred" in envelope.transport_metadata:
+                if envelope.transport_metadata["classification_deferred"] is not True:
+                    raise NormalizationError(
+                        "REST audit deferred-classification marker must be true"
+                    )
+                self._stage_rest_audit_response(envelope)
+            else:
+                self._complete_rest_audit_response(envelope)
             return
         if channel == CONTROL_BOOK_INVALIDATION:
             for request_id in tuple(sorted(self._pending_rest_audits)):
                 start = self._pending_rest_audits.pop(request_id)
+                self._pending_rest_audit_responses.pop(request_id, None)
+                self._pending_rest_audit_hard_expiries.pop(request_id, None)
+                self._pending_rest_audit_response_deadlines.pop(request_id, None)
                 self._record_audit_outcome(
                     self._failed_audit_outcome(
                         start,
@@ -884,15 +951,99 @@ class CanonicalProcessor:
             raise NormalizationError("audit start timestamp differs from raw receive evidence")
         if start.request_id in self._pending_rest_audits:
             raise NormalizationError("audit request ID is already pending")
-        if self._pending_rest_audits:
-            raise NormalizationError("only one REST audit request may be pending")
+        if len(self._pending_rest_audits) >= 2:
+            raise NormalizationError("at most two REST audit requests may be pending")
+        if any(
+            pending.native_asset_id == start.native_asset_id
+            for pending in self._pending_rest_audits.values()
+        ):
+            raise NormalizationError("only one REST audit request per instrument may be pending")
+        raw_hard_expiry = envelope.transport_metadata.get("hard_expiry_monotonic_ns")
+        raw_response_deadline = envelope.transport_metadata.get("response_deadline_monotonic_ns")
+        raw_run_deadline = envelope.transport_metadata.get("run_deadline_monotonic_ns")
+        bound_deadlines = (
+            raw_hard_expiry,
+            raw_response_deadline,
+            raw_run_deadline,
+        )
+        if any(value is None for value in bound_deadlines) and not all(
+            value is None for value in bound_deadlines
+        ):
+            raise NormalizationError(
+                "audit start must bind hard expiry, response deadline, and run deadline"
+            )
+        requested_mode = (
+            _RestAuditProtocolMode.LEGACY
+            if raw_hard_expiry is None
+            else _RestAuditProtocolMode.DEFERRED_BOUND
+        )
+        if (
+            self._rest_audit_protocol_mode is not None
+            and requested_mode is not self._rest_audit_protocol_mode
+        ):
+            raise NormalizationError("audit start changes the run protocol mode")
+        if raw_hard_expiry is not None:
+            if (
+                isinstance(raw_hard_expiry, bool)
+                or not isinstance(raw_hard_expiry, int)
+                or raw_hard_expiry <= start.request_started_monotonic_ns
+            ):
+                raise NormalizationError("audit start hard expiry metadata is invalid")
+            if (
+                isinstance(raw_response_deadline, bool)
+                or not isinstance(raw_response_deadline, int)
+                or raw_response_deadline <= start.request_started_monotonic_ns
+                or raw_response_deadline > raw_hard_expiry
+            ):
+                raise NormalizationError("audit start response deadline metadata is invalid")
+            if (
+                isinstance(raw_run_deadline, bool)
+                or not isinstance(raw_run_deadline, int)
+                or raw_run_deadline <= start.request_started_monotonic_ns
+                or raw_response_deadline != min(raw_hard_expiry, raw_run_deadline)
+            ):
+                raise NormalizationError("audit start run deadline metadata is invalid")
+            accepted_freshness = self._last_accepted_l2_monotonic.get(
+                start.starting_book.instrument_id
+            )
+            if accepted_freshness is None:
+                raise NormalizationError("deferred audit start lacks accepted book freshness")
+            if accepted_freshness.epoch_id != envelope.received_monotonic.epoch_id:
+                raise NormalizationError(
+                    "deferred audit start freshness belongs to another monotonic epoch"
+                )
+            if accepted_freshness.nanoseconds > start.request_started_monotonic_ns:
+                raise NormalizationError(
+                    "deferred audit start precedes its accepted book freshness"
+                )
+            expected_hard_expiry = (
+                accepted_freshness.nanoseconds + self._scanner.config.maximum_book_age_ns
+            )
+            if raw_hard_expiry != expected_hard_expiry:
+                raise NormalizationError(
+                    "audit start hard expiry differs from accepted book freshness"
+                )
         current_processed = self.processed_websocket_watermark(start.connection_id)
         if current_processed != start.starting_processed_watermark:
             raise NormalizationError("audit start processed watermark is ambiguous")
         current = self.audit_book_identity(start.native_asset_id)
         if current != start.starting_book:
             raise NormalizationError("audit start book identity changed before staging")
+        self._rest_audit_protocol_mode = requested_mode
+        if raw_run_deadline is not None:
+            if self._rest_audit_run_deadline_ns is not None and (
+                raw_run_deadline != self._rest_audit_run_deadline_ns
+                or envelope.received_monotonic.epoch_id != self._rest_audit_run_deadline_epoch_id
+            ):
+                raise NormalizationError("audit start changes the bound run deadline")
+            self._rest_audit_run_deadline_epoch_id = envelope.received_monotonic.epoch_id
+            self._rest_audit_run_deadline_ns = cast(int, raw_run_deadline)
         self._pending_rest_audits[start.request_id] = start
+        if raw_hard_expiry is not None:
+            self._pending_rest_audit_hard_expiries[start.request_id] = raw_hard_expiry
+            self._pending_rest_audit_response_deadlines[start.request_id] = cast(
+                int, raw_response_deadline
+            )
 
     def _parse_audit_failure(self, payload: bytes) -> tuple[str, AuditFailureReason]:
         control = self._control_object(
@@ -914,6 +1065,43 @@ class CanonicalProcessor:
         ):
             raise NormalizationError("audit failure evidence must use canonical encoding")
         return request_id, reason
+
+    def _expire_rest_audit_eligibility(self, envelope: RawEventEnvelope) -> None:
+        control = self._control_object(
+            envelope.payload_bytes,
+            schema=AUDIT_EXPIRY_SCHEMA,
+            expected_keys=frozenset(
+                {
+                    "last_accepted_receive_monotonic_ns",
+                    "native_asset_id",
+                    "schema",
+                }
+            ),
+        )
+        native_asset_id = self._control_text(control, "native_asset_id")
+        raw_freshness = control["last_accepted_receive_monotonic_ns"]
+        if raw_freshness is None:
+            freshness_ns = None
+        else:
+            freshness_ns = self._control_integer(
+                control,
+                "last_accepted_receive_monotonic_ns",
+            )
+        command = AuditExpiryCommand(
+            native_asset_id=native_asset_id,
+            last_accepted_receive_monotonic_ns=freshness_ns,
+        )
+        if envelope.payload_bytes != command.to_payload():
+            raise NormalizationError("audit expiry evidence must use canonical encoding")
+        if any(
+            pending.native_asset_id == native_asset_id
+            for pending in self._pending_rest_audits.values()
+        ):
+            raise NormalizationError("audit expiry conflicts with a pending request")
+        identity = self.audit_book_identity(native_asset_id)
+        self._audit_ineligible_instruments.add(identity.instrument_id)
+        owner = self._owners[identity.instrument_id]
+        self._mark_market_dirty(owner.market_id, ScanTriggerReason.REST_AUDIT)
 
     def _record_audit_outcome(self, evidence: AuditOutcomeEvidence) -> None:
         active = self._active_audit_outcomes
@@ -982,6 +1170,9 @@ class CanonicalProcessor:
             raise NormalizationError("audit failure references no pending request")
         if envelope.connection_id != start.connection_id:
             reason = AuditFailureReason.SOCKET_GENERATION_CHANGED
+        self._pending_rest_audit_responses.pop(request_id, None)
+        self._pending_rest_audit_hard_expiries.pop(request_id, None)
+        self._pending_rest_audit_response_deadlines.pop(request_id, None)
         self._record_audit_outcome(self._failed_audit_outcome(start, reason=reason))
 
     def _advance_websocket_watermark(self, envelope: RawEventEnvelope) -> None:
@@ -1022,11 +1213,159 @@ class CanonicalProcessor:
             raise NormalizationError("REST audit attempt metadata must be positive")
         return request_id, cast(int, boundary), cast(int, barrier), cast(int, attempt)
 
-    def _complete_rest_audit_response(self, envelope: RawEventEnvelope) -> None:
+    def _stage_rest_audit_response(self, envelope: RawEventEnvelope) -> None:
+        """Hold durable raw bytes until a replayable classification decision arrives."""
+
+        request_id, _, _, _ = self._audit_response_metadata(envelope)
+        if request_id not in self._pending_rest_audits:
+            raise NormalizationError("REST audit response references no pending request")
+        if request_id not in self._pending_rest_audit_hard_expiries:
+            raise NormalizationError("deferred REST audit response requires a bound start")
+        response_deadline_ns = self._pending_rest_audit_response_deadlines.get(request_id)
+        if response_deadline_ns is None:
+            raise NormalizationError("deferred REST audit response lacks a response deadline")
+        if (
+            self._rest_audit_run_deadline_epoch_id is None
+            or envelope.received_monotonic.epoch_id != self._rest_audit_run_deadline_epoch_id
+        ):
+            raise NormalizationError("deferred REST audit response changes monotonic epoch")
+        if envelope.received_monotonic.nanoseconds >= response_deadline_ns:
+            raise NormalizationError("REST audit response reached or exceeded its bound deadline")
+        if request_id in self._pending_rest_audit_responses:
+            raise NormalizationError("REST audit response is already staged")
+        metadata = envelope.transport_metadata
+        if any(
+            key in metadata
+            for key in (
+                "classification_monotonic_ns",
+                "coordinator_failure_reason",
+                "hard_expiry_monotonic_ns",
+            )
+        ):
+            raise NormalizationError("deferred REST audit response embeds a premature decision")
+        self._pending_rest_audit_responses[request_id] = envelope
+
+    def _parse_audit_classification(self, envelope: RawEventEnvelope) -> AuditClassificationCommand:
+        control = self._control_object(
+            envelope.payload_bytes,
+            schema=AUDIT_CLASSIFICATION_SCHEMA,
+            expected_keys=frozenset(
+                {
+                    "classification_monotonic_ns",
+                    "hard_expiry_monotonic_ns",
+                    "request_id",
+                    "response_ingest_seq",
+                    "schema",
+                }
+            ),
+        )
+        try:
+            command = AuditClassificationCommand(
+                request_id=self._control_text(control, "request_id", maximum=128),
+                response_ingest_seq=self._control_integer(
+                    control,
+                    "response_ingest_seq",
+                ),
+                classification_monotonic_ns=self._control_integer(
+                    control,
+                    "classification_monotonic_ns",
+                ),
+                hard_expiry_monotonic_ns=self._control_integer(
+                    control,
+                    "hard_expiry_monotonic_ns",
+                ),
+            )
+        except ValueError as error:
+            raise NormalizationError("audit classification decision is invalid") from error
+        if envelope.payload_bytes != command.to_payload():
+            raise NormalizationError("audit classification decision must use canonical encoding")
+        if command.classification_monotonic_ns != envelope.received_monotonic.nanoseconds:
+            raise NormalizationError("audit classification timestamp differs from raw evidence")
+        return command
+
+    def _classify_staged_rest_audit_response(self, envelope: RawEventEnvelope) -> None:
+        command = self._parse_audit_classification(envelope)
+        response = self._pending_rest_audit_responses.get(command.request_id)
+        if response is None:
+            raise NormalizationError("audit classification references no staged response")
+        if response.ingest_seq != command.response_ingest_seq:
+            raise NormalizationError("audit classification references another raw response")
+        if response.connection_id != envelope.connection_id:
+            raise NormalizationError("audit classification belongs to another socket generation")
+        if (
+            self._rest_audit_run_deadline_epoch_id is None
+            or response.received_monotonic.epoch_id != self._rest_audit_run_deadline_epoch_id
+            or envelope.received_monotonic.epoch_id != response.received_monotonic.epoch_id
+        ):
+            raise NormalizationError("audit classification changes monotonic epoch")
+        if command.classification_monotonic_ns < response.received_monotonic.nanoseconds:
+            raise NormalizationError("audit classification precedes its response receipt")
+        hard_expiry_ns = self._pending_rest_audit_hard_expiries.get(command.request_id)
+        if hard_expiry_ns is None:
+            raise NormalizationError("deferred audit start lacks a bound hard expiry")
+        if command.hard_expiry_monotonic_ns != hard_expiry_ns:
+            raise NormalizationError("audit classification changes its staged hard expiry")
+        self._active_scan_observed_at = response.received_wall_time
+        self._pending_rest_audit_responses.pop(command.request_id)
+        coordinator_failure = (
+            AuditFailureReason.BOOK_FRESHNESS_EXPIRED
+            if command.classification_monotonic_ns >= command.hard_expiry_monotonic_ns
+            else None
+        )
+        self._complete_rest_audit_response(
+            response,
+            coordinator_failure=coordinator_failure,
+            coordinator_decision_supplied=True,
+        )
+
+    def _audit_response_coordinator_failure(
+        self,
+        envelope: RawEventEnvelope,
+    ) -> AuditFailureReason | None:
+        metadata = envelope.transport_metadata
+        raw_classification = metadata.get("classification_monotonic_ns")
+        raw_expiry = metadata.get("hard_expiry_monotonic_ns")
+        raw_reason = metadata.get("coordinator_failure_reason")
+        if raw_classification is None and raw_expiry is None and raw_reason is None:
+            return None
+        for name, value in (
+            ("classification monotonic", raw_classification),
+            ("hard expiry monotonic", raw_expiry),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise NormalizationError(f"REST audit {name} metadata is invalid")
+        classification_ns = cast(int, raw_classification)
+        expiry_ns = cast(int, raw_expiry)
+        if raw_reason is None:
+            if classification_ns >= expiry_ns:
+                raise NormalizationError("expired REST audit lacks a forced failure decision")
+            return None
+        if raw_reason != AuditFailureReason.BOOK_FRESHNESS_EXPIRED.value:
+            raise NormalizationError("REST audit coordinator failure reason is unsupported")
+        if classification_ns < expiry_ns:
+            raise NormalizationError("REST audit expiry decision precedes the hard expiry")
+        return AuditFailureReason.BOOK_FRESHNESS_EXPIRED
+
+    def _complete_rest_audit_response(
+        self,
+        envelope: RawEventEnvelope,
+        *,
+        coordinator_failure: AuditFailureReason | None = None,
+        coordinator_decision_supplied: bool = False,
+    ) -> None:
         request_id, boundary, barrier_ordinal, attempt = self._audit_response_metadata(envelope)
+        if (
+            not coordinator_decision_supplied
+            and request_id in self._pending_rest_audit_hard_expiries
+        ):
+            raise NormalizationError(
+                "bound REST audit start requires deferred response classification"
+            )
         start = self._pending_rest_audits.pop(request_id, None)
         if start is None:
             raise NormalizationError("REST audit response references no pending request")
+        self._pending_rest_audit_hard_expiries.pop(request_id, None)
+        self._pending_rest_audit_response_deadlines.pop(request_id, None)
         if envelope.connection_id != start.connection_id or attempt != start.attempt:
             self._record_audit_outcome(
                 self._failed_audit_outcome(
@@ -1062,6 +1401,18 @@ class CanonicalProcessor:
                 )
             )
             return
+        if not coordinator_decision_supplied:
+            coordinator_failure = self._audit_response_coordinator_failure(envelope)
+        if coordinator_failure is not None:
+            self._record_audit_outcome(
+                self._failed_audit_outcome(
+                    start,
+                    reason=coordinator_failure,
+                    response=envelope,
+                    response_boundary_ordinal=boundary,
+                )
+            )
+            return
         barrier_book = self.audit_book_identity(start.native_asset_id)
         try:
             native = parse_rest_book(envelope.payload_bytes)
@@ -1087,6 +1438,11 @@ class CanonicalProcessor:
             return
 
         if barrier_book != start.starting_book:
+            # A raced request is not affirmative integrity evidence.  Make the
+            # leg explicitly audit-ineligible until a later fenced MATCH (or a
+            # full REST resnapshot) restores it; this also keeps expiry misses
+            # fail closed while acquisition continues on the same generation.
+            self._audit_ineligible_instruments.add(start.starting_book.instrument_id)
             evidence = AuditOutcomeEvidence(
                 request_id=start.request_id,
                 connection_id=start.connection_id,
@@ -1129,7 +1485,11 @@ class CanonicalProcessor:
                 )
             )
             return
-        self._record_book_mutation(result.mutation, reason=ScanTriggerReason.REST_AUDIT)
+        self._record_book_mutation(
+            result.mutation,
+            reason=ScanTriggerReason.REST_AUDIT,
+            freshness_received_monotonic=envelope.received_monotonic,
+        )
         if result.status is RestAuditStatus.NOT_COMPARABLE:
             self._record_audit_outcome(
                 self._failed_audit_outcome(
@@ -1788,6 +2148,22 @@ class CanonicalProcessor:
             (disposition, self._scan_disposition_counts[disposition])
             for disposition in sorted(ScanDisposition, key=lambda item: item.value)
         )
+        pending_rest_audit_state = tuple(
+            {
+                "hard_expiry_monotonic_ns": self._pending_rest_audit_hard_expiries.get(request_id),
+                "request_id": request_id,
+                "response": (
+                    None
+                    if (response := self._pending_rest_audit_responses.get(request_id)) is None
+                    else response.to_record()
+                ),
+                "response_deadline_monotonic_ns": (
+                    self._pending_rest_audit_response_deadlines.get(request_id)
+                ),
+                "start": self._pending_rest_audits[request_id],
+            }
+            for request_id in sorted(self._pending_rest_audits)
+        )
         terminal_hash = canonical_sha256(
             {
                 "config_hash": self._config.config_hash.value,
@@ -1806,6 +2182,7 @@ class CanonicalProcessor:
                     "rest_audit_raced": self._rest_audit_raced,
                     "rest_audits": self._rest_audits,
                     "pending_rest_audits": len(self._pending_rest_audits),
+                    "staged_rest_audit_responses": len(self._pending_rest_audit_responses),
                     "audit_ineligible_books": audit_ineligible_books,
                     "resyncs": self._resyncs,
                     "scans": self._scan_count,
@@ -1825,8 +2202,15 @@ class CanonicalProcessor:
                 "reference_versions": reference_versions,
                 "lifecycle_state_sha256": lifecycle_state_sha256,
                 "audit_ineligible_instrument_ids": audit_ineligible_instrument_ids,
-                "pending_rest_audits": tuple(
-                    self._pending_rest_audits[key] for key in sorted(self._pending_rest_audits)
+                "pending_rest_audits": pending_rest_audit_state,
+                "rest_audit_protocol_mode": self._rest_audit_protocol_mode,
+                "rest_audit_run_deadline": (
+                    None
+                    if self._rest_audit_run_deadline_ns is None
+                    else {
+                        "epoch_id": self._rest_audit_run_deadline_epoch_id,
+                        "monotonic_ns": self._rest_audit_run_deadline_ns,
+                    }
                 ),
                 "snapshot_hashes": snapshot_hashes,
             }

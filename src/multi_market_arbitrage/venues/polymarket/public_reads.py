@@ -247,6 +247,8 @@ class _PublicReadAttemptSuccess:
     status_code: int
     response_received_wall_time: UtcTimestamp
     response_received_monotonic_ns: int
+    response_received_loop_time: float
+    abandon_response_boundary: Callable[[], None] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -664,6 +666,22 @@ class _SafePublicReadController:  # pyright: ignore[reportUnusedClass]
             if failure is None:
                 if result is None:
                     raise AssertionError("successful public read attempt did not return a result")
+                if deadline is not None and result.response_received_loop_time >= deadline:
+                    if result.abandon_response_boundary is not None:
+                        result.abandon_response_boundary()
+                    failure = PolymarketHttpTransportError(
+                        endpoint_class=endpoint,
+                        category=PolymarketHttpFailureCategory.DEADLINE_EXCEEDED,
+                        retryable=False,
+                        attempt=attempt,
+                        status_code=result.status_code,
+                        detail=(
+                            "response body completed at or after the absolute public-read deadline"
+                        ),
+                    )
+                    self._observe_failure(failure)
+                    self._observe_final_failure(failure)
+                    raise failure
                 self._observe_status(endpoint, result.status_code)
                 if attempt == 1:
                     self._metrics.increment_counter(

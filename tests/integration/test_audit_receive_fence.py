@@ -29,6 +29,8 @@ from multi_market_arbitrage.observability import InMemoryMetrics
 from multi_market_arbitrage.pipeline import (
     CLOB_MARKET_PREFIX,
     CONTROL_BOOK_INVALIDATION,
+    CONTROL_REST_AUDIT_CLASSIFY,
+    CONTROL_REST_AUDIT_EXPIRED,
     CONTROL_REST_AUDIT_FAILED,
     CONTROL_REST_AUDIT_START,
     GAMMA_MARKETS_KEYSET,
@@ -40,8 +42,10 @@ from multi_market_arbitrage.pipeline import (
     AuditHttpHandoff,
     AuditHttpResponseHandoff,
     AuditOutcome,
+    AuditStartEvidence,
     CanonicalProcessor,
     ProcessedEnvelope,
+    WebSocketAdmissionWatermark,
 )
 from multi_market_arbitrage.pipeline import observe as observe_module
 from multi_market_arbitrage.pipeline.health import ObservationRuntimeHealth
@@ -243,6 +247,8 @@ async def test_pre_response_update_queued_in_ingress_is_inside_audit_fence(
             on_response_body_complete: Callable[[UtcTimestamp, int], None] | None = None,
         ) -> PublicReadResult:
             del deadline
+            if asset_id == "token-no":
+                return _public_read(_no_book(), on_response_body_complete)
             assert asset_id == "token-yes"
             request_started.set()
             await response_allowed.wait()
@@ -288,6 +294,10 @@ async def test_pre_response_update_queued_in_ingress_is_inside_audit_fence(
                 )
                 assert result.success
 
+            instrument_id = processor.audit_book_identity("token-yes").instrument_id
+            hard_expiry_ns = capture.book_freshness_receive_ns_by_instrument[instrument_id] + int(
+                config.scanner.maximum_book_age_seconds * 1_000_000_000
+            )
             start, start_result = await service._stage_audit_start(  # pyright: ignore[reportPrivateUsage]
                 capture=capture,
                 ingress=ingress,
@@ -295,6 +305,8 @@ async def test_pre_response_update_queued_in_ingress_is_inside_audit_fence(
                 attempt=1,
                 connection_id=connection_id,
                 subscription_id=subscription_id,
+                hard_expiry_monotonic_ns=hard_expiry_ns,
+                run_deadline_monotonic_ns=hard_expiry_ns,
             )
             assert start_result.success
             assert start.starting_admission_watermark.ordinal == 0
@@ -364,6 +376,7 @@ async def test_pre_response_update_queued_in_ingress_is_inside_audit_fence(
                 start=start,
                 barrier_ordinal=BACKLOG_MESSAGES,
                 subscription_id=subscription_id,
+                hard_expiry_monotonic_ns=hard_expiry_ns,
             )
             assert response_result.success
     except BaseException:
@@ -399,9 +412,159 @@ async def test_pre_response_update_queued_in_ingress_is_inside_audit_fence(
         CONTROL_REST_AUDIT_START,
         *(WS_MARKET for _ in range(BACKLOG_MESSAGES)),
         REST_BOOK_AUDIT,
+        CONTROL_REST_AUDIT_CLASSIFY,
     )
     replayed = replay_journal(tmp_path / "raw", run_id, config).processor
     assert tuple(outcome.outcome for outcome in replayed.audit_outcomes) == (AuditOutcome.RACED,)
+    assert replayed.terminal_hash == live.terminal_hash
+
+
+@pytest.mark.asyncio
+async def test_response_durable_before_expiry_but_classified_after_expiry_fails_replayably(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Journal delay cannot turn a post-expiry comparison into MATCH evidence."""
+
+    config = load_phase1_config(Path("config/phase1.toml"))
+    config = config.model_copy(
+        update={
+            "scanner": config.scanner.model_copy(
+                update={
+                    "maximum_book_age_seconds": 0.1,
+                    "maximum_interleg_skew_seconds": 0.05,
+                }
+            )
+        }
+    )
+    run_id = CollectorRunId("audit-classification-crosses-hard-expiry")
+    writer = RawJournalWriter(
+        JournalWriterConfig(
+            root=tmp_path / "raw",
+            collector_run_id=run_id,
+            venue_id=POLYMARKET_VENUE_ID,
+            stream="polymarket-public",
+            writer_id=WriterId("writer-audit-classification-crosses-hard-expiry"),
+            writer_software_version="test",
+            git_commit="fixture",
+        )
+    )
+    processor = CanonicalProcessor(config)
+    metrics = InMemoryMetrics()
+    capture = observe_module._RawCaptureBoundary(  # pyright: ignore[reportPrivateUsage]
+        collector_run_id=run_id,
+        writer=writer,
+        processor=processor,
+        metrics=metrics,
+    )
+    service = PolymarketObservationService(
+        config,
+        workspace_root=tmp_path,
+        code_commit="fixture",
+    )
+    connection_id = ConnectionId("audit-classification-crosses-hard-expiry")
+    subscription_id = SubscriptionId("audit-classification-crosses-hard-expiry-subscription")
+    ingress = BoundedRawIngress(
+        max_items=config.system.queue_capacity,
+        max_bytes=config.polymarket.maximum_ingress_queue_bytes,
+        connection_id=connection_id,
+    )
+
+    await writer.start()
+    await _initialize_books(capture)
+    instrument_id = processor.audit_book_identity("token-yes").instrument_id
+    hard_expiry_ns = capture.book_freshness_receive_ns_by_instrument[instrument_id] + int(
+        config.scanner.maximum_book_age_seconds * 1_000_000_000
+    )
+    start, start_result = await service._stage_audit_start(  # pyright: ignore[reportPrivateUsage]
+        capture=capture,
+        ingress=ingress,
+        native_asset_id="token-yes",
+        attempt=1,
+        connection_id=connection_id,
+        subscription_id=subscription_id,
+        hard_expiry_monotonic_ns=hard_expiry_ns,
+        run_deadline_monotonic_ns=hard_expiry_ns,
+    )
+    assert start_result.success
+
+    response_ns = time.monotonic_ns()
+    assert response_ns < hard_expiry_ns
+    scan_latency_before = metrics.histogram_snapshot("mma_receive_to_scan_complete_ns")
+    scan_latency_sum_before = 0.0 if scan_latency_before is None else scan_latency_before.total_sum
+    response = AuditHttpResponseHandoff(
+        request_id=start.request_id,
+        connection_id=connection_id,
+        payload_bytes=_fixture("polymarket_rest_book_yes.json"),
+        received_wall_time=UtcTimestamp.now(),
+        received_monotonic_ns=response_ns,
+        response_boundary_watermark=WebSocketAdmissionWatermark(
+            connection_id=connection_id,
+            ordinal=0,
+        ),
+    )
+    response_durable = asyncio.Event()
+    release_response = asyncio.Event()
+    original_enqueue = writer.enqueue
+
+    async def gated_enqueue(envelope: RawEventEnvelope) -> JournalTicket:
+        ticket = await original_enqueue(envelope)
+        if envelope.channel != REST_BOOK_AUDIT:
+            return ticket
+        return cast(
+            JournalTicket,
+            _CanonicalGateTicket(ticket, response_durable, release_response),
+        )
+
+    monkeypatch.setattr(writer, "enqueue", gated_enqueue)
+    classification_task = asyncio.create_task(
+        service._preserve_audit_response(  # pyright: ignore[reportPrivateUsage]
+            capture=capture,
+            response=response,
+            start=start,
+            barrier_ordinal=0,
+            subscription_id=subscription_id,
+            hard_expiry_monotonic_ns=hard_expiry_ns,
+        ),
+        name="audit-response-crossing-hard-expiry",
+    )
+    try:
+        async with asyncio.timeout(5.0):
+            await response_durable.wait()
+            await asyncio.sleep(max(0.0, (hard_expiry_ns - time.monotonic_ns()) / 1e9))
+            release_response.set()
+            result = await classification_task
+    except BaseException:
+        release_response.set()
+        if not classification_task.done():
+            classification_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await classification_task
+        with suppress(Exception):
+            await writer.close(completed=False)
+        raise
+    else:
+        await writer.close()
+
+    assert result.success
+    assert tuple(outcome.outcome for outcome in result.audit_outcomes) == (AuditOutcome.FAILED,)
+    outcome = result.audit_outcomes[0]
+    assert outcome.reason is AuditFailureReason.BOOK_FRESHNESS_EXPIRED
+    scan_latency_after = metrics.histogram_snapshot("mma_receive_to_scan_complete_ns")
+    assert scan_latency_after is not None
+    assert scan_latency_after.total_sum - scan_latency_sum_before >= (hard_expiry_ns - response_ns)
+    assert outcome.raw_response_sha256 == response.payload_sha256
+    live = processor.summary()
+    records = JournalReader(tmp_path / "raw", run_id).read_all()
+    response_record = next(record for record in records if record.channel == REST_BOOK_AUDIT)
+    classify_record = next(
+        record for record in records if record.channel == CONTROL_REST_AUDIT_CLASSIFY
+    )
+    assert response_record.ingest_seq < classify_record.ingest_seq
+    decision = cast(dict[str, object], json.loads(classify_record.payload_bytes))
+    assert cast(int, decision["classification_monotonic_ns"]) >= hard_expiry_ns
+    replayed = replay_journal(tmp_path / "raw", run_id, config).processor
+    assert replayed.audit_outcomes == live.audit_outcomes
     assert replayed.terminal_hash == live.terminal_hash
 
 
@@ -595,6 +758,8 @@ async def test_pre_response_update_cannot_false_match_across_receive_fence(
             on_response_body_complete: Callable[[UtcTimestamp, int], None] | None = None,
         ) -> PublicReadResult:
             del deadline
+            if asset_id == "token-no":
+                return _public_read(_no_book(), on_response_body_complete)
             assert asset_id == "token-yes"
             self.calls += 1
             if self.calls == 1:
@@ -692,15 +857,15 @@ async def test_pre_response_update_cannot_false_match_across_receive_fence(
     if stage == "journal_durability":
         assert first_response_probe["dequeued"] == 1
         assert first_response_probe["ingress_depth"] == BACKLOG_MESSAGES - 1
-        assert first_response_probe["writer_received"] == 6
-        assert first_response_probe["durable"] == 5
-        assert first_response_probe["writer_watermark"] == 4
+        assert first_response_probe["writer_received"] == 9
+        assert first_response_probe["durable"] == 8
+        assert first_response_probe["writer_watermark"] == 7
     else:
         assert first_response_probe["dequeued"] == 1
         assert first_response_probe["ingress_depth"] == BACKLOG_MESSAGES - 1
-        assert first_response_probe["writer_received"] == 6
-        assert first_response_probe["durable"] == 6
-        assert first_response_probe["writer_watermark"] == 5
+        assert first_response_probe["writer_received"] == 9
+        assert first_response_probe["durable"] == 9
+        assert first_response_probe["writer_watermark"] == 8
 
     ingress_metrics = generation.ingress_metrics
     assert ingress_metrics.received == BACKLOG_MESSAGES
@@ -711,13 +876,16 @@ async def test_pre_response_update_cannot_false_match_across_receive_fence(
 
     live = processor.summary()
     assert tuple(outcome.outcome for outcome in live.audit_outcomes) == (
+        AuditOutcome.MATCH,
         AuditOutcome.RACED,
         AuditOutcome.MISMATCH,
     )
-    assert live.rest_audit_matches == 0
+    assert live.rest_audit_matches == 1
     assert live.rest_audit_raced == 1
     assert live.rest_audit_mismatches == 1
-    first, second = live.audit_outcomes
+    first, second = (
+        outcome for outcome in live.audit_outcomes if outcome.native_asset_id == "token-yes"
+    )
     assert first.starting_processed_ordinal == 0
     assert first.response_boundary_ordinal == BACKLOG_MESSAGES
     assert first.barrier_processed_ordinal == BACKLOG_MESSAGES
@@ -731,21 +899,13 @@ async def test_pre_response_update_cannot_false_match_across_receive_fence(
     assert second.requires_resync
 
     records = JournalReader(tmp_path / "raw", run_id).read_all()
-    expected_channels = (
-        GAMMA_MARKETS_KEYSET,
-        f"{CLOB_MARKET_PREFIX}0xcondition",
-        REST_BOOK,
-        REST_BOOK,
-        CONTROL_REST_AUDIT_START,
-        *(WS_MARKET for _ in range(BACKLOG_MESSAGES)),
-        REST_BOOK_AUDIT,
-        CONTROL_REST_AUDIT_START,
-        REST_BOOK_AUDIT,
-    )
-    assert tuple(record.channel for record in records) == expected_channels
+    assert sum(record.channel == CONTROL_REST_AUDIT_START for record in records) == 3
+    assert sum(record.channel == REST_BOOK_AUDIT for record in records) == 3
+    assert sum(record.channel == WS_MARKET for record in records) == BACKLOG_MESSAGES
 
     replayed = replay_journal(tmp_path / "raw", run_id, config).processor
     assert tuple(outcome.outcome for outcome in replayed.audit_outcomes) == (
+        AuditOutcome.MATCH,
         AuditOutcome.RACED,
         AuditOutcome.MISMATCH,
     )
@@ -901,6 +1061,7 @@ async def test_post_response_economic_update_is_excluded_from_current_audit_fenc
             return httpx.Response(200, stream=delayed_stream, request=request)
         assert http_calls == 2
         assert asset_id == "token-no"
+        await release_response_cleanup.wait()
         return httpx.Response(200, content=_mismatching_no_book(), request=request)
 
     monkeypatch.setattr(observe_module, "PolymarketMarketWebSocket", _CommandSocket)
@@ -967,7 +1128,9 @@ async def test_post_response_economic_update_is_excluded_from_current_audit_fenc
         AuditOutcome.MATCH,
         AuditOutcome.MISMATCH,
     )
-    first = live.audit_outcomes[0]
+    first = next(
+        outcome for outcome in live.audit_outcomes if outcome.native_asset_id == "token-yes"
+    )
     assert first.starting_processed_ordinal == 0
     assert first.response_boundary_ordinal == 1
     assert first.barrier_processed_ordinal == 1
@@ -1077,6 +1240,8 @@ async def test_raced_retry_budget_exhaustion_is_bounded_and_replayable(
             on_response_body_complete: Callable[[UtcTimestamp, int], None] | None = None,
         ) -> PublicReadResult:
             del deadline
+            if asset_id == "token-no":
+                return _public_read(_no_book(), on_response_body_complete)
             assert asset_id == "token-yes"
             self.calls += 1
             assert self.calls <= 2
@@ -1145,6 +1310,9 @@ async def test_raced_retry_budget_exhaustion_is_bounded_and_replayable(
             if generation_task in done:
                 generation_task.result()
             await exhausted_task
+            # The terminal marker for this freshness boundary must suppress
+            # any immediate periodic/freshness re-entry after exhaustion.
+            await asyncio.sleep(0.05)
         generation_task.cancel()
         with suppress(asyncio.CancelledError):
             await generation_task
@@ -1163,21 +1331,37 @@ async def test_raced_retry_budget_exhaustion_is_bounded_and_replayable(
     assert client.calls == 2
     live = processor.summary()
     assert tuple(outcome.outcome for outcome in live.audit_outcomes) == (
+        AuditOutcome.MATCH,
         AuditOutcome.RACED,
         AuditOutcome.RACED,
         AuditOutcome.FAILED,
     )
     assert live.audit_outcomes[-1].reason is AuditFailureReason.RACE_RETRY_EXHAUSTED
     assert live.rest_audit_raced == 2
+    assert live.rest_audit_matches == 1
     assert live.rest_audit_failed == 1
 
     counters = {key.name: value for key, value in metrics.snapshot().counters}
     assert counters["mma_rest_audit_retries_total"] == 1
     assert counters["mma_rest_audit_race_budget_exhaustions_total"] == 1
     records = JournalReader(tmp_path / "raw", run_id).read_all()
-    assert sum(record.channel == CONTROL_REST_AUDIT_START for record in records) == 3
-    assert sum(record.channel == REST_BOOK_AUDIT for record in records) == 2
+    start_records = [record for record in records if record.channel == CONTROL_REST_AUDIT_START]
+    assert len(start_records) == 4
+    assert sum(record.channel == REST_BOOK_AUDIT for record in records) == 3
     assert sum(record.channel == CONTROL_REST_AUDIT_FAILED for record in records) == 1
+    first_request_ids = {
+        cast(dict[str, object], json.loads(record.payload_bytes))["request_id"]
+        for record in start_records[:2]
+    }
+    first_classifications = [
+        record
+        for record in records
+        if record.channel == CONTROL_REST_AUDIT_CLASSIFY
+        and cast(dict[str, object], json.loads(record.payload_bytes))["request_id"]
+        in first_request_ids
+    ]
+    assert len(first_classifications) == 2
+    assert max(record.ingest_seq for record in first_classifications) < start_records[2].ingest_seq
     replayed = replay_journal(tmp_path / "raw", run_id, config).processor
     assert replayed.audit_outcomes == live.audit_outcomes
     assert replayed.terminal_hash == live.terminal_hash
@@ -1300,6 +1484,8 @@ async def test_raced_audit_does_not_retry_after_protocol_resync_is_pending(
             on_response_body_complete: Callable[[UtcTimestamp, int], None] | None = None,
         ) -> PublicReadResult:
             del deadline
+            if asset_id == "token-no":
+                return _public_read(_no_book(), on_response_body_complete)
             assert asset_id == "token-yes"
             self.calls += 1
             assert self.calls == 1
@@ -1355,7 +1541,10 @@ async def test_raced_audit_does_not_retry_after_protocol_resync_is_pending(
     assert _CommandSocket.instances == 1
     assert client.calls == 1
     live = processor.summary()
-    assert tuple(outcome.outcome for outcome in live.audit_outcomes) == (AuditOutcome.RACED,)
+    assert tuple(outcome.outcome for outcome in live.audit_outcomes) == (
+        AuditOutcome.MATCH,
+        AuditOutcome.RACED,
+    )
     assert live.pending_rest_audits == 0
     assert live.parse_failures == 1
     assert runtime_health.snapshot().protocol_deviations == 1
@@ -1363,8 +1552,8 @@ async def test_raced_audit_does_not_retry_after_protocol_resync_is_pending(
     assert counters.get("mma_rest_audit_retries_total", 0) == 0
 
     records = JournalReader(tmp_path / "raw", run_id).read_all()
-    assert sum(record.channel == CONTROL_REST_AUDIT_START for record in records) == 1
-    assert sum(record.channel == REST_BOOK_AUDIT for record in records) == 1
+    assert sum(record.channel == CONTROL_REST_AUDIT_START for record in records) == 2
+    assert sum(record.channel == REST_BOOK_AUDIT for record in records) == 2
     replayed = replay_journal(tmp_path / "raw", run_id, config).processor
     assert replayed.audit_outcomes == live.audit_outcomes
     assert replayed.pending_rest_audits == 0
@@ -1372,7 +1561,393 @@ async def test_raced_audit_does_not_retry_after_protocol_resync_is_pending(
 
 
 @pytest.mark.asyncio
-async def test_matching_audit_does_not_start_second_leg_after_selected_refresh_exit(
+async def test_both_first_starts_are_durable_before_concurrent_http_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No first-leg GET can run while the second durable START is withheld."""
+
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("audit-stage-all-before-concurrent-http")
+    writer = RawJournalWriter(
+        JournalWriterConfig(
+            root=tmp_path / "raw",
+            collector_run_id=run_id,
+            venue_id=POLYMARKET_VENUE_ID,
+            stream="polymarket-public",
+            writer_id=WriterId("writer-audit-stage-all-before-concurrent-http"),
+            writer_software_version="test",
+            git_commit="fixture",
+        )
+    )
+    processor = CanonicalProcessor(config)
+    metrics = InMemoryMetrics()
+    capture = observe_module._RawCaptureBoundary(  # pyright: ignore[reportPrivateUsage]
+        collector_run_id=run_id,
+        writer=writer,
+        processor=processor,
+        metrics=metrics,
+    )
+    service = PolymarketObservationService(
+        config,
+        workspace_root=tmp_path,
+        code_commit="fixture",
+        metrics=metrics,
+    )
+    selected = parse_gamma_markets(_fixture("polymarket_gamma_market_keyset.json")).markets[0]
+    second_start_durable = asyncio.Event()
+    release_second_start = asyncio.Event()
+    both_http_started = asyncio.Event()
+    started_assets: list[str] = []
+
+    original_stage = service._stage_audit_start  # pyright: ignore[reportPrivateUsage]
+    stage_calls = 0
+
+    async def gated_stage(
+        *,
+        capture: observe_module._RawCaptureBoundary,  # pyright: ignore[reportPrivateUsage]
+        ingress: BoundedRawIngress,
+        native_asset_id: str,
+        attempt: int,
+        connection_id: ConnectionId,
+        subscription_id: SubscriptionId,
+        request_started_monotonic_ns: int | None = None,
+        hard_expiry_monotonic_ns: int | None = None,
+        response_deadline_monotonic_ns: int | None = None,
+        run_deadline_monotonic_ns: int | None = None,
+    ) -> tuple[AuditStartEvidence, ProcessedEnvelope]:
+        nonlocal stage_calls
+        result = await original_stage(
+            capture=capture,
+            ingress=ingress,
+            native_asset_id=native_asset_id,
+            attempt=attempt,
+            connection_id=connection_id,
+            subscription_id=subscription_id,
+            request_started_monotonic_ns=request_started_monotonic_ns,
+            hard_expiry_monotonic_ns=hard_expiry_monotonic_ns,
+            response_deadline_monotonic_ns=response_deadline_monotonic_ns,
+            run_deadline_monotonic_ns=run_deadline_monotonic_ns,
+        )
+        stage_calls += 1
+        if stage_calls == 2:
+            second_start_durable.set()
+            await release_second_start.wait()
+        return result
+
+    class _ExitAfterBothHttpStartSocket:
+        def __init__(self, asset_ids: tuple[str, ...], **kwargs: object) -> None:
+            assert asset_ids == selected.clob_token_ids
+            del kwargs
+            self.subscription_semantics_sha256 = hashlib.sha256(
+                b"audit-stage-all-before-concurrent-http"
+            ).hexdigest()
+
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            del admit
+            ready.set()
+            await both_http_started.wait()
+            raise PolymarketWebSocketTransportError(
+                category=PolymarketWebSocketFailureCategory.CONNECTION_CLOSED,
+                retryable=True,
+                detail="fixture exits after both first attempts are in flight",
+            )
+
+    class _BlockingAuditClient:
+        async def fetch_order_book_raw_with_evidence(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+            on_response_body_complete: Callable[[UtcTimestamp, int], None] | None = None,
+        ) -> PublicReadResult:
+            del deadline, on_response_body_complete
+            started_assets.append(asset_id)
+            if len(started_assets) == 2:
+                both_http_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    monkeypatch.setattr(service, "_stage_audit_start", gated_stage)
+    monkeypatch.setattr(observe_module, "PolymarketMarketWebSocket", _ExitAfterBothHttpStartSocket)
+    await writer.start()
+    await _initialize_books(capture)
+    generation_task = asyncio.create_task(
+        service._run_generation(  # pyright: ignore[reportPrivateUsage]
+            client=cast(PolymarketPublicClient, _BlockingAuditClient()),
+            capture=capture,
+            selected=(selected,),
+            asset_ids=selected.clob_token_ids,
+            deadline=asyncio.get_running_loop().time() + 30.0,
+            deadline_ns=time.monotonic_ns() + 30_000_000_000,
+            periodic_audit_due_ns=time.monotonic_ns(),
+            connection_id=ConnectionId("audit-stage-all-before-concurrent-http"),
+            subscription_id=SubscriptionId("audit-stage-all-before-concurrent-http-subscription"),
+            unavailable_started_ns=None,
+            runtime_health=ObservationRuntimeHealth(),
+        ),
+        name="audit-stage-all-before-concurrent-http-generation",
+    )
+    try:
+        async with asyncio.timeout(10.0):
+            await second_start_durable.wait()
+            await asyncio.sleep(0.02)
+            assert started_assets == []
+            release_second_start.set()
+            await both_http_started.wait()
+            assert started_assets == ["token-yes", "token-no"]
+            with pytest.raises(PolymarketWebSocketTransportError):
+                await generation_task
+    except BaseException:
+        release_second_start.set()
+        if not generation_task.done():
+            generation_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await generation_task
+        with suppress(Exception):
+            await writer.close(completed=False)
+        raise
+    else:
+        await writer.close()
+
+    records = JournalReader(tmp_path / "raw", run_id).read_all()
+    start_indices = [
+        index for index, record in enumerate(records) if record.channel == CONTROL_REST_AUDIT_START
+    ]
+    failure_indices = [
+        index for index, record in enumerate(records) if record.channel == CONTROL_REST_AUDIT_FAILED
+    ]
+    assert len(start_indices) == 2
+    assert len(failure_indices) == 2
+    assert max(start_indices) < min(failure_indices)
+    assert sum(record.channel == REST_BOOK_AUDIT for record in records) == 0
+    live = processor.summary()
+    replayed = replay_journal(tmp_path / "raw", run_id, config).processor
+    assert all(
+        outcome.outcome is AuditOutcome.FAILED
+        and outcome.reason is AuditFailureReason.SOCKET_GENERATION_CHANGED
+        for outcome in live.audit_outcomes
+    )
+    assert replayed.audit_outcomes == live.audit_outcomes
+    assert replayed.terminal_hash == live.terminal_hash
+
+
+@pytest.mark.asyncio
+async def test_second_start_crossing_leg_expiry_closes_all_staged_legs_without_http(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow second START cannot launch either staged first attempt after expiry."""
+
+    config = load_phase1_config(Path("config/phase1.toml"))
+    config = config.model_copy(
+        update={
+            "polymarket": config.polymarket.model_copy(
+                update={"snapshot_audit_interval_seconds": 30.0}
+            ),
+            "scanner": config.scanner.model_copy(
+                update={
+                    "maximum_book_age_seconds": 0.2,
+                    "maximum_interleg_skew_seconds": 0.1,
+                }
+            ),
+        }
+    )
+    run_id = CollectorRunId("audit-second-start-crosses-leg-expiry")
+    writer = RawJournalWriter(
+        JournalWriterConfig(
+            root=tmp_path / "raw",
+            collector_run_id=run_id,
+            venue_id=POLYMARKET_VENUE_ID,
+            stream="polymarket-public",
+            writer_id=WriterId("writer-audit-second-start-crosses-leg-expiry"),
+            writer_software_version="test",
+            git_commit="fixture",
+        )
+    )
+    processor = CanonicalProcessor(config)
+    metrics = InMemoryMetrics()
+    capture = observe_module._RawCaptureBoundary(  # pyright: ignore[reportPrivateUsage]
+        collector_run_id=run_id,
+        writer=writer,
+        processor=processor,
+        metrics=metrics,
+    )
+    service = PolymarketObservationService(
+        config,
+        workspace_root=tmp_path,
+        code_commit="fixture",
+        metrics=metrics,
+    )
+    selected = parse_gamma_markets(_fixture("polymarket_gamma_market_keyset.json")).markets[0]
+    second_start_durable = asyncio.Event()
+    release_second_start = asyncio.Event()
+    both_expiry_failures_recorded = asyncio.Event()
+    hard_expiries_ns: list[int] = []
+    http_calls = 0
+
+    original_stage = service._stage_audit_start  # pyright: ignore[reportPrivateUsage]
+    stage_calls = 0
+
+    async def gated_stage(
+        *,
+        capture: observe_module._RawCaptureBoundary,  # pyright: ignore[reportPrivateUsage]
+        ingress: BoundedRawIngress,
+        native_asset_id: str,
+        attempt: int,
+        connection_id: ConnectionId,
+        subscription_id: SubscriptionId,
+        request_started_monotonic_ns: int | None = None,
+        hard_expiry_monotonic_ns: int | None = None,
+        response_deadline_monotonic_ns: int | None = None,
+        run_deadline_monotonic_ns: int | None = None,
+    ) -> tuple[AuditStartEvidence, ProcessedEnvelope]:
+        nonlocal stage_calls
+        assert hard_expiry_monotonic_ns is not None
+        hard_expiries_ns.append(hard_expiry_monotonic_ns)
+        result = await original_stage(
+            capture=capture,
+            ingress=ingress,
+            native_asset_id=native_asset_id,
+            attempt=attempt,
+            connection_id=connection_id,
+            subscription_id=subscription_id,
+            request_started_monotonic_ns=request_started_monotonic_ns,
+            hard_expiry_monotonic_ns=hard_expiry_monotonic_ns,
+            response_deadline_monotonic_ns=response_deadline_monotonic_ns,
+            run_deadline_monotonic_ns=run_deadline_monotonic_ns,
+        )
+        stage_calls += 1
+        if stage_calls == 2:
+            second_start_durable.set()
+            await release_second_start.wait()
+        return result
+
+    original_failure = service._preserve_audit_failure  # pyright: ignore[reportPrivateUsage]
+    expiry_failure_count = 0
+
+    async def observed_failure(
+        *,
+        capture: observe_module._RawCaptureBoundary,  # pyright: ignore[reportPrivateUsage]
+        failure: AuditHttpFailureHandoff,
+        subscription_id: SubscriptionId,
+    ) -> ProcessedEnvelope:
+        nonlocal expiry_failure_count
+        result = await original_failure(
+            capture=capture,
+            failure=failure,
+            subscription_id=subscription_id,
+        )
+        if failure.reason is AuditFailureReason.BOOK_FRESHNESS_EXPIRED:
+            expiry_failure_count += 1
+            if expiry_failure_count == 2:
+                both_expiry_failures_recorded.set()
+        return result
+
+    class _ExitAfterExpiryFailuresSocket:
+        def __init__(self, asset_ids: tuple[str, ...], **kwargs: object) -> None:
+            assert asset_ids == selected.clob_token_ids
+            del kwargs
+            self.subscription_semantics_sha256 = hashlib.sha256(
+                b"audit-second-start-crosses-leg-expiry"
+            ).hexdigest()
+
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            del admit
+            ready.set()
+            await both_expiry_failures_recorded.wait()
+            raise PolymarketWebSocketTransportError(
+                category=PolymarketWebSocketFailureCategory.CONNECTION_CLOSED,
+                retryable=True,
+                detail="fixture exits after both staged legs expire",
+            )
+
+    class _UnexpectedAuditClient:
+        async def fetch_order_book_raw_with_evidence(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+            on_response_body_complete: Callable[[UtcTimestamp, int], None] | None = None,
+        ) -> PublicReadResult:
+            nonlocal http_calls
+            del asset_id, deadline, on_response_body_complete
+            http_calls += 1
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    monkeypatch.setattr(service, "_stage_audit_start", gated_stage)
+    monkeypatch.setattr(service, "_preserve_audit_failure", observed_failure)
+    monkeypatch.setattr(observe_module, "PolymarketMarketWebSocket", _ExitAfterExpiryFailuresSocket)
+    await writer.start()
+    await _initialize_books(capture)
+    generation_task = asyncio.create_task(
+        service._run_generation(  # pyright: ignore[reportPrivateUsage]
+            client=cast(PolymarketPublicClient, _UnexpectedAuditClient()),
+            capture=capture,
+            selected=(selected,),
+            asset_ids=selected.clob_token_ids,
+            deadline=asyncio.get_running_loop().time() + 30.0,
+            deadline_ns=time.monotonic_ns() + 30_000_000_000,
+            periodic_audit_due_ns=time.monotonic_ns(),
+            connection_id=ConnectionId("audit-second-start-crosses-leg-expiry"),
+            subscription_id=SubscriptionId("audit-second-start-crosses-leg-expiry-subscription"),
+            unavailable_started_ns=None,
+            runtime_health=ObservationRuntimeHealth(),
+        ),
+        name="audit-second-start-crosses-leg-expiry-generation",
+    )
+    try:
+        async with asyncio.timeout(10.0):
+            await second_start_durable.wait()
+            remaining_ns = max(hard_expiries_ns) - time.monotonic_ns()
+            if remaining_ns >= 0:
+                await asyncio.sleep(remaining_ns / 1e9 + 0.02)
+            release_second_start.set()
+            await both_expiry_failures_recorded.wait()
+            assert http_calls == 0
+            with pytest.raises(PolymarketWebSocketTransportError):
+                await generation_task
+    except BaseException:
+        release_second_start.set()
+        if not generation_task.done():
+            generation_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await generation_task
+        with suppress(Exception):
+            await writer.close(completed=False)
+        raise
+    else:
+        await writer.close()
+
+    records = JournalReader(tmp_path / "raw", run_id).read_all()
+    assert sum(record.channel == CONTROL_REST_AUDIT_START for record in records) == 2
+    assert sum(record.channel == CONTROL_REST_AUDIT_FAILED for record in records) == 2
+    assert sum(record.channel == REST_BOOK_AUDIT for record in records) == 0
+    live = processor.summary()
+    assert len(live.audit_outcomes) == 2
+    assert all(
+        outcome.outcome is AuditOutcome.FAILED
+        and outcome.reason is AuditFailureReason.BOOK_FRESHNESS_EXPIRED
+        for outcome in live.audit_outcomes
+    )
+    replayed = replay_journal(tmp_path / "raw", run_id, config).processor
+    assert replayed.audit_outcomes == live.audit_outcomes
+    assert replayed.terminal_hash == live.terminal_hash
+
+
+@pytest.mark.asyncio
+async def test_concurrent_first_legs_complete_before_selected_refresh_exit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1451,6 +2026,9 @@ async def test_matching_audit_does_not_start_second_leg_after_selected_refresh_e
     class _AuditClient:
         def __init__(self) -> None:
             self.assets: list[str] = []
+            self.active = 0
+            self.active_high_water = 0
+            self.both_started = asyncio.Event()
 
         async def fetch_order_book_raw_with_evidence(
             self,
@@ -1461,15 +2039,23 @@ async def test_matching_audit_does_not_start_second_leg_after_selected_refresh_e
         ) -> PublicReadResult:
             del deadline
             self.assets.append(asset_id)
-            if len(self.assets) > 1:
-                raise AssertionError("generation exit must suppress the second audit leg")
-            admitted = asyncio.Event()
-            await emissions.put((selected_new_market, admitted))
-            await admitted.wait()
-            return _public_read(
-                _fixture("polymarket_rest_book_yes.json"),
-                on_response_body_complete,
-            )
+            self.active += 1
+            self.active_high_water = max(self.active_high_water, self.active)
+            if len(self.assets) == 2:
+                self.both_started.set()
+            try:
+                await self.both_started.wait()
+                if asset_id == "token-no":
+                    return _public_read(_no_book(), on_response_body_complete)
+                admitted = asyncio.Event()
+                await emissions.put((selected_new_market, admitted))
+                await admitted.wait()
+                return _public_read(
+                    _fixture("polymarket_rest_book_yes.json"),
+                    on_response_body_complete,
+                )
+            finally:
+                self.active -= 1
 
     monkeypatch.setattr(observe_module, "PolymarketMarketWebSocket", _CommandSocket)
     client = _AuditClient()
@@ -1497,18 +2083,22 @@ async def test_matching_audit_does_not_start_second_leg_after_selected_refresh_e
     replayed = replay_journal(tmp_path / "raw", run_id, config).processor
     assert generation.reason.value == "REFERENCE_REFRESH"
     assert len(generation.refresh_requests) == 1
-    assert client.assets == ["token-yes"]
+    assert client.assets == ["token-yes", "token-no"]
+    assert client.active_high_water == 2
     assert _CommandSocket.instances == 1
-    assert tuple(outcome.outcome for outcome in live.audit_outcomes) == (AuditOutcome.MATCH,)
+    assert tuple(outcome.outcome for outcome in live.audit_outcomes) == (
+        AuditOutcome.MATCH,
+        AuditOutcome.MATCH,
+    )
     assert live.pending_rest_audits == 0
     assert live.terminal_hash == replayed.terminal_hash
-    assert counters["mma_rest_audit_legs_suppressed_total"] == 1
-    assert sum(record.channel == CONTROL_REST_AUDIT_START for record in records) == 1
-    assert sum(record.channel == REST_BOOK_AUDIT for record in records) == 1
+    assert counters.get("mma_rest_audit_legs_suppressed_total", 0) == 0
+    assert sum(record.channel == CONTROL_REST_AUDIT_START for record in records) == 2
+    assert sum(record.channel == REST_BOOK_AUDIT for record in records) == 2
 
 
 @pytest.mark.asyncio
-async def test_audit_start_on_unhealthy_generation_is_durably_failed_without_http(
+async def test_unhealthy_generation_records_expiry_without_http(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1614,14 +2204,13 @@ async def test_audit_start_on_unhealthy_generation_is_durably_failed_without_htt
     assert generation.reason.value == "RESYNC_REQUIRED"
     assert client.calls == 0
     live = processor.summary()
-    assert tuple(outcome.outcome for outcome in live.audit_outcomes) == (AuditOutcome.FAILED,)
-    assert live.audit_outcomes[0].reason is AuditFailureReason.LOCAL_STATE_NOT_COMPARABLE
+    assert live.audit_outcomes == ()
+    assert live.audit_ineligible_books == 1
     assert live.pending_rest_audits == 0
     records = JournalReader(tmp_path / "raw", run_id).read_all()
-    assert tuple(record.channel for record in records[-3:]) == (
+    assert tuple(record.channel for record in records[-2:]) == (
         CONTROL_BOOK_INVALIDATION,
-        CONTROL_REST_AUDIT_START,
-        CONTROL_REST_AUDIT_FAILED,
+        CONTROL_REST_AUDIT_EXPIRED,
     )
     replayed = replay_journal(tmp_path / "raw", run_id, config).processor
     assert replayed.audit_outcomes == live.audit_outcomes
@@ -1746,9 +2335,15 @@ async def test_websocket_disconnect_during_active_audit_fails_generation_and_onl
     assert stream.reconnects == 0
     assert _DisconnectDuringAuditSocket.instances == 1
     live = processor.summary()
-    assert tuple(outcome.outcome for outcome in live.audit_outcomes) == (AuditOutcome.FAILED,)
-    assert live.audit_outcomes[0].reason is AuditFailureReason.SOCKET_GENERATION_CHANGED
-    assert not live.audit_outcomes[0].requires_resync
+    assert tuple(outcome.outcome for outcome in live.audit_outcomes) == (
+        AuditOutcome.FAILED,
+        AuditOutcome.FAILED,
+    )
+    assert all(
+        outcome.reason is AuditFailureReason.SOCKET_GENERATION_CHANGED
+        and not outcome.requires_resync
+        for outcome in live.audit_outcomes
+    )
     health = runtime_health.snapshot()
     assert not health.socket_connected
     assert health.unavailable_intervals == 1
@@ -1759,22 +2354,23 @@ async def test_websocket_disconnect_during_active_audit_fails_generation_and_onl
     assert counters.get("mma_websocket_reconnects_total", 0) == 0
     assert counters.get("mma_polymarket_http_final_failures_total", 0) == 0
     records = JournalReader(tmp_path / "raw", run_id).read_all()
-    assert tuple(record.channel for record in records[-3:]) == (
-        CONTROL_REST_AUDIT_START,
-        CONTROL_REST_AUDIT_FAILED,
-        CONTROL_BOOK_INVALIDATION,
-    )
+    assert sum(record.channel == CONTROL_REST_AUDIT_START for record in records) == 2
+    # Both first attempts begin only after both starts are durable, so the
+    # generation exit explicitly closes both concurrently active requests.
+    assert sum(record.channel == CONTROL_REST_AUDIT_FAILED for record in records) == 2
+    assert sum(record.channel == CONTROL_BOOK_INVALIDATION for record in records) == 1
+    assert records[-1].channel == CONTROL_BOOK_INVALIDATION
     replayed = replay_journal(tmp_path / "raw", run_id, config).processor
     assert replayed.audit_outcomes == live.audit_outcomes
     assert replayed.terminal_hash == live.terminal_hash
 
 
 @pytest.mark.asyncio
-async def test_matching_audit_suppresses_next_leg_when_socket_ends_at_response(
+async def test_response_after_socket_end_fails_both_staged_legs_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Never stage a second audit leg after acquisition has already ended."""
+    """A response boundary after generation end cannot become MATCH evidence."""
 
     config = load_phase1_config(Path("config/phase1.toml"))
     run_id = CollectorRunId("audit-match-simultaneous-socket-end")
@@ -1851,8 +2447,8 @@ async def test_matching_audit_suppresses_next_leg_when_socket_ends_at_response(
         ) -> PublicReadResult:
             del deadline
             self.assets.append(asset_id)
-            if len(self.assets) > 1:
-                raise AssertionError("ended socket must suppress the second audit leg")
+            if asset_id == "token-no":
+                return _public_read(_no_book(), on_response_body_complete)
             request_started.set()
             await frame_admitted.wait()
             return _public_read(
@@ -1884,10 +2480,884 @@ async def test_matching_audit_suppresses_next_leg_when_socket_ends_at_response(
     counters = {key.name: value for key, value in metrics.snapshot().counters}
     records = JournalReader(tmp_path / "raw", run_id).read_all()
     replayed = replay_journal(tmp_path / "raw", run_id, config).processor
-    assert client.assets == ["token-yes"]
-    assert tuple(outcome.outcome for outcome in live.audit_outcomes) == (AuditOutcome.MATCH,)
+    assert client.assets == ["token-yes", "token-no"]
+    assert any(
+        outcome.native_asset_id == "token-yes"
+        and outcome.outcome is AuditOutcome.FAILED
+        and outcome.reason is AuditFailureReason.SOCKET_GENERATION_CHANGED
+        for outcome in live.audit_outcomes
+    )
+    assert any(
+        outcome.native_asset_id == "token-no" and outcome.outcome is AuditOutcome.MATCH
+        for outcome in live.audit_outcomes
+    )
     assert live.pending_rest_audits == 0
     assert live.terminal_hash == replayed.terminal_hash
-    assert counters["mma_rest_audit_legs_suppressed_total"] == 1
-    assert sum(record.channel == CONTROL_REST_AUDIT_START for record in records) == 1
+    assert counters.get("mma_rest_audit_legs_suppressed_total", 0) == 0
+    assert sum(record.channel == CONTROL_REST_AUDIT_START for record in records) == 2
     assert sum(record.channel == REST_BOOK_AUDIT for record in records) == 1
+    assert sum(record.channel == CONTROL_REST_AUDIT_CLASSIFY for record in records) == 1
+    assert sum(record.channel == CONTROL_REST_AUDIT_FAILED for record in records) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("earlier_cleanup_asset", ["token-yes", "token-no"])
+async def test_socket_exit_preserves_stored_later_body_when_earlier_cleanup_is_cancelled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    earlier_cleanup_asset: str,
+) -> None:
+    """Fail-all yields to immutable bodies released/stored in global fence order."""
+
+    config = load_phase1_config(Path("config/phase1.toml"))
+    later_stored_asset = "token-no" if earlier_cleanup_asset == "token-yes" else "token-yes"
+
+    def book_for_asset(asset_id: str) -> bytes:
+        return _fixture("polymarket_rest_book_yes.json") if asset_id == "token-yes" else _no_book()
+
+    earlier_payload = book_for_asset(earlier_cleanup_asset)
+    later_payload = book_for_asset(later_stored_asset)
+    run_id = CollectorRunId(f"audit-socket-exit-stored-later-{earlier_cleanup_asset}")
+    writer = RawJournalWriter(
+        JournalWriterConfig(
+            root=tmp_path / "raw",
+            collector_run_id=run_id,
+            venue_id=POLYMARKET_VENUE_ID,
+            stream="polymarket-public",
+            writer_id=WriterId(f"writer-audit-socket-exit-{earlier_cleanup_asset}"),
+            writer_software_version="test",
+            git_commit="fixture",
+        )
+    )
+    processor = CanonicalProcessor(config)
+    metrics = InMemoryMetrics()
+    capture = observe_module._RawCaptureBoundary(  # pyright: ignore[reportPrivateUsage]
+        collector_run_id=run_id,
+        writer=writer,
+        processor=processor,
+        metrics=metrics,
+    )
+    service = PolymarketObservationService(
+        config,
+        workspace_root=tmp_path,
+        code_commit="fixture",
+        metrics=metrics,
+    )
+    selected = parse_gamma_markets(_fixture("polymarket_gamma_market_keyset.json")).markets[0]
+    earlier_boundary_announced = asyncio.Event()
+    interleg_frame_admitted = asyncio.Event()
+    later_response_stored = asyncio.Event()
+    earlier_cleanup_cancelled = asyncio.Event()
+
+    class _ObservedQueue(asyncio.Queue[object]):
+        def get_nowait(self) -> object:
+            item = super().get_nowait()
+            if isinstance(item, AuditHttpResponseHandoff) and item.payload_bytes == later_payload:
+                # The coordinator assigns the dequeued item to
+                # _PendingAuditRequest.response without an intervening await.
+                later_response_stored.set()
+            return item
+
+    class _SocketEndingAfterLaterBodyIsStored:
+        def __init__(self, asset_ids: tuple[str, ...], **kwargs: object) -> None:
+            assert asset_ids == selected.clob_token_ids
+            del kwargs
+            self.subscription_semantics_sha256 = hashlib.sha256(
+                f"audit-socket-exit-stored-later-{earlier_cleanup_asset}".encode()
+            ).hexdigest()
+
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            ready.set()
+            await earlier_boundary_announced.wait()
+            admit(
+                ReceivedWebSocketMessage(
+                    payload_bytes=_fixture("polymarket_ws_last_trade.json"),
+                    received_wall_time=UtcTimestamp.now(),
+                    received_monotonic_ns=time.monotonic_ns(),
+                    message_type="TEXT",
+                )
+            )
+            interleg_frame_admitted.set()
+            await later_response_stored.wait()
+            raise PolymarketWebSocketTransportError(
+                category=PolymarketWebSocketFailureCategory.CONNECTION_CLOSED,
+                retryable=True,
+                detail="fixture socket ended with the later audit body stored",
+            )
+
+    class _EarlierCleanupBlockedClient:
+        async def fetch_order_book_raw_with_evidence(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+            on_response_body_complete: Callable[[UtcTimestamp, int], None] | None = None,
+        ) -> PublicReadResult:
+            del deadline
+            if asset_id == later_stored_asset:
+                await interleg_frame_admitted.wait()
+                return _public_read(later_payload, on_response_body_complete)
+
+            assert asset_id == earlier_cleanup_asset
+            response = _public_read(
+                earlier_payload,
+                on_response_body_complete,
+            )
+            earlier_boundary_announced.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # Model a body completed before generation end whose async
+                # response cleanup releases only when fail-all cancels it.
+                earlier_cleanup_cancelled.set()
+                return response
+            raise AssertionError("blocked response cleanup returned without cancellation")
+
+    monkeypatch.setattr(
+        observe_module,
+        "PolymarketMarketWebSocket",
+        _SocketEndingAfterLaterBodyIsStored,
+    )
+    monkeypatch.setattr(observe_module.asyncio, "Queue", _ObservedQueue)
+    await writer.start()
+    await _initialize_books(capture)
+    generation_task = asyncio.create_task(
+        service._run_generation(  # pyright: ignore[reportPrivateUsage]
+            client=cast(PolymarketPublicClient, _EarlierCleanupBlockedClient()),
+            capture=capture,
+            selected=(selected,),
+            asset_ids=selected.clob_token_ids,
+            deadline=asyncio.get_running_loop().time() + 30.0,
+            deadline_ns=time.monotonic_ns() + 30_000_000_000,
+            periodic_audit_due_ns=time.monotonic_ns(),
+            connection_id=ConnectionId(f"audit-socket-exit-stored-later-{earlier_cleanup_asset}"),
+            subscription_id=SubscriptionId(
+                f"audit-socket-exit-stored-later-{earlier_cleanup_asset}-subscription"
+            ),
+            unavailable_started_ns=None,
+            runtime_health=ObservationRuntimeHealth(),
+        ),
+        name=f"audit-socket-exit-stored-later-{earlier_cleanup_asset}-generation",
+    )
+    try:
+        done, _ = await asyncio.wait({generation_task}, timeout=10.0)
+        assert generation_task in done, (
+            earlier_boundary_announced.is_set(),
+            interleg_frame_admitted.is_set(),
+            later_response_stored.is_set(),
+            earlier_cleanup_cancelled.is_set(),
+        )
+        with pytest.raises(PolymarketWebSocketTransportError):
+            generation_task.result()
+    except BaseException:
+        if not generation_task.done():
+            generation_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await generation_task
+        with suppress(Exception):
+            await writer.close(completed=False)
+        raise
+    else:
+        await writer.close()
+
+    assert earlier_cleanup_cancelled.is_set()
+    live = processor.summary()
+    assert tuple(outcome.native_asset_id for outcome in live.audit_outcomes) == (
+        earlier_cleanup_asset,
+        later_stored_asset,
+    )
+    assert tuple(outcome.outcome for outcome in live.audit_outcomes) == (
+        AuditOutcome.MATCH,
+        AuditOutcome.MATCH,
+    )
+    assert live.pending_rest_audits == 0
+
+    records = JournalReader(tmp_path / "raw", run_id).read_all()
+    audit_records = [record for record in records if record.channel == REST_BOOK_AUDIT]
+    assert [record.payload_bytes for record in audit_records] == [
+        earlier_payload,
+        later_payload,
+    ]
+    assert [record.payload_sha256 for record in audit_records] == [
+        hashlib.sha256(earlier_payload).hexdigest(),
+        hashlib.sha256(later_payload).hexdigest(),
+    ]
+    assert [
+        record.transport_metadata["response_boundary_websocket_ordinal"] for record in audit_records
+    ] == [0, 1]
+    assert sum(record.channel == CONTROL_REST_AUDIT_CLASSIFY for record in records) == 2
+    assert sum(record.channel == CONTROL_REST_AUDIT_FAILED for record in records) == 0
+
+    replayed = replay_journal(tmp_path / "raw", run_id, config).processor
+    assert replayed.audit_outcomes == live.audit_outcomes
+    assert replayed.terminal_hash == live.terminal_hash
+
+
+@pytest.mark.asyncio
+async def test_done_acquisition_does_not_spin_while_post_fence_item_waits_for_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed socket task cannot keep the crossed-fence wait permanently ready."""
+
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("audit-post-fence-disconnect-no-spin")
+    writer = RawJournalWriter(
+        JournalWriterConfig(
+            root=tmp_path / "raw",
+            collector_run_id=run_id,
+            venue_id=POLYMARKET_VENUE_ID,
+            stream="polymarket-public",
+            writer_id=WriterId("writer-audit-post-fence-disconnect-no-spin"),
+            writer_software_version="test",
+            git_commit="fixture",
+        )
+    )
+    processor = CanonicalProcessor(config)
+    metrics = InMemoryMetrics()
+    capture = observe_module._RawCaptureBoundary(  # pyright: ignore[reportPrivateUsage]
+        collector_run_id=run_id,
+        writer=writer,
+        processor=processor,
+        metrics=metrics,
+    )
+    service = PolymarketObservationService(
+        config,
+        workspace_root=tmp_path,
+        code_commit="fixture",
+        metrics=metrics,
+    )
+    selected = parse_gamma_markets(_fixture("polymarket_gamma_market_keyset.json")).markets[0]
+    response_boundary_announced = asyncio.Event()
+    post_fence_admitted = asyncio.Event()
+    release_response_handoff = asyncio.Event()
+    response_cleanup_cancelled = asyncio.Event()
+
+    class _EndingAfterPostFenceSocket:
+        def __init__(self, asset_ids: tuple[str, ...], **kwargs: object) -> None:
+            assert asset_ids == selected.clob_token_ids
+            del kwargs
+            self.subscription_semantics_sha256 = hashlib.sha256(
+                b"audit-post-fence-disconnect-no-spin"
+            ).hexdigest()
+
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            ready.set()
+            await response_boundary_announced.wait()
+            admit(
+                ReceivedWebSocketMessage(
+                    payload_bytes=_fixture("polymarket_ws_price_change.json"),
+                    received_wall_time=UtcTimestamp.now(),
+                    received_monotonic_ns=time.monotonic_ns(),
+                    message_type="TEXT",
+                )
+            )
+            post_fence_admitted.set()
+            raise PolymarketWebSocketTransportError(
+                category=PolymarketWebSocketFailureCategory.CONNECTION_CLOSED,
+                retryable=True,
+                detail="fixture socket ended with a post-fence item queued",
+            )
+
+    class _DelayedHandoffClient:
+        async def fetch_order_book_raw_with_evidence(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+            on_response_body_complete: Callable[[UtcTimestamp, int], None] | None = None,
+        ) -> PublicReadResult:
+            del deadline
+            assert on_response_body_complete is not None
+            if asset_id == "token-no":
+                await release_response_handoff.wait()
+                return _public_read(_no_book(), on_response_body_complete)
+            assert asset_id == "token-yes"
+            received_wall_time = UtcTimestamp.now()
+            received_monotonic_ns = time.monotonic_ns()
+            on_response_body_complete(received_wall_time, received_monotonic_ns)
+            response_boundary_announced.set()
+            try:
+                await release_response_handoff.wait()
+            except asyncio.CancelledError:
+                # Match PolymarketPublicClient's body-completion contract:
+                # cancellation after the synchronous response fence releases
+                # the immutable body rather than revoking it.
+                response_cleanup_cancelled.set()
+            payload = _fixture("polymarket_rest_book_yes.json")
+            return PublicReadResult(
+                payload_bytes=payload,
+                evidence=PublicReadEvidence(
+                    endpoint_class=PolymarketEndpointClass.CLOB_BOOK,
+                    attempts=1,
+                    started_monotonic_ns=received_monotonic_ns - 1,
+                    response_received_wall_time=received_wall_time,
+                    response_received_monotonic_ns=received_monotonic_ns,
+                    completed_monotonic_ns=time.monotonic_ns(),
+                    status_code=200,
+                    cumulative_backoff_seconds=0.0,
+                    cumulative_rate_limit_wait_seconds=0.0,
+                    payload_sha256=hashlib.sha256(payload).hexdigest(),
+                ),
+            )
+
+    monkeypatch.setattr(observe_module, "PolymarketMarketWebSocket", _EndingAfterPostFenceSocket)
+    await writer.start()
+    await _initialize_books(capture)
+    generation_task = asyncio.create_task(
+        service._run_generation(  # pyright: ignore[reportPrivateUsage]
+            client=cast(PolymarketPublicClient, _DelayedHandoffClient()),
+            capture=capture,
+            selected=(selected,),
+            asset_ids=selected.clob_token_ids,
+            deadline=asyncio.get_running_loop().time() + 30.0,
+            deadline_ns=time.monotonic_ns() + 30_000_000_000,
+            periodic_audit_due_ns=time.monotonic_ns(),
+            connection_id=ConnectionId("audit-post-fence-disconnect-no-spin"),
+            subscription_id=SubscriptionId("audit-post-fence-disconnect-no-spin-subscription"),
+            unavailable_started_ns=None,
+            runtime_health=ObservationRuntimeHealth(),
+        ),
+        name="audit-post-fence-disconnect-no-spin-generation",
+    )
+    try:
+        async with asyncio.timeout(10.0):
+            with pytest.raises(PolymarketWebSocketTransportError):
+                await generation_task
+    except BaseException:
+        release_response_handoff.set()
+        if not generation_task.done():
+            generation_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await generation_task
+        with suppress(Exception):
+            await writer.close(completed=False)
+        raise
+    else:
+        await writer.close()
+
+    assert response_cleanup_cancelled.is_set()
+    live = processor.summary()
+    assert any(
+        outcome.native_asset_id == "token-yes" and outcome.outcome is AuditOutcome.MATCH
+        for outcome in live.audit_outcomes
+    )
+    assert any(
+        outcome.native_asset_id == "token-no"
+        and outcome.outcome is AuditOutcome.FAILED
+        and outcome.reason is AuditFailureReason.SOCKET_GENERATION_CHANGED
+        for outcome in live.audit_outcomes
+    )
+    replayed = replay_journal(tmp_path / "raw", run_id, config).processor
+    assert replayed.audit_outcomes == live.audit_outcomes
+    assert replayed.terminal_hash == live.terminal_hash
+
+
+@pytest.mark.asyncio
+async def test_planned_cutoff_suppresses_unneeded_near_deadline_cycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Do not poison a run whose accepted books remain fresh through cutoff."""
+
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("audit-planned-cutoff")
+    writer = RawJournalWriter(
+        JournalWriterConfig(
+            root=tmp_path / "raw",
+            collector_run_id=run_id,
+            venue_id=POLYMARKET_VENUE_ID,
+            stream="polymarket-public",
+            writer_id=WriterId("writer-audit-planned-cutoff"),
+            writer_software_version="test",
+            git_commit="fixture",
+        )
+    )
+    processor = CanonicalProcessor(config)
+    metrics = InMemoryMetrics()
+    capture = observe_module._RawCaptureBoundary(  # pyright: ignore[reportPrivateUsage]
+        collector_run_id=run_id,
+        writer=writer,
+        processor=processor,
+        metrics=metrics,
+    )
+    service = PolymarketObservationService(
+        config,
+        workspace_root=tmp_path,
+        code_commit="fixture",
+        metrics=metrics,
+    )
+    selected = parse_gamma_markets(_fixture("polymarket_gamma_market_keyset.json")).markets[0]
+
+    class _DeadlineSocket:
+        def __init__(self, asset_ids: tuple[str, ...], **kwargs: object) -> None:
+            assert asset_ids == selected.clob_token_ids
+            del kwargs
+            self.subscription_semantics_sha256 = hashlib.sha256(b"planned-cutoff").hexdigest()
+
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            ready.set()
+            del admit
+            await asyncio.Event().wait()
+
+    await writer.start()
+    await _initialize_books(capture)
+    baseline_ns = time.monotonic_ns()
+    remaining_seconds = 0.05
+    deadline_ns = baseline_ns + int(remaining_seconds * 1e9)
+
+    class _AuditClient:
+        def __init__(self) -> None:
+            self.assets: list[str] = []
+
+        async def fetch_order_book_raw_with_evidence(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+            on_response_body_complete: Callable[[UtcTimestamp, int], None] | None = None,
+        ) -> PublicReadResult:
+            self.assets.append(asset_id)
+            del deadline, on_response_body_complete
+            raise AssertionError("fresh-through-cutoff books must not start an audit")
+
+    monkeypatch.setattr(observe_module, "PolymarketMarketWebSocket", _DeadlineSocket)
+    client = _AuditClient()
+    generation = await service._run_generation(  # pyright: ignore[reportPrivateUsage]
+        client=cast(PolymarketPublicClient, client),
+        capture=capture,
+        selected=(selected,),
+        asset_ids=selected.clob_token_ids,
+        deadline=asyncio.get_running_loop().time() + remaining_seconds,
+        deadline_ns=deadline_ns,
+        periodic_audit_due_ns=baseline_ns,
+        connection_id=ConnectionId("audit-planned-cutoff"),
+        subscription_id=SubscriptionId("audit-planned-cutoff-subscription"),
+        unavailable_started_ns=None,
+        runtime_health=ObservationRuntimeHealth(),
+    )
+    await writer.close()
+
+    live = processor.summary()
+    records = JournalReader(tmp_path / "raw", run_id).read_all()
+    replayed = replay_journal(tmp_path / "raw", run_id, config).processor
+    assert generation.reason.value == "DEADLINE"
+    assert client.assets == []
+    assert live.audit_outcomes == ()
+    assert live.pending_rest_audits == 0
+    assert live.terminal_hash == replayed.terminal_hash
+    assert sum(record.channel == CONTROL_REST_AUDIT_START for record in records) == 0
+    assert sum(record.channel == REST_BOOK_AUDIT for record in records) == 0
+    assert sum(record.channel == CONTROL_REST_AUDIT_FAILED for record in records) == 0
+    assert sum(record.channel == WS_MARKET for record in records) == 0
+
+
+@pytest.mark.asyncio
+async def test_run_deadline_after_durable_audit_start_closes_without_http(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A staged audit remains fail-closed if durability crosses the run stop."""
+
+    config = load_phase1_config(Path("config/phase1.toml"))
+    config = config.model_copy(
+        update={
+            "polymarket": config.polymarket.model_copy(
+                update={"snapshot_audit_freshness_guard_seconds": 0.4}
+            ),
+            "scanner": config.scanner.model_copy(
+                update={
+                    "maximum_book_age_seconds": 1.0,
+                    "maximum_interleg_skew_seconds": 0.1,
+                }
+            ),
+        }
+    )
+    run_id = CollectorRunId("audit-start-durable-at-run-deadline")
+    writer = RawJournalWriter(
+        JournalWriterConfig(
+            root=tmp_path / "raw",
+            collector_run_id=run_id,
+            venue_id=POLYMARKET_VENUE_ID,
+            stream="polymarket-public",
+            writer_id=WriterId("writer-audit-start-durable-at-run-deadline"),
+            writer_software_version="test",
+            git_commit="fixture",
+        )
+    )
+    processor = CanonicalProcessor(config)
+    metrics = InMemoryMetrics()
+    capture = observe_module._RawCaptureBoundary(  # pyright: ignore[reportPrivateUsage]
+        collector_run_id=run_id,
+        writer=writer,
+        processor=processor,
+        metrics=metrics,
+    )
+    service = PolymarketObservationService(
+        config,
+        workspace_root=tmp_path,
+        code_commit="fixture",
+        metrics=metrics,
+    )
+    selected = parse_gamma_markets(_fixture("polymarket_gamma_market_keyset.json")).markets[0]
+
+    class _IdleSocket:
+        def __init__(self, asset_ids: tuple[str, ...], **kwargs: object) -> None:
+            assert asset_ids == selected.clob_token_ids
+            del kwargs
+            self.subscription_semantics_sha256 = hashlib.sha256(
+                b"audit-start-durable-at-run-deadline"
+            ).hexdigest()
+
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            del admit
+            ready.set()
+            await asyncio.Event().wait()
+
+    class _ForbiddenAuditClient:
+        calls = 0
+
+        async def fetch_order_book_raw_with_evidence(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+            on_response_body_complete: Callable[[UtcTimestamp, int], None] | None = None,
+        ) -> PublicReadResult:
+            del asset_id, deadline, on_response_body_complete
+            type(self).calls += 1
+            raise AssertionError("post-deadline staged audit must not issue HTTP")
+
+    await writer.start()
+    await _initialize_books(capture)
+    baseline_ns = time.monotonic_ns()
+    deadline_ns = min(capture.book_freshness_receive_ns) + 1_000_000_000
+    assert deadline_ns > baseline_ns
+    now_ns = [baseline_ns]
+    original_stage = service._stage_audit_start  # pyright: ignore[reportPrivateUsage]
+
+    async def stage_then_cross_deadline(
+        *,
+        capture: observe_module._RawCaptureBoundary,  # pyright: ignore[reportPrivateUsage]
+        ingress: BoundedRawIngress,
+        native_asset_id: str,
+        attempt: int,
+        connection_id: ConnectionId,
+        subscription_id: SubscriptionId,
+        request_started_monotonic_ns: int | None = None,
+        hard_expiry_monotonic_ns: int | None = None,
+        response_deadline_monotonic_ns: int | None = None,
+        run_deadline_monotonic_ns: int | None = None,
+    ) -> tuple[AuditStartEvidence, ProcessedEnvelope]:
+        result = await original_stage(
+            capture=capture,
+            ingress=ingress,
+            native_asset_id=native_asset_id,
+            attempt=attempt,
+            connection_id=connection_id,
+            subscription_id=subscription_id,
+            request_started_monotonic_ns=request_started_monotonic_ns,
+            hard_expiry_monotonic_ns=hard_expiry_monotonic_ns,
+            response_deadline_monotonic_ns=response_deadline_monotonic_ns,
+            run_deadline_monotonic_ns=run_deadline_monotonic_ns,
+        )
+        now_ns[0] = deadline_ns
+        return result
+
+    class _ObserveClock:
+        @staticmethod
+        def monotonic_ns() -> int:
+            return now_ns[0]
+
+    monkeypatch.setattr(observe_module, "PolymarketMarketWebSocket", _IdleSocket)
+    monkeypatch.setattr(observe_module, "time", _ObserveClock)
+    monkeypatch.setattr(service, "_stage_audit_start", stage_then_cross_deadline)
+    async with asyncio.timeout(5.0):
+        generation = await service._run_generation(  # pyright: ignore[reportPrivateUsage]
+            client=cast(PolymarketPublicClient, _ForbiddenAuditClient()),
+            capture=capture,
+            selected=(selected,),
+            asset_ids=selected.clob_token_ids,
+            deadline=asyncio.get_running_loop().time() + 30.0,
+            deadline_ns=deadline_ns,
+            periodic_audit_due_ns=baseline_ns,
+            connection_id=ConnectionId("audit-start-durable-at-run-deadline"),
+            subscription_id=SubscriptionId("audit-start-durable-at-run-deadline-subscription"),
+            unavailable_started_ns=None,
+            runtime_health=ObservationRuntimeHealth(),
+        )
+    await writer.close()
+
+    live = processor.summary()
+    records = JournalReader(tmp_path / "raw", run_id).read_all()
+    replayed = replay_journal(tmp_path / "raw", run_id, config).processor
+    counters = {
+        (key.name, dict(key.labels).get("reason")): value
+        for key, value in metrics.snapshot().counters
+    }
+    assert generation.reason.value == "DEADLINE"
+    assert _ForbiddenAuditClient.calls == 0
+    assert tuple(outcome.outcome for outcome in live.audit_outcomes) == (AuditOutcome.FAILED,)
+    assert live.audit_outcomes[0].reason is AuditFailureReason.RUN_ENDED
+    assert live.pending_rest_audits == 0
+    assert live.terminal_hash == replayed.terminal_hash
+    assert counters[("mma_rest_audit_launches_suppressed_total", "run_deadline_after_stage")] == 1
+    assert sum(record.channel == CONTROL_REST_AUDIT_START for record in records) == 1
+    assert sum(record.channel == CONTROL_REST_AUDIT_FAILED for record in records) == 1
+    assert sum(record.channel == REST_BOOK_AUDIT for record in records) == 0
+
+
+@pytest.mark.asyncio
+async def test_public_controller_deadline_wins_run_end_without_duplicate_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The controller's typed deadline handoff is the sole canonical terminal event."""
+
+    config = load_phase1_config(Path("config/phase1.toml"))
+    config = config.model_copy(
+        update={
+            "polymarket": config.polymarket.model_copy(
+                update={"snapshot_audit_freshness_guard_seconds": 0.025}
+            ),
+            "scanner": config.scanner.model_copy(
+                update={
+                    "maximum_book_age_seconds": 0.03,
+                    "maximum_interleg_skew_seconds": 0.01,
+                }
+            ),
+        }
+    )
+    run_id = CollectorRunId("audit-public-controller-observation-deadline")
+    writer = RawJournalWriter(
+        JournalWriterConfig(
+            root=tmp_path / "raw",
+            collector_run_id=run_id,
+            venue_id=POLYMARKET_VENUE_ID,
+            stream="polymarket-public",
+            writer_id=WriterId("writer-audit-public-controller-deadline"),
+            writer_software_version="test",
+            git_commit="fixture",
+        )
+    )
+    processor = CanonicalProcessor(config)
+    metrics = InMemoryMetrics()
+    capture = observe_module._RawCaptureBoundary(  # pyright: ignore[reportPrivateUsage]
+        collector_run_id=run_id,
+        writer=writer,
+        processor=processor,
+        metrics=metrics,
+    )
+    service = PolymarketObservationService(
+        config,
+        workspace_root=tmp_path,
+        code_commit="fixture",
+        metrics=metrics,
+    )
+    selected = parse_gamma_markets(_fixture("polymarket_gamma_market_keyset.json")).markets[0]
+
+    class _IdleSocket:
+        def __init__(self, asset_ids: tuple[str, ...], **kwargs: object) -> None:
+            assert asset_ids == selected.clob_token_ids
+            del kwargs
+            self.subscription_semantics_sha256 = hashlib.sha256(
+                b"audit-public-controller-observation-deadline"
+            ).hexdigest()
+
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            del admit
+            ready.set()
+            await asyncio.Event().wait()
+
+    http_attempt_started = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params.get("token_id") in {"token-yes", "token-no"}
+        http_attempt_started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("absolute public-read deadline did not cancel the attempt")
+
+    monkeypatch.setattr(observe_module, "PolymarketMarketWebSocket", _IdleSocket)
+    await writer.start()
+    await _initialize_books(capture)
+    loop = asyncio.get_running_loop()
+    remaining_seconds = 0.05
+    deadline = loop.time() + remaining_seconds
+    deadline_ns = time.monotonic_ns() + int(remaining_seconds * 1e9)
+    async with PolymarketPublicClient(
+        transport=httpx.MockTransport(handler),
+        metrics=metrics,
+    ) as client:
+        generation = await service._run_generation(  # pyright: ignore[reportPrivateUsage]
+            client=client,
+            capture=capture,
+            selected=(selected,),
+            asset_ids=selected.clob_token_ids,
+            deadline=deadline,
+            deadline_ns=deadline_ns,
+            periodic_audit_due_ns=time.monotonic_ns(),
+            connection_id=ConnectionId("audit-public-controller-deadline"),
+            subscription_id=SubscriptionId("audit-public-controller-deadline-subscription"),
+            unavailable_started_ns=None,
+            runtime_health=ObservationRuntimeHealth(),
+        )
+        generation_returned_monotonic_ns = time.monotonic_ns()
+        generation_returned_wall_time = UtcTimestamp.now()
+        endpoint_metrics = next(
+            snapshot
+            for snapshot in client.public_read_metrics_snapshot().endpoints
+            if snapshot.endpoint_class is PolymarketEndpointClass.CLOB_BOOK
+        )
+    await writer.close()
+
+    assert http_attempt_started.is_set()
+    assert generation.reason.value == "DEADLINE"
+    assert generation.capture_cutoff is not None
+    assert generation.capture_cutoff.monotonic_ns < generation_returned_monotonic_ns
+    assert generation.capture_cutoff.wall_time < generation_returned_wall_time
+    assert endpoint_metrics.requests == 2
+    assert endpoint_metrics.attempts == 2
+    assert endpoint_metrics.timeouts == 2
+    assert endpoint_metrics.final_failures == 2
+    assert endpoint_metrics.retries == 0
+    live = processor.summary()
+    assert tuple(outcome.outcome for outcome in live.audit_outcomes) == (
+        AuditOutcome.FAILED,
+        AuditOutcome.FAILED,
+    )
+    assert all(
+        outcome.reason is AuditFailureReason.BOOK_FRESHNESS_EXPIRED
+        for outcome in live.audit_outcomes
+    )
+    assert live.pending_rest_audits == 0
+    records = JournalReader(tmp_path / "raw", run_id).read_all()
+    assert sum(record.channel == CONTROL_REST_AUDIT_START for record in records) == 2
+    assert sum(record.channel == CONTROL_REST_AUDIT_FAILED for record in records) == 2
+    assert sum(record.channel == REST_BOOK_AUDIT for record in records) == 0
+    replayed = replay_journal(tmp_path / "raw", run_id, config).processor
+    assert replayed.audit_outcomes == live.audit_outcomes
+    assert replayed.pending_rest_audits == 0
+    assert replayed.terminal_hash == live.terminal_hash
+
+
+@pytest.mark.asyncio
+async def test_exact_run_deadline_starts_zero_audits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Equality at the absolute run stop is not permission to stage audit intent."""
+
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("audit-exact-run-deadline-zero-start")
+    writer = RawJournalWriter(
+        JournalWriterConfig(
+            root=tmp_path / "raw",
+            collector_run_id=run_id,
+            venue_id=POLYMARKET_VENUE_ID,
+            stream="polymarket-public",
+            writer_id=WriterId("writer-audit-exact-run-deadline-zero-start"),
+            writer_software_version="test",
+            git_commit="fixture",
+        )
+    )
+    processor = CanonicalProcessor(config)
+    metrics = InMemoryMetrics()
+    capture = observe_module._RawCaptureBoundary(  # pyright: ignore[reportPrivateUsage]
+        collector_run_id=run_id,
+        writer=writer,
+        processor=processor,
+        metrics=metrics,
+    )
+    service = PolymarketObservationService(
+        config,
+        workspace_root=tmp_path,
+        code_commit="fixture",
+        metrics=metrics,
+    )
+    selected = parse_gamma_markets(_fixture("polymarket_gamma_market_keyset.json")).markets[0]
+
+    class _ReadySocket:
+        def __init__(self, asset_ids: tuple[str, ...], **kwargs: object) -> None:
+            assert asset_ids == selected.clob_token_ids
+            del kwargs
+            self.subscription_semantics_sha256 = hashlib.sha256(
+                b"audit-exact-run-deadline-zero-start"
+            ).hexdigest()
+
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            del admit
+            ready.set()
+            await asyncio.Event().wait()
+
+    class _ForbiddenAuditClient:
+        async def fetch_order_book_raw_with_evidence(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+            on_response_body_complete: Callable[[UtcTimestamp, int], None] | None = None,
+        ) -> PublicReadResult:
+            del asset_id, deadline, on_response_body_complete
+            raise AssertionError("an exact-deadline run must not issue audit HTTP")
+
+    monkeypatch.setattr(observe_module, "PolymarketMarketWebSocket", _ReadySocket)
+    await writer.start()
+    await _initialize_books(capture)
+    deadline_ns = time.monotonic_ns()
+    generation = await service._run_generation(  # pyright: ignore[reportPrivateUsage]
+        client=cast(PolymarketPublicClient, _ForbiddenAuditClient()),
+        capture=capture,
+        selected=(selected,),
+        asset_ids=selected.clob_token_ids,
+        deadline=asyncio.get_running_loop().time(),
+        deadline_ns=deadline_ns,
+        periodic_audit_due_ns=deadline_ns,
+        connection_id=ConnectionId("audit-exact-run-deadline-zero-start"),
+        subscription_id=SubscriptionId("audit-exact-run-deadline-zero-start-subscription"),
+        unavailable_started_ns=None,
+        runtime_health=ObservationRuntimeHealth(),
+    )
+    await writer.close()
+
+    assert generation.reason.value == "DEADLINE"
+    live = processor.summary()
+    assert live.audit_outcomes == ()
+    assert live.pending_rest_audits == 0
+    records = JournalReader(tmp_path / "raw", run_id).read_all()
+    assert sum(record.channel == CONTROL_REST_AUDIT_START for record in records) == 0
+    assert sum(record.channel == CONTROL_REST_AUDIT_FAILED for record in records) == 0
+    assert sum(record.channel == REST_BOOK_AUDIT for record in records) == 0
+    replayed = replay_journal(tmp_path / "raw", run_id, config).processor
+    assert replayed.audit_outcomes == live.audit_outcomes
+    assert replayed.pending_rest_audits == 0
+    assert replayed.terminal_hash == live.terminal_hash

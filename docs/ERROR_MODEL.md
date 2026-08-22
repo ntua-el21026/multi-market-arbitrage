@@ -166,19 +166,53 @@ REST integrity audits add a separate typed outcome layer:
 
 - `MATCH` and `MISMATCH` are permitted only after the response-boundary
   WebSocket admission watermark has been durably processed by the canonical
-  owner and no relevant economic mutation crossed the request window;
+  owner, the staged raw response has crossed its durability barrier, a separate
+  classification control has released it, and no relevant economic mutation
+  crossed the request window;
 - `RACED` means a relevant economic mutation crossed that window and consumes
   only the bounded race-retry policy;
 - `FAILED` means HTTP, deadline, response, watermark, generation,
   comparability, retry-budget, or shutdown evidence could not support a safe
   classification.
 
+A production audit start binds its leg hard expiry, the absolute run deadline,
+and the effective response deadline, which must equal the earlier of those two.
+The first start locks the processor to run-wide `LEGACY` or `DEFERRED_BOUND`
+mode; bound mode also locks one monotonic epoch/run-deadline pair for every
+later start. A bound start is rejected unless its hard expiry exactly equals
+the processor's same-epoch last accepted book-receive time plus configured
+maximum age; no freshness, freshness later than the claimed START, and a forged
+later expiry all fail closed. Deferred response and classification envelopes
+must remain in the bound monotonic epoch. A raw response is timely only when its
+receive timestamp is strictly less than the bound response deadline. Its later
+durable classification control is timely
+only when its classification timestamp is strictly less than the bound hard
+expiry. Equality at either boundary fails closed; a response that was timely
+but could not be durably classified before hard expiry becomes
+`FAILED`/`BOOK_FRESHNESS_EXPIRED`, not a late `MATCH`. Socket-generation exit is
+another strict fence: a response received before the recorded generation end
+may be evaluated, while one received at or after it fails with
+`SOCKET_GENERATION_CHANGED`.
+
+Exact bounded body completion is the immutable HTTP response boundary. If
+asynchronous connection cleanup is still pending when the socket generation
+ends, cancellation releases that completed body for globally fence-ordered
+durability/classification; cleanup must not replace it with a synthetic socket
+failure. A request whose body never completed remains eligible only for the
+typed failure path.
+
 `RACED`/`FAILED` never become `MATCH` by default. Only a proven `MISMATCH`
 requires audit-driven resynchronization; an isolated HTTP failure does not
 terminate a healthy WebSocket generation. The durable audit start,
 response/failure, barrier evidence, outcome, and hash chain make replay reach
 the same classification without repeating remote I/O or depending on current
-task timing.
+task timing. The deferred raw response and complete bound start state remain
+pending deterministic state until the classification control arrives and are
+included in terminal hashing. The locked audit mode and bound run cutoff remain
+in that hash even after requests complete. Replay uses the durable
+classification timestamp, never the current clock. Historical all-inline audit
+runs remain replayable, but mode upgrades/downgrades or inline completion or
+expiry in a deferred-bound run are protocol errors and are rejected.
 
 ## 10. Test requirement
 
@@ -193,5 +227,8 @@ Fault injection must cover:
 - queue saturation;
 - disk failure;
 - unsupported schema;
-- audit watermark ambiguity, race/retry exhaustion, and health-writer failure;
+- audit watermark ambiguity, response/classification deadline equality,
+  mixed/malformed deferred controls, cross-epoch or reversed chronology,
+  socket-generation boundary ordering,
+  race/retry exhaustion, and health-writer failure;
 - future live unknown command.

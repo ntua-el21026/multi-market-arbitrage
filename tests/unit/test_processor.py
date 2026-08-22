@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from multi_market_arbitrage.core.config import load_phase1_config
+from multi_market_arbitrage.core.config import Phase1Config, load_phase1_config
 from multi_market_arbitrage.core.errors import ProgrammingInvariantViolation, StorageFault
 from multi_market_arbitrage.core.health import BookHealth
 from multi_market_arbitrage.core.ids import (
@@ -24,6 +25,8 @@ from multi_market_arbitrage.normalization import polymarket as normalization_mod
 from multi_market_arbitrage.pipeline import (
     CLOB_MARKET_PREFIX,
     CONTROL_BOOK_INVALIDATION,
+    CONTROL_REST_AUDIT_CLASSIFY,
+    CONTROL_REST_AUDIT_EXPIRED,
     CONTROL_REST_AUDIT_FAILED,
     CONTROL_REST_AUDIT_START,
     GAMMA_EVENT_PREFIX,
@@ -33,6 +36,8 @@ from multi_market_arbitrage.pipeline import (
     REST_BOOK,
     REST_BOOK_AUDIT,
     WS_MARKET,
+    AuditClassificationCommand,
+    AuditExpiryCommand,
     AuditFailureCommand,
     AuditFailureReason,
     AuditOutcome,
@@ -184,6 +189,10 @@ def _audit_start(
     native_asset_id: str = "token-yes",
     attempt: int = 1,
     admitted_ordinal: int | None = None,
+    hard_expiry_monotonic_ns: int | None = None,
+    response_deadline_monotonic_ns: int | None = None,
+    run_deadline_monotonic_ns: int | None = None,
+    request_started_monotonic_ns: int | None = None,
 ) -> tuple[AuditStartEvidence, RawEventEnvelope]:
     connection_id = ConnectionId("processor-test-connection")
     processed = processor.processed_websocket_watermark(connection_id)
@@ -192,7 +201,9 @@ def _audit_start(
         connection_id=connection_id,
         native_asset_id=native_asset_id,
         attempt=attempt,
-        request_started_monotonic_ns=100 + sequence,
+        request_started_monotonic_ns=(
+            100 + sequence if request_started_monotonic_ns is None else request_started_monotonic_ns
+        ),
         starting_admission_watermark=WebSocketAdmissionWatermark(
             connection_id=connection_id,
             ordinal=processed.ordinal if admitted_ordinal is None else admitted_ordinal,
@@ -207,6 +218,27 @@ def _audit_start(
         start.to_payload(),
         connection_id=connection_id,
         monotonic_ns=start.request_started_monotonic_ns,
+        transport_metadata=(
+            None
+            if hard_expiry_monotonic_ns is None
+            else {
+                "hard_expiry_monotonic_ns": hard_expiry_monotonic_ns,
+                "response_deadline_monotonic_ns": (
+                    hard_expiry_monotonic_ns
+                    if response_deadline_monotonic_ns is None
+                    else response_deadline_monotonic_ns
+                ),
+                "run_deadline_monotonic_ns": (
+                    (
+                        hard_expiry_monotonic_ns
+                        if response_deadline_monotonic_ns is None
+                        else response_deadline_monotonic_ns
+                    )
+                    if run_deadline_monotonic_ns is None
+                    else run_deadline_monotonic_ns
+                ),
+            }
+        ),
     )
 
 
@@ -218,19 +250,23 @@ def _audit_response(
     *,
     boundary: int,
     barrier: int | None = None,
+    classification_deferred: bool | str | None = None,
 ) -> RawEventEnvelope:
+    metadata: dict[str, str | int | bool] = {
+        "audit_attempt": start.attempt,
+        "barrier_websocket_ordinal": boundary if barrier is None else barrier,
+        "request_id": start.request_id,
+        "response_boundary_websocket_ordinal": boundary,
+    }
+    if classification_deferred is not None:
+        metadata["classification_deferred"] = classification_deferred
     return _envelope(
         run_id,
         sequence,
         REST_BOOK_AUDIT,
         payload,
         connection_id=start.connection_id,
-        transport_metadata={
-            "audit_attempt": start.attempt,
-            "barrier_websocket_ordinal": boundary if barrier is None else barrier,
-            "request_id": start.request_id,
-            "response_boundary_websocket_ordinal": boundary,
-        },
+        transport_metadata=metadata,
     )
 
 
@@ -241,6 +277,17 @@ def _receipt(envelope: RawEventEnvelope) -> JournalReceipt:
         ingest_seq=envelope.ingest_seq,
         state=JournalDurabilityState.DURABLE,
     )
+
+
+def _bootstrap_hard_expiry_ns(
+    config: Phase1Config,
+    native_asset_id: str = "token-yes",
+    *,
+    freshness_ns: int | None = None,
+) -> int:
+    if freshness_ns is None:
+        freshness_ns = 102 if native_asset_id == "token-yes" else 103
+    return freshness_ns + int(config.scanner.maximum_book_age_seconds * 1_000_000_000)
 
 
 def _bootstrap(run_id: CollectorRunId) -> tuple[RawEventEnvelope, ...]:
@@ -598,6 +645,631 @@ def test_malformed_audit_and_control_payloads_are_expected_data_faults(
     assert not result.success
     assert result.error_type == error_type
     assert processor.summary().parse_failures == 1
+
+
+@pytest.mark.parametrize("deferred_marker", [None, False, "true"])
+def test_bound_audit_start_rejects_legacy_or_invalid_deferred_response(
+    deferred_marker: bool | str | None,
+) -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    processor = CanonicalProcessor(config)
+    run_id = CollectorRunId(f"processor-bound-audit-mode-{deferred_marker!s}")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="bound-audit",
+        hard_expiry_monotonic_ns=_bootstrap_hard_expiry_ns(config),
+        response_deadline_monotonic_ns=900,
+    )
+    assert processor.process_replayed(intent).success
+
+    response = _audit_response(
+        run_id,
+        5,
+        start,
+        _fixture("polymarket_rest_book_yes.json"),
+        boundary=0,
+        classification_deferred=deferred_marker,
+    )
+    result = processor.process_replayed(response)
+
+    assert not result.success
+    assert result.error_type == "NormalizationError"
+    assert processor.summary().pending_rest_audits == 1
+
+
+def test_bound_audit_start_rejects_forged_expiry_and_missing_freshness() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("processor-bound-audit-forged-expiry")
+    processor = CanonicalProcessor(config)
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    true_expiry_ns = _bootstrap_hard_expiry_ns(config)
+    forged_expiry_ns = true_expiry_ns + int(config.scanner.maximum_book_age_seconds * 1_000_000_000)
+    forged_start, forged_intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="forged-future-expiry",
+        hard_expiry_monotonic_ns=forged_expiry_ns,
+        response_deadline_monotonic_ns=900,
+    )
+
+    rejected_start = processor.process_replayed(forged_intent)
+    assert not rejected_start.success
+    assert rejected_start.error_type == "NormalizationError"
+    forged_response = _audit_response(
+        run_id,
+        5,
+        forged_start,
+        _fixture("polymarket_rest_book_yes.json"),
+        boundary=0,
+        classification_deferred=True,
+    )
+    assert not processor.process_replayed(forged_response).success
+    forged_classification = AuditClassificationCommand(
+        request_id=forged_start.request_id,
+        response_ingest_seq=forged_response.ingest_seq,
+        classification_monotonic_ns=true_expiry_ns + 1,
+        hard_expiry_monotonic_ns=forged_expiry_ns,
+    )
+    rejected_classification = processor.process_replayed(
+        _envelope(
+            run_id,
+            6,
+            CONTROL_REST_AUDIT_CLASSIFY,
+            forged_classification.to_payload(),
+            monotonic_ns=forged_classification.classification_monotonic_ns,
+            connection_id=forged_start.connection_id,
+        )
+    )
+    assert not rejected_classification.success
+    assert not processor.audit_outcomes
+    assert processor.summary().pending_rest_audits == 0
+
+    no_freshness_run = CollectorRunId("processor-bound-audit-no-freshness")
+    no_freshness = CanonicalProcessor(config)
+    for envelope in _bootstrap(no_freshness_run)[:2]:
+        assert no_freshness.process_replayed(envelope).success
+    _, no_freshness_intent = _audit_start(
+        no_freshness,
+        no_freshness_run,
+        2,
+        request_id="no-accepted-freshness",
+        hard_expiry_monotonic_ns=_bootstrap_hard_expiry_ns(config),
+        response_deadline_monotonic_ns=900,
+    )
+    rejected_missing_freshness = no_freshness.process_replayed(no_freshness_intent)
+    assert not rejected_missing_freshness.success
+    assert rejected_missing_freshness.error_type == "NormalizationError"
+    assert no_freshness.summary().pending_rest_audits == 0
+
+
+def test_bound_audit_start_cannot_precede_accepted_freshness() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("processor-bound-audit-start-before-freshness")
+    processor = CanonicalProcessor(config)
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="start-before-accepted-freshness",
+        hard_expiry_monotonic_ns=_bootstrap_hard_expiry_ns(config),
+        response_deadline_monotonic_ns=900,
+        request_started_monotonic_ns=50,
+    )
+    rejected = processor.process_replayed(intent)
+    assert not rejected.success
+    assert rejected.error_type == "NormalizationError"
+
+    response = _audit_response(
+        run_id,
+        5,
+        start,
+        _fixture("polymarket_rest_book_yes.json"),
+        boundary=0,
+        classification_deferred=True,
+    )
+    assert not processor.process_replayed(response).success
+    classification = AuditClassificationCommand(
+        request_id=start.request_id,
+        response_ingest_seq=response.ingest_seq,
+        classification_monotonic_ns=200,
+        hard_expiry_monotonic_ns=_bootstrap_hard_expiry_ns(config),
+    )
+    assert not processor.process_replayed(
+        _envelope(
+            run_id,
+            6,
+            CONTROL_REST_AUDIT_CLASSIFY,
+            classification.to_payload(),
+            monotonic_ns=classification.classification_monotonic_ns,
+            connection_id=start.connection_id,
+        )
+    ).success
+    assert not processor.audit_outcomes
+    assert processor.summary().pending_rest_audits == 0
+
+
+def test_bound_audit_start_rejects_forged_run_cutoff_extension() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("processor-bound-audit-forged-run-cutoff")
+    processor = CanonicalProcessor(config)
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    yes_expiry_ns = _bootstrap_hard_expiry_ns(config, "token-yes")
+    _, valid_intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="bind-real-run-cutoff",
+        native_asset_id="token-yes",
+        hard_expiry_monotonic_ns=yes_expiry_ns,
+        response_deadline_monotonic_ns=900,
+        run_deadline_monotonic_ns=900,
+    )
+    assert processor.process_replayed(valid_intent).success
+
+    no_expiry_ns = _bootstrap_hard_expiry_ns(config, "token-no")
+    _, inconsistent_response_intent = _audit_start(
+        processor,
+        run_id,
+        5,
+        request_id="extend-only-response-cutoff",
+        native_asset_id="token-no",
+        hard_expiry_monotonic_ns=no_expiry_ns,
+        response_deadline_monotonic_ns=no_expiry_ns,
+        run_deadline_monotonic_ns=900,
+    )
+    assert not processor.process_replayed(inconsistent_response_intent).success
+
+    _, forged_run_intent = _audit_start(
+        processor,
+        run_id,
+        6,
+        request_id="extend-response-and-run-cutoff",
+        native_asset_id="token-no",
+        hard_expiry_monotonic_ns=no_expiry_ns,
+        response_deadline_monotonic_ns=no_expiry_ns,
+        run_deadline_monotonic_ns=no_expiry_ns,
+    )
+    rejected = processor.process_replayed(forged_run_intent)
+    assert not rejected.success
+    assert rejected.error_type == "NormalizationError"
+    assert processor.summary().pending_rest_audits == 1
+    assert not processor.audit_outcomes
+
+    next_epoch_run = CollectorRunId("processor-bound-audit-next-monotonic-epoch")
+    next_epoch_no_book = _envelope(next_epoch_run, 5, REST_BOOK, _no_book())
+    assert processor.process_replayed(next_epoch_no_book).success
+    _, next_epoch_intent = _audit_start(
+        processor,
+        next_epoch_run,
+        6,
+        request_id="reuse-numeric-cutoff-in-next-epoch",
+        native_asset_id="token-no",
+        hard_expiry_monotonic_ns=_bootstrap_hard_expiry_ns(
+            config,
+            "token-no",
+            freshness_ns=next_epoch_no_book.received_monotonic.nanoseconds,
+        ),
+        response_deadline_monotonic_ns=900,
+        run_deadline_monotonic_ns=900,
+    )
+    rejected_epoch = processor.process_replayed(next_epoch_intent)
+    assert not rejected_epoch.success
+    assert rejected_epoch.error_type == "NormalizationError"
+    assert processor.summary().pending_rest_audits == 1
+
+
+def test_audit_start_protocol_mode_cannot_upgrade_or_downgrade_mid_run() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+
+    bound_run = CollectorRunId("processor-audit-mode-bound-first")
+    bound_first = CanonicalProcessor(config)
+    for envelope in _bootstrap(bound_run):
+        assert bound_first.process_replayed(envelope).success
+    bound_start, bound_intent = _audit_start(
+        bound_first,
+        bound_run,
+        4,
+        request_id="bound-before-downgrade",
+        hard_expiry_monotonic_ns=_bootstrap_hard_expiry_ns(config),
+        response_deadline_monotonic_ns=900,
+    )
+    assert bound_first.process_replayed(bound_intent).success
+    bound_failure = AuditFailureCommand(
+        request_id=bound_start.request_id,
+        reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+    )
+    assert bound_first.process_replayed(
+        _envelope(
+            bound_run,
+            5,
+            CONTROL_REST_AUDIT_FAILED,
+            bound_failure.to_payload(),
+            connection_id=bound_start.connection_id,
+        )
+    ).success
+    _, legacy_downgrade = _audit_start(
+        bound_first,
+        bound_run,
+        6,
+        request_id="legacy-after-bound",
+    )
+    assert not bound_first.process_replayed(legacy_downgrade).success
+    assert bound_first.summary().pending_rest_audits == 0
+
+    legacy_run = CollectorRunId("processor-audit-mode-legacy-first")
+    legacy_first = CanonicalProcessor(config)
+    for envelope in _bootstrap(legacy_run):
+        assert legacy_first.process_replayed(envelope).success
+    legacy_start, legacy_intent = _audit_start(
+        legacy_first,
+        legacy_run,
+        4,
+        request_id="legacy-before-upgrade",
+    )
+    assert legacy_first.process_replayed(legacy_intent).success
+    legacy_failure = AuditFailureCommand(
+        request_id=legacy_start.request_id,
+        reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+    )
+    assert legacy_first.process_replayed(
+        _envelope(
+            legacy_run,
+            5,
+            CONTROL_REST_AUDIT_FAILED,
+            legacy_failure.to_payload(),
+            connection_id=legacy_start.connection_id,
+        )
+    ).success
+    _, bound_upgrade = _audit_start(
+        legacy_first,
+        legacy_run,
+        6,
+        request_id="bound-after-legacy",
+        hard_expiry_monotonic_ns=_bootstrap_hard_expiry_ns(config),
+        response_deadline_monotonic_ns=900,
+    )
+    assert not legacy_first.process_replayed(bound_upgrade).success
+    assert legacy_first.summary().pending_rest_audits == 0
+
+
+def test_deferred_audit_response_requires_bound_start_and_predeadline_receipt() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("processor-deferred-audit-mode")
+    legacy = CanonicalProcessor(config)
+    for envelope in _bootstrap(run_id):
+        assert legacy.process_replayed(envelope).success
+    legacy_start, legacy_intent = _audit_start(
+        legacy,
+        run_id,
+        4,
+        request_id="legacy-audit",
+    )
+    assert legacy.process_replayed(legacy_intent).success
+    deferred = _audit_response(
+        run_id,
+        5,
+        legacy_start,
+        _fixture("polymarket_rest_book_yes.json"),
+        boundary=0,
+        classification_deferred=True,
+    )
+    assert not legacy.process_replayed(deferred).success
+    assert legacy.summary().pending_rest_audits == 1
+
+    bound = CanonicalProcessor(config)
+    for envelope in _bootstrap(run_id):
+        assert bound.process_replayed(envelope).success
+    bound_start, bound_intent = _audit_start(
+        bound,
+        run_id,
+        4,
+        request_id="deadline-bound-audit",
+        hard_expiry_monotonic_ns=_bootstrap_hard_expiry_ns(config),
+        response_deadline_monotonic_ns=105,
+    )
+    assert bound.process_replayed(bound_intent).success
+    at_deadline = _audit_response(
+        run_id,
+        5,
+        bound_start,
+        _fixture("polymarket_rest_book_yes.json"),
+        boundary=0,
+        classification_deferred=True,
+    )
+    assert at_deadline.received_monotonic.nanoseconds == 105
+    assert not bound.process_replayed(at_deadline).success
+    assert bound.summary().pending_rest_audits == 1
+
+
+def test_deferred_protocol_rejects_cross_epoch_response_and_classification() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    start_run = CollectorRunId("processor-deferred-epoch-start")
+    response_run = CollectorRunId("processor-deferred-epoch-response")
+
+    response_epoch = CanonicalProcessor(config)
+    for envelope in _bootstrap(start_run):
+        assert response_epoch.process_replayed(envelope).success
+    response_start, response_intent = _audit_start(
+        response_epoch,
+        start_run,
+        4,
+        request_id="cross-epoch-response",
+        hard_expiry_monotonic_ns=_bootstrap_hard_expiry_ns(config),
+        response_deadline_monotonic_ns=900,
+    )
+    assert response_epoch.process_replayed(response_intent).success
+    cross_epoch_response = _audit_response(
+        response_run,
+        5,
+        response_start,
+        _fixture("polymarket_rest_book_yes.json"),
+        boundary=0,
+        classification_deferred=True,
+    )
+    rejected_response = response_epoch.process_replayed(cross_epoch_response)
+    assert not rejected_response.success
+    assert rejected_response.error_type == "NormalizationError"
+    assert not response_epoch.audit_outcomes
+
+    classification_epoch = CanonicalProcessor(config)
+    for envelope in _bootstrap(start_run):
+        assert classification_epoch.process_replayed(envelope).success
+    classification_start, classification_intent = _audit_start(
+        classification_epoch,
+        start_run,
+        4,
+        request_id="cross-epoch-classification",
+        hard_expiry_monotonic_ns=_bootstrap_hard_expiry_ns(config),
+        response_deadline_monotonic_ns=900,
+    )
+    assert classification_epoch.process_replayed(classification_intent).success
+    staged_response = _audit_response(
+        start_run,
+        5,
+        classification_start,
+        _fixture("polymarket_rest_book_yes.json"),
+        boundary=0,
+        classification_deferred=True,
+    )
+    assert classification_epoch.process_replayed(staged_response).success
+    cross_epoch_classification = AuditClassificationCommand(
+        request_id=classification_start.request_id,
+        response_ingest_seq=staged_response.ingest_seq,
+        classification_monotonic_ns=200,
+        hard_expiry_monotonic_ns=_bootstrap_hard_expiry_ns(config),
+    )
+    rejected_classification = classification_epoch.process_replayed(
+        _envelope(
+            response_run,
+            6,
+            CONTROL_REST_AUDIT_CLASSIFY,
+            cross_epoch_classification.to_payload(),
+            monotonic_ns=cross_epoch_classification.classification_monotonic_ns,
+            connection_id=classification_start.connection_id,
+        )
+    )
+    assert not rejected_classification.success
+    assert rejected_classification.error_type == "NormalizationError"
+    assert not classification_epoch.audit_outcomes
+    assert classification_epoch.summary().pending_rest_audits == 1
+
+
+def test_deferred_match_uses_response_freshness_and_expiry_equality_fails() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("processor-deferred-audit-freshness")
+    processor = CanonicalProcessor(config)
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    hard_expiry_ns = _bootstrap_hard_expiry_ns(config)
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="deferred-match",
+        hard_expiry_monotonic_ns=hard_expiry_ns,
+        response_deadline_monotonic_ns=900,
+    )
+    assert processor.process_replayed(intent).success
+    response = _audit_response(
+        run_id,
+        5,
+        start,
+        _fixture("polymarket_rest_book_yes.json"),
+        boundary=0,
+        classification_deferred=True,
+    )
+    staged = processor.process_replayed(response)
+    assert staged.success
+    assert not staged.audit_outcomes
+    classification = AuditClassificationCommand(
+        request_id=start.request_id,
+        response_ingest_seq=response.ingest_seq,
+        classification_monotonic_ns=800,
+        hard_expiry_monotonic_ns=hard_expiry_ns,
+    )
+    matched = processor.process_replayed(
+        _envelope(
+            run_id,
+            6,
+            CONTROL_REST_AUDIT_CLASSIFY,
+            classification.to_payload(),
+            monotonic_ns=classification.classification_monotonic_ns,
+            connection_id=start.connection_id,
+        )
+    )
+    assert matched.success
+    assert matched.audit_outcomes[0].outcome is AuditOutcome.MATCH
+    assert matched.book_freshness_updates[0].received_monotonic == response.received_monotonic
+    assert matched.scan_source_received_monotonic_ns == response.received_monotonic.nanoseconds
+
+    equality_processor = CanonicalProcessor(config)
+    equality_run = CollectorRunId("processor-deferred-audit-expiry-equality")
+    for envelope in _bootstrap(equality_run):
+        assert equality_processor.process_replayed(envelope).success
+    equality_start, equality_intent = _audit_start(
+        equality_processor,
+        equality_run,
+        4,
+        request_id="expiry-equality",
+        hard_expiry_monotonic_ns=hard_expiry_ns,
+        response_deadline_monotonic_ns=900,
+    )
+    assert equality_processor.process_replayed(equality_intent).success
+    equality_response = _audit_response(
+        equality_run,
+        5,
+        equality_start,
+        _fixture("polymarket_rest_book_yes.json"),
+        boundary=0,
+        classification_deferred=True,
+    )
+    assert equality_processor.process_replayed(equality_response).success
+    equality_decision = AuditClassificationCommand(
+        request_id=equality_start.request_id,
+        response_ingest_seq=equality_response.ingest_seq,
+        classification_monotonic_ns=hard_expiry_ns,
+        hard_expiry_monotonic_ns=hard_expiry_ns,
+    )
+    expired = equality_processor.process_replayed(
+        _envelope(
+            equality_run,
+            6,
+            CONTROL_REST_AUDIT_CLASSIFY,
+            equality_decision.to_payload(),
+            monotonic_ns=equality_decision.classification_monotonic_ns,
+            connection_id=equality_start.connection_id,
+        )
+    )
+    assert expired.success
+    assert expired.audit_outcomes[0].outcome is AuditOutcome.FAILED
+    assert expired.audit_outcomes[0].reason is AuditFailureReason.BOOK_FRESHNESS_EXPIRED
+    assert not expired.book_freshness_updates
+
+
+def test_audit_expiry_control_rejects_same_asset_pending_request() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    processor = CanonicalProcessor(config)
+    run_id = CollectorRunId("processor-expiry-pending-audit-conflict")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    _, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="pending-before-expiry",
+        hard_expiry_monotonic_ns=_bootstrap_hard_expiry_ns(config),
+        response_deadline_monotonic_ns=900,
+    )
+    assert processor.process_replayed(intent).success
+    expiry = AuditExpiryCommand(
+        native_asset_id="token-yes",
+        last_accepted_receive_monotonic_ns=100,
+    )
+    result = processor.process_replayed(
+        _envelope(
+            run_id,
+            5,
+            CONTROL_REST_AUDIT_EXPIRED,
+            expiry.to_payload(),
+            connection_id=ConnectionId("processor-test-connection"),
+        )
+    )
+
+    assert not result.success
+    assert result.error_type == "NormalizationError"
+    assert processor.summary().pending_rest_audits == 1
+
+
+def test_terminal_hash_binds_pending_audit_deadlines_and_staged_response_mapping() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("processor-pending-audit-terminal-hash")
+    bootstrap = _bootstrap(run_id)
+    expiry_a = CanonicalProcessor(config)
+    expiry_b = CanonicalProcessor(config)
+    for envelope in bootstrap:
+        assert expiry_a.process_replayed(envelope).success
+        assert expiry_b.process_replayed(envelope).success
+    hard_expiry_ns = _bootstrap_hard_expiry_ns(config)
+    _start, intent = _audit_start(
+        expiry_a,
+        run_id,
+        4,
+        request_id="expiry-bound",
+        hard_expiry_monotonic_ns=hard_expiry_ns,
+        response_deadline_monotonic_ns=900,
+    )
+    alternate_intent = replace(
+        intent,
+        transport_metadata_allowlist=tuple(
+            sorted(
+                {
+                    "hard_expiry_monotonic_ns": hard_expiry_ns,
+                    "response_deadline_monotonic_ns": 901,
+                    "run_deadline_monotonic_ns": 901,
+                }.items()
+            )
+        ),
+    )
+    assert expiry_a.process_replayed(intent).success
+    assert expiry_b.process_replayed(alternate_intent).success
+    assert expiry_a.summary().raw_input_chain_sha256 == expiry_b.summary().raw_input_chain_sha256
+    assert expiry_a.summary().terminal_hash != expiry_b.summary().terminal_hash
+
+    mapping_a = CanonicalProcessor(config)
+    mapping_b = CanonicalProcessor(config)
+    for envelope in bootstrap:
+        assert mapping_a.process_replayed(envelope).success
+        assert mapping_b.process_replayed(envelope).success
+    start_a, intent_a = _audit_start(
+        mapping_a,
+        run_id,
+        4,
+        request_id="mapping-a",
+        native_asset_id="token-yes",
+        hard_expiry_monotonic_ns=_bootstrap_hard_expiry_ns(config, "token-yes"),
+        response_deadline_monotonic_ns=900,
+    )
+    assert mapping_a.process_replayed(intent_a).success
+    assert mapping_b.process_replayed(intent_a).success
+    start_b, intent_b = _audit_start(
+        mapping_a,
+        run_id,
+        5,
+        request_id="mapping-b",
+        native_asset_id="token-no",
+        hard_expiry_monotonic_ns=_bootstrap_hard_expiry_ns(config, "token-no"),
+        response_deadline_monotonic_ns=900,
+    )
+    assert mapping_a.process_replayed(intent_b).success
+    assert mapping_b.process_replayed(intent_b).success
+    response_a = _audit_response(
+        run_id,
+        6,
+        start_a,
+        _fixture("polymarket_rest_book_yes.json"),
+        boundary=0,
+        classification_deferred=True,
+    )
+    response_b_metadata = response_a.transport_metadata
+    response_b_metadata["request_id"] = start_b.request_id
+    response_b_metadata["audit_attempt"] = start_b.attempt
+    response_b = replace(
+        response_a,
+        transport_metadata_allowlist=tuple(sorted(response_b_metadata.items())),
+    )
+    assert mapping_a.process_replayed(response_a).success
+    assert mapping_b.process_replayed(response_b).success
+    assert mapping_a.summary().raw_input_chain_sha256 == mapping_b.summary().raw_input_chain_sha256
+    assert mapping_a.summary().terminal_hash != mapping_b.summary().terminal_hash
 
 
 def test_rest_audit_counts_matches_and_invalidates_on_exact_mismatch() -> None:

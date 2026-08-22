@@ -13,6 +13,8 @@ from multi_market_arbitrage.core.time import UtcTimestamp
 
 AUDIT_START_SCHEMA: Final = "mma-rest-audit-start-v1"
 AUDIT_FAILURE_SCHEMA: Final = "mma-rest-audit-failure-v1"
+AUDIT_EXPIRY_SCHEMA: Final = "mma-rest-audit-expiry-v1"
+AUDIT_CLASSIFICATION_SCHEMA: Final = "mma-rest-audit-classification-v1"
 
 
 class AuditOutcome(StrEnum):
@@ -36,6 +38,7 @@ class AuditFailureReason(StrEnum):
     LOCAL_STATE_NOT_COMPARABLE = "LOCAL_STATE_NOT_COMPARABLE"
     RACE_RETRY_EXHAUSTED = "RACE_RETRY_EXHAUSTED"
     RUN_ENDED = "RUN_ENDED"
+    BOOK_FRESHNESS_EXPIRED = "BOOK_FRESHNESS_EXPIRED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,8 +143,65 @@ class AuditFailureCommand:
 
 
 @dataclass(frozen=True, slots=True)
+class AuditExpiryCommand:
+    """Replayable per-instrument fail-closed freshness-expiry decision."""
+
+    native_asset_id: str
+    last_accepted_receive_monotonic_ns: int | None
+
+    def __post_init__(self) -> None:
+        if not self.native_asset_id or len(self.native_asset_id) > 2048:
+            raise ValueError("audit expiry native asset ID must be non-empty and bounded")
+        if (
+            self.last_accepted_receive_monotonic_ns is not None
+            and self.last_accepted_receive_monotonic_ns < 0
+        ):
+            raise ValueError("audit expiry freshness boundary cannot be negative")
+
+    def to_payload(self) -> bytes:
+        return canonical_json_bytes(
+            {
+                "last_accepted_receive_monotonic_ns": (self.last_accepted_receive_monotonic_ns),
+                "native_asset_id": self.native_asset_id,
+                "schema": AUDIT_EXPIRY_SCHEMA,
+            }
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AuditClassificationCommand:
+    """Durable decision that releases one captured response to canonical comparison."""
+
+    request_id: str
+    response_ingest_seq: int
+    classification_monotonic_ns: int
+    hard_expiry_monotonic_ns: int
+
+    def __post_init__(self) -> None:
+        if not self.request_id or len(self.request_id) > 128:
+            raise ValueError("audit request ID must be non-empty and bounded")
+        if self.response_ingest_seq < 0:
+            raise ValueError("audit response ingest sequence cannot be negative")
+        if self.classification_monotonic_ns < 0:
+            raise ValueError("audit classification monotonic time cannot be negative")
+        if self.hard_expiry_monotonic_ns < 0:
+            raise ValueError("audit hard expiry monotonic time cannot be negative")
+
+    def to_payload(self) -> bytes:
+        return canonical_json_bytes(
+            {
+                "classification_monotonic_ns": self.classification_monotonic_ns,
+                "hard_expiry_monotonic_ns": self.hard_expiry_monotonic_ns,
+                "request_id": self.request_id,
+                "response_ingest_seq": self.response_ingest_seq,
+                "schema": AUDIT_CLASSIFICATION_SCHEMA,
+            }
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class AuditHttpResponseHandoff:
-    """Immutable one-slot handoff captured at the HTTP response boundary."""
+    """Immutable request-scoped handoff captured at the HTTP response boundary."""
 
     request_id: str
     connection_id: ConnectionId
@@ -257,9 +317,13 @@ class AuditOutcomeEvidence:
 
 
 __all__ = [
+    "AUDIT_CLASSIFICATION_SCHEMA",
+    "AUDIT_EXPIRY_SCHEMA",
     "AUDIT_FAILURE_SCHEMA",
     "AUDIT_START_SCHEMA",
     "AuditBookIdentity",
+    "AuditClassificationCommand",
+    "AuditExpiryCommand",
     "AuditFailureCommand",
     "AuditFailureReason",
     "AuditHttpFailureHandoff",

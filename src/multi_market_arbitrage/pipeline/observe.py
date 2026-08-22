@@ -10,7 +10,7 @@ import time
 import uuid
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 
@@ -42,6 +42,7 @@ from multi_market_arbitrage.observability import (
     HealthCheckpoint,
     HealthDecision,
     HealthDecisionReason,
+    HealthEvidenceRuntimeSnapshot,
     HealthEvidenceSummary,
     InMemoryMetrics,
     MetricsSnapshot,
@@ -52,6 +53,7 @@ from multi_market_arbitrage.observability import (
 )
 from multi_market_arbitrage.reference import POLYMARKET_VENUE_ID
 from multi_market_arbitrage.research import (
+    AnalyticalRuntimeSnapshot,
     Phase1AnalyticalOutputs,
     ResearchOutputSummary,
     SupervisedAnalyticalOutputs,
@@ -74,10 +76,11 @@ from multi_market_arbitrage.venues.polymarket import (
 from multi_market_arbitrage.venues.polymarket.schemas import GammaMarket
 
 from .audit import (
+    AuditClassificationCommand,
+    AuditExpiryCommand,
     AuditFailureCommand,
     AuditFailureReason,
     AuditHttpFailureHandoff,
-    AuditHttpHandoff,
     AuditHttpResponseHandoff,
     AuditOutcome,
     AuditStartEvidence,
@@ -86,6 +89,8 @@ from .audit import (
 from .channels import (
     CLOB_MARKET_PREFIX,
     CONTROL_BOOK_INVALIDATION,
+    CONTROL_REST_AUDIT_CLASSIFY,
+    CONTROL_REST_AUDIT_EXPIRED,
     CONTROL_REST_AUDIT_FAILED,
     CONTROL_REST_AUDIT_START,
     GAMMA_EVENT_PREFIX,
@@ -96,10 +101,11 @@ from .channels import (
     REST_BOOK_AUDIT,
     WS_MARKET,
 )
-from .freshness import IntegrityDeadline, IntegrityDeadlineReason, next_integrity_deadline
+from .freshness import IntegrityDeadline, IntegrityDeadlineReason
 from .health import (
     ObservationRuntimeHealth,
     ObservationRuntimeHealthSnapshot,
+    ProcessResourceSnapshot,
     SupervisedProcessResourceSampler,
     build_observation_health_checkpoint,
 )
@@ -131,6 +137,14 @@ class _GenerationExit(StrEnum):
     INGRESS_OVERFLOW = "INGRESS_OVERFLOW"
 
 
+class _AuditLaunchResult(StrEnum):
+    STARTED = "STARTED"
+    FAILED_CLOSED = "FAILED_CLOSED"
+    EXPIRED = "EXPIRED"
+    GENERATION_ENDED = "GENERATION_ENDED"
+    RUN_ENDED = "RUN_ENDED"
+
+
 def _empty_ingress_metrics() -> RawIngressMetricsSnapshot:
     return RawIngressMetricsSnapshot(
         received=0,
@@ -147,11 +161,20 @@ def _empty_ingress_metrics() -> RawIngressMetricsSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class _CaptureCutoffMoment:
+    """Wall and monotonic clocks sampled when capture admission stops."""
+
+    wall_time: UtcTimestamp
+    monotonic_ns: int
+
+
+@dataclass(frozen=True, slots=True)
 class _GenerationResult:
     reason: _GenerationExit
     deviations: tuple[str, ...] = ()
     refresh_requests: tuple[ReferenceRefreshRequest, ...] = ()
     ingress_metrics: RawIngressMetricsSnapshot = field(default_factory=_empty_ingress_metrics)
+    capture_cutoff: _CaptureCutoffMoment | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +184,23 @@ class _StreamResult:
     selected_market_resolved: bool
     deviations: tuple[str, ...]
     ingress_metrics: RawIngressMetricsSnapshot = field(default_factory=_empty_ingress_metrics)
+    capture_cutoff: _CaptureCutoffMoment | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _HealthCheckpointMoment:
+    """Owner snapshots and clocks frozen at one capture boundary."""
+
+    emitted_at: UtcTimestamp
+    monotonic_now_ns: int
+    runtime: ObservationRuntimeHealthSnapshot
+    journal: JournalMetricsSnapshot
+    journal_failure_type: str | None
+    analytical: AnalyticalRuntimeSnapshot
+    health_writer: HealthEvidenceRuntimeSnapshot
+    public_reads: PublicReadMetricsSnapshot
+    resources: ProcessResourceSnapshot | None
+    book_last_valid_receive_monotonic_ns: tuple[tuple[InstrumentId, int], ...]
 
 
 @dataclass(slots=True)
@@ -213,6 +253,30 @@ class _AuditResponseBoundaryFence:
     @property
     def barrier_ordinal(self) -> int | None:
         return None if self.watermark is None else self.watermark.ordinal
+
+
+@dataclass(slots=True)
+class _PendingAuditRequest:
+    """Coordinator-owned state for one of the bounded concurrent audit legs."""
+
+    start: AuditStartEvidence
+    response_fence: _AuditResponseBoundaryFence
+    task: asyncio.Task[None]
+    freshness_marker_ns: int | None
+    hard_expiry_ns: int
+    asset_order: int
+    response: AuditHttpResponseHandoff | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _StagedAuditRequest:
+    """Durable START awaiting the back-to-back first-attempt launch boundary."""
+
+    start: AuditStartEvidence
+    freshness_marker_ns: int | None
+    hard_expiry_ns: int
+    response_deadline_ns: int
+    asset_order: int
 
 
 _EMPTY_INGRESS_METRICS = _empty_ingress_metrics()
@@ -348,11 +412,16 @@ class _RawCaptureBoundary:
         for update in result.book_freshness_updates:
             self._book_freshness_ns[update.instrument_id] = update.received_monotonic.nanoseconds
         if result.scan_count:
+            scan_source_received_ns = (
+                envelope.received_monotonic.nanoseconds
+                if result.scan_source_received_monotonic_ns is None
+                else result.scan_source_received_monotonic_ns
+            )
             self.metrics.observe_histogram(
                 "mma_receive_to_scan_complete_ns",
                 max(
                     0,
-                    scan_completed_monotonic_ns - envelope.received_monotonic.nanoseconds,
+                    scan_completed_monotonic_ns - scan_source_received_ns,
                 ),
             )
 
@@ -391,6 +460,12 @@ class _RawCaptureBoundary:
     @property
     def book_freshness_receive_ns(self) -> tuple[int, ...]:
         return tuple(self._book_freshness_ns.values())
+
+    @property
+    def book_freshness_receive_ns_by_instrument(self) -> dict[InstrumentId, int]:
+        """Return a detached typed view of accepted L2 monotonic receive times."""
+
+        return dict(self._book_freshness_ns)
 
     async def preserve_then_process(
         self,
@@ -591,34 +666,64 @@ def _final_health_decision(
     *,
     evidence: HealthEvidenceSummary,
     analytical_outputs: ResearchOutputSummary,
+    terminal_runtime_reasons: tuple[HealthDecisionReason, ...] = (),
 ) -> HealthDecision:
     """Reconcile the last checkpoint with close-time derived-owner outcomes."""
 
     if checkpoint_decision is None:
-        reasons = {HealthDecisionReason.HEALTH_EVIDENCE_UNHEALTHY}
+        reasons = {
+            HealthDecisionReason.HEALTH_EVIDENCE_UNHEALTHY,
+            *terminal_runtime_reasons,
+        }
         if not analytical_outputs.research_eligible:
             reasons.add(HealthDecisionReason.ANALYTICAL_UNHEALTHY)
         return HealthDecision(
-            capture_healthy=True,
-            research_eligible=analytical_outputs.research_eligible,
+            capture_healthy=False,
+            research_eligible=False,
             gate1_eligible_so_far=False,
             reason_codes=tuple(sorted(reasons, key=str)),
         )
     reasons = set(checkpoint_decision.reason_codes)
-    research_eligible = checkpoint_decision.research_eligible
+    reasons.update(terminal_runtime_reasons)
+    capture_healthy = checkpoint_decision.capture_healthy and not terminal_runtime_reasons
+    research_eligible = checkpoint_decision.research_eligible and not terminal_runtime_reasons
     if not evidence.gate1_evidence_eligible:
         reasons.add(HealthDecisionReason.HEALTH_EVIDENCE_UNHEALTHY)
     if not analytical_outputs.research_eligible:
         reasons.add(HealthDecisionReason.ANALYTICAL_UNHEALTHY)
         research_eligible = False
     return HealthDecision(
-        capture_healthy=checkpoint_decision.capture_healthy,
+        capture_healthy=capture_healthy,
         research_eligible=research_eligible,
         gate1_eligible_so_far=(
             checkpoint_decision.gate1_eligible_so_far
             and evidence.gate1_evidence_eligible
             and analytical_outputs.research_eligible
             and not reasons
+        ),
+        reason_codes=tuple(sorted(reasons, key=str)),
+    )
+
+
+def _accumulate_gate1_decision(
+    current: HealthDecision,
+    previous: HealthDecision | None,
+    *,
+    cumulative_reason_codes: tuple[HealthDecisionReason, ...] = (),
+) -> HealthDecision:
+    """Keep Gate-1 eligibility and its reasons sticky across checkpoint cadence."""
+
+    reasons = set(current.reason_codes)
+    reasons.update(cumulative_reason_codes)
+    if previous is not None:
+        reasons.update(previous.reason_codes)
+    return HealthDecision(
+        capture_healthy=current.capture_healthy,
+        research_eligible=current.research_eligible,
+        gate1_eligible_so_far=(
+            current.gate1_eligible_so_far
+            and not cumulative_reason_codes
+            and (previous is None or previous.gate1_eligible_so_far)
         ),
         reason_codes=tuple(sorted(reasons, key=str)),
     )
@@ -766,6 +871,8 @@ class PolymarketObservationService:
         health_start_error: BaseException | None = None
         latest_health_decision: HealthDecision | None = None
         health_checkpoint_builder: Callable[[], HealthCheckpoint] | None = None
+        terminal_health_moment: _HealthCheckpointMoment | None = None
+        terminal_capture_cutoff: _CaptureCutoffMoment | None = None
         resource_sampler: SupervisedProcessResourceSampler | None = None
         resource_sampler_started = False
         capture = _RawCaptureBoundary(
@@ -775,6 +882,7 @@ class PolymarketObservationService:
             metrics=self._metrics,
         )
         run_completed = False
+        analytical_summary: ResearchOutputSummary | None = None
         logger.info("observation_started", "bounded public observation started")
         writer_started = False
         try:
@@ -812,38 +920,162 @@ class PolymarketObservationService:
 
                 def build_health_checkpoint() -> HealthCheckpoint:
                     nonlocal latest_health_decision
-                    monotonic_now_ns = int(loop.time() * 1_000_000_000)
-                    resources = resource_sampler.snapshot.latest
+                    moment = terminal_health_moment
+                    monotonic_now_ns = (
+                        time.monotonic_ns() if moment is None else moment.monotonic_now_ns
+                    )
+                    resources = (
+                        resource_sampler.snapshot.latest if moment is None else moment.resources
+                    )
                     if resources is None:
                         raise RuntimeError("resource sampler has not published a sample")
+                    runtime_snapshot = (
+                        runtime_health.snapshot(now_ns=monotonic_now_ns)
+                        if moment is None
+                        else moment.runtime
+                    )
                     checkpoint = build_observation_health_checkpoint(
                         config=self._config,
                         collector_run_id=run_id,
                         git_commit=self._code_commit,
                         target=target,
-                        runtime=runtime_health.snapshot(now_ns=monotonic_now_ns),
+                        runtime=runtime_snapshot,
                         processor=processor,
-                        journal=writer.metrics,
+                        journal=writer.metrics if moment is None else moment.journal,
                         journal_failure_type=(
-                            None if writer.failure is None else type(writer.failure).__name__
+                            (None if writer.failure is None else type(writer.failure).__name__)
+                            if moment is None
+                            else moment.journal_failure_type
                         ),
-                        analytical=outputs.runtime_snapshot,
-                        health_writer=health_writer.runtime_snapshot,
-                        public_reads=client.public_read_metrics_snapshot(),
+                        analytical=(
+                            outputs.runtime_snapshot if moment is None else moment.analytical
+                        ),
+                        health_writer=(
+                            health_writer.runtime_snapshot
+                            if moment is None
+                            else moment.health_writer
+                        ),
+                        public_reads=(
+                            client.public_read_metrics_snapshot()
+                            if moment is None
+                            else moment.public_reads
+                        ),
                         metrics=self._metrics,
                         resources=resources,
-                        emitted_at=UtcTimestamp.now(),
+                        book_last_valid_receive_monotonic_ns=(
+                            capture.book_freshness_receive_ns_by_instrument
+                            if moment is None
+                            else dict(moment.book_last_valid_receive_monotonic_ns)
+                        ),
+                        emitted_at=(UtcTimestamp.now() if moment is None else moment.emitted_at),
                         monotonic_now_ns=monotonic_now_ns,
                     )
-                    latest_health_decision = HealthDecision(
+                    current_health_decision = HealthDecision(
                         capture_healthy=checkpoint.capture_healthy,
                         research_eligible=checkpoint.research_eligible,
                         gate1_eligible_so_far=checkpoint.gate1_eligible_so_far,
                         reason_codes=checkpoint.reason_codes,
                     )
-                    return checkpoint
+                    latest_health_decision = _accumulate_gate1_decision(
+                        current_health_decision,
+                        latest_health_decision,
+                        cumulative_reason_codes=(
+                            (HealthDecisionReason.SOCKET_DISCONNECTED,)
+                            if runtime_snapshot.unavailable_intervals > 0
+                            else ()
+                        ),
+                    )
+                    return replace(
+                        checkpoint,
+                        gate1_eligible_so_far=(latest_health_decision.gate1_eligible_so_far),
+                        reason_codes=latest_health_decision.reason_codes,
+                    )
 
                 health_checkpoint_builder = build_health_checkpoint
+
+                def stop_periodic_health_at_capture_cutoff(
+                    cutoff: _CaptureCutoffMoment,
+                ) -> None:
+                    """Seal periodic evidence synchronously at the acquisition cutoff."""
+
+                    nonlocal terminal_capture_cutoff
+                    if terminal_capture_cutoff is not None:
+                        if terminal_capture_cutoff != cutoff:
+                            raise RuntimeError("capture cutoff changed after it was sealed")
+                        return
+                    terminal_capture_cutoff = cutoff
+                    if not health_started:
+                        return
+                    if health_emitter is None:
+                        raise RuntimeError("started health evidence has no emitter")
+                    health_emitter.stop_periodic_emission_nowait()
+
+                async def emit_terminal_health_checkpoint() -> None:
+                    """Freeze capture state, then admit exactly one terminal checkpoint."""
+
+                    nonlocal terminal_capture_cutoff, terminal_health_moment
+                    if terminal_capture_cutoff is None:
+                        if stream_result.capture_cutoff is not None:
+                            terminal_capture_cutoff = stream_result.capture_cutoff
+                        else:
+                            cutoff_monotonic_ns = time.monotonic_ns()
+                            terminal_capture_cutoff = _CaptureCutoffMoment(
+                                wall_time=UtcTimestamp.now(),
+                                monotonic_ns=cutoff_monotonic_ns,
+                            )
+                    if target is None or not health_started:
+                        return
+                    if health_emitter is None:
+                        raise RuntimeError("started health evidence has no emitter")
+
+                    cutoff_monotonic_ns = terminal_capture_cutoff.monotonic_ns
+                    cutoff_emitted_at = terminal_capture_cutoff.wall_time
+                    cutoff_runtime = runtime_health.snapshot(now_ns=cutoff_monotonic_ns)
+                    cutoff_journal = writer.metrics
+                    cutoff_journal_failure_type = (
+                        None if writer.failure is None else type(writer.failure).__name__
+                    )
+                    cutoff_analytical = outputs.runtime_snapshot
+                    cutoff_health_writer = health_writer.runtime_snapshot
+                    cutoff_public_reads = client.public_read_metrics_snapshot()
+                    cutoff_book_receive_times = tuple(
+                        sorted(
+                            capture.book_freshness_receive_ns_by_instrument.items(),
+                            key=lambda item: item[0].value,
+                        )
+                    )
+                    cutoff_resources = resource_sampler.snapshot.latest
+
+                    # Cancel the periodic producer at the capture boundary.  The
+                    # writer remains open so raw/analytical owners may close and
+                    # the health file may be published later without rebuilding.
+                    await health_emitter.stop_periodic_emission()
+                    if cutoff_resources is None and resource_sampler_started:
+                        try:
+                            async with asyncio.timeout(
+                                max(
+                                    1.0,
+                                    self._config.health.checkpoint_interval_seconds,
+                                )
+                            ):
+                                cutoff_resources = (
+                                    await resource_sampler.wait_for_initial_attempt()
+                                ).latest
+                        except TimeoutError as error:
+                            health_writer.record_failure(error)
+                    terminal_health_moment = _HealthCheckpointMoment(
+                        emitted_at=cutoff_emitted_at,
+                        monotonic_now_ns=cutoff_monotonic_ns,
+                        runtime=cutoff_runtime,
+                        journal=cutoff_journal,
+                        journal_failure_type=cutoff_journal_failure_type,
+                        analytical=cutoff_analytical,
+                        health_writer=cutoff_health_writer,
+                        public_reads=cutoff_public_reads,
+                        resources=cutoff_resources,
+                        book_last_valid_receive_monotonic_ns=(cutoff_book_receive_times),
+                    )
+                    health_emitter.emit_terminal_now()
 
                 health_emitter = PeriodicHealthCheckpointEmitter(
                     writer=health_writer,
@@ -907,12 +1139,19 @@ class PolymarketObservationService:
                         deadline=deadline,
                         logger=logger,
                         runtime_health=runtime_health,
+                        on_capture_cutoff=stop_periodic_health_at_capture_cutoff,
                     )
                     websocket_observation_nanoseconds = max(
                         0,
-                        time.monotonic_ns() - websocket_started_ns,
+                        (
+                            time.monotonic_ns()
+                            if stream_result.capture_cutoff is None
+                            else stream_result.capture_cutoff.monotonic_ns
+                        )
+                        - websocket_started_ns,
                     )
                     deviations.extend(stream_result.deviations)
+                await emit_terminal_health_checkpoint()
                 run_completed = True
                 public_read_metrics = client.public_read_metrics_snapshot()
         except Exception as error:
@@ -958,7 +1197,12 @@ class PolymarketObservationService:
                             raise RuntimeError("started health evidence has no emitter")
                         try:
                             health_evidence = await health_emitter.close(
-                                completed=run_completed,
+                                completed=(
+                                    run_completed
+                                    and raw_completion_sha256 is not None
+                                    and analytical_summary is not None
+                                    and analytical_summary.research_eligible
+                                ),
                             )
                         except BaseException as error:
                             if isinstance(error, (KeyboardInterrupt, SystemExit)):
@@ -979,7 +1223,13 @@ class PolymarketObservationService:
                             writer=health_writer,
                             error=failure,
                         )
-        if latest_health_decision is None and health_checkpoint_builder is not None:
+        if analytical_summary is None:
+            raise RuntimeError("analytical output close did not produce a summary")
+        if (
+            target is None
+            and latest_health_decision is None
+            and health_checkpoint_builder is not None
+        ):
             # A pre-target deadline intentionally writes no Gate-1 evidence, but
             # the returned scoped decision must still reflect the terminal
             # socket/target/book state rather than defaulting to healthy.
@@ -988,14 +1238,31 @@ class PolymarketObservationService:
             except BaseException as error:
                 if isinstance(error, (KeyboardInterrupt, SystemExit)):
                     raise
-        ended = UtcTimestamp.now()
-        actual_duration_nanoseconds = time.monotonic_ns() - started_monotonic_ns
+        if terminal_capture_cutoff is None:
+            raise RuntimeError("completed observation lacks a paired terminal cutoff")
+        ended = terminal_capture_cutoff.wall_time
+        summary_cutoff_monotonic_ns = terminal_capture_cutoff.monotonic_ns
+        actual_duration_nanoseconds = max(
+            0,
+            summary_cutoff_monotonic_ns - started_monotonic_ns,
+        )
+        runtime_health_snapshot = runtime_health.snapshot(now_ns=summary_cutoff_monotonic_ns)
+        terminal_runtime_reasons: list[HealthDecisionReason] = []
+        if not runtime_health_snapshot.socket_connected:
+            terminal_runtime_reasons.append(HealthDecisionReason.SOCKET_DISCONNECTED)
+        if (
+            runtime_health_snapshot.data_loss_count > 0
+            or runtime_health_snapshot.ingress.overflows > 0
+        ):
+            terminal_runtime_reasons.append(HealthDecisionReason.INGRESS_DATA_LOSS)
+        if runtime_health_snapshot.protocol_deviations > 0:
+            terminal_runtime_reasons.append(HealthDecisionReason.PROTOCOL_DEVIATION)
         health_decision = _final_health_decision(
             latest_health_decision,
             evidence=health_evidence,
             analytical_outputs=analytical_summary,
+            terminal_runtime_reasons=tuple(terminal_runtime_reasons),
         )
-        runtime_health_snapshot = runtime_health.snapshot(now_ns=time.monotonic_ns())
         status = (
             ComponentHealth.HEALTHY
             if (
@@ -1431,8 +1698,16 @@ class PolymarketObservationService:
         attempt: int,
         connection_id: ConnectionId,
         subscription_id: SubscriptionId,
+        request_started_monotonic_ns: int | None = None,
+        hard_expiry_monotonic_ns: int | None = None,
+        response_deadline_monotonic_ns: int | None = None,
+        run_deadline_monotonic_ns: int | None = None,
     ) -> tuple[AuditStartEvidence, ProcessedEnvelope]:
-        request_started_ns = time.monotonic_ns()
+        request_started_ns = (
+            time.monotonic_ns()
+            if request_started_monotonic_ns is None
+            else request_started_monotonic_ns
+        )
         start = AuditStartEvidence(
             request_id=uuid.uuid4().hex,
             connection_id=connection_id,
@@ -1445,6 +1720,24 @@ class PolymarketObservationService:
             ),
             starting_book=capture.processor.audit_book_identity(native_asset_id),
         )
+        metadata: dict[str, str | int | bool] = {
+            "audit_attempt": attempt,
+            "request_id": start.request_id,
+        }
+        if hard_expiry_monotonic_ns is None and (
+            response_deadline_monotonic_ns is not None or run_deadline_monotonic_ns is not None
+        ):
+            raise ValueError("audit response/run deadline requires a hard expiry")
+        if hard_expiry_monotonic_ns is not None:
+            if run_deadline_monotonic_ns is None:
+                raise ValueError("bound audit start requires the run deadline")
+            metadata["hard_expiry_monotonic_ns"] = hard_expiry_monotonic_ns
+            metadata["response_deadline_monotonic_ns"] = (
+                hard_expiry_monotonic_ns
+                if response_deadline_monotonic_ns is None
+                else response_deadline_monotonic_ns
+            )
+            metadata["run_deadline_monotonic_ns"] = run_deadline_monotonic_ns
         result = await capture.preserve_then_process(
             channel=CONTROL_REST_AUDIT_START,
             payload=start.to_payload(),
@@ -1452,7 +1745,7 @@ class PolymarketObservationService:
             semantics_hash=_semantics(CONTROL_REST_AUDIT_START),
             connection_id=connection_id,
             subscription_id=subscription_id,
-            transport_metadata={"audit_attempt": attempt, "request_id": start.request_id},
+            transport_metadata=metadata,
             received_wall_time=UtcTimestamp.now(),
             received_monotonic_ns=request_started_ns,
         )
@@ -1465,8 +1758,10 @@ class PolymarketObservationService:
         ingress: BoundedRawIngress,
         start: AuditStartEvidence,
         deadline: float,
-        handoff: asyncio.Queue[AuditHttpHandoff],
+        handoff: asyncio.Queue[AuditHttpResponseHandoff | AuditHttpFailureHandoff],
         response_fence: _AuditResponseBoundaryFence | None = None,
+        deadline_monotonic_ns: int | None = None,
+        deadline_failure_reason: AuditFailureReason = AuditFailureReason.OBSERVATION_DEADLINE,
     ) -> None:
         if response_fence is None:
             response_fence = _AuditResponseBoundaryFence(
@@ -1493,11 +1788,11 @@ class PolymarketObservationService:
             )
         except PolymarketHttpError as error:
             reason = (
-                AuditFailureReason.OBSERVATION_DEADLINE
+                deadline_failure_reason
                 if error.category is PolymarketHttpFailureCategory.DEADLINE_EXCEEDED
                 else AuditFailureReason.HTTP_REQUEST_FAILED
             )
-            item: AuditHttpHandoff = AuditHttpFailureHandoff(
+            item: AuditHttpResponseHandoff | AuditHttpFailureHandoff = AuditHttpFailureHandoff(
                 request_id=start.request_id,
                 connection_id=start.connection_id,
                 reason=reason,
@@ -1522,6 +1817,16 @@ class PolymarketObservationService:
                     connection_id=start.connection_id,
                     reason=AuditFailureReason.RESPONSE_WATERMARK_UNAVAILABLE,
                     error_type="MissingResponseBoundaryAnnouncement",
+                )
+            elif (
+                deadline_monotonic_ns is not None
+                and response_fence.received_monotonic_ns >= deadline_monotonic_ns
+            ):
+                item = AuditHttpFailureHandoff(
+                    request_id=start.request_id,
+                    connection_id=start.connection_id,
+                    reason=deadline_failure_reason,
+                    error_type="ResponseReceivedAtOrAfterObservationDeadline",
                 )
             elif (
                 response_fence.received_wall_time != response.evidence.response_received_wall_time
@@ -1569,6 +1874,29 @@ class PolymarketObservationService:
         )
 
     @staticmethod
+    async def _preserve_audit_expiry(
+        *,
+        capture: _RawCaptureBoundary,
+        native_asset_id: str,
+        last_accepted_receive_monotonic_ns: int | None,
+        connection_id: ConnectionId,
+        subscription_id: SubscriptionId,
+    ) -> ProcessedEnvelope:
+        command = AuditExpiryCommand(
+            native_asset_id=native_asset_id,
+            last_accepted_receive_monotonic_ns=last_accepted_receive_monotonic_ns,
+        )
+        return await capture.preserve_then_process(
+            channel=CONTROL_REST_AUDIT_EXPIRED,
+            payload=command.to_payload(),
+            transport_type="CONTROL",
+            semantics_hash=_semantics(CONTROL_REST_AUDIT_EXPIRED),
+            connection_id=connection_id,
+            subscription_id=subscription_id,
+            transport_metadata={"native_asset_id": native_asset_id},
+        )
+
+    @staticmethod
     async def _preserve_audit_response(
         *,
         capture: _RawCaptureBoundary,
@@ -1576,8 +1904,18 @@ class PolymarketObservationService:
         start: AuditStartEvidence,
         barrier_ordinal: int,
         subscription_id: SubscriptionId,
+        classification_monotonic_ns: int | None = None,
+        hard_expiry_monotonic_ns: int | None = None,
+        forced_failure_reason: AuditFailureReason | None = None,
     ) -> ProcessedEnvelope:
-        return await capture.preserve_then_process(
+        metadata: dict[str, str | int | bool] = {
+            "audit_attempt": start.attempt,
+            "barrier_websocket_ordinal": barrier_ordinal,
+            "classification_deferred": True,
+            "request_id": response.request_id,
+            "response_boundary_websocket_ordinal": (response.response_boundary_watermark.ordinal),
+        }
+        staged = await capture.preserve_then_process(
             channel=REST_BOOK_AUDIT,
             payload=response.payload_bytes,
             transport_type="HTTP",
@@ -1587,16 +1925,40 @@ class PolymarketObservationService:
             ),
             connection_id=response.connection_id,
             subscription_id=subscription_id,
-            transport_metadata={
-                "audit_attempt": start.attempt,
-                "barrier_websocket_ordinal": barrier_ordinal,
-                "request_id": response.request_id,
-                "response_boundary_websocket_ordinal": (
-                    response.response_boundary_watermark.ordinal
-                ),
-            },
+            transport_metadata=metadata,
             received_wall_time=response.received_wall_time,
             received_monotonic_ns=response.received_monotonic_ns,
+        )
+        if not staged.success or staged.audit_outcomes:
+            raise RuntimeError("durable audit response could not enter deferred classification")
+        decision_ns = (
+            time.monotonic_ns()
+            if classification_monotonic_ns is None
+            else classification_monotonic_ns
+        )
+        hard_expiry_ns = (
+            (2**63) - 1 if hard_expiry_monotonic_ns is None else hard_expiry_monotonic_ns
+        )
+        derived_failure = (
+            AuditFailureReason.BOOK_FRESHNESS_EXPIRED if decision_ns >= hard_expiry_ns else None
+        )
+        if forced_failure_reason is not None and forced_failure_reason is not derived_failure:
+            raise ValueError("forced audit failure differs from the classification deadline")
+        decision = AuditClassificationCommand(
+            request_id=response.request_id,
+            response_ingest_seq=staged.ingest_seq,
+            classification_monotonic_ns=decision_ns,
+            hard_expiry_monotonic_ns=hard_expiry_ns,
+        )
+        return await capture.preserve_then_process(
+            channel=CONTROL_REST_AUDIT_CLASSIFY,
+            payload=decision.to_payload(),
+            transport_type="CONTROL",
+            semantics_hash=_semantics(CONTROL_REST_AUDIT_CLASSIFY),
+            connection_id=response.connection_id,
+            subscription_id=subscription_id,
+            transport_metadata={"request_id": response.request_id},
+            received_monotonic_ns=decision_ns,
         )
 
     async def _handle_refresh_requests(
@@ -1682,6 +2044,7 @@ class PolymarketObservationService:
         subscription_id: SubscriptionId,
         unavailable_started_ns: int | None,
         runtime_health: ObservationRuntimeHealth | None = None,
+        on_capture_cutoff: Callable[[_CaptureCutoffMoment], None] | None = None,
     ) -> _GenerationResult:
         if runtime_health is None:
             runtime_health = ObservationRuntimeHealth()
@@ -1699,23 +2062,28 @@ class PolymarketObservationService:
         )
         runtime_health.begin_generation(connection_id, ingress)
         ready = asyncio.Event()
+        acquisition_ended_monotonic_ns: int | None = None
 
         async def acquire() -> None:
+            nonlocal acquisition_ended_monotonic_ns
             # `raw_messages` is retained solely for existing adapter fixtures;
             # production uses pump_received so stamping+admission has no yield gap.
-            if hasattr(socket, "pump_received"):
-                await socket.pump_received(ingress.admit_nowait, ready=ready)
-                return
-            ready.set()
-            async for payload in socket.raw_messages():
-                ingress.admit_nowait(
-                    ReceivedWebSocketMessage(
-                        payload_bytes=payload,
-                        received_wall_time=UtcTimestamp.now(),
-                        received_monotonic_ns=time.monotonic_ns(),
-                        message_type="BINARY",
+            try:
+                if hasattr(socket, "pump_received"):
+                    await socket.pump_received(ingress.admit_nowait, ready=ready)
+                    return
+                ready.set()
+                async for payload in socket.raw_messages():
+                    ingress.admit_nowait(
+                        ReceivedWebSocketMessage(
+                            payload_bytes=payload,
+                            received_wall_time=UtcTimestamp.now(),
+                            received_monotonic_ns=time.monotonic_ns(),
+                            message_type="BINARY",
+                        )
                     )
-                )
+            finally:
+                acquisition_ended_monotonic_ns = time.monotonic_ns()
 
         acquisition_task = asyncio.create_task(
             acquire(),
@@ -1731,19 +2099,26 @@ class PolymarketObservationService:
         )
         integrity_interval_ns = int(self._config.polymarket.snapshot_audit_interval_seconds * 1e9)
         pending_exit: _GenerationExit | None = None
+        capture_cutoff: _CaptureCutoffMoment | None = None
         pending_transport_error: PolymarketWebSocketError | None = None
         deviations: list[str] = []
         refresh_requests: list[ReferenceRefreshRequest] = []
-        audit_handoff: asyncio.Queue[AuditHttpHandoff] = asyncio.Queue(maxsize=1)
-        audit_task: asyncio.Task[None] | None = None
-        active_audit: AuditStartEvidence | None = None
-        active_response_fence: _AuditResponseBoundaryFence | None = None
-        pending_response: AuditHttpResponseHandoff | None = None
+        # One binary market has exactly two explicitly selected legs.  Both
+        # first attempts may be in flight, but the canonical processor below
+        # remains the sole serialized state owner.
+        if not 0 < len(asset_ids) <= 2:
+            raise RuntimeError("continuous audit requires one or two bounded legs")
+        audit_handoff = asyncio.Queue[AuditHttpResponseHandoff | AuditHttpFailureHandoff](maxsize=2)
+        pending_audits = dict[str, _PendingAuditRequest]()
         deferred_item: RawIngressItem | None = None
+        pending_ingress_get_task: asyncio.Task[RawIngressItem] | None = None
         audit_cycle_active = False
-        audit_asset_index = 0
-        audit_attempt = 0
+        cycle_unfinished_assets: set[str] = set()
+        first_attempts_pending: set[str] = set()
+        deferred_retry_actions: dict[str, tuple[int, bool]] = {}
+        expired_freshness_markers: dict[str, int | None] = {}
         maximum_race_retries = self._config.polymarket.snapshot_audit_max_race_retries
+        stable_asset_order = {asset_id: index for index, asset_id in enumerate(asset_ids)}
         selected_gamma_ids = {market.gamma_market_id for market in selected}
         selected_condition_ids = {market.condition_id for market in selected}
         selected_asset_ids = {asset_id for market in selected for asset_id in market.clob_token_ids}
@@ -1758,11 +2133,36 @@ class PolymarketObservationService:
                 or any(asset_id in selected_asset_ids for asset_id in request.native_asset_ids)
             )
 
-        def generation_is_exiting() -> bool:
+        def audit_launch_block_reason() -> str | None:
+            if time.monotonic_ns() >= deadline_ns:
+                return "run_deadline"
             return (
-                pending_exit is not None
-                or pending_transport_error is not None
-                or acquisition_task.done()
+                "generation_exit"
+                if (
+                    pending_exit is not None
+                    or pending_transport_error is not None
+                    or acquisition_task.done()
+                )
+                else None
+            )
+
+        def leg_freshness_ns(native_asset_id: str) -> int | None:
+            instrument_id = capture.processor.audit_book_identity(native_asset_id).instrument_id
+            return capture.book_freshness_receive_ns_by_instrument.get(instrument_id)
+
+        def leg_hard_expiry_ns(native_asset_id: str, *, now_ns: int) -> int:
+            freshness_ns = leg_freshness_ns(native_asset_id)
+            return now_ns if freshness_ns is None else freshness_ns + maximum_book_age_ns
+
+        def ordered_cycle_assets(*, now_ns: int) -> tuple[str, ...]:
+            return tuple(
+                sorted(
+                    asset_ids,
+                    key=lambda asset_id: (
+                        leg_hard_expiry_ns(asset_id, now_ns=now_ns),
+                        stable_asset_order[asset_id],
+                    ),
+                )
             )
 
         def current_deadline() -> IntegrityDeadline:
@@ -1771,23 +2171,168 @@ class PolymarketObservationService:
                     deadline_ns=deadline_ns,
                     reason=IntegrityDeadlineReason.RUN_DEADLINE,
                 )
-            return next_integrity_deadline(
-                run_deadline_ns=deadline_ns,
-                periodic_audit_deadline_ns=periodic_audit_due_ns,
-                valid_book_receive_ns=capture.book_freshness_receive_ns,
-                required_books=len(asset_ids),
-                maximum_book_age_ns=maximum_book_age_ns,
-                now_ns=time.monotonic_ns(),
-                freshness_audit_guard_ns=freshness_audit_guard_ns,
+            now_ns = time.monotonic_ns()
+            freshness_deadlines: list[int] = []
+            hard_expiries: list[int] = []
+            for asset_id in asset_ids:
+                freshness_ns = leg_freshness_ns(asset_id)
+                if expired_freshness_markers.get(asset_id, object()) == freshness_ns:
+                    # This exact accepted freshness boundary has already
+                    # expired.  Wait for a new accepted L2 update rather than
+                    # spinning public reads after the per-leg hard deadline.
+                    continue
+                hard_expiry_ns = (
+                    now_ns if freshness_ns is None else freshness_ns + maximum_book_age_ns
+                )
+                hard_expiries.append(hard_expiry_ns)
+                if hard_expiry_ns <= deadline_ns:
+                    freshness_deadlines.append(
+                        max(now_ns, hard_expiry_ns - freshness_audit_guard_ns)
+                    )
+            freshness_deadline_ns = min(freshness_deadlines) if freshness_deadlines else deadline_ns
+            periodic_deadline_ns = periodic_audit_due_ns
+            if (
+                deadline_ns - now_ns <= freshness_audit_guard_ns
+                and len(hard_expiries) == len(asset_ids)
+                and all(expiry_ns > deadline_ns for expiry_ns in hard_expiries)
+            ):
+                periodic_deadline_ns = deadline_ns
+            next_ns = min(deadline_ns, periodic_deadline_ns, freshness_deadline_ns)
+            if next_ns == deadline_ns:
+                reason = IntegrityDeadlineReason.RUN_DEADLINE
+            elif next_ns == periodic_deadline_ns:
+                reason = IntegrityDeadlineReason.PERIODIC_AUDIT
+            else:
+                reason = IntegrityDeadlineReason.BOOK_FRESHNESS
+            return IntegrityDeadline(deadline_ns=next_ns, reason=reason)
+
+        def finish_cycle_leg(native_asset_id: str) -> None:
+            nonlocal audit_cycle_active, periodic_audit_due_ns
+            first_attempts_pending.discard(native_asset_id)
+            deferred_retry_actions.pop(native_asset_id, None)
+            cycle_unfinished_assets.discard(native_asset_id)
+            if not cycle_unfinished_assets:
+                audit_cycle_active = False
+                periodic_audit_due_ns = time.monotonic_ns() + integrity_interval_ns
+
+        async def mark_expired_leg(native_asset_id: str, *, reason: str) -> None:
+            nonlocal pending_exit
+            freshness_ns = leg_freshness_ns(native_asset_id)
+            result = await self._preserve_audit_expiry(
+                capture=capture,
+                native_asset_id=native_asset_id,
+                last_accepted_receive_monotonic_ns=freshness_ns,
+                connection_id=connection_id,
+                subscription_id=subscription_id,
             )
+            if not result.success:
+                raise RuntimeError("audit expiry control failed canonical processing")
+            if result.needs_resync:
+                pending_exit = _GenerationExit.RESYNC_REQUIRED
+            expired_freshness_markers[native_asset_id] = freshness_ns
+            self._metrics.increment_counter(
+                "mma_rest_audit_legs_suppressed_total",
+                labels={"reason": reason},
+            )
+            deviations.append(f"REST audit leg expired before launch: {native_asset_id}")
+            finish_cycle_leg(native_asset_id)
+
+        def start_staged_audit_http(
+            staged: _StagedAuditRequest,
+            *,
+            launch_monotonic_ns: int,
+        ) -> None:
+            start = staged.start
+            response_fence = _AuditResponseBoundaryFence(
+                request_id=start.request_id,
+                connection_id=start.connection_id,
+            )
+            public_deadline = min(
+                deadline,
+                asyncio.get_running_loop().time()
+                + max(0.0, (staged.hard_expiry_ns - launch_monotonic_ns) / 1e9),
+            )
+            task = asyncio.create_task(
+                self._run_audit_http_request(
+                    client=client,
+                    ingress=ingress,
+                    start=start,
+                    deadline=public_deadline,
+                    handoff=audit_handoff,
+                    response_fence=response_fence,
+                    deadline_monotonic_ns=staged.response_deadline_ns,
+                    deadline_failure_reason=(
+                        AuditFailureReason.BOOK_FRESHNESS_EXPIRED
+                        if staged.hard_expiry_ns < deadline_ns
+                        else AuditFailureReason.OBSERVATION_DEADLINE
+                    ),
+                ),
+                name=f"polymarket-rest-audit-{start.request_id}",
+            )
+            pending_audits[start.request_id] = _PendingAuditRequest(
+                start=start,
+                response_fence=response_fence,
+                task=task,
+                freshness_marker_ns=staged.freshness_marker_ns,
+                hard_expiry_ns=staged.hard_expiry_ns,
+                asset_order=staged.asset_order,
+            )
+
+        async def close_staged_audit(
+            staged: _StagedAuditRequest,
+            *,
+            reason: AuditFailureReason,
+        ) -> None:
+            result = await self._preserve_audit_failure(
+                capture=capture,
+                failure=AuditHttpFailureHandoff(
+                    request_id=staged.start.request_id,
+                    connection_id=staged.start.connection_id,
+                    reason=reason,
+                    error_type=reason.value,
+                ),
+                subscription_id=subscription_id,
+            )
+            if result.audit_outcomes:
+                self._metrics.increment_counter(
+                    "mma_rest_audit_outcomes_total",
+                    labels={"outcome": result.audit_outcomes[-1].outcome.value},
+                )
+            if reason is AuditFailureReason.BOOK_FRESHNESS_EXPIRED:
+                expired_freshness_markers[staged.start.native_asset_id] = staged.freshness_marker_ns
+            finish_cycle_leg(staged.start.native_asset_id)
 
         async def launch_audit(
             native_asset_id: str,
             *,
             attempt: int,
-            issue_http_request: bool = True,
-        ) -> bool:
-            nonlocal active_audit, active_response_fence, audit_task
+            deferred_starts: list[_StagedAuditRequest] | None = None,
+        ) -> _AuditLaunchResult:
+            launch_block_reason = audit_launch_block_reason()
+            if launch_block_reason == "generation_exit":
+                self._metrics.increment_counter(
+                    "mma_rest_audit_launches_suppressed_total",
+                    labels={"reason": launch_block_reason},
+                )
+                finish_cycle_leg(native_asset_id)
+                return _AuditLaunchResult.GENERATION_ENDED
+            request_started_ns = time.monotonic_ns()
+            if request_started_ns >= deadline_ns:
+                self._metrics.increment_counter(
+                    "mma_rest_audit_launches_suppressed_total",
+                    labels={"reason": "run_deadline_before_stage"},
+                )
+                return _AuditLaunchResult.RUN_ENDED
+            freshness_marker_ns = leg_freshness_ns(native_asset_id)
+            hard_expiry_ns = (
+                request_started_ns
+                if freshness_marker_ns is None
+                else freshness_marker_ns + maximum_book_age_ns
+            )
+            if request_started_ns >= hard_expiry_ns:
+                await mark_expired_leg(native_asset_id, reason="leg_expired_before_stage")
+                return _AuditLaunchResult.EXPIRED
+            hard_deadline_ns = min(deadline_ns, hard_expiry_ns)
             start, result = await self._stage_audit_start(
                 capture=capture,
                 ingress=ingress,
@@ -1795,53 +2340,207 @@ class PolymarketObservationService:
                 attempt=attempt,
                 connection_id=connection_id,
                 subscription_id=subscription_id,
+                request_started_monotonic_ns=request_started_ns,
+                hard_expiry_monotonic_ns=hard_expiry_ns,
+                response_deadline_monotonic_ns=hard_deadline_ns,
+                run_deadline_monotonic_ns=deadline_ns,
             )
-            if result.needs_resync:
+            if not result.success or result.needs_resync:
                 deviations.append(f"audit start failed closed at ingest_seq={result.ingest_seq}")
                 if result.success:
-                    active_audit = start
-                    await fail_active_audit(AuditFailureReason.LOCAL_STATE_NOT_COMPARABLE)
-                return False
-            active_audit = start
-            if not issue_http_request:
-                active_response_fence = None
-                audit_task = None
-                return True
-            active_response_fence = _AuditResponseBoundaryFence(
-                request_id=start.request_id,
-                connection_id=start.connection_id,
+                    await self._preserve_audit_failure(
+                        capture=capture,
+                        failure=AuditHttpFailureHandoff(
+                            request_id=start.request_id,
+                            connection_id=start.connection_id,
+                            reason=AuditFailureReason.LOCAL_STATE_NOT_COMPARABLE,
+                            error_type=AuditFailureReason.LOCAL_STATE_NOT_COMPARABLE.value,
+                        ),
+                        subscription_id=subscription_id,
+                    )
+                finish_cycle_leg(native_asset_id)
+                return _AuditLaunchResult.FAILED_CLOSED
+            after_stage_ns = time.monotonic_ns()
+            if (
+                pending_exit is not None
+                or pending_transport_error is not None
+                or acquisition_task.done()
+            ):
+                await self._preserve_audit_failure(
+                    capture=capture,
+                    failure=AuditHttpFailureHandoff(
+                        request_id=start.request_id,
+                        connection_id=start.connection_id,
+                        reason=AuditFailureReason.SOCKET_GENERATION_CHANGED,
+                        error_type=AuditFailureReason.SOCKET_GENERATION_CHANGED.value,
+                    ),
+                    subscription_id=subscription_id,
+                )
+                finish_cycle_leg(native_asset_id)
+                return _AuditLaunchResult.GENERATION_ENDED
+            if after_stage_ns >= hard_deadline_ns:
+                self._metrics.increment_counter(
+                    "mma_rest_audit_launches_suppressed_total",
+                    labels={
+                        "reason": (
+                            "run_deadline_after_stage"
+                            if deadline_ns <= hard_expiry_ns
+                            else "leg_expired_after_stage"
+                        )
+                    },
+                )
+                failure_reason = (
+                    AuditFailureReason.RUN_ENDED
+                    if deadline_ns <= hard_expiry_ns
+                    else AuditFailureReason.BOOK_FRESHNESS_EXPIRED
+                )
+                await self._preserve_audit_failure(
+                    capture=capture,
+                    failure=AuditHttpFailureHandoff(
+                        request_id=start.request_id,
+                        connection_id=start.connection_id,
+                        reason=failure_reason,
+                        error_type=failure_reason.value,
+                    ),
+                    subscription_id=subscription_id,
+                )
+                if hard_expiry_ns <= deadline_ns:
+                    expired_freshness_markers[native_asset_id] = freshness_marker_ns
+                finish_cycle_leg(native_asset_id)
+                return (
+                    _AuditLaunchResult.RUN_ENDED
+                    if failure_reason is AuditFailureReason.RUN_ENDED
+                    else _AuditLaunchResult.EXPIRED
+                )
+            staged = _StagedAuditRequest(
+                start=start,
+                freshness_marker_ns=freshness_marker_ns,
+                hard_expiry_ns=hard_expiry_ns,
+                response_deadline_ns=hard_deadline_ns,
+                asset_order=stable_asset_order[native_asset_id],
             )
-            audit_task = asyncio.create_task(
-                self._run_audit_http_request(
-                    client=client,
-                    ingress=ingress,
-                    start=start,
-                    deadline=deadline,
-                    handoff=audit_handoff,
-                    response_fence=active_response_fence,
-                ),
-                name=f"polymarket-rest-audit-{start.request_id}",
+            if deferred_starts is None:
+                start_staged_audit_http(staged, launch_monotonic_ns=after_stage_ns)
+            else:
+                deferred_starts.append(staged)
+            return _AuditLaunchResult.STARTED
+
+        async def stage_failed_leg(
+            native_asset_id: str,
+            *,
+            attempt: int,
+            reason: AuditFailureReason,
+        ) -> _AuditLaunchResult:
+            """Durably close a bounded leg without starting another HTTP read."""
+
+            launch_block_reason = audit_launch_block_reason()
+            if launch_block_reason is not None:
+                self._metrics.increment_counter(
+                    "mma_rest_audit_launches_suppressed_total",
+                    labels={"reason": launch_block_reason},
+                )
+                finish_cycle_leg(native_asset_id)
+                return (
+                    _AuditLaunchResult.RUN_ENDED
+                    if launch_block_reason == "run_deadline"
+                    else _AuditLaunchResult.GENERATION_ENDED
+                )
+            request_started_ns = time.monotonic_ns()
+            if request_started_ns >= deadline_ns:
+                finish_cycle_leg(native_asset_id)
+                return _AuditLaunchResult.RUN_ENDED
+            freshness_marker_ns = leg_freshness_ns(native_asset_id)
+            hard_expiry_ns = (
+                request_started_ns
+                if freshness_marker_ns is None
+                else freshness_marker_ns + maximum_book_age_ns
             )
-            return True
-
-        async def stop_audit_task() -> None:
-            nonlocal audit_task
-            task = audit_task
-            audit_task = None
-            if task is None:
-                return
-            if not task.done():
-                task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
-
-        async def fail_active_audit(reason: AuditFailureReason) -> None:
-            nonlocal active_audit, active_response_fence, pending_response
-            start = active_audit
-            if start is None:
-                return
-            await stop_audit_task()
-            pending_response = None
+            if request_started_ns >= hard_expiry_ns:
+                await mark_expired_leg(
+                    native_asset_id,
+                    reason="leg_expired_before_terminal_record",
+                )
+                return _AuditLaunchResult.EXPIRED
+            hard_deadline_ns = min(deadline_ns, hard_expiry_ns)
+            start, result = await self._stage_audit_start(
+                capture=capture,
+                ingress=ingress,
+                native_asset_id=native_asset_id,
+                attempt=attempt,
+                connection_id=connection_id,
+                subscription_id=subscription_id,
+                request_started_monotonic_ns=request_started_ns,
+                hard_expiry_monotonic_ns=hard_expiry_ns,
+                response_deadline_monotonic_ns=hard_deadline_ns,
+                run_deadline_monotonic_ns=deadline_ns,
+            )
+            if not result.success or result.needs_resync:
+                if result.success:
+                    failure = AuditHttpFailureHandoff(
+                        request_id=start.request_id,
+                        connection_id=start.connection_id,
+                        reason=AuditFailureReason.LOCAL_STATE_NOT_COMPARABLE,
+                        error_type=AuditFailureReason.LOCAL_STATE_NOT_COMPARABLE.value,
+                    )
+                    result = await self._preserve_audit_failure(
+                        capture=capture,
+                        failure=failure,
+                        subscription_id=subscription_id,
+                    )
+                finish_cycle_leg(native_asset_id)
+                return _AuditLaunchResult.FAILED_CLOSED
+            after_stage_ns = time.monotonic_ns()
+            if (
+                pending_exit is not None
+                or pending_transport_error is not None
+                or acquisition_task.done()
+            ):
+                result = await self._preserve_audit_failure(
+                    capture=capture,
+                    failure=AuditHttpFailureHandoff(
+                        request_id=start.request_id,
+                        connection_id=start.connection_id,
+                        reason=AuditFailureReason.SOCKET_GENERATION_CHANGED,
+                        error_type=AuditFailureReason.SOCKET_GENERATION_CHANGED.value,
+                    ),
+                    subscription_id=subscription_id,
+                )
+                if result.audit_outcomes:
+                    self._metrics.increment_counter(
+                        "mma_rest_audit_outcomes_total",
+                        labels={"outcome": result.audit_outcomes[-1].outcome.value},
+                    )
+                finish_cycle_leg(native_asset_id)
+                return _AuditLaunchResult.GENERATION_ENDED
+            if after_stage_ns >= hard_deadline_ns:
+                failure_reason = (
+                    AuditFailureReason.RUN_ENDED
+                    if deadline_ns <= hard_expiry_ns
+                    else AuditFailureReason.BOOK_FRESHNESS_EXPIRED
+                )
+                result = await self._preserve_audit_failure(
+                    capture=capture,
+                    failure=AuditHttpFailureHandoff(
+                        request_id=start.request_id,
+                        connection_id=start.connection_id,
+                        reason=failure_reason,
+                        error_type=failure_reason.value,
+                    ),
+                    subscription_id=subscription_id,
+                )
+                if result.audit_outcomes:
+                    self._metrics.increment_counter(
+                        "mma_rest_audit_outcomes_total",
+                        labels={"outcome": result.audit_outcomes[-1].outcome.value},
+                    )
+                if failure_reason is AuditFailureReason.BOOK_FRESHNESS_EXPIRED:
+                    expired_freshness_markers[native_asset_id] = freshness_marker_ns
+                finish_cycle_leg(native_asset_id)
+                return (
+                    _AuditLaunchResult.RUN_ENDED
+                    if failure_reason is AuditFailureReason.RUN_ENDED
+                    else _AuditLaunchResult.EXPIRED
+                )
             result = await self._preserve_audit_failure(
                 capture=capture,
                 failure=AuditHttpFailureHandoff(
@@ -1852,30 +2551,153 @@ class PolymarketObservationService:
                 ),
                 subscription_id=subscription_id,
             )
-            active_audit = None
-            active_response_fence = None
             if result.audit_outcomes:
                 self._metrics.increment_counter(
                     "mma_rest_audit_outcomes_total",
                     labels={"outcome": result.audit_outcomes[-1].outcome.value},
                 )
+            expired_freshness_markers[native_asset_id] = freshness_marker_ns
+            finish_cycle_leg(native_asset_id)
+            return _AuditLaunchResult.STARTED
+
+        async def stop_audit_request(request_id: str) -> None:
+            pending = pending_audits.get(request_id)
+            if pending is None:
+                return
+            if not pending.task.done():
+                pending.task.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending.task
+
+        async def fail_audit_request(
+            request_id: str,
+            reason: AuditFailureReason,
+        ) -> bool:
+            pending = pending_audits.get(request_id)
+            if pending is None:
+                return False
+            if pending.response is not None:
+                # The body has already crossed the immutable response
+                # boundary and was dequeued into coordinator-owned state.
+                # Return to the ordered response drain; never replace it with
+                # a synthetic generation failure.
+                return True
+            if not pending.task.done():
+                pending.task.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending.task
+            queued: list[AuditHttpResponseHandoff | AuditHttpFailureHandoff] = []
+            while not audit_handoff.empty():
+                queued.append(audit_handoff.get_nowait())
+            for item in queued:
+                audit_handoff.put_nowait(item)
+            if any(
+                isinstance(item, AuditHttpResponseHandoff) or item.request_id == request_id
+                for item in queued
+            ):
+                # Cancellation can release a body that was already immutable
+                # at any response boundary, while another request may also
+                # complete during this await.  Stop the fail-all pass and let
+                # the normal serialized path preserve/classify queued bodies
+                # in global fence order.
+                return True
+            pending_audits.pop(request_id, None)
+            result = await self._preserve_audit_failure(
+                capture=capture,
+                failure=AuditHttpFailureHandoff(
+                    request_id=pending.start.request_id,
+                    connection_id=pending.start.connection_id,
+                    reason=reason,
+                    error_type=reason.value,
+                ),
+                subscription_id=subscription_id,
+            )
+            if result.audit_outcomes:
+                self._metrics.increment_counter(
+                    "mma_rest_audit_outcomes_total",
+                    labels={"outcome": result.audit_outcomes[-1].outcome.value},
+                )
+            return False
+
+        def announced_audit_order(
+            pending: _PendingAuditRequest,
+        ) -> tuple[int, int, int, int, int, str]:
+            barrier_ordinal = pending.response_fence.barrier_ordinal
+            received_monotonic_ns = pending.response_fence.received_monotonic_ns
+            if barrier_ordinal is None or received_monotonic_ns is None:
+                raise RuntimeError("audit response fence is not fully announced")
+            return (
+                barrier_ordinal,
+                received_monotonic_ns,
+                pending.hard_expiry_ns,
+                pending.asset_order,
+                pending.start.request_started_monotonic_ns,
+                pending.start.request_id,
+            )
+
+        def earliest_announced_audit() -> _PendingAuditRequest | None:
+            announced = tuple(
+                pending
+                for pending in pending_audits.values()
+                if pending.response_fence.barrier_ordinal is not None
+            )
+            return min(announced, key=announced_audit_order) if announced else None
+
+        async def fail_all_audits(reason: AuditFailureReason) -> bool:
+            while pending_audits:
+                earliest = earliest_announced_audit()
+                if earliest is not None:
+                    if earliest.response is not None:
+                        # The normal drain owns this immutable body.  A stored
+                        # later-fence response never wins here: the globally
+                        # earliest announced blocker is selected first.
+                        return True
+                    request_id = earliest.start.request_id
+                else:
+                    request_id = min(
+                        pending_audits,
+                        key=lambda key: (
+                            pending_audits[key].start.request_started_monotonic_ns,
+                            pending_audits[key].asset_order,
+                            key,
+                        ),
+                    )
+                if await fail_audit_request(request_id, reason):
+                    return True
+            return False
+
+        async def drain_completed_exit_handoffs() -> bool:
+            """Drain only immutable handoffs, never a provisional fence."""
+
+            if not audit_handoff.empty():
+                return True
+            drainable = tuple(
+                pending.task for pending in pending_audits.values() if pending.task.done()
+            )
+            if not drainable:
+                return False
+            await asyncio.gather(*drainable, return_exceptions=True)
+            return not audit_handoff.empty()
 
         async def complete_audit_response(
             response: AuditHttpResponseHandoff,
         ) -> ProcessedEnvelope:
-            start = active_audit
-            if start is None or start.request_id != response.request_id:
+            pending = pending_audits.get(response.request_id)
+            if pending is None:
                 raise RuntimeError("audit response handoff has no matching active request")
             processed = capture.processor.processed_websocket_watermark(connection_id).ordinal
             return await self._preserve_audit_response(
                 capture=capture,
                 response=response,
-                start=start,
+                start=pending.start,
                 barrier_ordinal=processed,
                 subscription_id=subscription_id,
+                hard_expiry_monotonic_ns=pending.hard_expiry_ns,
             )
 
         async def stop_acquisition() -> None:
+            if capture_cutoff is not None and on_capture_cutoff is not None:
+                on_capture_cutoff(capture_cutoff)
             if not acquisition_task.done():
                 acquisition_task.cancel()
             with suppress(
@@ -1899,10 +2721,15 @@ class PolymarketObservationService:
                     detail="public market WebSocket ended before readiness",
                 )
             if ready_task not in done:
+                capture_cutoff = _CaptureCutoffMoment(
+                    wall_time=UtcTimestamp.now(),
+                    monotonic_ns=time.monotonic_ns(),
+                )
                 await stop_acquisition()
                 return _GenerationResult(
                     _GenerationExit.DEADLINE,
                     ingress_metrics=ingress.metrics,
+                    capture_cutoff=capture_cutoff,
                 )
             runtime_health.mark_connected(now_ns=time.monotonic_ns())
             if unavailable_started_ns is not None:
@@ -1912,157 +2739,208 @@ class PolymarketObservationService:
                 )
 
             while True:
-                if audit_task is not None and audit_task.done():
-                    audit_task.result()
-                    audit_task = None
-                    if audit_handoff.empty():
+                handoffs: list[AuditHttpResponseHandoff | AuditHttpFailureHandoff] = []
+                while not audit_handoff.empty():
+                    handoffs.append(audit_handoff.get_nowait())
+                handoffs.sort(
+                    key=lambda item: (
+                        pending_audits[item.request_id].hard_expiry_ns,
+                        pending_audits[item.request_id].asset_order,
+                        pending_audits[item.request_id].start.request_started_monotonic_ns,
+                        item.request_id,
+                    )
+                )
+                handed_off_ids = {item.request_id for item in handoffs}
+                for pending in pending_audits.values():
+                    if (
+                        pending.task.done()
+                        and pending.response is None
+                        and pending.start.request_id not in handed_off_ids
+                    ):
+                        pending.task.result()
                         raise RuntimeError("audit task completed without a handoff")
-                    handoff = audit_handoff.get_nowait()
+                for handoff in handoffs:
+                    pending = pending_audits.get(handoff.request_id)
+                    if pending is None:
+                        raise RuntimeError("audit handoff references no pending request")
+                    await pending.task
+                    if acquisition_task.done() and pending_exit is not _GenerationExit.DEADLINE:
+                        response_preceded_generation_end = (
+                            isinstance(handoff, AuditHttpResponseHandoff)
+                            and acquisition_ended_monotonic_ns is not None
+                            and handoff.received_monotonic_ns < acquisition_ended_monotonic_ns
+                        )
+                        if not response_preceded_generation_end:
+                            handoff = AuditHttpFailureHandoff(
+                                request_id=pending.start.request_id,
+                                connection_id=pending.start.connection_id,
+                                reason=AuditFailureReason.SOCKET_GENERATION_CHANGED,
+                                error_type=AuditFailureReason.SOCKET_GENERATION_CHANGED.value,
+                            )
                     if isinstance(handoff, AuditHttpFailureHandoff):
+                        pending_audits.pop(handoff.request_id)
                         result = await self._preserve_audit_failure(
                             capture=capture,
                             failure=handoff,
                             subscription_id=subscription_id,
                         )
-                        active_audit = None
-                        active_response_fence = None
                         if result.audit_outcomes:
                             outcome = result.audit_outcomes[-1]
                             self._metrics.increment_counter(
                                 "mma_rest_audit_outcomes_total",
                                 labels={"outcome": outcome.outcome.value},
                             )
-                        audit_cycle_active = False
-                        periodic_audit_due_ns = time.monotonic_ns() + integrity_interval_ns
+                        if pending.start.attempt == 1:
+                            first_attempts_pending.discard(pending.start.native_asset_id)
+                        expired_freshness_markers[pending.start.native_asset_id] = (
+                            pending.freshness_marker_ns
+                        )
+                        finish_cycle_leg(pending.start.native_asset_id)
                         deviations.append(
                             f"REST audit HTTP failure isolated at ingest_seq={result.ingest_seq}"
                         )
-                    else:
-                        if (
-                            active_response_fence is None
-                            or active_response_fence.request_id != handoff.request_id
-                            or active_response_fence.barrier_ordinal
-                            != handoff.response_boundary_watermark.ordinal
-                        ):
-                            raise RuntimeError(
-                                "active audit fence differs from its response handoff"
-                            )
-                        pending_response = handoff
-                        processed_at_handoff = capture.processor.processed_websocket_watermark(
-                            connection_id
-                        ).ordinal
-                        self._metrics.observe_histogram(
-                            "mma_rest_audit_barrier_lag_messages",
-                            max(
-                                0,
-                                handoff.response_boundary_watermark.ordinal - processed_at_handoff,
-                            ),
-                        )
+                        continue
+                    if (
+                        pending.response_fence.request_id != handoff.request_id
+                        or pending.response_fence.barrier_ordinal
+                        != handoff.response_boundary_watermark.ordinal
+                    ):
+                        raise RuntimeError("audit fence differs from its response handoff")
+                    pending.response = handoff
+                    processed_at_handoff = capture.processor.processed_websocket_watermark(
+                        connection_id
+                    ).ordinal
+                    self._metrics.observe_histogram(
+                        "mma_rest_audit_barrier_lag_messages",
+                        max(
+                            0,
+                            handoff.response_boundary_watermark.ordinal - processed_at_handoff,
+                        ),
+                    )
 
-                if pending_response is not None:
-                    classified_response: AuditHttpResponseHandoff | None = None
+                # Classify only the globally earliest announced receive fence.
+                # This preserves each request's exact response boundary even
+                # when the two HTTP responses complete in the opposite order.
+                while True:
+                    announced = tuple(
+                        pending
+                        for pending in pending_audits.values()
+                        if pending.response_fence.barrier_ordinal is not None
+                    )
+                    if not announced:
+                        break
+                    earliest = min(
+                        announced,
+                        key=lambda pending: (
+                            pending.response_fence.barrier_ordinal,
+                            pending.response_fence.received_monotonic_ns,
+                            pending.hard_expiry_ns,
+                            pending.asset_order,
+                            pending.start.request_started_monotonic_ns,
+                            pending.start.request_id,
+                        ),
+                    )
+                    response = earliest.response
+                    if response is None:
+                        break
+                    boundary = response.response_boundary_watermark.ordinal
                     processed = capture.processor.processed_websocket_watermark(
                         connection_id
                     ).ordinal
-                    boundary = pending_response.response_boundary_watermark.ordinal
-                    if processed >= boundary or (
-                        processed < boundary
-                        and ingress.empty
+                    if processed < boundary and not (
+                        ingress.empty
                         and (deferred_item is None or deferred_item.watermark.ordinal > boundary)
                     ):
-                        classified_response = pending_response
-                        result = await complete_audit_response(classified_response)
-                        pending_response = None
-                    else:
-                        result = None
-                    if result is not None:
-                        if classified_response is None:
-                            raise RuntimeError(
-                                "audit result is missing its response-boundary handoff"
-                            )
-                        start = active_audit
-                        if start is None or not result.audit_outcomes:
-                            raise RuntimeError("audit response produced no canonical outcome")
-                        outcome = result.audit_outcomes[-1]
-                        active_audit = None
-                        active_response_fence = None
-                        self._metrics.increment_counter(
-                            "mma_rest_audit_outcomes_total",
-                            labels={"outcome": outcome.outcome.value},
+                        break
+                    if processed > boundary:
+                        raise RuntimeError("canonical owner crossed a pending audit fence")
+                    result = await complete_audit_response(response)
+                    pending_audits.pop(earliest.start.request_id)
+                    if not result.audit_outcomes:
+                        raise RuntimeError("audit response produced no canonical outcome")
+                    outcome = result.audit_outcomes[-1]
+                    start = earliest.start
+                    if start.attempt == 1:
+                        first_attempts_pending.discard(start.native_asset_id)
+                    self._metrics.increment_counter(
+                        "mma_rest_audit_outcomes_total",
+                        labels={"outcome": outcome.outcome.value},
+                    )
+                    self._metrics.observe_histogram(
+                        "mma_rest_audit_classification_latency_ns",
+                        max(0, time.monotonic_ns() - response.received_monotonic_ns),
+                    )
+                    if outcome.outcome is AuditOutcome.MISMATCH:
+                        pending_exit = _GenerationExit.RESYNC_REQUIRED
+                        deviations.append(f"REST audit MISMATCH at ingest_seq={result.ingest_seq}")
+                        finish_cycle_leg(start.native_asset_id)
+                        await stop_acquisition()
+                        break
+                    if outcome.outcome is AuditOutcome.FAILED:
+                        expired_freshness_markers[start.native_asset_id] = (
+                            earliest.freshness_marker_ns
                         )
-                        self._metrics.observe_histogram(
-                            "mma_rest_audit_classification_latency_ns",
-                            max(
-                                0,
-                                time.monotonic_ns() - classified_response.received_monotonic_ns,
-                            ),
+                        deviations.append(
+                            f"REST audit FAILED isolated at ingest_seq={result.ingest_seq}"
                         )
-                        if outcome.outcome is AuditOutcome.MISMATCH:
-                            pending_exit = _GenerationExit.RESYNC_REQUIRED
-                            deviations.append(
-                                f"REST audit MISMATCH at ingest_seq={result.ingest_seq}"
+                        finish_cycle_leg(start.native_asset_id)
+                        continue
+                    if outcome.outcome is AuditOutcome.RACED:
+                        launch_block_reason = audit_launch_block_reason()
+                        if launch_block_reason is not None:
+                            self._metrics.increment_counter(
+                                "mma_rest_audit_retries_suppressed_total",
+                                labels={"reason": launch_block_reason},
                             )
-                            await stop_acquisition()
-                        elif outcome.outcome is AuditOutcome.FAILED:
-                            audit_cycle_active = False
-                            periodic_audit_due_ns = time.monotonic_ns() + integrity_interval_ns
-                            deviations.append(
-                                f"REST audit FAILED isolated at ingest_seq={result.ingest_seq}"
+                            finish_cycle_leg(start.native_asset_id)
+                        elif start.attempt <= maximum_race_retries:
+                            self._metrics.increment_counter("mma_rest_audit_retries_total")
+                            deferred_retry_actions[start.native_asset_id] = (
+                                start.attempt + 1,
+                                False,
                             )
-                        elif outcome.outcome is AuditOutcome.RACED:
-                            if generation_is_exiting():
-                                audit_cycle_active = False
-                                periodic_audit_due_ns = time.monotonic_ns() + integrity_interval_ns
-                                self._metrics.increment_counter(
-                                    "mma_rest_audit_retries_suppressed_total",
-                                    labels={"reason": "generation_exit"},
-                                )
-                            elif start.attempt <= maximum_race_retries:
-                                self._metrics.increment_counter("mma_rest_audit_retries_total")
-                                audit_attempt = start.attempt + 1
-                                if not await launch_audit(
-                                    start.native_asset_id,
-                                    attempt=audit_attempt,
-                                ):
-                                    pending_exit = _GenerationExit.RESYNC_REQUIRED
-                                    await stop_acquisition()
-                            else:
-                                self._metrics.increment_counter(
-                                    "mma_rest_audit_race_budget_exhaustions_total"
-                                )
-                                audit_attempt = start.attempt + 1
-                                if await launch_audit(
-                                    start.native_asset_id,
-                                    attempt=audit_attempt,
-                                    issue_http_request=False,
-                                ):
-                                    await fail_active_audit(AuditFailureReason.RACE_RETRY_EXHAUSTED)
-                                audit_cycle_active = False
-                                periodic_audit_due_ns = time.monotonic_ns() + integrity_interval_ns
+                        else:
+                            self._metrics.increment_counter(
+                                "mma_rest_audit_race_budget_exhaustions_total"
+                            )
+                            deferred_retry_actions[start.native_asset_id] = (
+                                start.attempt + 1,
+                                True,
+                            )
+                        continue
+                    expired_freshness_markers.pop(start.native_asset_id, None)
+                    finish_cycle_leg(start.native_asset_id)
+
+                if (
+                    not first_attempts_pending
+                    and deferred_retry_actions
+                    and pending_exit is None
+                    and pending_transport_error is None
+                ):
+                    for asset_id in sorted(
+                        deferred_retry_actions,
+                        key=lambda item: (
+                            leg_hard_expiry_ns(item, now_ns=time.monotonic_ns()),
+                            stable_asset_order[item],
+                        ),
+                    ):
+                        if len(pending_audits) >= 2:
+                            break
+                        attempt, terminal = deferred_retry_actions.pop(asset_id)
+                        if terminal:
+                            launched = await stage_failed_leg(
+                                asset_id,
+                                attempt=attempt,
+                                reason=AuditFailureReason.RACE_RETRY_EXHAUSTED,
+                            )
+                            if launched is not _AuditLaunchResult.RUN_ENDED:
                                 deviations.append("REST audit race retry budget exhausted")
                         else:
-                            if generation_is_exiting():
-                                audit_cycle_active = False
-                                periodic_audit_due_ns = time.monotonic_ns() + integrity_interval_ns
-                                self._metrics.increment_counter(
-                                    "mma_rest_audit_legs_suppressed_total",
-                                    labels={"reason": "generation_exit"},
-                                )
-                            else:
-                                audit_asset_index += 1
-                                if audit_asset_index < len(asset_ids):
-                                    audit_attempt = 1
-                                    if not await launch_audit(
-                                        asset_ids[audit_asset_index],
-                                        attempt=audit_attempt,
-                                    ):
-                                        pending_exit = _GenerationExit.RESYNC_REQUIRED
-                                        await stop_acquisition()
-                                else:
-                                    audit_cycle_active = False
-                                    periodic_audit_due_ns = (
-                                        time.monotonic_ns() + integrity_interval_ns
-                                    )
+                            launched = await launch_audit(asset_id, attempt=attempt)
+                            if launched is _AuditLaunchResult.FAILED_CLOSED:
+                                pending_exit = _GenerationExit.RESYNC_REQUIRED
+                                await stop_acquisition()
+                                break
 
                 now_ns = time.monotonic_ns()
                 due = current_deadline()
@@ -2094,15 +2972,103 @@ class PolymarketObservationService:
                 if pending_exit is None and now_ns >= due_ns:
                     if due.reason is IntegrityDeadlineReason.RUN_DEADLINE:
                         pending_exit = _GenerationExit.DEADLINE
+                        capture_cutoff = _CaptureCutoffMoment(
+                            wall_time=UtcTimestamp.now(),
+                            monotonic_ns=now_ns,
+                        )
                         await stop_acquisition()
                     else:
                         audit_cycle_active = True
-                        audit_asset_index = 0
-                        audit_attempt = 1
                         self._metrics.increment_counter("mma_rest_audit_cycles_total")
-                        if not await launch_audit(asset_ids[0], attempt=audit_attempt):
-                            pending_exit = _GenerationExit.RESYNC_REQUIRED
+                        ordered_assets = ordered_cycle_assets(now_ns=now_ns)
+                        cycle_unfinished_assets.update(ordered_assets)
+                        first_attempts_pending.update(ordered_assets)
+                        staged_first_attempts: list[_StagedAuditRequest] = []
+                        staging_abort_reason: AuditFailureReason | None = None
+                        for asset_id in ordered_assets:
+                            launched = await launch_audit(
+                                asset_id,
+                                attempt=1,
+                                deferred_starts=staged_first_attempts,
+                            )
+                            if launched is not _AuditLaunchResult.STARTED:
+                                first_attempts_pending.discard(asset_id)
+                            if launched is _AuditLaunchResult.FAILED_CLOSED:
+                                pending_exit = _GenerationExit.RESYNC_REQUIRED
+                                staging_abort_reason = AuditFailureReason.LOCAL_STATE_NOT_COMPARABLE
+                                await stop_acquisition()
+                                break
+                            if launched is _AuditLaunchResult.RUN_ENDED:
+                                pending_exit = _GenerationExit.DEADLINE
+                                staging_abort_reason = AuditFailureReason.RUN_ENDED
+                                capture_cutoff = _CaptureCutoffMoment(
+                                    wall_time=UtcTimestamp.now(),
+                                    monotonic_ns=time.monotonic_ns(),
+                                )
+                                await stop_acquisition()
+                                break
+                            if launched is _AuditLaunchResult.GENERATION_ENDED:
+                                staging_abort_reason = AuditFailureReason.SOCKET_GENERATION_CHANGED
+                                break
+                        launch_ns = time.monotonic_ns()
+                        if staging_abort_reason is None and (
+                            pending_exit is not None
+                            or pending_transport_error is not None
+                            or acquisition_task.done()
+                        ):
+                            staging_abort_reason = AuditFailureReason.SOCKET_GENERATION_CHANGED
+                        if staging_abort_reason is None and launch_ns >= deadline_ns:
+                            pending_exit = _GenerationExit.DEADLINE
+                            staging_abort_reason = AuditFailureReason.RUN_ENDED
+                            capture_cutoff = _CaptureCutoffMoment(
+                                wall_time=UtcTimestamp.now(),
+                                monotonic_ns=launch_ns,
+                            )
                             await stop_acquisition()
+
+                        launchable: list[_StagedAuditRequest] = []
+                        staged_failures: list[tuple[_StagedAuditRequest, AuditFailureReason]] = []
+                        for staged in staged_first_attempts:
+                            failure_reason = staging_abort_reason
+                            if failure_reason is None and launch_ns >= staged.response_deadline_ns:
+                                failure_reason = (
+                                    AuditFailureReason.RUN_ENDED
+                                    if deadline_ns <= staged.hard_expiry_ns
+                                    else AuditFailureReason.BOOK_FRESHNESS_EXPIRED
+                                )
+                            if failure_reason is None:
+                                launchable.append(staged)
+                            else:
+                                staged_failures.append((staged, failure_reason))
+
+                        # Both first-attempt GET tasks become runnable only
+                        # after every START is durable.  Creating all eligible
+                        # tasks synchronously leaves no await-based starvation
+                        # point between the two legs.
+                        for staged in launchable:
+                            start_staged_audit_http(
+                                staged,
+                                launch_monotonic_ns=launch_ns,
+                            )
+                        for staged, failure_reason in staged_failures:
+                            await close_staged_audit(staged, reason=failure_reason)
+
+                if (
+                    pending_audits
+                    and pending_exit is not _GenerationExit.DEADLINE
+                    and (pending_exit is not None or pending_transport_error is not None)
+                ):
+                    if await drain_completed_exit_handoffs():
+                        continue
+                    earliest = earliest_announced_audit()
+                    # A deferred post-fence ingress item must not trap an audit
+                    # cleanup that releases only when generation exit cancels
+                    # it. Unblock the globally earliest announced fence before
+                    # returning to normal ordered drain.
+                    if (earliest is None or earliest.response is None) and await fail_all_audits(
+                        AuditFailureReason.SOCKET_GENERATION_CHANGED
+                    ):
+                        continue
 
                 first_item: RawIngressItem | None = None
                 if deferred_item is not None:
@@ -2111,22 +3077,32 @@ class PolymarketObservationService:
                 elif not ingress.empty:
                     first_item = ingress.get_nowait()
                 elif pending_exit is not None:
-                    if active_audit is not None:
-                        reason = (
-                            AuditFailureReason.RUN_ENDED
-                            if pending_exit is _GenerationExit.DEADLINE
-                            else AuditFailureReason.SOCKET_GENERATION_CHANGED
-                        )
-                        await fail_active_audit(reason)
+                    if pending_audits and await drain_completed_exit_handoffs():
+                        continue
+                    if pending_audits and pending_exit is _GenerationExit.DEADLINE:
+                        # Already-started reads share the absolute deadline.
+                        # Let their bounded handoffs publish, then classify any
+                        # body received before the cutoff; this starts no work.
+                        await asyncio.gather(*(pending.task for pending in pending_audits.values()))
+                        continue
+                    if pending_audits and await fail_all_audits(
+                        AuditFailureReason.SOCKET_GENERATION_CHANGED
+                    ):
+                        continue
                     return _GenerationResult(
                         pending_exit,
                         deviations=tuple(deviations),
                         refresh_requests=tuple(refresh_requests),
                         ingress_metrics=ingress.metrics,
+                        capture_cutoff=capture_cutoff,
                     )
                 elif pending_transport_error is not None:
-                    if active_audit is not None:
-                        await fail_active_audit(AuditFailureReason.SOCKET_GENERATION_CHANGED)
+                    if pending_audits and await drain_completed_exit_handoffs():
+                        continue
+                    if pending_audits and await fail_all_audits(
+                        AuditFailureReason.SOCKET_GENERATION_CHANGED
+                    ):
+                        continue
                     raise pending_transport_error
                 elif acquisition_task.done():
                     try:
@@ -2151,44 +3127,107 @@ class PolymarketObservationService:
                         ingress.get(),
                         name="polymarket-public-ingress-dequeue",
                     )
-                    wait_tasks: set[asyncio.Task[object]] = {
-                        item_task,
-                        acquisition_task,
+                    pending_ingress_get_task = item_task
+                    active_audit_tasks = {
+                        pending.task
+                        for pending in pending_audits.values()
+                        if not pending.task.done()
                     }
-                    if audit_task is not None:
-                        wait_tasks.add(audit_task)
-                    done, _ = await asyncio.wait(
-                        wait_tasks,
-                        timeout=max(0.0, (due_ns - time.monotonic_ns()) / 1e9),
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    if audit_task is not None and audit_task in done:
-                        if item_task in done:
+                    if not audit_handoff.empty() or any(
+                        pending.task.done() and pending.response is None
+                        for pending in pending_audits.values()
+                    ):
+                        if item_task.done():
                             deferred_item = item_task.result()
                         else:
                             item_task.cancel()
                             with suppress(asyncio.CancelledError):
                                 await item_task
+                        pending_ingress_get_task = None
+                        continue
+                    if acquisition_task.done():
+                        item_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await item_task
+                        pending_ingress_get_task = None
+                        continue
+                    wait_tasks: set[asyncio.Task[object]] = {item_task}
+                    wait_tasks.add(acquisition_task)
+                    wait_tasks.update(active_audit_tasks)
+                    done, _ = await asyncio.wait(
+                        wait_tasks,
+                        timeout=max(0.0, (due_ns - time.monotonic_ns()) / 1e9),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if active_audit_tasks.intersection(done):
+                        if item_task in done:
+                            deferred_item = item_task.result()
+                            pending_ingress_get_task = None
+                        else:
+                            item_task.cancel()
+                            with suppress(asyncio.CancelledError):
+                                await item_task
+                            pending_ingress_get_task = None
                         continue
                     if item_task in done:
                         first_item = item_task.result()
+                        pending_ingress_get_task = None
                     else:
                         item_task.cancel()
                         with suppress(asyncio.CancelledError):
                             await item_task
+                        pending_ingress_get_task = None
                         continue
 
                 batch = [first_item]
-                barrier_limit = (
-                    active_response_fence.barrier_ordinal
-                    if active_response_fence is not None
-                    else None
+                announced_barriers = tuple(
+                    pending.response_fence.barrier_ordinal
+                    for pending in pending_audits.values()
+                    if pending.response_fence.barrier_ordinal is not None
                 )
+                barrier_limit = min(announced_barriers) if announced_barriers else None
                 if barrier_limit is not None and first_item.watermark.ordinal > barrier_limit:
                     deferred_item = first_item
-                    if audit_task is not None and not audit_task.done():
+                    audit_tasks = {
+                        pending.task
+                        for pending in pending_audits.values()
+                        if not pending.task.done()
+                    }
+                    if not audit_handoff.empty() or any(
+                        pending.task.done() and pending.response is None
+                        for pending in pending_audits.values()
+                    ):
+                        continue
+                    if acquisition_task.done():
+                        earliest = earliest_announced_audit()
+                        if earliest is None:
+                            raise RuntimeError("audit fence disappeared while ingress was deferred")
+                        if earliest.response is None:
+                            # A response body may be immutable while its HTTP
+                            # task is still awaiting connection cleanup.  Once
+                            # the socket generation ends, cancellation is what
+                            # releases that exact body into the handoff.  Do it
+                            # here instead of spinning on the deferred
+                            # post-fence frame or waiting forever on cleanup.
+                            await fail_all_audits(AuditFailureReason.SOCKET_GENERATION_CHANGED)
+                            continue
+                        processed = capture.processor.processed_websocket_watermark(
+                            connection_id
+                        ).ordinal
+                        if processed < barrier_limit:
+                            raise RuntimeError(
+                                "completed audit fence is missing its contiguous ingress prefix"
+                            )
+                        # The response became coordinator-owned after this
+                        # iteration's ordered drain.  Re-enter it so the body
+                        # is classified before the deferred later frame.
+                        continue
+                    wait_tasks = set(audit_tasks)
+                    if not acquisition_task.done():
+                        wait_tasks.add(acquisition_task)
+                    if wait_tasks:
                         await asyncio.wait(
-                            {audit_task, acquisition_task},
+                            wait_tasks,
                             timeout=max(0.0, (due_ns - time.monotonic_ns()) / 1e9),
                             return_when=asyncio.FIRST_COMPLETED,
                         )
@@ -2241,11 +3280,17 @@ class PolymarketObservationService:
                 if pending_exit is not None:
                     await stop_acquisition()
         finally:
+            if pending_ingress_get_task is not None and not pending_ingress_get_task.done():
+                pending_ingress_get_task.cancel()
+            if pending_ingress_get_task is not None:
+                with suppress(asyncio.CancelledError):
+                    await pending_ingress_get_task
             if not ready_task.done():
                 ready_task.cancel()
             with suppress(asyncio.CancelledError):
                 await ready_task
-            await stop_audit_task()
+            for request_id in tuple(pending_audits):
+                await stop_audit_request(request_id)
             await stop_acquisition()
 
     async def _observe_websocket(
@@ -2258,6 +3303,7 @@ class PolymarketObservationService:
         deadline: float,
         logger: StructuredLogger,
         runtime_health: ObservationRuntimeHealth | None = None,
+        on_capture_cutoff: Callable[[_CaptureCutoffMoment], None] | None = None,
     ) -> _StreamResult:
         if runtime_health is None:
             runtime_health = ObservationRuntimeHealth()
@@ -2295,6 +3341,7 @@ class PolymarketObservationService:
                         subscription_id=subscription_id,
                         unavailable_started_ns=unavailable_started_ns,
                         runtime_health=runtime_health,
+                        on_capture_cutoff=on_capture_cutoff,
                     )
                 except BaseException:
                     runtime_health.finish_generation(
@@ -2304,7 +3351,11 @@ class PolymarketObservationService:
                     raise
                 runtime_health.finish_generation(
                     continuity_interrupted=generation.reason is not _GenerationExit.DEADLINE,
-                    now_ns=time.monotonic_ns(),
+                    now_ns=(
+                        time.monotonic_ns()
+                        if generation.capture_cutoff is None
+                        else generation.capture_cutoff.monotonic_ns
+                    ),
                 )
                 ingress_metrics = _merge_ingress_metrics(
                     ingress_metrics,
@@ -2318,6 +3369,7 @@ class PolymarketObservationService:
                         False,
                         tuple(deviations),
                         ingress_metrics,
+                        generation.capture_cutoff,
                     )
                 unavailable_started_ns = time.monotonic_ns()
                 if generation.reason is _GenerationExit.REFERENCE_REFRESH:

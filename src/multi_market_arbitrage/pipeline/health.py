@@ -7,13 +7,14 @@ import resource
 import shutil
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
 from multi_market_arbitrage.core.config import Phase1Config
-from multi_market_arbitrage.core.ids import CollectorRunId, ConnectionId
+from multi_market_arbitrage.core.health import BookHealth
+from multi_market_arbitrage.core.ids import CollectorRunId, ConnectionId, InstrumentId
 from multi_market_arbitrage.core.time import UtcTimestamp
 from multi_market_arbitrage.journal import JournalMetricsSnapshot
 from multi_market_arbitrage.observability import (
@@ -24,6 +25,7 @@ from multi_market_arbitrage.observability import (
     InMemoryMetrics,
     evaluate_health_decision,
 )
+from multi_market_arbitrage.reference import POLYMARKET_VENUE_ID
 from multi_market_arbitrage.research import AnalyticalRuntimeSnapshot
 from multi_market_arbitrage.venues.polymarket import PublicReadMetricsSnapshot
 
@@ -289,6 +291,7 @@ class SupervisedProcessResourceSampler:
         self._sample_count = 0
         self._failure_type: str | None = None
         self._task: asyncio.Task[None] | None = None
+        self._initial_attempt_completed = asyncio.Event()
         self._closed = False
 
     async def start(self) -> None:
@@ -300,20 +303,24 @@ class SupervisedProcessResourceSampler:
         )
 
     async def _run(self) -> None:
-        while True:
-            try:
-                sampled = await asyncio.to_thread(self._sample, self._storage_path)
-            except asyncio.CancelledError:
-                raise
-            except BaseException as error:
-                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+        try:
+            while True:
+                try:
+                    sampled = await asyncio.to_thread(self._sample, self._storage_path)
+                except asyncio.CancelledError:
                     raise
-                self._failure_type = type(error).__name__
-                self._on_failure(error)
-                return
-            self._latest = sampled
-            self._sample_count += 1
-            await asyncio.sleep(self._interval_seconds)
+                except BaseException as error:
+                    if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                        raise
+                    self._failure_type = type(error).__name__
+                    self._on_failure(error)
+                    return
+                self._latest = sampled
+                self._sample_count += 1
+                self._initial_attempt_completed.set()
+                await asyncio.sleep(self._interval_seconds)
+        finally:
+            self._initial_attempt_completed.set()
 
     @property
     def snapshot(self) -> ProcessResourceSamplerSnapshot:
@@ -323,6 +330,14 @@ class SupervisedProcessResourceSampler:
             sample_count=self._sample_count,
             failure_type=self._failure_type,
         )
+
+    async def wait_for_initial_attempt(self) -> ProcessResourceSamplerSnapshot:
+        """Wait until the first sample succeeds or fails without blocking the loop."""
+
+        if self._task is None:
+            raise RuntimeError("resource sampler was not started")
+        await self._initial_attempt_completed.wait()
+        return self.snapshot
 
     async def close(self) -> None:
         if self._closed:
@@ -361,10 +376,12 @@ def _histogram_record(value: HistogramSnapshot | None) -> dict[str, int | float 
     }
 
 
-def _age_nanoseconds(now_ns: int, then_ns: int | None) -> int | None:
-    if then_ns is None:
+def _monotonic_age_nanoseconds(now_ns: int, received_ns: int | None) -> int | None:
+    """Return elapsed receive age, failing closed on an invalid clock relation."""
+
+    if received_ns is None or received_ns < 0 or received_ns > now_ns:
         return None
-    return max(0, now_ns - then_ns)
+    return now_ns - received_ns
 
 
 def build_observation_health_checkpoint(
@@ -382,22 +399,42 @@ def build_observation_health_checkpoint(
     public_reads: PublicReadMetricsSnapshot,
     metrics: InMemoryMetrics,
     resources: ProcessResourceSnapshot,
+    book_last_valid_receive_monotonic_ns: Mapping[InstrumentId, int],
     emitted_at: UtcTimestamp,
     monotonic_now_ns: int,
 ) -> HealthCheckpoint:
     """Build one immutable checkpoint without performing I/O or blocking owners."""
 
+    if monotonic_now_ns < 0:
+        raise ValueError("health-checkpoint monotonic time cannot be negative")
+
     processor_summary: ProcessorSummary = processor.summary()
-    snapshots = processor.snapshots()
+    all_snapshots = processor.snapshots()
+    required_instrument_ids = (
+        ()
+        if target is None
+        else (
+            InstrumentId.from_native(POLYMARKET_VENUE_ID, target.yes_token_id),
+            InstrumentId.from_native(POLYMARKET_VENUE_ID, target.no_token_id),
+        )
+    )
+    snapshots_by_instrument = {snapshot.instrument_id: snapshot for snapshot in all_snapshots}
+    snapshots = tuple(
+        snapshots_by_instrument[instrument_id]
+        for instrument_id in required_instrument_ids
+        if instrument_id in snapshots_by_instrument
+    )
+    freshness_age_by_instrument = {
+        snapshot.instrument_id: _monotonic_age_nanoseconds(
+            monotonic_now_ns,
+            book_last_valid_receive_monotonic_ns.get(snapshot.instrument_id),
+        )
+        for snapshot in snapshots
+    }
     books: tuple[dict[str, object], ...] = tuple(
         {
             "cost_rule_set_version_id": snapshot.cost_rule_set_version_id.value,
-            "freshness_age_nanoseconds": _age_nanoseconds(
-                emitted_at.nanoseconds_since_epoch,
-                None
-                if snapshot.last_valid_update_time is None
-                else snapshot.last_valid_update_time.nanoseconds_since_epoch,
-            ),
+            "freshness_age_nanoseconds": freshness_age_by_instrument[snapshot.instrument_id],
             "generation": snapshot.generation,
             "health": snapshot.health.value,
             "invalidation_reason": (
@@ -410,12 +447,12 @@ def build_observation_health_checkpoint(
         }
         for snapshot in snapshots
     )
-    last_match_ns = max(
+    last_match_monotonic_ns = max(
         (
-            outcome.response_received_wall_time.nanoseconds_since_epoch
+            outcome.response_received_monotonic_ns
             for outcome in processor_summary.audit_outcomes
             if outcome.outcome is AuditOutcome.MATCH
-            and outcome.response_received_wall_time is not None
+            and outcome.response_received_monotonic_ns is not None
         ),
         default=None,
     )
@@ -428,12 +465,18 @@ def build_observation_health_checkpoint(
         outcome.reason is AuditFailureReason.RACE_RETRY_EXHAUSTED
         for outcome in processor_summary.audit_outcomes
     )
-    required_books = 0 if target is None else 2
+    maximum_book_age_ns = int(config.scanner.maximum_book_age_seconds * 1_000_000_000)
+    audit_ineligible_instruments = set(processor.audit_ineligible_instruments)
+    required_books = len(required_instrument_ids)
     all_required_books_healthy = (
         required_books > 0
         and len(snapshots) == required_books
-        and processor_summary.healthy_books == required_books
-        and processor_summary.audit_ineligible_books == 0
+        and all(snapshot.health is BookHealth.HEALTHY for snapshot in snapshots)
+        and all(
+            age_nanoseconds is not None and age_nanoseconds <= maximum_book_age_ns
+            for age_nanoseconds in freshness_age_by_instrument.values()
+        )
+        and audit_ineligible_instruments.isdisjoint(required_instrument_ids)
     )
     ingress_saturated = (
         runtime.ingress.overflows > 0
@@ -476,11 +519,11 @@ def build_observation_health_checkpoint(
             minimum_free_disk_bytes=config.health.minimum_free_disk_bytes,
         )
     )
-    last_frame_age = _age_nanoseconds(
+    last_frame_age = _monotonic_age_nanoseconds(
         monotonic_now_ns,
         runtime.last_frame_received_monotonic_ns,
     )
-    unavailable_current = _age_nanoseconds(
+    unavailable_current = _monotonic_age_nanoseconds(
         monotonic_now_ns,
         runtime.current_unavailable_started_monotonic_ns,
     )
@@ -578,9 +621,11 @@ def build_observation_health_checkpoint(
         audit={
             "barrier_lag_frames_max": max(barrier_lag_frames, default=None),
             "failed": processor_summary.rest_audit_failed,
-            "last_successful_race_free_integrity_age_nanoseconds": _age_nanoseconds(
-                emitted_at.nanoseconds_since_epoch,
-                last_match_ns,
+            "last_successful_race_free_integrity_age_nanoseconds": (
+                _monotonic_age_nanoseconds(
+                    monotonic_now_ns,
+                    last_match_monotonic_ns,
+                )
             ),
             "match": processor_summary.rest_audit_matches,
             "mismatch": processor_summary.rest_audit_mismatches,

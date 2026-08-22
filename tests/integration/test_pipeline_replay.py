@@ -5,7 +5,7 @@ import hashlib
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
-from types import TracebackType
+from types import SimpleNamespace, TracebackType
 from typing import cast
 
 import pytest
@@ -16,6 +16,7 @@ from multi_market_arbitrage.core.ids import (
     CanonicalEventId,
     CollectorRunId,
     ConnectionId,
+    InstrumentId,
     SubscriptionId,
     WriterId,
 )
@@ -659,11 +660,21 @@ async def test_ingress_overflow_is_journaled_and_forces_rest_resnapshot(
         def on_backpressure(self) -> None:
             raise AssertionError("raw journal did not saturate")
 
+        @staticmethod
+        def audit_book_identity(native_asset_id: str) -> object:
+            return SimpleNamespace(instrument_id=InstrumentId(native_asset_id))
+
     capture = observe_module._RawCaptureBoundary(  # pyright: ignore[reportPrivateUsage]
         collector_run_id=run_id,
         writer=writer,
         processor=cast(CanonicalProcessor, _AcceptingProcessor()),
         metrics=metrics,
+    )
+    capture._book_freshness_ns.update(  # pyright: ignore[reportPrivateUsage]
+        {
+            InstrumentId(asset_id): observe_module.time.monotonic_ns()
+            for asset_id in ("token-yes", "token-no")
+        }
     )
 
     class _OverflowThenBlockingSocket:
@@ -767,7 +778,10 @@ async def test_continuous_audit_fences_response_without_replacing_socket_generat
     config = config.model_copy(
         update={
             "polymarket": config.polymarket.model_copy(
-                update={"snapshot_audit_interval_seconds": 0.05}
+                update={
+                    "snapshot_audit_freshness_guard_seconds": 0.01,
+                    "snapshot_audit_interval_seconds": 0.05,
+                }
             )
         }
     )
@@ -839,6 +853,7 @@ async def test_continuous_audit_fences_response_without_replacing_socket_generat
         def __init__(self) -> None:
             self.frames_admitted_during_requests: list[int] = []
             self.calls = 0
+            self.attempts_by_asset: dict[str, int] = {}
 
         async def fetch_order_book_raw_with_evidence(
             self,
@@ -851,7 +866,9 @@ async def test_continuous_audit_fences_response_without_replacing_socket_generat
             socket = _ContinuousSocket.active
             assert socket is not None
             self.calls += 1
-            if self.calls == 2:
+            asset_attempt = self.attempts_by_asset.get(asset_id, 0) + 1
+            self.attempts_by_asset[asset_id] = asset_attempt
+            if asset_id == "token-yes" and asset_attempt == 1:
                 socket.emit_economic_update = True
             before = socket.admitted
             while socket.admitted < before + 2:
@@ -859,7 +876,7 @@ async def test_continuous_audit_fences_response_without_replacing_socket_generat
                 if socket.admitted < before + 2:
                     await socket.frame_admitted.wait()
             self.frames_admitted_during_requests.append(socket.admitted - before)
-            if self.calls == 1:
+            if asset_id == "token-no" and asset_attempt == 1:
                 raise PolymarketHttpTransportError(
                     endpoint_class=PolymarketEndpointClass.CLOB_BOOK,
                     category=PolymarketHttpFailureCategory.NETWORK,
@@ -869,7 +886,7 @@ async def test_continuous_audit_fences_response_without_replacing_socket_generat
                 )
             if asset_id == "token-yes":
                 payload = _fixture("polymarket_rest_book_yes.json")
-                if self.calls >= 3:
+                if asset_attempt >= 2:
                     payload = payload.replace(
                         b'"price": "0.45", "size": "4"',
                         b'"price": "0.45", "size": "7"',
@@ -1163,6 +1180,14 @@ async def test_successful_state_invalidation_resync_is_not_a_protocol_deviation(
         def __init__(self) -> None:
             now_ns = observe_module.time.monotonic_ns()
             self.book_freshness_receive_ns = (now_ns, now_ns)
+            self.book_freshness_receive_ns_by_instrument = {
+                InstrumentId(asset_id): now_ns for asset_id in ("token-yes", "token-no")
+            }
+            self.processor = self
+
+        @staticmethod
+        def audit_book_identity(native_asset_id: str) -> object:
+            return SimpleNamespace(instrument_id=InstrumentId(native_asset_id))
 
         async def preserve_websocket_batch(
             self,
@@ -1248,18 +1273,19 @@ async def test_observation_duration_uses_monotonic_time_when_wall_clock_steps_ba
             UtcTimestamp(1_000_000_000),
         )
     )
-    monotonic_times = iter(
-        (
-            10_000_000_000,
-            10_250_000_000,
-            10_250_000_000,
-        )
-    )
+    monotonic_times = [10_000_000_000, 10_250_000_000, 10_250_000_000]
 
     class _SteppingWallClock:
         @staticmethod
         def now() -> UtcTimestamp:
             return next(wall_times)
+
+    class _SteadyObserveClock:
+        @staticmethod
+        def monotonic_ns() -> int:
+            if len(monotonic_times) > 1:
+                return monotonic_times.pop(0)
+            return monotonic_times[0]
 
     async def empty_bootstrap(
         service: PolymarketObservationService,
@@ -1274,7 +1300,7 @@ async def test_observation_duration_uses_monotonic_time_when_wall_clock_steps_ba
 
     monkeypatch.setattr(observe_module, "PolymarketPublicClient", _BrokenPublicClient)
     monkeypatch.setattr(observe_module, "UtcTimestamp", _SteppingWallClock)
-    monkeypatch.setattr(observe_module.time, "monotonic_ns", lambda: next(monotonic_times))
+    monkeypatch.setattr(observe_module, "time", _SteadyObserveClock)
     monkeypatch.setattr(PolymarketObservationService, "_bootstrap", empty_bootstrap)
     service = PolymarketObservationService(
         load_phase1_config(Path("config/phase1.toml")),

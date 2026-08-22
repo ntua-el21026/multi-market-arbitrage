@@ -28,11 +28,11 @@ def test_committed_phase1_configuration_loads_strictly() -> None:
     assert config.logging.json_output is True
     assert config.polymarket.maximum_http_response_bytes == 8 * 1024 * 1024
     assert config.polymarket.maximum_websocket_message_bytes == 1024 * 1024
-    assert config.polymarket.snapshot_audit_freshness_guard_seconds == 1.0
+    assert config.polymarket.snapshot_audit_freshness_guard_seconds == 4.0
     assert config.polymarket.snapshot_audit_max_race_retries == 2
     assert config.polymarket.public_reads.maximum_attempts == 3
     assert config.polymarket.public_reads.gamma_markets_requests_per_window == 30
-    assert config.polymarket.public_reads.rate_limit_checked_on.isoformat() == "2026-08-21"
+    assert config.polymarket.public_reads.rate_limit_checked_on.isoformat() == "2026-08-22"
     assert config.scanner.maximum_capacity_evaluations == 4096
     assert config.health.checkpoint_interval_seconds == 10.0
     assert config.storage.journal_segment_max_uncompressed_bytes == 64 * 1024 * 1024

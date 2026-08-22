@@ -83,7 +83,7 @@ The policy provides:
 - rate-limit/throttle metrics;
 - no retry for permanent client/schema/configuration faults.
 
-Current venue rate limits are external reference data, not architectural constants. The implementation re-checks current official Polymarket documentation and records source URL/check time with the tested configuration. On 2026-08-21 the official rate-limit page states that limits are IP-based Cloudflare throttles using sliding windows and lists, among others, Gamma general `4,000 req / 10s`, Gamma `/markets` `300 req / 10s`, CLOB `/book` `1,500 req / 10s`, and CLOB `/books` `500 req / 10s`. Phase 1 currently operates far below those values; the rate-aware layer is a resilience and future-scaling control, not a reason to increase request traffic.
+Current venue rate limits are external reference data, not architectural constants. The implementation re-checks current official Polymarket documentation and records source URL/check time with the tested configuration. On 2026-08-22 the official rate-limit page states that limits are IP-based Cloudflare throttles using sliding windows and lists, among others, general `15,000 req / 10s`, Gamma general `4,000 req / 10s`, Gamma `/markets` `300 req / 10s`, combined Gamma listing `900 req / 10s`, CLOB general `9,000 req / 10s`, CLOB `/book` `1,500 req / 10s`, and CLOB `/books` `500 req / 10s`. Phase 1 currently operates far below those values; the rate-aware layer is a resilience and future-scaling control, not a reason to increase request traffic.
 
 ### 5. Gate-1 requires periodic machine-readable scoped health evidence
 
@@ -154,7 +154,7 @@ Design Freeze v0.1 remains locked. This ADR refines implementation of existing i
 
 ## Official references
 
-- Polymarket Rate Limits, checked 2026-08-21: https://docs.polymarket.com/api-reference/rate-limits
+- Polymarket Rate Limits, checked 2026-08-22: https://docs.polymarket.com/api-reference/rate-limits
 - Polymarket public Market WebSocket: https://docs.polymarket.com/api-reference/wss/market
 - Polymarket REST order book: https://docs.polymarket.com/api-reference/market-data/get-order-book
 - Polymarket batch REST order books: https://docs.polymarket.com/api-reference/market-data/get-order-books-request-body

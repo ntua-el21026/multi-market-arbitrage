@@ -214,7 +214,11 @@ research_eligible
 gate1_eligible_so_far
 ```
 
-Stable reason codes distinguish target, socket/book, ingress, journal,
+`capture_healthy` and `research_eligible` describe the current checkpoint;
+`gate1_eligible_so_far` is sticky for the run. `decisions.reason_codes` is the
+cumulative Gate-1 blocker history through that checkpoint, so a recovered
+current condition does not erase earlier disqualifying evidence. Stable reason
+codes distinguish target, socket/book, ingress, journal,
 analytical, health-evidence, HTTP-integrity, audit, protocol, raw-cap, and disk
 failures. These decisions are scoped: a derived analytical failure can leave
 capture evidence valid while blocking research, and a health-evidence failure
@@ -232,12 +236,31 @@ retained in the final health summary and makes automatic Gate-1 evidence
 ineligible; it must not corrupt canonical state or be relabeled as raw-journal
 failure.
 
+Terminal evidence freezes one paired wall/monotonic capture cutoff before raw,
+analytical, resource, and health owners close. A stream-provided acquisition
+cutoff is reused; otherwise the terminal emitter materializes the pair exactly
+once. The final health checkpoint and `ObservationSummary` both reuse that
+same pair, so delayed durability/sealing cannot extend the reported capture
+duration or re-age socket/book state. If the initial resource attempt is still
+pending, the terminal path may await it only after freezing capture-owned state;
+the eventual resource sample or failure does not move the cutoff. A monotonic
+source timestamp later than the cutoff yields unknown age rather than a
+clamped zero-age value.
+
+The periodic health producer is stopped at the acquisition cutoff, before any
+bounded post-cutoff audit drain. Responses whose exact bodies completed before
+the cutoff may still be durably classified and reflected in the one terminal
+checkpoint, but no periodic checkpoint may acquire a later timestamp and then
+precede the cutoff-stamped terminal record in the evidence stream.
+
 Routine REST integrity auditing must not be represented as a WebSocket
 disconnect. HTTP and WebSocket failures are separate operational dimensions,
 and audit HTTP failure does not create artificial socket downtime or reconnect
-counts. A successfully parsed freshness-expiry invalidation is recorded as a
-resynchronization, not as a venue protocol deviation; malformed or unsupported
-WebSocket protocol input remains a protocol deviation and fails closed.
+counts. A successfully parsed WebSocket L2 freshness-gap invalidation is
+recorded as a resynchronization, not as a venue protocol deviation; malformed
+or unsupported WebSocket protocol input remains a protocol deviation and fails
+closed. This is distinct from a replayable REST-audit eligibility expiry, which
+blocks the affected leg from research without inventing a socket disconnect.
 
 ## 8. Alert routing
 

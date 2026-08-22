@@ -110,10 +110,11 @@ checkpoint cadence is ten seconds. A bounded live calibration rejected the
 initial five-second choice because its conservative six-hour projection
 threatened the 64 MiB health-evidence limit; the ten-second cadence preserves
 incident reconstruction while retaining strict file and count headroom.
-`snapshot_audit_freshness_guard_seconds` is a one-second audit-launch guard,
+`snapshot_audit_freshness_guard_seconds` is a four-second audit-launch guard,
 strictly smaller than the unchanged five-second hard book-age limit. It creates
-time for the bounded public read without adding any acceptance tolerance: an L2
-message beyond the hard age still invalidates and resynchronizes fail closed.
+time for both bounded binary-leg public reads, their independent receive fences,
+and serialized canonical classification without adding any acceptance
+tolerance: an L2 message beyond the hard age still invalidates fail closed.
 
 ## CLI
 
@@ -274,8 +275,9 @@ boundary cannot make a late WebSocket L2 update acceptable.
 
 Routine audit HTTP I/O does not close or cancel a healthy WebSocket generation.
 The dedicated acquisition task continues to receive, timestamp, and admit
-frames while one supervised audit request is in flight and while the canonical
-owner catches up. True WebSocket disconnect, parser/state uncertainty, ingress
+frames while the two bounded first-attempt binary-leg requests are in flight
+and while the canonical owner catches up. True WebSocket disconnect,
+parser/state uncertainty, ingress
 loss, or a proven REST mismatch may still end the generation and require a
 fresh baseline; those are separate recovery cases and metrics.
 
@@ -285,17 +287,54 @@ Each audit is an ordered, replayable protocol:
    record containing request/connection/instrument identity, attempt number,
    request-start monotonic time, the contiguous WebSocket admission and
    processed ordinals at start, and the starting book generation/economic hash.
+   The production form also binds the deferred-classification protocol, the
+   leg's accepted-receive hard expiry, the absolute run deadline, and an
+   effective response deadline exactly equal to the earlier of those two.
+   The processor independently requires that hard expiry to equal its
+   same-epoch last accepted book-receive time plus the configured maximum age;
+   absent freshness, freshness received after the claimed START, or a
+   serialized future extension is malformed evidence.
+   The first audit start locks run-wide `LEGACY` or `DEFERRED_BOUND` mode. In
+   bound mode it also locks the run-deadline monotonic epoch/value pair, which
+   every later start must match.
 2. The HTTP task fetches the exact raw book without entering the canonical
    processor. At the actual response handoff it records wall/monotonic time,
    payload identity, and the current contiguous successful-admission watermark
-   for the same socket generation.
+   for the same socket generation. The response receive time must be strictly
+   before the response deadline bound by the start; equality is late and fails
+   closed. Its monotonic epoch must match the bound START/run epoch.
 3. Acquisition continues. The single canonical owner processes every durable
    WebSocket frame through that response-boundary ordinal; later frames may
    continue entering ingress but are not allowed to cross the classification
    barrier.
-4. The raw REST response and barrier metadata are durably ordered through the
-   same capture boundary. Only then does the canonical owner compare the
-   response with the book identity at the barrier.
+4. The exact bounded REST response bytes and barrier metadata are durably
+   staged through the same capture boundary with classification deferred. The
+   staged response is not yet permitted to mutate audit eligibility or produce
+   `MATCH`, `MISMATCH`, or `RACED`.
+5. Only after the staged response durability barrier does the owner append a
+   separate `mma.control.rest-audit-classify.v1` control referencing the raw
+   response ingest sequence. Its classification time must be strictly before
+   the start-bound hard expiry; equality or a later classification becomes a
+   replayable `FAILED`/`BOOK_FRESHNESS_EXPIRED` result. The canonical processor
+   releases the staged response only on this control and compares it with the
+   book identity at the preserved barrier. The classification control must
+   share the staged response's bound monotonic epoch.
+
+At each cycle the two explicit binary legs are ordered by their independent
+accepted-receive hard expiry and then stable asset order. Both starts are
+staged serially before any HTTP read is launched; eligible first-attempt tasks
+are then created back-to-back and run concurrently. A deadline crossed during
+start durability fails that staged leg without HTTP. Each request retains its
+own start evidence, raw response provenance, and response fence. The canonical owner classifies the
+globally earliest announced fence first and never processes past it. A `RACED`
+retry uses only the slot released by its completed attempt, so it cannot delay
+the other leg's already-launched first attempt. No request or retry starts at or
+after the run deadline or that leg's hard expiry. A missed expiry is a durable,
+replayable per-leg audit-ineligibility decision; it does not reconnect the
+healthy WebSocket. These are independent `GET /book` observations, not a claim
+of batch or cross-leg atomicity. Completed tasks are filtered out before the
+coordinator blocks on its wait set, so reverse completion order cannot turn the
+drain loop into a busy spin.
 
 The typed outcomes are:
 
@@ -322,7 +361,15 @@ Failed/race-exhausted instruments remain audit-ineligible for research until a
 later race-free match establishes integrity. Start, response/failure, boundary,
 barrier, economic identities, attempts, outcome counters, and an audit-outcome
 hash chain are replay evidence, so classification does not depend on replay
-task scheduling.
+task scheduling. Pending deferred responses, including their complete bound
+start state and raw identity, are also terminal-hash inputs. The run-wide audit
+mode and bound run-deadline epoch/value remain terminal-hash inputs even after
+all requests close. Replay consumes the
+durable classification time and never substitutes the current clock or the
+wall-clock schedule. Historical all-inline runs remain supported for old
+datasets, but a run cannot upgrade or downgrade between inline and bound
+deferred modes. A bound start cannot be completed by an inline response or
+expiry record; mixed, mismatched, and malformed controls fail closed.
 
 Reference refresh requests are accepted only for the selected market's Gamma
 market/event and condition/assets. Requests are coalesced to one selected-market
@@ -467,9 +514,15 @@ economic state.
 ## Supervised Gate-1 health evidence
 
 The observer emits versioned `gate1-health-checkpoint-v1` JSONL evidence at the
-configured ten-second cadence and once at finalization. The producer creates
-an immutable point-in-time snapshot and performs one `put_nowait`; a dedicated
-single-owner task performs canonical serialization, append, and file `fsync`.
+configured ten-second cadence and once for the terminal capture boundary. At
+the exact acquisition cutoff it synchronously cancels periodic production
+before draining already accepted audit work; after that drain it emits one
+checkpoint timestamped with the frozen cutoff. This prevents a later periodic
+record from preceding a backdated terminal record while still including
+classifications for exact response bodies completed before the cutoff. The
+producer creates an immutable point-in-time snapshot and performs one
+`put_nowait`; a dedicated single-owner task performs canonical serialization,
+append, and file `fsync`.
 The queue, checkpoint count, and file bytes are bounded. Output starts as a
 run-scoped `.jsonl.partial` and is atomically renamed to `.jsonl` with a
 directory sync only after clean completion; the summary records counts,
@@ -478,16 +531,18 @@ high-water, bytes, SHA-256, completion/evidence eligibility, and failure type.
 Checkpoint groups are `target`, `capture`, per-book `books`, `ingress`,
 `journal`, `analytical`, `http`, `audit`, `scanner`, `recovery`, and
 `resources`, plus run/code/config identity. Decisions are deliberately scoped:
-`capture_healthy`, `research_eligible`, and `gate1_eligible_so_far` carry stable
-typed reason codes. For example, an analytical or audit-integrity failure can
-block research without falsifying raw-journal durability, while a health-writer
-failure leaves authoritative capture independent but blocks automatic Gate-1
-evidence eligibility. A public-HTTP final failure or exhausted retry budget
-likewise blocks research and Gate-1 integrity evidence without being relabeled
-as raw-capture or WebSocket failure. Queue saturation, count/file exhaustion,
-storage failure, missing explicit target, book/integrity problems, ingress
-loss, persistence faults, protocol deviations, raw-cap pressure, and
-insufficient disk are never silently treated as healthy.
+`capture_healthy` and `research_eligible` are checkpoint-current, while
+`gate1_eligible_so_far` is run-sticky. `decisions.reason_codes` is the cumulative
+history of typed Gate-1 blockers observed so far, even when a checkpoint-current
+condition later recovers. For example, an analytical or audit-integrity failure
+can block research without falsifying raw-journal durability, while a
+health-writer failure leaves authoritative capture independent but blocks
+automatic Gate-1 evidence eligibility. A public-HTTP final failure or exhausted
+retry budget likewise blocks research and Gate-1 integrity evidence without
+being relabeled as raw-capture or WebSocket failure. Queue saturation,
+count/file exhaustion, storage failure, missing explicit target, book/integrity
+problems, ingress loss, persistence faults, protocol deviations, raw-cap
+pressure, and insufficient disk are never silently treated as healthy.
 
 The health path is derived diagnostic evidence. It never mutates canonical
 state and is not permitted to block socket acquisition or raw durability.
@@ -528,7 +583,7 @@ extra, symlinked, or inconsistent artifacts.
 ## Current official Polymarket evidence
 
 The public-adapter source set below was checked on 2026-08-20. The rate-limit
-and batch-book pages were rechecked on 2026-08-21 for the pre-soak public-read
+and batch-book pages were rechecked on 2026-08-22 for the pre-soak public-read
 controller:
 
 - [Discover Markets](https://docs.polymarket.com/market-data/discover-markets)
@@ -553,7 +608,7 @@ controller:
 Current protocol conclusions:
 
 - The official rate-limit page describes Cloudflare/IP-based sliding windows
-  that throttle by delaying or queueing over-limit traffic. On the check date
+  that throttle by delaying or queueing over-limit traffic. On 2026-08-22
   it listed general traffic at 15,000 requests/10 s; Gamma general at
   4,000/10 s, `/events` at 500/10 s, `/markets` at 300/10 s, and combined
   `/markets` + `/events` listing at 900/10 s; and CLOB general at 9,000/10 s,

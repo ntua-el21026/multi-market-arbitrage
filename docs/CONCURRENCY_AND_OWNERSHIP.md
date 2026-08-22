@@ -53,12 +53,54 @@ unauthenticated read methods. The controller does not own WebSocket recovery
 and exposes no future mutation retry surface.
 
 ### REST audit coordinator
-Stages one immutable durable start command, launches at most one supervised
-HTTP request for the active audit, and receives one immutable response/failure
-handoff through a one-slot queue. It captures the response-boundary admission
-watermark without pausing acquisition. The canonical owner drains every
-pre-boundary frame and performs the only classification; post-boundary frames
-may continue to enter ingress meanwhile.
+Stages at most two immutable durable start commands for the explicit binary
+legs and launches their first-attempt `GET /book` requests concurrently through
+the existing public-read controller. Each request owns an independent response
+fence, immutable response/failure handoff, and durable start identity; the
+shared handoff queue is bounded to two. A production start binds the deferred
+classification protocol, the leg's accepted-receive hard expiry, the absolute
+run deadline, and the effective response deadline (the earlier of the two).
+The canonical owner accepts that bound form only when the hard expiry equals
+its same-epoch last accepted book-receive timestamp plus the configured maximum
+book age; serialized metadata cannot extend the freshness horizon. The first
+audit start locks the processor to either historical `LEGACY` or production
+`DEFERRED_BOUND` mode for the whole run. Deferred starts also bind one
+processor-wide `(monotonic epoch, run deadline)` pair, and later starts must
+match it. Protocol mode and the paired cutoff remain terminal-hash state after
+requests complete. Accepted book freshness may not occur after the START it
+supports, and deferred response and classification controls must remain in the
+same bound monotonic epoch.
+
+For a two-leg cycle the owner durably stages both starts serially before
+launching either HTTP request, then creates both eligible first-attempt tasks
+back-to-back without an intervening await. This keeps sequence assignment and
+canonical processing single-owned while ensuring a fast response can never be
+trapped behind durability of the other leg's start. Every staged leg is
+rechecked against its bound deadlines before launch and is failed closed
+without HTTP if staging consumed its remaining window.
+The coordinator orders starts by hard expiry and stable asset order, while the
+canonical owner drains the globally earliest announced response fence first.
+A raced retry can consume only the slot released by its completed request, so
+it cannot starve the other leg's first attempt. Completed audit tasks are
+removed from the wait set before blocking, preventing a completed task from
+creating a scheduler spin.
+
+The response owner first stages the exact bounded raw response and its receive
+watermark durably; the response receive timestamp must be strictly before the
+bound response deadline. Only after that durability barrier may the canonical
+owner create a separate durable classification control that references the
+staged response ingest sequence. Its classification timestamp must be strictly
+before the start-bound hard expiry. Deadline equality fails closed. The
+canonical processor alone releases staged response state on that control, and
+pending staged state is part of the terminal deterministic hash.
+
+Post-boundary frames may continue to enter ingress, but no request, retry, or
+terminal exhaustion start is created after its leg expiry or the run deadline.
+Expiry is a replayable per-leg audit-ineligibility transition, not a reason to
+reconnect a healthy socket. Historical all-inline runs remain replayable, but
+production uses bound deferred classification and rejects mode upgrades,
+downgrades, or malformed protocol records. The two independent responses make
+no cross-leg atomicity claim.
 
 ### Health-checkpoint writer
 Owns its run-scoped JSONL file, serialization, append, `fsync`, publication,
@@ -97,7 +139,7 @@ its monotonically increasing per-connection admission ordinal describes the
 exact contiguous successfully admitted prefix. Overflow makes the watermark
 ambiguous, journals `BACKPRESSURE_DATA_LOSS`, invalidates affected state, and
 requires a new REST baseline/socket generation. The journal and analytical
-queues are separately bounded. The one-slot audit handoff cannot accumulate
+queues are separately bounded. The two-slot binary-leg audit handoff cannot accumulate
 responses, and the health queue degrades health evidence instead of applying
 backpressure to acquisition.
 
@@ -164,13 +206,19 @@ Locks are allowed when a simpler transactional boundary genuinely requires them,
 
 Shutdown is structured:
 1. stop new subscriptions/work creation;
-2. drain/close producers;
-3. flush writers;
-4. finalize manifests;
-5. emit a final health checkpoint and close/publish or retain explicit partial
-   health evidence;
-6. stop consumers;
-7. emit health/shutdown result.
+2. freeze the exact acquisition cutoff and stop periodic health emission;
+3. drain bounded work that was accepted before that cutoff;
+4. build and enqueue the terminal health checkpoint paired to the frozen
+   cutoff, after the accepted audit classifications are reflected;
+5. drain/close producers and consumers, flush writers, and finalize manifests;
+6. close the health owner, then publish the complete health evidence or retain
+   an explicit partial-health artifact;
+7. emit the health/shutdown result.
+
+The terminal checkpoint is a capture-boundary record, not a post-finalization
+record. Its timestamp is the frozen acquisition cutoff. No periodic checkpoint
+may be emitted after that cutoff, even while already accepted audit work is
+draining, and publication occurs only after all relevant owners are closed.
 
 Future live shutdown follows the stricter operations runbook.
 

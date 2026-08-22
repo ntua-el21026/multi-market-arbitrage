@@ -105,6 +105,18 @@ watermarks, raw response identity, barrier book identity, typed outcome, and
 audit outcome hash chain are included in replay comparisons. Tests require the
 same `MATCH`/`MISMATCH`/`RACED`/`FAILED` classification and terminal hash
 without repeating the HTTP request or depending on current scheduler timing.
+The matrix also covers pending deferred raw responses and their complete bound
+start state in the terminal hash, then proves that only the durable
+classification control releases them. Historical inline records replay in
+their all-legacy mode, while legacy-to-bound and bound-to-legacy run changes,
+mismatched ingest-sequence, repeated-classification, and malformed bound-control
+records fail closed. The terminal hash binds the locked mode and the bound
+run-deadline monotonic epoch/value after requests complete.
+Adversarial starts include no accepted freshness and a forged future hard
+expiry followed by classification after the true freshness boundary; neither
+may produce an audit outcome or refresh eligibility. A START earlier than its
+claimed accepted freshness and same-connection response/classification records
+from another monotonic epoch are likewise rejected before any `MATCH`.
 
 ## 9. Fault injection
 
@@ -123,7 +135,20 @@ durability, canonical processing, and audit HTTP handoff. It covers an economic
 update processed before response, still queued at response, post-response
 updates, last-trade-only changes, multiple updates around the boundary, large
 backlog, ambiguous watermark, socket close during audit, bounded race retry,
-race-budget exhaustion, and persistent HTTP failure. A pre-response economic
+race-budget exhaustion, and persistent HTTP failure. Slow journal durability is
+forced across the bound hard expiry: a timely raw response whose classification
+is equal to or later than expiry must deterministically become
+`BOOK_FRESHNESS_EXPIRED`. Tests separately place response receipt immediately
+before and at/after the recorded socket-generation end. Reverse leg-completion
+order and an already-completed task in the wait set prove that the coordinator
+does not spin and that a raced retry cannot starve the other leg's first
+attempt. Both START/fence-order permutations terminate the socket after one
+exact body is coordinator-owned and the globally earlier body is waiting on
+cancelable connection cleanup; the tests require both raw bodies and hashes,
+two classifications, no synthetic failure, and replay equality. A gated second
+START proves neither HTTP read begins before both starts are durable and that
+the two eligible first attempts then coexist in flight; another case crosses a
+staged leg's deadline and proves no late HTTP launch. A pre-response economic
 update must never yield a false `MATCH`, and routine audit must not cancel or
 replace a healthy socket generation.
 
@@ -132,9 +157,12 @@ delta-seconds and HTTP-date `Retry-After`, over-policy `Retry-After`, permanent
 `4xx`, malformed framing/schema, deadline and retry exhaustion, WebSocket
 close/protocol errors, and isolation of HTTP failures from WebSocket
 disconnect/reconnect/invalidation metrics. Health faults cover periodic output,
-the final terminal-disconnect record, queue saturation, count/file/storage
-failure, non-blocking raw-capture independence, and fail-closed Gate-1 reason
-codes. Calibration tests cover
+the final terminal-disconnect record, paired acquisition-cutoff wall/monotonic
+timestamps despite delayed queue drain, immediate cutoff-time cancellation of
+periodic emission with nondecreasing evidence timestamps, missing or failed
+initial resource sampling, queue saturation, count/file/storage failure,
+non-blocking raw-capture independence, and fail-closed Gate-1 reason codes.
+Calibration tests cover
 under/over raw cap, insufficient disk, path/queue threat, health failure,
 fresh-directory/symlink protection, and deterministic report/binding identity.
 

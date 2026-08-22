@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -25,6 +26,7 @@ from multi_market_arbitrage.venues.polymarket import (
     PolymarketWebSocketProtocolError,
     PolymarketWebSocketTransportError,
     PublicReadPolicy,
+    PublicReadResult,
 )
 
 
@@ -346,17 +348,19 @@ class _BodyCompleteCleanupStream(httpx.AsyncByteStream):
         *,
         cleanup_started: asyncio.Event | None = None,
         release_cleanup: asyncio.Event | None = None,
-        cleanup_error: httpx.NetworkError | None = None,
+        cleanup_error: Exception | None = None,
     ) -> None:
         self._payload = payload
         self._cleanup_started = cleanup_started
         self._release_cleanup = release_cleanup
         self._cleanup_error = cleanup_error
+        self.cleanup_calls = 0
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         yield self._payload
 
     async def aclose(self) -> None:
+        self.cleanup_calls += 1
         if self._cleanup_started is not None:
             self._cleanup_started.set()
         if self._release_cleanup is not None:
@@ -366,7 +370,7 @@ class _BodyCompleteCleanupStream(httpx.AsyncByteStream):
 
 
 @pytest.mark.asyncio
-async def test_failed_cleanup_abandons_provisional_boundary_before_typed_retry() -> None:
+async def test_failed_cleanup_cannot_revoke_completed_body_or_boundary() -> None:
     calls = 0
     boundary_events: list[tuple[str, int]] = []
 
@@ -378,7 +382,7 @@ async def test_failed_cleanup_abandons_provisional_boundary_before_typed_retry()
             200,
             stream=_BodyCompleteCleanupStream(
                 b"first" if calls == 1 else b"second",
-                cleanup_error=cleanup_error if calls == 1 else None,
+                cleanup_error=cleanup_error,
             ),
             request=request,
         )
@@ -405,19 +409,81 @@ async def test_failed_cleanup_abandons_provisional_boundary_before_typed_retry()
         )
         snapshot = _endpoint_snapshot(client, PolymarketEndpointClass.CLOB_BOOK)
 
-    assert result.payload_bytes == b"second"
-    assert calls == 2
-    assert [event for event, _timestamp in boundary_events] == [
-        "announce",
-        "abandon",
-        "announce",
-    ]
+    assert result.payload_bytes == b"first"
+    assert calls == 1
+    assert [event for event, _timestamp in boundary_events] == ["announce"]
     assert result.evidence.response_received_monotonic_ns == boundary_events[-1][1]
-    assert snapshot.retries == 1
+    assert snapshot.retries == 0
+    assert snapshot.final_failures == 0
 
 
 @pytest.mark.asyncio
-async def test_cancellation_during_response_cleanup_abandons_provisional_boundary() -> None:
+@pytest.mark.parametrize(
+    "cleanup_error",
+    [
+        pytest.param(ValueError("unexpected fixture cleanup failure"), id="unexpected"),
+        pytest.param(
+            PolymarketHttpProtocolError(
+                endpoint_class=PolymarketEndpointClass.CLOB_BOOK,
+                category=PolymarketHttpFailureCategory.RESPONSE_PROTOCOL,
+                retryable=False,
+                attempt=1,
+                status_code=200,
+                detail="fixture cleanup protocol failure",
+            ),
+            id="domain-protocol",
+        ),
+        pytest.param(
+            PolymarketHttpStatusError(
+                endpoint_class=PolymarketEndpointClass.CLOB_BOOK,
+                category=PolymarketHttpFailureCategory.HTTP_STATUS,
+                retryable=True,
+                attempt=1,
+                status_code=503,
+                detail="fixture cleanup status failure",
+            ),
+            id="domain-status",
+        ),
+    ],
+)
+async def test_post_commit_cleanup_exception_cannot_leave_a_false_boundary(
+    cleanup_error: Exception,
+) -> None:
+    boundary_events: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=_BodyCompleteCleanupStream(
+                b"complete-body",
+                cleanup_error=cleanup_error,
+            ),
+            request=request,
+        )
+
+    def announce(_wall_time: object, _monotonic_ns: int):
+        boundary_events.append("announce")
+
+        def abandon() -> None:
+            boundary_events.append("abandon")
+
+        return abandon
+
+    async with PolymarketPublicClient(transport=httpx.MockTransport(handler)) as client:
+        result = await client.fetch_order_book_raw_with_evidence(
+            "token",
+            on_response_body_complete=announce,
+        )
+        snapshot = _endpoint_snapshot(client, PolymarketEndpointClass.CLOB_BOOK)
+
+    assert result.payload_bytes == b"complete-body"
+    assert boundary_events == ["announce"]
+    assert snapshot.first_attempt_successes == 1
+    assert snapshot.final_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_cleanup_cancellation_preserves_completed_body_and_boundary() -> None:
     cleanup_started = asyncio.Event()
     release_cleanup = asyncio.Event()
     boundary_abandoned = asyncio.Event()
@@ -446,10 +512,203 @@ async def test_cancellation_during_response_cleanup_abandons_provisional_boundar
         await cleanup_started.wait()
         assert not boundary_abandoned.is_set()
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        result = await task
 
-    assert boundary_abandoned.is_set()
+    assert result.payload_bytes == b"complete-body"
+    assert not boundary_abandoned.is_set()
+
+
+@pytest.mark.asyncio
+async def test_deadline_during_cleanup_preserves_predeadline_body_and_success_metrics() -> None:
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    boundary_abandoned = asyncio.Event()
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            stream=_BodyCompleteCleanupStream(
+                b"complete-before-deadline",
+                cleanup_started=cleanup_started,
+                release_cleanup=release_cleanup,
+            ),
+            request=request,
+        )
+
+    def announce(_wall_time: object, _monotonic_ns: int):
+        return boundary_abandoned.set
+
+    async with PolymarketPublicClient(
+        transport=httpx.MockTransport(handler),
+        public_read_policy=_policy(),
+    ) as client:
+        deadline = asyncio.get_running_loop().time() + 0.01
+        result = await client.fetch_order_book_raw_with_evidence(
+            "token",
+            deadline=deadline,
+            on_response_body_complete=announce,
+        )
+        snapshot = _endpoint_snapshot(client, PolymarketEndpointClass.CLOB_BOOK)
+
+    assert cleanup_started.is_set()
+    assert result.payload_bytes == b"complete-before-deadline"
+    assert calls == 1
+    assert not boundary_abandoned.is_set()
+    assert snapshot.attempts == 1
+    assert snapshot.retries == 0
+    assert snapshot.timeouts == 0
+    assert snapshot.final_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_late_body_boundary_fails_deadline_even_when_event_loop_timer_is_delayed() -> None:
+    boundary_events: list[str] = []
+
+    class _BlockingBodyStream(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            time.sleep(0.03)  # noqa: ASYNC251 - intentionally delays the loop's timer
+            yield b"late-body"
+
+        async def aclose(self) -> None:
+            return None
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=_BlockingBodyStream(), request=request)
+
+    def announce(_wall_time: object, _monotonic_ns: int):
+        boundary_events.append("announce")
+
+        def abandon() -> None:
+            boundary_events.append("abandon")
+
+        return abandon
+
+    async with PolymarketPublicClient(transport=httpx.MockTransport(handler)) as client:
+        deadline = asyncio.get_running_loop().time() + 0.005
+        with pytest.raises(PolymarketHttpTransportError) as caught:
+            await client.fetch_order_book_raw_with_evidence(
+                "token",
+                deadline=deadline,
+                on_response_body_complete=announce,
+            )
+        snapshot = _endpoint_snapshot(client, PolymarketEndpointClass.CLOB_BOOK)
+
+    assert caught.value.category is PolymarketHttpFailureCategory.DEADLINE_EXCEEDED
+    assert caught.value.status_code == 200
+    assert caught.value.attempt_count == 1
+    assert snapshot.attempts == 1
+    assert snapshot.first_attempt_successes == 0
+    assert dict(snapshot.status_classes)["2xx"] == 1
+    assert snapshot.timeouts == 1
+    assert snapshot.final_failures == 1
+    assert boundary_events == ["announce", "abandon"]
+
+
+@pytest.mark.asyncio
+async def test_completed_body_cleanup_supervision_is_bounded_by_public_concurrency() -> None:
+    release_cleanup = asyncio.Event()
+    streams = (
+        _BodyCompleteCleanupStream(b"first", release_cleanup=release_cleanup),
+        _BodyCompleteCleanupStream(b"second", release_cleanup=release_cleanup),
+    )
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        stream = streams[calls]
+        calls += 1
+        return httpx.Response(200, stream=stream, request=request)
+
+    async with PolymarketPublicClient(
+        transport=httpx.MockTransport(handler),
+        public_read_policy=_policy(maximum_concurrency=1),
+    ) as client:
+        results: list[PublicReadResult] = []
+        for token in ("first", "second"):
+            deadline = asyncio.get_running_loop().time() + 0.01
+            results.append(
+                await client.fetch_order_book_raw_with_evidence(token, deadline=deadline)
+            )
+
+        # The first interrupted response owns the only best-effort cleanup slot;
+        # the second body still succeeds without spawning another detached task.
+        assert streams[0].cleanup_calls == 2
+        assert streams[1].cleanup_calls == 1
+
+    assert [result.payload_bytes for result in results] == [b"first", b"second"]
+    assert calls == 2
+
+
+class _BlockingCloseTransport(httpx.AsyncBaseTransport):
+    def __init__(self) -> None:
+        self.close_started = asyncio.Event()
+        self.release_close = asyncio.Event()
+        self.close_calls = 0
+        self.close_completed = False
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"ok", request=request)
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        self.close_started.set()
+        await self.release_close.wait()
+        self.close_completed = True
+
+
+@pytest.mark.asyncio
+async def test_cancelled_and_concurrent_close_callers_share_one_close_owner() -> None:
+    transport = _BlockingCloseTransport()
+    client = PolymarketPublicClient(transport=transport)
+
+    first = asyncio.create_task(client.aclose())
+    await transport.close_started.wait()
+    second = asyncio.create_task(client.aclose())
+    await asyncio.sleep(0)
+    assert not second.done()
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert transport.close_calls == 1
+    assert not transport.close_completed
+    assert not second.done()
+
+    transport.release_close.set()
+    await second
+    await client.aclose()
+    assert transport.close_calls == 1
+    assert transport.close_completed
+
+
+@pytest.mark.asyncio
+async def test_completed_read_cannot_spawn_cleanup_after_client_close() -> None:
+    cleanup_started = asyncio.Event()
+    never_release_cleanup = asyncio.Event()
+    stream = _BodyCompleteCleanupStream(
+        b"complete-body",
+        cleanup_started=cleanup_started,
+        release_cleanup=never_release_cleanup,
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=stream, request=request)
+
+    client = PolymarketPublicClient(transport=httpx.MockTransport(handler))
+    read_task = asyncio.create_task(client.fetch_order_book_raw_with_evidence("token"))
+    await cleanup_started.wait()
+    await client.aclose()
+
+    read_task.cancel()
+    result = await read_task
+    await asyncio.sleep(0)
+
+    assert result.payload_bytes == b"complete-body"
+    assert stream.cleanup_calls == 1
+    assert not client._response_cleanup_tasks  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio

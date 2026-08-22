@@ -2,6 +2,8 @@
 
 from .audit import (
     AuditBookIdentity,
+    AuditClassificationCommand,
+    AuditExpiryCommand,
     AuditFailureCommand,
     AuditFailureReason,
     AuditHttpFailureHandoff,
@@ -15,6 +17,8 @@ from .audit import (
 from .channels import (
     CLOB_MARKET_PREFIX,
     CONTROL_BOOK_INVALIDATION,
+    CONTROL_REST_AUDIT_CLASSIFY,
+    CONTROL_REST_AUDIT_EXPIRED,
     CONTROL_REST_AUDIT_FAILED,
     CONTROL_REST_AUDIT_START,
     GAMMA_EVENT_PREFIX,
@@ -46,6 +50,8 @@ from .targeting import (
 __all__ = [
     "CLOB_MARKET_PREFIX",
     "CONTROL_BOOK_INVALIDATION",
+    "CONTROL_REST_AUDIT_CLASSIFY",
+    "CONTROL_REST_AUDIT_EXPIRED",
     "CONTROL_REST_AUDIT_FAILED",
     "CONTROL_REST_AUDIT_START",
     "GAMMA_EVENT_PREFIX",
@@ -57,6 +63,8 @@ __all__ = [
     "WS_MARKET",
     "AnalyticalOutputSink",
     "AuditBookIdentity",
+    "AuditClassificationCommand",
+    "AuditExpiryCommand",
     "AuditFailureCommand",
     "AuditFailureReason",
     "AuditHttpFailureHandoff",
