@@ -2864,6 +2864,162 @@ async def test_done_acquisition_does_not_spin_while_post_fence_item_waits_for_ha
 
 
 @pytest.mark.asyncio
+async def test_idle_books_launch_guarded_audit_before_future_periodic_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An overdue freshness deadline must not chase a newer monotonic sample."""
+
+    config = load_phase1_config(Path("config/phase1.toml"))
+    config = config.model_copy(
+        update={
+            "polymarket": config.polymarket.model_copy(
+                update={
+                    "snapshot_audit_interval_seconds": 30.0,
+                    "snapshot_audit_freshness_guard_seconds": 0.3,
+                }
+            ),
+            "scanner": config.scanner.model_copy(
+                update={
+                    "maximum_book_age_seconds": 0.4,
+                    "maximum_interleg_skew_seconds": 0.1,
+                }
+            ),
+        }
+    )
+    run_id = CollectorRunId("audit-idle-guarded-freshness-deadline")
+    writer = RawJournalWriter(
+        JournalWriterConfig(
+            root=tmp_path / "raw",
+            collector_run_id=run_id,
+            venue_id=POLYMARKET_VENUE_ID,
+            stream="polymarket-public",
+            writer_id=WriterId("writer-audit-idle-guarded-freshness-deadline"),
+            writer_software_version="test",
+            git_commit="fixture",
+        )
+    )
+    processor = CanonicalProcessor(config)
+    metrics = InMemoryMetrics()
+    capture = observe_module._RawCaptureBoundary(  # pyright: ignore[reportPrivateUsage]
+        collector_run_id=run_id,
+        writer=writer,
+        processor=processor,
+        metrics=metrics,
+    )
+    service = PolymarketObservationService(
+        config,
+        workspace_root=tmp_path,
+        code_commit="fixture",
+        metrics=metrics,
+    )
+    selected = parse_gamma_markets(_fixture("polymarket_gamma_market_keyset.json")).markets[0]
+
+    class _IdleSocket:
+        def __init__(self, asset_ids: tuple[str, ...], **kwargs: object) -> None:
+            assert asset_ids == selected.clob_token_ids
+            del kwargs
+            self.subscription_semantics_sha256 = hashlib.sha256(
+                b"audit-idle-guarded-freshness-deadline"
+            ).hexdigest()
+
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            del admit
+            ready.set()
+            await asyncio.Event().wait()
+
+    class _AuditClient:
+        def __init__(self) -> None:
+            self.call_ns_by_asset: dict[str, int] = {}
+
+        async def fetch_order_book_raw_with_evidence(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+            on_response_body_complete: Callable[[UtcTimestamp, int], None] | None = None,
+        ) -> PublicReadResult:
+            del deadline
+            self.call_ns_by_asset[asset_id] = time.monotonic_ns()
+            payload = (
+                _fixture("polymarket_rest_book_yes.json") if asset_id == "token-yes" else _no_book()
+            )
+            return _public_read(payload, on_response_body_complete)
+
+    class _StrictlyIncreasingClock:
+        """Expose the stale-sample bug even on a coarse monotonic clock."""
+
+        offset_ns = 0
+
+        @classmethod
+        def monotonic_ns(cls) -> int:
+            cls.offset_ns += 1
+            return time.monotonic_ns() + cls.offset_ns
+
+    monkeypatch.setattr(observe_module, "PolymarketMarketWebSocket", _IdleSocket)
+    await writer.start()
+    await _initialize_books(capture)
+    maximum_book_age_ns = int(config.scanner.maximum_book_age_seconds * 1_000_000_000)
+    hard_expiry_ns_by_asset = {
+        asset_id: capture.book_freshness_receive_ns_by_instrument[
+            processor.audit_book_identity(asset_id).instrument_id
+        ]
+        + maximum_book_age_ns
+        for asset_id in selected.clob_token_ids
+    }
+    baseline_ns = time.monotonic_ns()
+    duration_seconds = 0.45
+    client = _AuditClient()
+    monkeypatch.setattr(observe_module, "time", _StrictlyIncreasingClock)
+    try:
+        async with asyncio.timeout(2.0):
+            generation = await service._run_generation(  # pyright: ignore[reportPrivateUsage]
+                client=cast(PolymarketPublicClient, client),
+                capture=capture,
+                selected=(selected,),
+                asset_ids=selected.clob_token_ids,
+                deadline=asyncio.get_running_loop().time() + duration_seconds,
+                deadline_ns=baseline_ns + int(duration_seconds * 1_000_000_000),
+                periodic_audit_due_ns=baseline_ns + 30_000_000_000,
+                connection_id=ConnectionId("audit-idle-guarded-freshness-deadline"),
+                subscription_id=SubscriptionId(
+                    "audit-idle-guarded-freshness-deadline-subscription"
+                ),
+                unavailable_started_ns=None,
+                runtime_health=ObservationRuntimeHealth(),
+            )
+    except BaseException:
+        with suppress(Exception):
+            await writer.close(completed=False)
+        raise
+    else:
+        await writer.close()
+
+    assert generation.reason.value == "DEADLINE"
+    assert set(client.call_ns_by_asset) == set(selected.clob_token_ids)
+    assert all(
+        client.call_ns_by_asset[asset_id] < hard_expiry_ns_by_asset[asset_id]
+        for asset_id in selected.clob_token_ids
+    )
+    live = processor.summary()
+    assert len(live.audit_outcomes) == 2
+    assert all(outcome.outcome is AuditOutcome.MATCH for outcome in live.audit_outcomes)
+    assert live.pending_rest_audits == 0
+    records = JournalReader(tmp_path / "raw", run_id).read_all()
+    assert sum(record.channel == CONTROL_REST_AUDIT_START for record in records) == 2
+    assert sum(record.channel == REST_BOOK_AUDIT for record in records) == 2
+    assert sum(record.channel == CONTROL_REST_AUDIT_EXPIRED for record in records) == 0
+    replayed = replay_journal(tmp_path / "raw", run_id, config).processor
+    assert replayed.audit_outcomes == live.audit_outcomes
+    assert replayed.terminal_hash == live.terminal_hash
+
+
+@pytest.mark.asyncio
 async def test_planned_cutoff_suppresses_unneeded_near_deadline_cycle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

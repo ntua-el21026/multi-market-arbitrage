@@ -2165,13 +2165,12 @@ class PolymarketObservationService:
                 )
             )
 
-        def current_deadline() -> IntegrityDeadline:
+        def current_deadline(*, now_ns: int) -> IntegrityDeadline:
             if audit_cycle_active:
                 return IntegrityDeadline(
                     deadline_ns=deadline_ns,
                     reason=IntegrityDeadlineReason.RUN_DEADLINE,
                 )
-            now_ns = time.monotonic_ns()
             freshness_deadlines: list[int] = []
             hard_expiries: list[int] = []
             for asset_id in asset_ids:
@@ -2943,7 +2942,7 @@ class PolymarketObservationService:
                                 break
 
                 now_ns = time.monotonic_ns()
-                due = current_deadline()
+                due = current_deadline(now_ns=now_ns)
                 due_ns = due.deadline_ns
                 if (
                     pending_exit is None
