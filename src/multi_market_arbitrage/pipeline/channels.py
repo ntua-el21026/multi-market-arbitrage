@@ -15,6 +15,7 @@ CONTROL_REST_AUDIT_START = "mma.control.rest-audit-start.v1"
 CONTROL_REST_AUDIT_FAILED = "mma.control.rest-audit-failed.v1"
 CONTROL_REST_AUDIT_EXPIRED = "mma.control.rest-audit-expired.v1"
 CONTROL_REST_AUDIT_CLASSIFY = "mma.control.rest-audit-classify.v1"
+CONTROL_REPORTED_TOP_TRANSITION_EXPIRED = "mma.control.reported-top-transition-expired.v1"
 
 
 def channel_native_id(channel: str, prefix: str) -> str:
@@ -29,6 +30,7 @@ def channel_native_id(channel: str, prefix: str) -> str:
 __all__ = [
     "CLOB_MARKET_PREFIX",
     "CONTROL_BOOK_INVALIDATION",
+    "CONTROL_REPORTED_TOP_TRANSITION_EXPIRED",
     "CONTROL_REST_AUDIT_CLASSIFY",
     "CONTROL_REST_AUDIT_EXPIRED",
     "CONTROL_REST_AUDIT_FAILED",

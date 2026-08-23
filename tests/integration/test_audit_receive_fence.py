@@ -25,10 +25,15 @@ from multi_market_arbitrage.journal import (
     JournalWriterConfig,
     RawJournalWriter,
 )
-from multi_market_arbitrage.observability import InMemoryMetrics
+from multi_market_arbitrage.observability import (
+    AvailabilityCause,
+    AvailabilityScope,
+    InMemoryMetrics,
+)
 from multi_market_arbitrage.pipeline import (
     CLOB_MARKET_PREFIX,
     CONTROL_BOOK_INVALIDATION,
+    CONTROL_REPORTED_TOP_TRANSITION_EXPIRED,
     CONTROL_REST_AUDIT_CLASSIFY,
     CONTROL_REST_AUDIT_EXPIRED,
     CONTROL_REST_AUDIT_FAILED,
@@ -45,6 +50,8 @@ from multi_market_arbitrage.pipeline import (
     AuditStartEvidence,
     CanonicalProcessor,
     ProcessedEnvelope,
+    ReportedTopTransitionReason,
+    ReportedTopTransitionStatus,
     WebSocketAdmissionWatermark,
 )
 from multi_market_arbitrage.pipeline import observe as observe_module
@@ -142,6 +149,25 @@ def _protocol_invalid_yes_price_change() -> bytes:
                     "best_ask": "0.60",
                 }
             ],
+            "timestamp": "1787198402000",
+        },
+        separators=(",", ":"),
+    ).encode()
+
+
+def _yes_reported_top_transition(
+    *,
+    best_ask: str = "0.56",
+    spread: str = "0.11",
+) -> bytes:
+    return json.dumps(
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "token-yes",
+            "market": "0xcondition",
+            "best_bid": "0.45",
+            "best_ask": best_ask,
+            "spread": spread,
             "timestamp": "1787198402000",
         },
         separators=(",", ":"),
@@ -917,6 +943,19 @@ async def test_pre_response_update_cannot_false_match_across_receive_fence(
     assert second.response_boundary_ordinal == BACKLOG_MESSAGES
     assert second.barrier_processed_ordinal == BACKLOG_MESSAGES
     assert second.requires_resync
+    assert second.response_received_wall_time is not None
+    assert second.response_received_monotonic_ns is not None
+    assert second.response_ingest_id is not None
+    assert generation.interruption_started_at is not None
+    assert generation.interruption is not None
+    assert generation.interruption.cause is AvailabilityCause.AUDIT_MISMATCH_RESYNCHRONIZATION
+    assert generation.interruption.reason_code == "REST_AUDIT_MISMATCH"
+    assert generation.interruption.source_evidence_ids == (
+        f"audit-request:{second.request_id}",
+        f"response-ingest:{second.response_ingest_id.value}",
+    )
+    assert generation.interruption_started_at.monotonic_ns == second.response_received_monotonic_ns
+    assert generation.interruption_started_at.wall_time == second.response_received_wall_time
 
     records = JournalReader(tmp_path / "raw", run_id).read_all()
     assert sum(record.channel == CONTROL_REST_AUDIT_START for record in records) == 3
@@ -937,9 +976,16 @@ async def test_post_response_economic_update_is_excluded_from_current_audit_fenc
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Admit a later economic frame while the response-boundary prefix is blocked."""
+    """An audit control cannot expire a transition before its deferred WS frame."""
 
-    config = load_phase1_config(Path("config/phase1.toml"))
+    base_config = load_phase1_config(Path("config/phase1.toml"))
+    config = base_config.model_copy(
+        update={
+            "polymarket": base_config.polymarket.model_copy(
+                update={"reported_top_transition_max_seconds": 0.25}
+            )
+        }
+    )
     run_id = CollectorRunId("adversarial-audit-post-response")
     writer = RawJournalWriter(
         JournalWriterConfig(
@@ -978,6 +1024,8 @@ async def test_post_response_economic_update_is_excluded_from_current_audit_fenc
     release_response_cleanup = asyncio.Event()
     pre_boundary_processed = asyncio.Event()
     response_ingress: BoundedRawIngress | None = None
+    transition_received_monotonic_ns: int | None = None
+    convergence_received_monotonic_ns: int | None = None
 
     original_enqueue = writer.enqueue
     canonical_gate_used = False
@@ -1037,14 +1085,21 @@ async def test_post_response_economic_update_is_excluded_from_current_audit_fenc
             *,
             ready: asyncio.Event,
         ) -> None:
+            nonlocal transition_received_monotonic_ns
+            nonlocal convergence_received_monotonic_ns
             ready.set()
             while True:
                 payload, admitted = await emissions.get()
+                received_monotonic_ns = time.monotonic_ns()
+                if transition_received_monotonic_ns is None:
+                    transition_received_monotonic_ns = received_monotonic_ns
+                else:
+                    convergence_received_monotonic_ns = received_monotonic_ns
                 admit(
                     ReceivedWebSocketMessage(
                         payload_bytes=payload,
                         received_wall_time=UtcTimestamp.now(),
-                        received_monotonic_ns=time.monotonic_ns(),
+                        received_monotonic_ns=received_monotonic_ns,
                         message_type="TEXT",
                     )
                 )
@@ -1075,7 +1130,12 @@ async def test_post_response_economic_update_is_excluded_from_current_audit_fenc
         if http_calls == 1:
             assert asset_id == "token-yes"
             admitted = asyncio.Event()
-            await emissions.put((_fixture("polymarket_ws_last_trade.json"), admitted))
+            await emissions.put(
+                (
+                    _yes_reported_top_transition(best_ask="0.60", spread="0.15"),
+                    admitted,
+                )
+            )
             await admitted.wait()
             await stage_ready.wait()
             return httpx.Response(200, stream=delayed_stream, request=request)
@@ -1124,6 +1184,20 @@ async def test_post_response_economic_update_is_excluded_from_current_audit_fenc
                 await pre_boundary_processed.wait()
                 assert not release_response_cleanup.is_set()
                 assert processor.processed_websocket_watermark(connection_id).ordinal == 1
+                transitions = processor.reported_top_transitions
+                assert len(transitions) == 1
+                transition = transitions[0]
+                assert transition_received_monotonic_ns is not None
+                assert convergence_received_monotonic_ns is not None
+                assert transition.first_received_monotonic_ns == transition_received_monotonic_ns
+                assert convergence_received_monotonic_ns < transition.deadline_monotonic_ns
+                await asyncio.sleep(
+                    max(
+                        0.0,
+                        (transition.deadline_monotonic_ns - time.monotonic_ns() + 1_000_000) / 1e9,
+                    )
+                )
+                assert time.monotonic_ns() >= transition.deadline_monotonic_ns
                 release_response_cleanup.set()
                 generation = await generation_task
         except BaseException:
@@ -1145,7 +1219,7 @@ async def test_post_response_economic_update_is_excluded_from_current_audit_fenc
     assert delayed_stream.closed
     live = processor.summary()
     assert tuple(outcome.outcome for outcome in live.audit_outcomes) == (
-        AuditOutcome.MATCH,
+        AuditOutcome.RACED,
         AuditOutcome.MISMATCH,
     )
     first = next(
@@ -1154,8 +1228,17 @@ async def test_post_response_economic_update_is_excluded_from_current_audit_fenc
     assert first.starting_processed_ordinal == 0
     assert first.response_boundary_ordinal == 1
     assert first.barrier_processed_ordinal == 1
-    assert first.barrier_book == first.starting_book
+    assert first.barrier_book is not None
+    assert first.barrier_book.generation > first.starting_book.generation
+    assert first.barrier_book.economic_content_sha256 == first.starting_book.economic_content_sha256
     assert processor.processed_websocket_watermark(connection_id).ordinal == 2
+    assert live.reported_top_transitions_converged == 1
+    assert live.reported_top_transitions_expired == 0
+    transition_outcome = live.reported_top_transition_outcomes[-1]
+    assert transition_outcome.status is ReportedTopTransitionStatus.CONVERGED
+    assert transition_outcome.close_source is not None
+    assert transition_outcome.close_source.channel == WS_MARKET
+    assert transition_outcome.close_source.admission_ordinal == 2
 
     records = JournalReader(tmp_path / "raw", run_id).read_all()
     first_audit_index = next(
@@ -1167,9 +1250,20 @@ async def test_post_response_economic_update_is_excluded_from_current_audit_fenc
         if record.channel == WS_MARKET
         and record.transport_metadata.get("websocket_admission_ordinal") == 2
     )
-    assert first_audit_index < post_response_index
+    first_classify_index = next(
+        index
+        for index, record in enumerate(records)
+        if record.channel == CONTROL_REST_AUDIT_CLASSIFY
+    )
+    assert first_audit_index < first_classify_index < post_response_index
+    first_classify = records[first_classify_index]
+    assert first_classify.received_monotonic.nanoseconds >= (
+        transition_outcome.transition.deadline_monotonic_ns
+    )
+    assert all(record.channel != CONTROL_REPORTED_TOP_TRANSITION_EXPIRED for record in records)
     replayed = replay_journal(tmp_path / "raw", run_id, config).processor
     assert replayed.audit_outcomes == live.audit_outcomes
+    assert replayed.reported_top_transition_outcomes == live.reported_top_transition_outcomes
     assert replayed.terminal_hash == live.terminal_hash
 
 
@@ -1716,6 +1810,8 @@ async def test_quiet_race_retry_never_crosses_deadline_boundaries(
         last_accepted_receive_monotonic_ns: int | None,
         connection_id: ConnectionId,
         subscription_id: SubscriptionId,
+        decision_at: UtcTimestamp,
+        decision_monotonic_ns: int,
     ) -> ProcessedEnvelope:
         result = await original_expiry(
             capture=capture,
@@ -1723,6 +1819,8 @@ async def test_quiet_race_retry_never_crosses_deadline_boundaries(
             last_accepted_receive_monotonic_ns=last_accepted_receive_monotonic_ns,
             connection_id=connection_id,
             subscription_id=subscription_id,
+            decision_at=decision_at,
+            decision_monotonic_ns=decision_monotonic_ns,
         )
         if native_asset_id == "token-yes":
             expired.set()
@@ -1991,8 +2089,8 @@ async def test_raced_audit_does_not_retry_after_protocol_resync_is_pending(
         AuditOutcome.RACED,
     )
     assert live.pending_rest_audits == 0
-    assert live.parse_failures == 1
-    assert runtime_health.snapshot().protocol_deviations == 1
+    assert live.parse_failures == 0
+    assert runtime_health.snapshot().protocol_deviations == 0
     counters = {key.name: value for key, value in metrics.snapshot().counters}
     assert counters.get("mma_rest_audit_retries_total", 0) == 0
     labeled_counters = {
@@ -2396,8 +2494,36 @@ async def test_second_start_crossing_leg_expiry_closes_all_staged_legs_without_h
     assert replayed.terminal_hash == live.terminal_hash
 
 
+@pytest.mark.parametrize(
+    (
+        "refresh_event_type",
+        "expected_cause",
+        "expected_reason",
+        "expected_audit_outcomes",
+    ),
+    [
+        pytest.param(
+            "new_market",
+            AvailabilityCause.PROTOCOL_SCHEMA_INVARIANT,
+            "REFERENCE_PRECISION_REFRESH",
+            (AuditOutcome.MATCH, AuditOutcome.MATCH),
+            id="reference-precision",
+        ),
+        pytest.param(
+            "market_resolved",
+            AvailabilityCause.TARGET_LIFECYCLE,
+            "TARGET_LIFECYCLE_REFERENCE_REFRESH",
+            (AuditOutcome.MATCH, AuditOutcome.RACED),
+            id="target-lifecycle",
+        ),
+    ],
+)
 @pytest.mark.asyncio
 async def test_concurrent_first_legs_complete_before_selected_refresh_exit(
+    refresh_event_type: str,
+    expected_cause: AvailabilityCause,
+    expected_reason: str,
+    expected_audit_outcomes: tuple[AuditOutcome, ...],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2432,16 +2558,25 @@ async def test_concurrent_first_legs_complete_before_selected_refresh_exit(
     )
     selected = parse_gamma_markets(_fixture("polymarket_gamma_market_keyset.json")).markets[0]
     emissions: asyncio.Queue[tuple[bytes, asyncio.Event]] = asyncio.Queue()
-    selected_new_market = json.dumps(
-        {
-            "assets_ids": list(selected.clob_token_ids),
-            "event_type": "new_market",
-            "id": selected.gamma_market_id,
-            "market": selected.condition_id,
-            "timestamp": "1787198406000",
-        },
+    selected_refresh_payload: dict[str, object] = {
+        "assets_ids": list(selected.clob_token_ids),
+        "event_type": refresh_event_type,
+        "id": selected.gamma_market_id,
+        "market": selected.condition_id,
+        "timestamp": "1787198406000",
+    }
+    if refresh_event_type == "market_resolved":
+        selected_refresh_payload.update(
+            {
+                "winning_asset_id": selected.clob_token_ids[0],
+                "winning_outcome": "Yes",
+            }
+        )
+    selected_refresh = json.dumps(
+        selected_refresh_payload,
         separators=(",", ":"),
     ).encode()
+    refresh_received_at: list[tuple[UtcTimestamp, int]] = []
 
     class _CommandSocket:
         instances = 0
@@ -2463,11 +2598,14 @@ async def test_concurrent_first_legs_complete_before_selected_refresh_exit(
             ready.set()
             while True:
                 payload, admitted = await emissions.get()
+                received_wall_time = UtcTimestamp.now()
+                received_monotonic_ns = time.monotonic_ns()
+                refresh_received_at.append((received_wall_time, received_monotonic_ns))
                 admit(
                     ReceivedWebSocketMessage(
                         payload_bytes=payload,
-                        received_wall_time=UtcTimestamp.now(),
-                        received_monotonic_ns=time.monotonic_ns(),
+                        received_wall_time=received_wall_time,
+                        received_monotonic_ns=received_monotonic_ns,
                         message_type="TEXT",
                     )
                 )
@@ -2498,7 +2636,7 @@ async def test_concurrent_first_legs_complete_before_selected_refresh_exit(
                 if asset_id == "token-no":
                     return _public_read(_no_book(), on_response_body_complete)
                 admitted = asyncio.Event()
-                await emissions.put((selected_new_market, admitted))
+                await emissions.put((selected_refresh, admitted))
                 await admitted.wait()
                 return _public_read(
                     _fixture("polymarket_rest_book_yes.json"),
@@ -2533,13 +2671,24 @@ async def test_concurrent_first_legs_complete_before_selected_refresh_exit(
     replayed = replay_journal(tmp_path / "raw", run_id, config).processor
     assert generation.reason.value == "REFERENCE_REFRESH"
     assert len(generation.refresh_requests) == 1
+    assert generation.interruption is not None
+    assert generation.interruption.cause is expected_cause
+    assert generation.interruption.reason_code == expected_reason
+    assert (AvailabilityScope.TARGET in generation.interruption.affected_scopes) is (
+        expected_cause is AvailabilityCause.TARGET_LIFECYCLE
+    )
+    assert generation.interruption_started_at is not None
+    assert refresh_received_at
+    assert generation.interruption_started_at.wall_time == refresh_received_at[0][0]
+    assert generation.interruption_started_at.monotonic_ns == refresh_received_at[0][1]
+    runtime = runtime_health.snapshot(now_ns=refresh_received_at[0][1])
+    assert runtime.current_unavailable_cause is expected_cause
+    assert runtime.current_unavailable_reason_code == expected_reason
+    assert runtime.current_unavailable_started_monotonic_ns == refresh_received_at[0][1]
     assert client.assets == ["token-yes", "token-no"]
     assert client.active_high_water == 2
     assert _CommandSocket.instances == 1
-    assert tuple(outcome.outcome for outcome in live.audit_outcomes) == (
-        AuditOutcome.MATCH,
-        AuditOutcome.MATCH,
-    )
+    assert tuple(outcome.outcome for outcome in live.audit_outcomes) == expected_audit_outcomes
     assert live.pending_rest_audits == 0
     assert live.terminal_hash == replayed.terminal_hash
     assert counters.get("mma_rest_audit_legs_suppressed_total", 0) == 0
@@ -3966,4 +4115,299 @@ async def test_exact_run_deadline_starts_zero_audits(
     replayed = replay_journal(tmp_path / "raw", run_id, config).processor
     assert replayed.audit_outcomes == live.audit_outcomes
     assert replayed.pending_rest_audits == 0
+    assert replayed.terminal_hash == live.terminal_hash
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("expiry_at_run_cutoff", "expected_exit"),
+    [
+        pytest.param(False, "RESYNC_REQUIRED", id="idle-before-run-cutoff"),
+        pytest.param(True, "DEADLINE", id="exact-run-cutoff-tie"),
+    ],
+)
+async def test_idle_reported_top_transition_expires_through_durable_supervisor_control(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    expiry_at_run_cutoff: bool,
+    expected_exit: str,
+) -> None:
+    """An idle socket cannot leave transition eligibility pending past its bound."""
+
+    base_config = load_phase1_config(Path("config/phase1.toml"))
+    bounded_polymarket = base_config.polymarket.model_copy(
+        update={"reported_top_transition_max_seconds": 0.05}
+    )
+    config = base_config.model_copy(update={"polymarket": bounded_polymarket})
+    run_id = CollectorRunId("reported-top-idle-supervisor-expiry")
+    writer = RawJournalWriter(
+        JournalWriterConfig(
+            root=tmp_path / "raw",
+            collector_run_id=run_id,
+            venue_id=POLYMARKET_VENUE_ID,
+            stream="polymarket-public",
+            writer_id=WriterId("writer-reported-top-idle-supervisor-expiry"),
+            writer_software_version="test",
+            git_commit="fixture",
+        )
+    )
+    processor = CanonicalProcessor(config)
+    metrics = InMemoryMetrics()
+    capture = observe_module._RawCaptureBoundary(  # pyright: ignore[reportPrivateUsage]
+        collector_run_id=run_id,
+        writer=writer,
+        processor=processor,
+        metrics=metrics,
+    )
+    service = PolymarketObservationService(
+        config,
+        workspace_root=tmp_path,
+        code_commit="fixture",
+        metrics=metrics,
+    )
+    selected = parse_gamma_markets(_fixture("polymarket_gamma_market_keyset.json")).markets[0]
+    transition_received_monotonic_ns: int | None = None
+
+    class _IdleTransitionSocket:
+        def __init__(self, asset_ids: tuple[str, ...], **kwargs: object) -> None:
+            assert asset_ids == selected.clob_token_ids
+            del kwargs
+            self.subscription_semantics_sha256 = hashlib.sha256(
+                b"reported-top-idle-supervisor-expiry"
+            ).hexdigest()
+
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            ready.set()
+            admit(
+                ReceivedWebSocketMessage(
+                    payload_bytes=_yes_reported_top_transition(),
+                    received_wall_time=UtcTimestamp.now(),
+                    received_monotonic_ns=(
+                        time.monotonic_ns()
+                        if transition_received_monotonic_ns is None
+                        else transition_received_monotonic_ns
+                    ),
+                    message_type="TEXT",
+                )
+            )
+            await asyncio.Event().wait()
+
+    class _ForbiddenAuditClient:
+        async def fetch_order_book_raw_with_evidence(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+            on_response_body_complete: Callable[[UtcTimestamp, int], None] | None = None,
+        ) -> PublicReadResult:
+            del asset_id, deadline, on_response_body_complete
+            raise AssertionError("transition expiry must not require a REST audit")
+
+    monkeypatch.setattr(observe_module, "PolymarketMarketWebSocket", _IdleTransitionSocket)
+    await writer.start()
+    await _initialize_books(capture)
+    run_duration_seconds = 0.15 if expiry_at_run_cutoff else 1.0
+    deadline_ns = time.monotonic_ns() + int(run_duration_seconds * 1_000_000_000)
+    if expiry_at_run_cutoff:
+        transition_received_monotonic_ns = deadline_ns - 50_000_000
+    generation = await service._run_generation(  # pyright: ignore[reportPrivateUsage]
+        client=cast(PolymarketPublicClient, _ForbiddenAuditClient()),
+        capture=capture,
+        selected=(selected,),
+        asset_ids=selected.clob_token_ids,
+        deadline=asyncio.get_running_loop().time() + run_duration_seconds,
+        deadline_ns=deadline_ns,
+        periodic_audit_due_ns=deadline_ns,
+        connection_id=ConnectionId("reported-top-idle-supervisor-expiry-socket"),
+        subscription_id=SubscriptionId("reported-top-idle-supervisor-expiry-subscription"),
+        unavailable_started_ns=None,
+        runtime_health=ObservationRuntimeHealth(),
+    )
+    await writer.close()
+
+    assert generation.reason.value == expected_exit
+    if expiry_at_run_cutoff:
+        assert generation.interruption is None
+    else:
+        assert generation.interruption is not None
+        assert generation.interruption.cause.value == "REPORTED_TOP_TRANSITION_EXPIRY"
+    live = processor.summary()
+    assert live.pending_reported_top_transitions == 0
+    assert live.reported_top_transitions_expired == 1
+    outcome = live.reported_top_transition_outcomes[-1]
+    assert outcome.status is ReportedTopTransitionStatus.EXPIRED
+    assert outcome.reason is ReportedTopTransitionReason.TIME_BOUND_EXPIRED
+    assert outcome.duration_ns >= 50_000_000
+    assert outcome.duration_is_lower_bound is False
+    assert outcome.close_source is not None
+    assert outcome.close_source.channel == CONTROL_REPORTED_TOP_TRANSITION_EXPIRED
+    if not expiry_at_run_cutoff:
+        assert generation.interruption_started_at is not None
+        assert generation.interruption_started_at.monotonic_ns == outcome.ended_monotonic_ns
+        assert generation.interruption_started_at.wall_time == outcome.ended_at
+    records = JournalReader(tmp_path / "raw", run_id).read_all()
+    expiry_records = tuple(
+        record for record in records if record.channel == CONTROL_REPORTED_TOP_TRANSITION_EXPIRED
+    )
+    assert len(expiry_records) == 1
+    assert expiry_records[0].ingest_seq == outcome.close_source.ingest_seq
+    assert expiry_records[0].ingest_id == outcome.close_source.raw_source.ingest_id
+    replayed = replay_journal(tmp_path / "raw", run_id, config).processor
+    assert replayed.reported_top_transition_outcomes == live.reported_top_transition_outcomes
+    assert replayed.reported_top_transition_chain_sha256 == (
+        live.reported_top_transition_chain_sha256
+    )
+    assert replayed.terminal_hash == live.terminal_hash
+
+
+@pytest.mark.asyncio
+async def test_reported_top_expiry_timer_does_not_overtake_admitted_convergence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FIFO receive evidence wins even when processing crosses the wall-time bound."""
+
+    base_config = load_phase1_config(Path("config/phase1.toml"))
+    bounded_polymarket = base_config.polymarket.model_copy(
+        update={"reported_top_transition_max_seconds": 0.05}
+    )
+    single_event_storage = base_config.storage.model_copy(
+        update={"journal_group_commit_max_events": 1}
+    )
+    config = base_config.model_copy(
+        update={
+            "polymarket": bounded_polymarket,
+            "storage": single_event_storage,
+        }
+    )
+    run_id = CollectorRunId("reported-top-expiry-fifo-convergence")
+    writer = RawJournalWriter(
+        JournalWriterConfig(
+            root=tmp_path / "raw",
+            collector_run_id=run_id,
+            venue_id=POLYMARKET_VENUE_ID,
+            stream="polymarket-public",
+            writer_id=WriterId("writer-reported-top-expiry-fifo-convergence"),
+            writer_software_version="test",
+            git_commit="fixture",
+        )
+    )
+    processor = CanonicalProcessor(config)
+    metrics = InMemoryMetrics()
+    capture = observe_module._RawCaptureBoundary(  # pyright: ignore[reportPrivateUsage]
+        collector_run_id=run_id,
+        writer=writer,
+        processor=processor,
+        metrics=metrics,
+    )
+    service = PolymarketObservationService(
+        config,
+        workspace_root=tmp_path,
+        code_commit="fixture",
+        metrics=metrics,
+    )
+    selected = parse_gamma_markets(_fixture("polymarket_gamma_market_keyset.json")).markets[0]
+
+    class _QueuedConvergenceSocket:
+        def __init__(self, asset_ids: tuple[str, ...], **kwargs: object) -> None:
+            assert asset_ids == selected.clob_token_ids
+            del kwargs
+            self.subscription_semantics_sha256 = hashlib.sha256(
+                b"reported-top-expiry-fifo-convergence"
+            ).hexdigest()
+
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            ready.set()
+            received_ns = time.monotonic_ns()
+            for offset_ns, payload in (
+                (
+                    0,
+                    _yes_reported_top_transition(best_ask="0.60", spread="0.15"),
+                ),
+                (1_000_000, _fixture("polymarket_ws_price_change.json")),
+            ):
+                admit(
+                    ReceivedWebSocketMessage(
+                        payload_bytes=payload,
+                        received_wall_time=UtcTimestamp.now(),
+                        received_monotonic_ns=received_ns + offset_ns,
+                        message_type="TEXT",
+                    )
+                )
+            await asyncio.Event().wait()
+
+    class _ForbiddenAuditClient:
+        async def fetch_order_book_raw_with_evidence(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+            on_response_body_complete: Callable[[UtcTimestamp, int], None] | None = None,
+        ) -> PublicReadResult:
+            del asset_id, deadline, on_response_body_complete
+            raise AssertionError("queued convergence must not require a REST audit")
+
+    original_preserve = capture.preserve_websocket_batch
+    first_batch = True
+
+    async def delay_after_first_batch(
+        items: tuple[RawIngressItem, ...],
+        *,
+        semantics_hash: str,
+        connection_id: ConnectionId,
+        subscription_id: SubscriptionId,
+    ) -> tuple[ProcessedEnvelope, ...]:
+        nonlocal first_batch
+        results = await original_preserve(
+            items,
+            semantics_hash=semantics_hash,
+            connection_id=connection_id,
+            subscription_id=subscription_id,
+        )
+        if first_batch:
+            first_batch = False
+            await asyncio.sleep(0.075)
+        return results
+
+    monkeypatch.setattr(capture, "preserve_websocket_batch", delay_after_first_batch)
+    monkeypatch.setattr(observe_module, "PolymarketMarketWebSocket", _QueuedConvergenceSocket)
+    await writer.start()
+    await _initialize_books(capture)
+    deadline_ns = time.monotonic_ns() + 250_000_000
+    generation = await service._run_generation(  # pyright: ignore[reportPrivateUsage]
+        client=cast(PolymarketPublicClient, _ForbiddenAuditClient()),
+        capture=capture,
+        selected=(selected,),
+        asset_ids=selected.clob_token_ids,
+        deadline=asyncio.get_running_loop().time() + 0.25,
+        deadline_ns=deadline_ns,
+        periodic_audit_due_ns=deadline_ns,
+        connection_id=ConnectionId("reported-top-expiry-fifo-convergence-socket"),
+        subscription_id=SubscriptionId("reported-top-expiry-fifo-convergence-subscription"),
+        unavailable_started_ns=None,
+        runtime_health=ObservationRuntimeHealth(),
+    )
+    await writer.close()
+
+    assert generation.reason.value == "DEADLINE"
+    live = processor.summary()
+    assert live.reported_top_transitions_converged == 1
+    assert live.reported_top_transitions_expired == 0
+    assert live.reported_top_transition_outcomes[-1].status is (
+        ReportedTopTransitionStatus.CONVERGED
+    )
+    records = JournalReader(tmp_path / "raw", run_id).read_all()
+    assert all(record.channel != CONTROL_REPORTED_TOP_TRANSITION_EXPIRED for record in records)
+    replayed = replay_journal(tmp_path / "raw", run_id, config).processor
+    assert replayed.reported_top_transition_outcomes == live.reported_top_transition_outcomes
     assert replayed.terminal_hash == live.terminal_hash

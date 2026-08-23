@@ -36,6 +36,9 @@ def test_committed_phase1_configuration_loads_strictly() -> None:
     assert config.polymarket.public_reads.rate_limit_checked_on.isoformat() == "2026-08-22"
     assert config.scanner.maximum_capacity_evaluations == 4096
     assert config.health.checkpoint_interval_seconds == 10.0
+    assert config.health.availability_queue_capacity == 64
+    assert config.health.maximum_availability_intervals == 8192
+    assert config.health.maximum_availability_file_bytes == 64 * 1024 * 1024
     assert config.storage.journal_segment_max_uncompressed_bytes == 64 * 1024 * 1024
     assert config.storage.journal_run_max_uncompressed_bytes == 4 * 1024 * 1024 * 1024
     assert config.storage.analytical_record_max_bytes == 8 * 1024 * 1024

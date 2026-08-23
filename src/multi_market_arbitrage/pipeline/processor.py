@@ -12,6 +12,7 @@ from typing import Protocol, cast
 
 from multi_market_arbitrage.core.config import Phase1Config
 from multi_market_arbitrage.core.errors import ProgrammingInvariantViolation
+from multi_market_arbitrage.core.exact import ExactDecimal, Price
 from multi_market_arbitrage.core.health import BookHealth
 from multi_market_arbitrage.core.ids import (
     CanonicalEventId,
@@ -34,6 +35,7 @@ from multi_market_arbitrage.ingestion import RawEventEnvelope
 from multi_market_arbitrage.journal import JournalDurabilityState, JournalReceipt
 from multi_market_arbitrage.normalization import (
     BestBidAskEvent,
+    BookSide,
     CanonicalEvent,
     CanonicalEventType,
     MarketResolvedEvent,
@@ -97,14 +99,19 @@ from .audit import (
     AuditClassificationCommand,
     AuditExpiryCommand,
     AuditFailureReason,
+    AuditMismatchCause,
+    AuditMismatchDiagnostic,
     AuditOutcome,
     AuditOutcomeEvidence,
     AuditStartEvidence,
     WebSocketAdmissionWatermark,
+    build_audit_mismatch_diagnostic,
+    compare_audit_exact_depth,
 )
 from .channels import (
     CLOB_MARKET_PREFIX,
     CONTROL_BOOK_INVALIDATION,
+    CONTROL_REPORTED_TOP_TRANSITION_EXPIRED,
     CONTROL_REST_AUDIT_CLASSIFY,
     CONTROL_REST_AUDIT_EXPIRED,
     CONTROL_REST_AUDIT_FAILED,
@@ -118,9 +125,27 @@ from .channels import (
     WS_MARKET,
     channel_native_id,
 )
+from .transitions import (
+    REPORTED_TOP_TRANSITION_EXPIRY_SCHEMA,
+    ReportedTopTransition,
+    ReportedTopTransitionBaselineEvidence,
+    ReportedTopTransitionCloseSource,
+    ReportedTopTransitionEntrySource,
+    ReportedTopTransitionExpiryCommand,
+    ReportedTopTransitionOutcome,
+    ReportedTopTransitionReason,
+    ReportedTopTransitionStatus,
+)
 
 _RECENT_HISTORY_LIMIT = 4096
 _CHAIN_NAMESPACE = b"mma-canonical-processor-chain-v1\0"
+_V1_AUDIT_GENERATION_REBASE_SOURCE_COMMITS = frozenset(
+    {
+        # Failed Gate-1 producer whose pre-ADR-0053 generation semantics are
+        # preserved in immutable raw audit-start controls.
+        "a382b93220011428703fe02483f7034f59c1f045",
+    }
+)
 
 
 def _chain_seed(name: str) -> bytes:
@@ -211,6 +236,14 @@ class _RawReferenceSource:
 
 
 @dataclass(frozen=True, slots=True)
+class _PostSnapshotBaseline:
+    """One ordinal-1 two-leg baseline eligible for the narrow catch-up rule."""
+
+    market_id: MarketId
+    evidence: ReportedTopTransitionBaselineEvidence
+
+
+@dataclass(frozen=True, slots=True)
 class ProcessorSummary:
     processed_raw_messages: int
     parse_failures: int
@@ -227,8 +260,26 @@ class ProcessorSummary:
     rest_audit_mismatches: int
     rest_audit_raced: int
     rest_audit_failed: int
+    audit_start_generation_rebases: int
+    audit_mismatch_cause_counts: tuple[tuple[AuditMismatchCause, int], ...]
     pending_rest_audits: int
     audit_ineligible_books: int
+    reported_top_transitions_started: int
+    reported_top_transitions_converged: int
+    reported_top_transitions_superseded: int
+    reported_top_transitions_resnapshotted: int
+    reported_top_transitions_expired: int
+    reported_top_transitions_invalidated: int
+    reported_top_transition_frames: int
+    reported_top_transition_duration_total_ns: int
+    reported_top_transition_duration_max_ns: int
+    reported_top_transition_duration_lower_bound_count: int
+    reported_top_transition_entry_counts: tuple[tuple[ReportedTopTransitionEntrySource, int], ...]
+    reported_top_transition_reason_counts: tuple[tuple[ReportedTopTransitionReason, int], ...]
+    reported_top_transition_research_eligibility_restored: int
+    reported_top_no_pending_recognized: int
+    reported_top_no_pending_rejected: int
+    pending_reported_top_transitions: int
     reference_refresh_requests: int
     unique_opportunity_lifecycles: int
     healthy_books: int
@@ -239,14 +290,20 @@ class ProcessorSummary:
     validated_opportunity_chain_sha256: str
     reference_refresh_chain_sha256: str
     audit_outcome_chain_sha256: str
+    reported_top_transition_chain_sha256: str
     lifecycle_state_sha256: str
     scan_results_truncated: bool
     opportunity_hashes_truncated: bool
     reference_refresh_requests_truncated: bool
     audit_outcomes_truncated: bool
+    audit_mismatch_diagnostics_truncated: bool
+    reported_top_transition_outcomes_truncated: bool
     terminal_hash: str
     opportunity_hashes: tuple[str, ...]
     audit_outcomes: tuple[AuditOutcomeEvidence, ...]
+    audit_mismatch_diagnostics: tuple[AuditMismatchDiagnostic, ...]
+    reported_top_transitions: tuple[ReportedTopTransition, ...]
+    reported_top_transition_outcomes: tuple[ReportedTopTransitionOutcome, ...]
 
 
 class AnalyticalOutputSink(Protocol):
@@ -278,6 +335,7 @@ class CanonicalProcessor:
         *,
         analytical_outputs: AnalyticalOutputSink | None = None,
         scan_latency_observer: Callable[[int], None] | None = None,
+        source_journal_git_commit: str | None = None,
     ) -> None:
         self._config = config
         self._registry = ReferenceRegistry()
@@ -295,6 +353,10 @@ class CanonicalProcessor:
         self._lifecycle_tracker = OpportunityLifecycleTracker()
         self._outputs = analytical_outputs
         self._scan_latency_observer = scan_latency_observer
+        self._source_journal_git_commit = source_journal_git_commit
+        self._allow_v1_audit_generation_rebase = (
+            source_journal_git_commit in _V1_AUDIT_GENERATION_REBASE_SOURCE_COMMITS
+        )
         self._gamma_by_condition: dict[str, GammaMarket] = {}
         self._gamma_by_id: dict[str, GammaMarket] = {}
         self._events_by_id: dict[str, GammaEvent] = {}
@@ -318,6 +380,9 @@ class CanonicalProcessor:
             maxlen=_RECENT_HISTORY_LIMIT
         )
         self._audit_outcomes: deque[AuditOutcomeEvidence] = deque(maxlen=_RECENT_HISTORY_LIMIT)
+        self._audit_mismatch_diagnostics: deque[AuditMismatchDiagnostic] = deque(
+            maxlen=_RECENT_HISTORY_LIMIT
+        )
         self._pending_rest_audits: dict[str, AuditStartEvidence] = {}
         self._pending_rest_audit_responses: dict[str, RawEventEnvelope] = {}
         self._pending_rest_audit_hard_expiries: dict[str, int] = {}
@@ -326,10 +391,12 @@ class CanonicalProcessor:
         self._rest_audit_run_deadline_epoch_id: str | None = None
         self._rest_audit_run_deadline_ns: int | None = None
         self._audit_ineligible_instruments: set[InstrumentId] = set()
-        # A changed BBO notification can precede its authoritative L2 delta.
-        # Keep that ordering window separate from durable REST-audit failures so
-        # an accepted delta cannot accidentally clear another fail-closed cause.
-        self._pending_best_bid_ask: dict[InstrumentId, BestBidAskEvent] = {}
+        self._reported_top_transitions: dict[InstrumentId, ReportedTopTransition] = {}
+        self._reported_top_transition_outcomes: deque[ReportedTopTransitionOutcome] = deque(
+            maxlen=_RECENT_HISTORY_LIMIT
+        )
+        self._transition_resync_instruments: set[InstrumentId] = set()
+        self._post_snapshot_baselines: dict[MarketId, _PostSnapshotBaseline] = {}
         self._audit_economic_generations: dict[InstrumentId, int] = {}
         self._processed_ws_watermarks: dict[ConnectionId, int] = {}
         self._active_refresh_requests: list[ReferenceRefreshRequest] | None = None
@@ -337,8 +404,10 @@ class CanonicalProcessor:
         self._active_freshness_updates: dict[InstrumentId, BookFreshnessUpdate] | None = None
         self._active_relevant_l2_updates: dict[InstrumentId, BookFreshnessUpdate] | None = None
         self._active_received_monotonic: MonotonicTimestamp | None = None
+        self._active_envelope: RawEventEnvelope | None = None
         self._active_scan_observed_at: UtcTimestamp | None = None
         self._active_audit_outcomes: list[AuditOutcomeEvidence] | None = None
+        self._active_canonical_event: CanonicalEvent | None = None
         self._last_accepted_l2_monotonic: dict[InstrumentId, MonotonicTimestamp] = {}
         self._raw_input_chain = _chain_seed("raw-input")
         self._canonical_event_chain = _chain_seed("canonical-event")
@@ -347,6 +416,8 @@ class CanonicalProcessor:
         self._validated_opportunity_chain = _chain_seed("validated-opportunity")
         self._reference_refresh_chain = _chain_seed("reference-refresh")
         self._audit_outcome_chain = _chain_seed("rest-audit-outcome")
+        self._audit_compatibility_chain = _chain_seed("rest-audit-compatibility")
+        self._reported_top_transition_chain = _chain_seed("reported-top-transition")
         self._processed = 0
         self._parse_failures = 0
         self._canonical_events = 0
@@ -363,6 +434,29 @@ class CanonicalProcessor:
         self._rest_audit_mismatches = 0
         self._rest_audit_raced = 0
         self._rest_audit_failed = 0
+        self._audit_start_generation_rebases = 0
+        self._audit_mismatch_cause_counts = dict.fromkeys(AuditMismatchCause, 0)
+        self._reported_top_transitions_started = 0
+        self._reported_top_transitions_converged = 0
+        self._reported_top_transitions_superseded = 0
+        self._reported_top_transitions_resnapshotted = 0
+        self._reported_top_transitions_expired = 0
+        self._reported_top_transitions_invalidated = 0
+        self._reported_top_transition_frames = 0
+        self._reported_top_transition_duration_total_ns = 0
+        self._reported_top_transition_duration_max_ns = 0
+        self._reported_top_transition_duration_lower_bound_count = 0
+        self._reported_top_transition_entry_counts = dict.fromkeys(
+            ReportedTopTransitionEntrySource,
+            0,
+        )
+        self._reported_top_transition_reason_counts = dict.fromkeys(
+            ReportedTopTransitionReason,
+            0,
+        )
+        self._reported_top_transition_research_eligibility_restored = 0
+        self._reported_top_no_pending_recognized = 0
+        self._reported_top_no_pending_rejected = 0
 
     @property
     def discovered_markets(self) -> tuple[GammaMarket, ...]:
@@ -403,10 +497,25 @@ class CanonicalProcessor:
 
         return tuple(
             sorted(
-                self._audit_ineligible_instruments | self._pending_best_bid_ask.keys(),
+                self._audit_ineligible_instruments | self._reported_top_transitions.keys(),
                 key=lambda item: item.value,
             )
         )
+
+    @property
+    def reported_top_transitions(self) -> tuple[ReportedTopTransition, ...]:
+        return tuple(
+            self._reported_top_transitions[instrument_id]
+            for instrument_id in sorted(
+                self._reported_top_transitions,
+                key=lambda item: item.value,
+            )
+        )
+
+    def reported_top_transition_for(
+        self, instrument_id: InstrumentId
+    ) -> ReportedTopTransition | None:
+        return self._reported_top_transitions.get(instrument_id)
 
     def processed_websocket_watermark(
         self, connection_id: ConnectionId
@@ -479,8 +588,10 @@ class CanonicalProcessor:
             or self._active_freshness_updates is not None
             or self._active_relevant_l2_updates is not None
             or self._active_received_monotonic is not None
+            or self._active_envelope is not None
             or self._active_scan_observed_at is not None
             or self._active_audit_outcomes is not None
+            or self._active_canonical_event is not None
         ):
             raise ProgrammingInvariantViolation(
                 "canonical processor cannot process envelopes reentrantly",
@@ -504,6 +615,7 @@ class CanonicalProcessor:
         self._active_freshness_updates = current_freshness_updates
         self._active_relevant_l2_updates = current_relevant_l2_updates
         self._active_received_monotonic = envelope.received_monotonic
+        self._active_envelope = envelope
         self._active_scan_observed_at = None
         self._active_audit_outcomes = current_audit_outcomes
         try:
@@ -607,8 +719,10 @@ class CanonicalProcessor:
             self._active_freshness_updates = None
             self._active_relevant_l2_updates = None
             self._active_received_monotonic = None
+            self._active_envelope = None
             self._active_scan_observed_at = None
             self._active_audit_outcomes = None
+            self._active_canonical_event = None
         return processed
 
     def _record_book_mutation(
@@ -669,16 +783,261 @@ class CanonicalProcessor:
         )
 
     @staticmethod
+    def _owner_top(owner: CanonicalL2BookOwner) -> tuple[Price | None, Price | None]:
+        snapshot = owner.snapshot()
+        if snapshot.health is not BookHealth.HEALTHY:
+            return None, None
+        best_bid = None if snapshot.best_bid is None else snapshot.best_bid.price
+        best_ask = None if snapshot.best_ask is None else snapshot.best_ask.price
+        return best_bid, best_ask
+
+    @classmethod
     def _owner_matches_best_bid_ask(
+        cls,
         owner: CanonicalL2BookOwner,
         reported: BestBidAskEvent,
     ) -> bool:
+        return cls._owner_top(owner) == (reported.best_bid, reported.best_ask)
+
+    @staticmethod
+    def _reported_target(payload: PriceChangeEvent) -> tuple[Price, Price] | None:
+        final = payload.changes[-1]
+        if final.reported_best_bid is None or final.reported_best_ask is None:
+            return None
+        return final.reported_best_bid, final.reported_best_ask
+
+    def _active_websocket_evidence(
+        self,
+    ) -> tuple[RawEventEnvelope, int]:
+        envelope = self._active_envelope
+        if envelope is None or envelope.channel != WS_MARKET:
+            raise ProgrammingInvariantViolation(
+                "reported-top transition was changed outside WebSocket processing",
+                component="canonical-processor",
+            )
+        ordinal = envelope.transport_metadata.get("websocket_admission_ordinal")
+        if ordinal is None:
+            # Historical/small-test envelopes may predate admission ordinals.
+            # The transition still binds the explicit ingest ordinal and can
+            # never enter the post-snapshot recognizer without true 1->2
+            # admission evidence.
+            ordinal = envelope.ingest_seq
+        if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0:
+            raise NormalizationError("reported-top transition source ordinal is invalid")
+        return envelope, ordinal
+
+    def _start_reported_top_transition(
+        self,
+        *,
+        event: CanonicalEvent,
+        owner: CanonicalL2BookOwner,
+        target: tuple[Price, Price],
+        entry_source: ReportedTopTransitionEntrySource,
+        reason: ReportedTopTransitionReason,
+        baseline_evidence: ReportedTopTransitionBaselineEvidence | None = None,
+    ) -> ReportedTopTransition:
+        envelope, ordinal = self._active_websocket_evidence()
         snapshot = owner.snapshot()
-        if snapshot.health is not BookHealth.HEALTHY:
-            return False
-        best_bid = None if snapshot.best_bid is None else snapshot.best_bid.price
-        best_ask = None if snapshot.best_ask is None else snapshot.best_ask.price
-        return best_bid == reported.best_bid and best_ask == reported.best_ask
+        transition = ReportedTopTransition.start(
+            instrument_id=owner.instrument_id,
+            market_id=owner.market_id,
+            target_best_bid=target[0],
+            target_best_ask=target[1],
+            starting_best_bid=(None if snapshot.best_bid is None else snapshot.best_bid.price),
+            starting_best_ask=(None if snapshot.best_ask is None else snapshot.best_ask.price),
+            starting_generation=snapshot.generation,
+            starting_economic_sha256=owner.economic_content_sha256(),
+            event=event,
+            connection_id=envelope.connection_id,
+            admission_ordinal=ordinal,
+            ingest_seq=envelope.ingest_seq,
+            received_monotonic=envelope.received_monotonic,
+            maximum_frames=self._config.polymarket.reported_top_transition_max_frames,
+            maximum_duration_ns=int(
+                self._config.polymarket.reported_top_transition_max_seconds * 1_000_000_000
+            ),
+            entry_source=entry_source,
+            reason=reason,
+            baseline_evidence=baseline_evidence,
+        )
+        self._reported_top_transitions[owner.instrument_id] = transition
+        self._reported_top_transitions_started += 1
+        self._reported_top_transition_entry_counts[entry_source] += 1
+        self._reported_top_transition_frames += 1
+        if entry_source is ReportedTopTransitionEntrySource.POST_SNAPSHOT_CATCH_UP:
+            self._reported_top_no_pending_recognized += 1
+        self._reported_top_transition_chain = _chain_extend(
+            self._reported_top_transition_chain,
+            "reported-top-transition",
+            ("START", transition),
+        )
+        return transition
+
+    def _advance_reported_top_transition(
+        self,
+        transition: ReportedTopTransition,
+        *,
+        event: CanonicalEvent,
+        reason: ReportedTopTransitionReason,
+    ) -> ReportedTopTransition | None:
+        envelope, ordinal = self._active_websocket_evidence()
+        if (
+            envelope.connection_id != transition.connection_id
+            or envelope.received_monotonic.epoch_id != transition.monotonic_epoch_id
+        ):
+            self._fail_reported_top_transition(
+                transition.instrument_id,
+                status=ReportedTopTransitionStatus.INVALIDATED,
+                reason=ReportedTopTransitionReason.SOCKET_GENERATION_CHANGED,
+                invalidation_reason=InvalidationReason.PROTOCOL_VIOLATION,
+            )
+            return None
+        if envelope.received_monotonic.nanoseconds >= transition.deadline_monotonic_ns:
+            self._fail_reported_top_transition(
+                transition.instrument_id,
+                status=ReportedTopTransitionStatus.EXPIRED,
+                reason=ReportedTopTransitionReason.TIME_BOUND_EXPIRED,
+                invalidation_reason=InvalidationReason.PROTOCOL_VIOLATION,
+            )
+            return None
+        if transition.accepted_frame_count >= transition.maximum_frames:
+            self._fail_reported_top_transition(
+                transition.instrument_id,
+                status=ReportedTopTransitionStatus.EXPIRED,
+                reason=ReportedTopTransitionReason.FRAME_BOUND_EXCEEDED,
+                invalidation_reason=InvalidationReason.PROTOCOL_VIOLATION,
+            )
+            return None
+        advanced = transition.advance(
+            event=event,
+            admission_ordinal=ordinal,
+            ingest_seq=envelope.ingest_seq,
+            received_monotonic=envelope.received_monotonic,
+            reason=reason,
+        )
+        self._reported_top_transitions[transition.instrument_id] = advanced
+        self._reported_top_transition_frames += 1
+        self._reported_top_transition_chain = _chain_extend(
+            self._reported_top_transition_chain,
+            "reported-top-transition",
+            ("ADVANCE", advanced),
+        )
+        return advanced
+
+    def _reported_top_transition_close_source(
+        self,
+    ) -> ReportedTopTransitionCloseSource | None:
+        envelope = self._active_envelope
+        if envelope is None:
+            return None
+        raw_ordinal = envelope.transport_metadata.get("websocket_admission_ordinal")
+        if raw_ordinal is None:
+            admission_ordinal = None
+        elif isinstance(raw_ordinal, bool) or not isinstance(raw_ordinal, int) or raw_ordinal < 0:
+            raise NormalizationError("reported-top close source admission ordinal is invalid")
+        else:
+            admission_ordinal = raw_ordinal
+        canonical_event = self._active_canonical_event
+        return ReportedTopTransitionCloseSource(
+            raw_source=RawSourceRef(
+                ingest_id=envelope.ingest_id,
+                payload_sha256=envelope.payload_sha256,
+            ),
+            ingest_seq=envelope.ingest_seq,
+            channel=envelope.channel,
+            connection_id=envelope.connection_id,
+            received_at=envelope.received_wall_time,
+            received_monotonic=envelope.received_monotonic,
+            admission_ordinal=admission_ordinal,
+            canonical_event_id=(
+                None if canonical_event is None else canonical_event.canonical_event_id
+            ),
+        )
+
+    def _close_reported_top_transition(
+        self,
+        instrument_id: InstrumentId,
+        *,
+        status: ReportedTopTransitionStatus,
+        reason: ReportedTopTransitionReason,
+        ended_monotonic_ns: int | None = None,
+        research_eligibility_restored: bool,
+    ) -> ReportedTopTransitionOutcome | None:
+        transition = self._reported_top_transitions.pop(instrument_id, None)
+        if transition is None:
+            return None
+        current = self._active_received_monotonic
+        envelope = self._active_envelope
+        duration_is_lower_bound = current is None or (
+            current.epoch_id != transition.monotonic_epoch_id
+        )
+        if ended_monotonic_ns is None:
+            ended_monotonic_ns = (
+                transition.latest_received_monotonic_ns if current is None else current.nanoseconds
+            )
+        ended_epoch_id = transition.monotonic_epoch_id if current is None else current.epoch_id
+        outcome = ReportedTopTransitionOutcome.close(
+            transition,
+            status=status,
+            reason=reason,
+            ended_monotonic_ns=ended_monotonic_ns,
+            ended_at=(
+                transition.latest_received_at if envelope is None else envelope.received_wall_time
+            ),
+            ended_monotonic_epoch_id=ended_epoch_id,
+            duration_is_lower_bound=duration_is_lower_bound,
+            close_source=self._reported_top_transition_close_source(),
+            research_eligibility_restored=research_eligibility_restored,
+        )
+        self._reported_top_transition_outcomes.append(outcome)
+        self._reported_top_transition_duration_total_ns += outcome.duration_ns
+        self._reported_top_transition_duration_max_ns = max(
+            self._reported_top_transition_duration_max_ns,
+            outcome.duration_ns,
+        )
+        self._reported_top_transition_reason_counts[reason] += 1
+        if outcome.duration_is_lower_bound:
+            self._reported_top_transition_duration_lower_bound_count += 1
+        if outcome.research_eligibility_restored:
+            self._reported_top_transition_research_eligibility_restored += 1
+        if status is ReportedTopTransitionStatus.CONVERGED:
+            self._reported_top_transitions_converged += 1
+        elif status is ReportedTopTransitionStatus.SUPERSEDED:
+            self._reported_top_transitions_superseded += 1
+        elif status is ReportedTopTransitionStatus.AUTHORITATIVE_SNAPSHOT:
+            self._reported_top_transitions_resnapshotted += 1
+        elif status is ReportedTopTransitionStatus.EXPIRED:
+            self._reported_top_transitions_expired += 1
+        elif status is ReportedTopTransitionStatus.INVALIDATED:
+            self._reported_top_transitions_invalidated += 1
+        self._reported_top_transition_chain = _chain_extend(
+            self._reported_top_transition_chain,
+            "reported-top-transition",
+            ("CLOSE", outcome),
+        )
+        return outcome
+
+    def _fail_reported_top_transition(
+        self,
+        instrument_id: InstrumentId,
+        *,
+        status: ReportedTopTransitionStatus,
+        reason: ReportedTopTransitionReason,
+        invalidation_reason: InvalidationReason,
+    ) -> None:
+        owner = self._owners[instrument_id]
+        was_invalid = owner.health is BookHealth.INVALID
+        mutation = owner.invalidate(invalidation_reason)
+        self._transition_resync_instruments.add(instrument_id)
+        self._close_reported_top_transition(
+            instrument_id,
+            status=status,
+            reason=reason,
+            research_eligibility_restored=False,
+        )
+        self._record_book_mutation(mutation, reason=ScanTriggerReason.INVALIDATION)
+        if not was_invalid:
+            self._invalidations += 1
 
     def _apply_best_bid_ask(self, event: CanonicalEvent) -> None:
         payload = event.payload
@@ -692,67 +1051,82 @@ class CanonicalProcessor:
             market_id=payload.market_id,
             instrument_id=payload.instrument_id,
         )
-        previous = self._pending_best_bid_ask.get(payload.instrument_id)
-        if self._owner_matches_best_bid_ask(owner, payload):
-            if previous is None:
+        if payload.instrument_id in self._transition_resync_instruments:
+            return
+        if owner.health is not BookHealth.HEALTHY:
+            # The instrument already requires an authoritative snapshot.  A
+            # quantity-free reported top cannot repair or further classify an
+            # invalid exact book, and must not create a second uncertainty
+            # state while resynchronization is pending.
+            return
+        transition = self._reported_top_transitions.get(payload.instrument_id)
+        owner_top = self._owner_top(owner)
+        target = payload.best_bid, payload.best_ask
+        if transition is None:
+            if owner_top == target:
                 return
-            if previous == payload:
-                return
-            # Returning top prices do not prove that quantity-bearing depth was
-            # restored. Preserve the unresolved marker, but advance the fence
-            # so an out-and-back BBO transition cannot disappear inside an
-            # audit window.
-            self._pending_best_bid_ask[payload.instrument_id] = payload
+            self._start_reported_top_transition(
+                event=event,
+                owner=owner,
+                target=target,
+                entry_source=ReportedTopTransitionEntrySource.BEST_BID_ASK,
+                reason=ReportedTopTransitionReason.BBO_AHEAD_OF_EXACT_L2,
+            )
             self._advance_audit_economic_generation(payload.instrument_id)
             self._mark_market_dirty(payload.market_id, ScanTriggerReason.BOOK_UPDATE)
             return
-        if previous == payload:
-            return
-        # BBO has no quantities, so fabricating/removing L2 levels would be
-        # unsafe. Block opportunity eligibility until an ordered exact
-        # quantity-bearing price_change or authoritative full snapshot/new
-        # baseline establishes the exact book.
-        self._pending_best_bid_ask[payload.instrument_id] = payload
-        self._advance_audit_economic_generation(payload.instrument_id)
-        self._mark_market_dirty(payload.market_id, ScanTriggerReason.BOOK_UPDATE)
-
-    def _reconcile_best_bid_ask_after_l2(
-        self,
-        payload: OrderBookSnapshotEvent | PriceChangeEvent,
-        owner: CanonicalL2BookOwner,
-        mutation: BookMutation,
-    ) -> None:
-        pending = self._pending_best_bid_ask.get(owner.instrument_id)
-        if pending is None:
-            return
-        superseded = isinstance(payload, OrderBookSnapshotEvent)
-        if isinstance(payload, PriceChangeEvent):
-            final_change = payload.changes[-1]
-            reports_complete_top = (
-                final_change.reported_best_bid is not None
-                and final_change.reported_best_ask is not None
+        if target == (transition.target_best_bid, transition.target_best_ask):
+            advanced = self._advance_reported_top_transition(
+                transition,
+                event=event,
+                reason=ReportedTopTransitionReason.BBO_AHEAD_OF_EXACT_L2,
             )
-            reports_pending_top = (
-                final_change.reported_best_bid == pending.best_bid
-                and final_change.reported_best_ask == pending.best_ask
-            )
-            # A venue update can publish the final BBO before several exact
-            # level-change frames. The first exact mutation may therefore
-            # leave an older top level in place. Keep the BBO
-            # unresolved until a later exact mutation produces that announced
-            # top.  A different complete reported top has passed the owner's
-            # ordinary strict validation and supersedes the older BBO.
-            superseded = reports_complete_top and (
-                not reports_pending_top or self._owner_matches_best_bid_ask(owner, pending)
-            )
-        if not superseded:
+            if advanced is not None:
+                self._advance_audit_economic_generation(payload.instrument_id)
+                self._mark_market_dirty(payload.market_id, ScanTriggerReason.BOOK_UPDATE)
             return
-        self._pending_best_bid_ask.pop(owner.instrument_id)
-        if not mutation.audit_economic_changed:
-            # Exact quantity-bearing reconciliation changed eligibility even
-            # when its level update was an economic no-op. This remains a
-            # relevant transition for an audit already in flight.
-            self._advance_audit_economic_generation(owner.instrument_id)
+        if owner_top == target and target != (
+            transition.starting_best_bid,
+            transition.starting_best_ask,
+        ):
+            self._close_reported_top_transition(
+                payload.instrument_id,
+                status=ReportedTopTransitionStatus.SUPERSEDED,
+                reason=ReportedTopTransitionReason.COMPLETE_REPORTED_TOP_SUPERSEDED,
+                research_eligibility_restored=(
+                    payload.instrument_id not in self._audit_ineligible_instruments
+                ),
+            )
+            self._advance_audit_economic_generation(payload.instrument_id)
+            self._mark_market_dirty(payload.market_id, ScanTriggerReason.BOOK_UPDATE)
+            return
+        if (
+            owner_top
+            == target
+            == (
+                transition.starting_best_bid,
+                transition.starting_best_ask,
+            )
+        ):
+            # An out-and-back reported top does not prove that the missing
+            # quantity-bearing transition was restored.  Retain the original
+            # target and uncertainty while binding this later source frame.
+            advanced = self._advance_reported_top_transition(
+                transition,
+                event=event,
+                reason=ReportedTopTransitionReason.BBO_AHEAD_OF_EXACT_L2,
+            )
+            if advanced is not None:
+                self._advance_audit_economic_generation(payload.instrument_id)
+                self._mark_market_dirty(payload.market_id, ScanTriggerReason.BOOK_UPDATE)
+            return
+        # An unrelated complete target is conflicting evidence.
+        self._fail_reported_top_transition(
+            payload.instrument_id,
+            status=ReportedTopTransitionStatus.INVALIDATED,
+            reason=ReportedTopTransitionReason.CONFLICTING_REPORTED_TOP,
+            invalidation_reason=InvalidationReason.PROTOCOL_VIOLATION,
+        )
 
     def _ws_l2_exceeds_freshness_window(self, instrument_id: InstrumentId) -> bool:
         current = self._active_received_monotonic
@@ -803,6 +1177,14 @@ class CanonicalProcessor:
 
     def _route(self, envelope: RawEventEnvelope) -> None:
         channel = envelope.channel
+        # Only an ordered WebSocket frame may enforce the bound inline.  An
+        # unrelated REST/control envelope can be processed while an earlier
+        # admitted socket frame is deferred at an audit receive fence; allowing
+        # it to expire the transition would overtake a pre-deadline convergence
+        # frame.  Idle expiry is owned by the FIFO-empty durable supervisor
+        # control, which also binds the exact closing source.
+        if channel == WS_MARKET:
+            self._expire_reported_top_transitions(envelope)
         if channel == GAMMA_MARKETS_KEYSET:
             for market in parse_gamma_markets(envelope.payload_bytes).markets:
                 self._remember_gamma(market)
@@ -908,7 +1290,13 @@ class CanonicalProcessor:
             was_unhealthy = owner.health is not BookHealth.HEALTHY
             self._prepare_for_rest_snapshot(owner)
             mutation = owner.apply_rest_snapshot(rest)
-            self._pending_best_bid_ask.pop(rest.instrument_id, None)
+            self._transition_resync_instruments.discard(rest.instrument_id)
+            self._close_reported_top_transition(
+                rest.instrument_id,
+                status=ReportedTopTransitionStatus.AUTHORITATIVE_SNAPSHOT,
+                reason=ReportedTopTransitionReason.AUTHORITATIVE_FULL_SNAPSHOT,
+                research_eligibility_restored=True,
+            )
             self._record_book_mutation(
                 mutation,
                 reason=ScanTriggerReason.REST_SNAPSHOT,
@@ -927,6 +1315,9 @@ class CanonicalProcessor:
             return
         if channel == CONTROL_REST_AUDIT_CLASSIFY:
             self._classify_staged_rest_audit_response(envelope)
+            return
+        if channel == CONTROL_REPORTED_TOP_TRANSITION_EXPIRED:
+            self._expire_reported_top_transition_from_control(envelope)
             return
         if channel == REST_BOOK_AUDIT:
             if "classification_deferred" in envelope.transport_metadata:
@@ -1171,7 +1562,29 @@ class CanonicalProcessor:
             raise NormalizationError("audit start processed watermark is ambiguous")
         current = self.audit_book_identity(start.native_asset_id)
         if current != start.starting_book:
-            raise NormalizationError("audit start book identity changed before staging")
+            if (
+                self._allow_v1_audit_generation_rebase
+                and current.instrument_id == start.starting_book.instrument_id
+                and current.economic_content_sha256 == start.starting_book.economic_content_sha256
+            ):
+                # Historical v1 audit controls bind the owner generation used
+                # by the code that produced them.  A corrected replay may
+                # renumber that non-economic counter while preserving the
+                # exact book hash and the same processed WebSocket fence.  In
+                # that one narrow case, rebase the fence to the corrected
+                # generation and bind the compatibility decision into the
+                # terminal identity.  Economic-hash disagreement remains a
+                # real race and is never rebased.
+                recorded = start.starting_book
+                start = replace(start, starting_book=current)
+                self._audit_start_generation_rebases += 1
+                self._audit_compatibility_chain = _chain_extend(
+                    self._audit_compatibility_chain,
+                    "rest-audit-generation-rebase",
+                    (start.request_id, recorded, current),
+                )
+            else:
+                raise NormalizationError("audit start book identity changed before staging")
         self._rest_audit_protocol_mode = requested_mode
         if raw_run_deadline is not None:
             if self._rest_audit_run_deadline_ns is not None and (
@@ -1258,6 +1671,11 @@ class CanonicalProcessor:
             self._rest_audit_matches += 1
         elif evidence.outcome is AuditOutcome.MISMATCH:
             self._rest_audit_mismatches += 1
+            diagnostic = evidence.mismatch_diagnostic
+            cause = AuditMismatchCause.UNKNOWN if diagnostic is None else diagnostic.cause
+            self._audit_mismatch_cause_counts[cause] += 1
+            if diagnostic is not None:
+                self._audit_mismatch_diagnostics.append(diagnostic)
         elif evidence.outcome is AuditOutcome.RACED:
             self._rest_audit_raced += 1
         else:
@@ -1612,7 +2030,7 @@ class CanonicalProcessor:
             return
 
         owner = self._owners[start.starting_book.instrument_id]
-        if owner.instrument_id in self._pending_best_bid_ask:
+        if owner.instrument_id in self._reported_top_transitions:
             # A quantity-free BBO that contradicts local depth proves that the
             # local L2 image is unresolved.  A REST body equal to that stale
             # image does not prove venue-side causal freshness, so it must not
@@ -1630,6 +2048,7 @@ class CanonicalProcessor:
                 )
             )
             return
+        local_snapshot = owner.snapshot()
         previous_health = owner.health
         try:
             result = owner.audit_rest_snapshot(rest, checked_at=envelope.received_wall_time)
@@ -1666,12 +2085,72 @@ class CanonicalProcessor:
         outcome = (
             AuditOutcome.MATCH if result.status is RestAuditStatus.MATCH else AuditOutcome.MISMATCH
         )
+        mismatch_diagnostic: AuditMismatchDiagnostic | None = None
+        if outcome is AuditOutcome.MISMATCH:
+            comparison = compare_audit_exact_depth(
+                local_bids=local_snapshot.bids,
+                local_asks=local_snapshot.asks,
+                rest_bids=rest.bids,
+                rest_asks=rest.asks,
+            )
+            if comparison.difference_count:
+                # The exact fence proves the local image did not change over
+                # the request/response window.  Without later causal evidence,
+                # the strongest immediate classification is the observed
+                # exact-depth divergence itself; no timing heuristic upgrades
+                # it to a venue/window cause.
+                cause = AuditMismatchCause.TRUE_EXACT_DEPTH_DIVERGENCE
+            else:
+                # Pending reported-top transitions and unhealthy owners were
+                # rejected as non-comparable above, so neither is a reachable
+                # MISMATCH cause here.  Equal depth can differ only on a
+                # reference scalar, but the fenced response alone cannot prove
+                # a precision transition rather than bad REST/reference data.
+                # The bounded post-hoc raw join may upgrade it only when a
+                # causally bound transition frame exists.
+                cause = AuditMismatchCause.UNKNOWN
+            local_provenance = (
+                local_snapshot.state_source_provenance or local_snapshot.last_source_provenance
+            )
+            response_source = RawSourceRef(
+                ingest_id=envelope.ingest_id,
+                payload_sha256=envelope.payload_sha256,
+            )
+            try:
+                mismatch_diagnostic = build_audit_mismatch_diagnostic(
+                    cause=cause,
+                    local_book=barrier_book,
+                    local_bids=local_snapshot.bids,
+                    local_asks=local_snapshot.asks,
+                    local_raw_sources=(
+                        () if local_provenance is None else local_provenance.raw_source_refs
+                    ),
+                    rest_instrument_id=rest.instrument_id,
+                    rest_market_id=rest.market_id,
+                    rest_bids=rest.bids,
+                    rest_asks=rest.asks,
+                    rest_tick_size=rest.tick_size,
+                    rest_minimum_order_size=rest.minimum_order_size,
+                    rest_neg_risk=rest.neg_risk,
+                    rest_raw_sources=rest.provenance.raw_source_refs,
+                    response_source=response_source,
+                )
+            except ValueError as error:
+                raise ProgrammingInvariantViolation(
+                    "bounded REST mismatch diagnostic could not be constructed",
+                    component="canonical-processor",
+                ) from error
         if outcome is AuditOutcome.MISMATCH and previous_health is not BookHealth.INVALID:
             self._invalidations += 1
         if outcome is AuditOutcome.MATCH:
             self._audit_ineligible_instruments.discard(owner.instrument_id)
         elif outcome is AuditOutcome.MISMATCH:
             self._audit_ineligible_instruments.add(owner.instrument_id)
+            # A mismatch invalidates this exact local book.  Suppress further
+            # incrementals for this instrument until an authoritative REST or
+            # full-book snapshot restores it, rather than allowing the next
+            # delta to escape as a BookStateError and globally cascade.
+            self._transition_resync_instruments.add(owner.instrument_id)
         evidence = AuditOutcomeEvidence(
             request_id=start.request_id,
             connection_id=start.connection_id,
@@ -1691,6 +2170,7 @@ class CanonicalProcessor:
             barrier_processed_ordinal=processed,
             barrier_book=barrier_book,
             requires_resync=outcome is AuditOutcome.MISMATCH,
+            mismatch_diagnostic=mismatch_diagnostic,
         )
         self._record_audit_outcome(evidence)
 
@@ -1967,6 +2447,296 @@ class CanonicalProcessor:
             reference_bundle=bundle,
         )
 
+    def _expire_reported_top_transitions(self, envelope: RawEventEnvelope) -> None:
+        for transition in tuple(self.reported_top_transitions):
+            if envelope.received_monotonic.epoch_id != transition.monotonic_epoch_id:
+                self._fail_reported_top_transition(
+                    transition.instrument_id,
+                    status=ReportedTopTransitionStatus.INVALIDATED,
+                    reason=ReportedTopTransitionReason.SOCKET_GENERATION_CHANGED,
+                    invalidation_reason=InvalidationReason.PROTOCOL_VIOLATION,
+                )
+            elif envelope.received_monotonic.nanoseconds >= transition.deadline_monotonic_ns:
+                self._fail_reported_top_transition(
+                    transition.instrument_id,
+                    status=ReportedTopTransitionStatus.EXPIRED,
+                    reason=ReportedTopTransitionReason.TIME_BOUND_EXPIRED,
+                    invalidation_reason=InvalidationReason.PROTOCOL_VIOLATION,
+                )
+
+    def _expire_reported_top_transition_from_control(
+        self,
+        envelope: RawEventEnvelope,
+    ) -> None:
+        control = self._control_object(
+            envelope.payload_bytes,
+            schema=REPORTED_TOP_TRANSITION_EXPIRY_SCHEMA,
+            expected_keys=frozenset(
+                {
+                    "deadline_monotonic_ns",
+                    "decision_monotonic_ns",
+                    "instrument_id",
+                    "monotonic_epoch_id",
+                    "schema",
+                    "transition_id",
+                }
+            ),
+        )
+        try:
+            command = ReportedTopTransitionExpiryCommand(
+                transition_id=self._control_text(
+                    control,
+                    "transition_id",
+                    maximum=64,
+                ),
+                instrument_id=InstrumentId(
+                    self._control_text(control, "instrument_id", maximum=256)
+                ),
+                monotonic_epoch_id=self._control_text(
+                    control,
+                    "monotonic_epoch_id",
+                    maximum=256,
+                ),
+                deadline_monotonic_ns=self._control_integer(
+                    control,
+                    "deadline_monotonic_ns",
+                ),
+                decision_monotonic_ns=self._control_integer(
+                    control,
+                    "decision_monotonic_ns",
+                ),
+            )
+        except ValueError as error:
+            raise NormalizationError("reported-top expiry evidence is invalid") from error
+        if envelope.payload_bytes != command.to_payload():
+            raise NormalizationError("reported-top expiry evidence must use canonical encoding")
+        transition = self._reported_top_transitions.get(command.instrument_id)
+        if transition is None:
+            raise NormalizationError("reported-top expiry does not identify a current transition")
+        if (
+            transition.transition_id != command.transition_id
+            or transition.monotonic_epoch_id != command.monotonic_epoch_id
+            or transition.deadline_monotonic_ns != command.deadline_monotonic_ns
+        ):
+            raise NormalizationError(
+                "reported-top expiry differs from the current transition bound"
+            )
+        if (
+            envelope.received_monotonic.epoch_id != command.monotonic_epoch_id
+            or envelope.received_monotonic.nanoseconds != command.decision_monotonic_ns
+        ):
+            raise NormalizationError(
+                "reported-top expiry decision differs from its durable receive boundary"
+            )
+        self._fail_reported_top_transition(
+            command.instrument_id,
+            status=ReportedTopTransitionStatus.EXPIRED,
+            reason=ReportedTopTransitionReason.TIME_BOUND_EXPIRED,
+            invalidation_reason=InvalidationReason.PROTOCOL_VIOLATION,
+        )
+
+    @staticmethod
+    def _one_tick_difference(left: Price, right: Price, tick: ExactDecimal) -> bool:
+        difference = left.value - right.value
+        return difference == tick or difference == ExactDecimal.zero() - tick
+
+    def _recognize_post_snapshot_catch_up(
+        self,
+        envelope: RawEventEnvelope,
+        events: tuple[CanonicalEvent, ...],
+    ) -> dict[InstrumentId, ReportedTopTransitionBaselineEvidence]:
+        """Recognize only the three source-proven ordinal-2 corpus patterns."""
+
+        ordinal = envelope.transport_metadata.get("websocket_admission_ordinal")
+        if ordinal != 2 or len(events) != 2:
+            return {}
+        if not all(isinstance(event.payload, PriceChangeEvent) for event in events):
+            return {}
+        price_events = events
+        payloads = tuple(cast(PriceChangeEvent, event.payload) for event in price_events)
+        market_ids = {payload.market_id for payload in payloads}
+        if len(market_ids) != 1:
+            return {}
+        market_id = next(iter(market_ids))
+        baseline = self._post_snapshot_baselines.get(market_id)
+        evidence = None if baseline is None else baseline.evidence
+        if (
+            evidence is None
+            or evidence.admission_ordinal != 1
+            or evidence.connection_id != envelope.connection_id
+            or evidence.monotonic_epoch_id != envelope.received_monotonic.epoch_id
+            or evidence.ingest_seq >= envelope.ingest_seq
+            or evidence.received_monotonic_ns >= envelope.received_monotonic.nanoseconds
+        ):
+            return {}
+        expected_instruments = self._market_instruments.get(market_id, ())
+        instruments = tuple(payload.instrument_id for payload in payloads)
+        if set(instruments) != set(expected_instruments) or len(set(instruments)) != 2:
+            return {}
+        if any(
+            instrument_id in self._reported_top_transitions
+            or instrument_id in self._transition_resync_instruments
+            for instrument_id in instruments
+        ):
+            return {}
+        if any(len(payload.changes) != 1 for payload in payloads):
+            return {}
+        changes = tuple(payload.changes[0] for payload in payloads)
+        if (
+            changes[0].side is changes[1].side
+            or changes[0].price.value + changes[1].price.value != ExactDecimal.one()
+            or changes[0].new_quantity != changes[1].new_quantity
+            or changes[0].new_quantity.value <= ExactDecimal.zero()
+        ):
+            return {}
+        baseline_by_instrument = {
+            instrument_id: (generation, exact_state_sha256, best_bid, best_ask)
+            for instrument_id, generation, exact_state_sha256, best_bid, best_ask in (
+                evidence.instrument_states
+            )
+        }
+        targets: list[tuple[Price, Price]] = []
+        target_change_sides: list[BookSide] = []
+        source_change_matches_target_side: list[bool] = []
+        for event, payload, change in zip(price_events, payloads, changes, strict=True):
+            owner = self._owners[payload.instrument_id]
+            baseline_state = baseline_by_instrument.get(payload.instrument_id)
+            if baseline_state is None:
+                return {}
+            current_top = self._owner_top(owner)
+            if (
+                owner.generation != baseline_state[0]
+                or owner.audit_comparison_sha256() != baseline_state[1]
+                or current_top != (baseline_state[2], baseline_state[3])
+            ):
+                return {}
+            target = self._reported_target(payload)
+            if target is None or target[0].value >= target[1].value:
+                return {}
+            if current_top[0] is None or current_top[1] is None:
+                return {}
+            complete_current_top = cast(tuple[Price, Price], current_top)
+            changed_sides = int(target[0] != complete_current_top[0]) + int(
+                target[1] != complete_current_top[1]
+            )
+            tick = owner.tick_size
+            if (
+                changed_sides != 1
+                or tick is None
+                or not any(
+                    self._one_tick_difference(candidate, prior, tick)
+                    for candidate, prior in zip(target, complete_current_top, strict=True)
+                    if candidate != prior
+                )
+            ):
+                return {}
+            try:
+                preview = owner.preview_price_change(payload, event=event)
+            except BookStateError:
+                return {}
+            # Every source-proven ordinal-2 case changed exact depth without
+            # changing the current derived top.  Requiring both facts excludes
+            # economic no-ops and broader complementary mismatch patterns.
+            if (
+                not preview.levels_changed
+                or preview.crossed
+                or (preview.best_bid, preview.best_ask) != complete_current_top
+                or (preview.best_bid, preview.best_ask) == target
+            ):
+                return {}
+            target_side = BookSide.BID if target[0] != complete_current_top[0] else BookSide.ASK
+            target_price = target[0] if target_side is BookSide.BID else target[1]
+            matches_target_side = change.side is target_side
+            if matches_target_side:
+                # Corpus case 84229: the exact change adds/resizes the future
+                # reported top level, while the old better level remains.
+                if change.price != target_price:
+                    return {}
+            else:
+                # Corpus cases 26146/57885: the paired exact changes are deep
+                # complementary updates on the opposite side.  They must be
+                # strictly worse than the baseline top and cannot themselves
+                # equal either reported top.
+                if change.price in target:
+                    return {}
+                if change.side is BookSide.BID:
+                    if change.price.value >= complete_current_top[0].value:
+                        return {}
+                elif change.price.value <= complete_current_top[1].value:
+                    return {}
+            target_change_sides.append(target_side)
+            source_change_matches_target_side.append(matches_target_side)
+            targets.append(target)
+        first_target, second_target = targets
+        if (
+            first_target[0].value + second_target[1].value != ExactDecimal.one()
+            or first_target[1].value + second_target[0].value != ExactDecimal.one()
+            or target_change_sides[0] is target_change_sides[1]
+            or source_change_matches_target_side[0] != source_change_matches_target_side[1]
+        ):
+            return {}
+        return dict.fromkeys(instruments, evidence)
+
+    def _remember_complete_ordinal_one_snapshot(
+        self,
+        envelope: RawEventEnvelope,
+        events: tuple[CanonicalEvent, ...],
+    ) -> None:
+        ordinal = envelope.transport_metadata.get("websocket_admission_ordinal")
+        if (
+            isinstance(ordinal, bool)
+            or not isinstance(ordinal, int)
+            or ordinal != 1
+            or len(events) != 2
+        ):
+            return
+        if not all(isinstance(event.payload, OrderBookSnapshotEvent) for event in events):
+            return
+        snapshots = tuple(cast(OrderBookSnapshotEvent, event.payload) for event in events)
+        market_ids = {snapshot.market_id for snapshot in snapshots}
+        if len(market_ids) != 1:
+            return
+        market_id = next(iter(market_ids))
+        expected = self._market_instruments.get(market_id, ())
+        if {snapshot.instrument_id for snapshot in snapshots} != set(expected):
+            return
+        try:
+            raw_refs = tuple(
+                sorted(
+                    merge_raw_source_refs(*(event.raw_source_refs for event in events)),
+                    key=lambda item: item.ingest_id.value,
+                )
+            )
+        except RawSourceInvariantError as error:
+            raise ProgrammingInvariantViolation(
+                "post-snapshot baseline contains conflicting raw sources",
+                component="canonical-processor",
+            ) from error
+        evidence = ReportedTopTransitionBaselineEvidence(
+            connection_id=envelope.connection_id,
+            monotonic_epoch_id=envelope.received_monotonic.epoch_id,
+            admission_ordinal=ordinal,
+            ingest_seq=envelope.ingest_seq,
+            received_at=envelope.received_wall_time,
+            received_monotonic_ns=envelope.received_monotonic.nanoseconds,
+            source_raw_refs=raw_refs,
+            source_canonical_event_ids=tuple(event.canonical_event_id for event in events),
+            instrument_states=tuple(
+                (
+                    instrument_id,
+                    self._owners[instrument_id].generation,
+                    self._owners[instrument_id].audit_comparison_sha256(),
+                    self._owner_top(self._owners[instrument_id])[0],
+                    self._owner_top(self._owners[instrument_id])[1],
+                )
+                for instrument_id in sorted(expected, key=lambda item: item.value)
+            ),
+        )
+        self._post_snapshot_baselines[market_id] = _PostSnapshotBaseline(
+            market_id=market_id,
+            evidence=evidence,
+        )
+
     def _route_websocket(self, envelope: RawEventEnvelope) -> None:
         native_events = parse_market_ws_message(envelope.payload_bytes)
         condition_ids = {
@@ -1994,8 +2764,34 @@ class CanonicalProcessor:
             native_events,
             self._normalization_context(envelope, bundle),
         )
+        recognized = self._recognize_post_snapshot_catch_up(envelope, events)
+        snapshot_instruments = {
+            event.payload.instrument_id
+            for event in events
+            if isinstance(event.payload, OrderBookSnapshotEvent)
+        }
+        for transition in tuple(self.reported_top_transitions):
+            if (
+                transition.connection_id != envelope.connection_id
+                and transition.instrument_id not in snapshot_instruments
+            ):
+                self._fail_reported_top_transition(
+                    transition.instrument_id,
+                    status=ReportedTopTransitionStatus.INVALIDATED,
+                    reason=ReportedTopTransitionReason.SOCKET_GENERATION_CHANGED,
+                    invalidation_reason=InvalidationReason.PROTOCOL_VIOLATION,
+                )
         for event in events:
-            self._apply_canonical(event)
+            self._active_canonical_event = event
+            try:
+                self._apply_canonical(
+                    event,
+                    recognized_post_snapshot=(
+                        None if event.instrument_id is None else recognized.get(event.instrument_id)
+                    ),
+                )
+            finally:
+                self._active_canonical_event = None
             if isinstance(event.payload, TickSizeChangeEvent):
                 if bundle is None:
                     raise ProgrammingInvariantViolation(
@@ -2003,8 +2799,18 @@ class CanonicalProcessor:
                         component="canonical-processor",
                     )
                 bundle = self._publish_dynamic_tick_reference(event, bundle)
+        if market_id is not None:
+            ordinal = envelope.transport_metadata.get("websocket_admission_ordinal")
+            if ordinal != 1:
+                self._post_snapshot_baselines.pop(market_id, None)
+        self._remember_complete_ordinal_one_snapshot(envelope, events)
 
-    def _apply_canonical(self, event: CanonicalEvent) -> None:
+    def _apply_canonical(
+        self,
+        event: CanonicalEvent,
+        *,
+        recognized_post_snapshot: ReportedTopTransitionBaselineEvidence | None = None,
+    ) -> None:
         self._canonical_events += 1
         self._canonical_event_chain = _chain_extend(
             self._canonical_event_chain,
@@ -2027,7 +2833,15 @@ class CanonicalProcessor:
         for instrument_id in target_ids:
             owner = self._owners[instrument_id]
             previous = owner.health
-            if isinstance(event.payload, (OrderBookSnapshotEvent, PriceChangeEvent)) and (
+            if instrument_id in self._transition_resync_instruments and not isinstance(
+                event.payload, (OrderBookSnapshotEvent, MarketResolvedEvent)
+            ):
+                # Exact incremental state cannot be based on an invalidated
+                # transition image.  Retain the raw/canonical record and wait
+                # for an authoritative baseline without creating cascaded
+                # BookStateError failures.
+                continue
+            if isinstance(event.payload, PriceChangeEvent) and (
                 self._ws_l2_exceeds_freshness_window(instrument_id)
             ):
                 mutation = owner.invalidate(InvalidationReason.STALE_SNAPSHOT)
@@ -2040,11 +2854,162 @@ class CanonicalProcessor:
                 continue
             try:
                 if isinstance(event.payload, PriceChangeEvent):
-                    mutation = owner.apply_price_change(
-                        event.payload,
-                        event=event,
-                        pending_best_bid_ask=self._pending_best_bid_ask.get(instrument_id),
-                    )
+                    transition = self._reported_top_transitions.get(instrument_id)
+                    try:
+                        preview = owner.preview_price_change(event.payload, event=event)
+                    except BookStateError:
+                        if transition is None:
+                            raise
+                        self._fail_reported_top_transition(
+                            instrument_id,
+                            status=ReportedTopTransitionStatus.INVALIDATED,
+                            reason=ReportedTopTransitionReason.INVALID_EXACT_FRAME,
+                            invalidation_reason=InvalidationReason.PROTOCOL_VIOLATION,
+                        )
+                        continue
+                    reported_target = self._reported_target(event.payload)
+                    if transition is not None:
+                        if transition.accepted_frame_count >= transition.maximum_frames:
+                            self._fail_reported_top_transition(
+                                instrument_id,
+                                status=ReportedTopTransitionStatus.EXPIRED,
+                                reason=ReportedTopTransitionReason.FRAME_BOUND_EXCEEDED,
+                                invalidation_reason=InvalidationReason.PROTOCOL_VIOLATION,
+                            )
+                            continue
+                        bound_target = (
+                            transition.target_best_bid,
+                            transition.target_best_ask,
+                        )
+                        if reported_target is not None and reported_target != bound_target:
+                            if (
+                                not preview.crossed
+                                and (preview.best_bid, preview.best_ask) == reported_target
+                            ):
+                                mutation = owner.apply_price_change(event.payload, event=event)
+                                self._close_reported_top_transition(
+                                    instrument_id,
+                                    status=ReportedTopTransitionStatus.SUPERSEDED,
+                                    reason=(
+                                        ReportedTopTransitionReason.COMPLETE_REPORTED_TOP_SUPERSEDED
+                                    ),
+                                    research_eligibility_restored=(
+                                        instrument_id not in self._audit_ineligible_instruments
+                                    ),
+                                )
+                                if not mutation.audit_economic_changed:
+                                    self._advance_audit_economic_generation(instrument_id)
+                            else:
+                                self._fail_reported_top_transition(
+                                    instrument_id,
+                                    status=ReportedTopTransitionStatus.INVALIDATED,
+                                    reason=(ReportedTopTransitionReason.CONFLICTING_REPORTED_TOP),
+                                    invalidation_reason=InvalidationReason.PROTOCOL_VIOLATION,
+                                )
+                                continue
+                        elif preview.crossed:
+                            self._fail_reported_top_transition(
+                                instrument_id,
+                                status=ReportedTopTransitionStatus.INVALIDATED,
+                                reason=ReportedTopTransitionReason.CROSSED_EXACT_BOOK,
+                                invalidation_reason=InvalidationReason.IMPOSSIBLE_STATE,
+                            )
+                            continue
+                        else:
+                            mutation = owner.apply_price_change(
+                                event.payload,
+                                event=event,
+                                reported_top_transition_target=bound_target,
+                            )
+                            advanced = self._advance_reported_top_transition(
+                                transition,
+                                event=event,
+                                reason=ReportedTopTransitionReason.SAME_TARGET_EXACT_FRAME,
+                            )
+                            if advanced is None:
+                                continue
+                            if (preview.best_bid, preview.best_ask) == bound_target:
+                                self._close_reported_top_transition(
+                                    instrument_id,
+                                    status=ReportedTopTransitionStatus.CONVERGED,
+                                    reason=ReportedTopTransitionReason.EXACT_L2_CONVERGED,
+                                    research_eligibility_restored=(
+                                        instrument_id not in self._audit_ineligible_instruments
+                                    ),
+                                )
+                                if not mutation.audit_economic_changed:
+                                    self._advance_audit_economic_generation(instrument_id)
+                    elif (
+                        reported_target is not None
+                        and (
+                            preview.best_bid,
+                            preview.best_ask,
+                        )
+                        != reported_target
+                    ):
+                        if recognized_post_snapshot is None:
+                            self._reported_top_no_pending_rejected += 1
+                            envelope, ordinal = self._active_websocket_evidence()
+                            self._reported_top_transition_chain = _chain_extend(
+                                self._reported_top_transition_chain,
+                                "reported-top-transition",
+                                (
+                                    "REJECT",
+                                    instrument_id,
+                                    event.canonical_event_id,
+                                    envelope.connection_id,
+                                    ordinal,
+                                    envelope.ingest_seq,
+                                    reported_target,
+                                    preview,
+                                    ReportedTopTransitionReason.UNRECOGNIZED_NO_PENDING,
+                                ),
+                            )
+                            was_invalid = owner.health is BookHealth.INVALID
+                            mutation = owner.invalidate(InvalidationReason.PROTOCOL_VIOLATION)
+                            self._transition_resync_instruments.add(instrument_id)
+                            self._record_book_mutation(
+                                mutation,
+                                reason=ScanTriggerReason.INVALIDATION,
+                            )
+                            if not was_invalid:
+                                self._invalidations += 1
+                            continue
+                        transition = self._start_reported_top_transition(
+                            event=event,
+                            owner=owner,
+                            target=reported_target,
+                            entry_source=(ReportedTopTransitionEntrySource.POST_SNAPSHOT_CATCH_UP),
+                            reason=(ReportedTopTransitionReason.POST_SNAPSHOT_PAIRED_CATCH_UP),
+                            baseline_evidence=recognized_post_snapshot,
+                        )
+                        if preview.crossed:
+                            self._fail_reported_top_transition(
+                                instrument_id,
+                                status=ReportedTopTransitionStatus.INVALIDATED,
+                                reason=ReportedTopTransitionReason.CROSSED_EXACT_BOOK,
+                                invalidation_reason=InvalidationReason.IMPOSSIBLE_STATE,
+                            )
+                            continue
+                        try:
+                            mutation = owner.apply_price_change(
+                                event.payload,
+                                event=event,
+                                reported_top_transition_target=(
+                                    transition.target_best_bid,
+                                    transition.target_best_ask,
+                                ),
+                            )
+                        except BookStateError:
+                            self._fail_reported_top_transition(
+                                instrument_id,
+                                status=ReportedTopTransitionStatus.INVALIDATED,
+                                reason=ReportedTopTransitionReason.INVALID_EXACT_FRAME,
+                                invalidation_reason=InvalidationReason.PROTOCOL_VIOLATION,
+                            )
+                            continue
+                    else:
+                        mutation = owner.apply_price_change(event.payload, event=event)
                 else:
                     mutation = owner.apply_event(event)
             except RawSourceInvariantError as error:
@@ -2058,10 +3023,34 @@ class CanonicalProcessor:
                 raise
             if previous is not BookHealth.INVALID and owner.health is BookHealth.INVALID:
                 self._invalidations += 1
-            if isinstance(event.payload, (OrderBookSnapshotEvent, PriceChangeEvent)):
-                self._reconcile_best_bid_ask_after_l2(event.payload, owner, mutation)
+            if (
+                isinstance(event.payload, TickSizeChangeEvent)
+                and instrument_id in self._reported_top_transitions
+            ):
+                self._fail_reported_top_transition(
+                    instrument_id,
+                    status=ReportedTopTransitionStatus.INVALIDATED,
+                    reason=(ReportedTopTransitionReason.REFERENCE_PRECISION_CHANGED),
+                    invalidation_reason=InvalidationReason.UNKNOWN_PRECISION,
+                )
+            if isinstance(event.payload, OrderBookSnapshotEvent):
+                self._transition_resync_instruments.discard(owner.instrument_id)
+                self._close_reported_top_transition(
+                    owner.instrument_id,
+                    status=ReportedTopTransitionStatus.AUTHORITATIVE_SNAPSHOT,
+                    reason=ReportedTopTransitionReason.AUTHORITATIVE_FULL_SNAPSHOT,
+                    research_eligibility_restored=(
+                        owner.instrument_id not in self._audit_ineligible_instruments
+                    ),
+                )
             elif isinstance(event.payload, MarketResolvedEvent):
-                self._pending_best_bid_ask.pop(owner.instrument_id, None)
+                self._transition_resync_instruments.discard(owner.instrument_id)
+                self._close_reported_top_transition(
+                    owner.instrument_id,
+                    status=ReportedTopTransitionStatus.INVALIDATED,
+                    reason=ReportedTopTransitionReason.MARKET_RESOLVED,
+                    research_eligibility_restored=False,
+                )
             if isinstance(event.payload, MarketResolvedEvent):
                 reason = ScanTriggerReason.LIFECYCLE
             elif isinstance(event.payload, TickSizeChangeEvent):
@@ -2269,6 +3258,20 @@ class CanonicalProcessor:
         )
 
     def invalidate_all(self, reason: InvalidationReason) -> tuple[InstrumentId, ...]:
+        transition_reason = (
+            ReportedTopTransitionReason.DISCONNECT
+            if reason is InvalidationReason.DISCONNECT
+            else ReportedTopTransitionReason.INVALID_EXACT_FRAME
+        )
+        for transition in tuple(self.reported_top_transitions):
+            self._transition_resync_instruments.add(transition.instrument_id)
+            self._close_reported_top_transition(
+                transition.instrument_id,
+                status=ReportedTopTransitionStatus.INVALIDATED,
+                reason=transition_reason,
+                research_eligibility_restored=False,
+            )
+        self._post_snapshot_baselines.clear()
         affected: list[InstrumentId] = []
         for owner in self.owners:
             if owner.health is BookHealth.CLOSED:
@@ -2314,7 +3317,30 @@ class CanonicalProcessor:
         validated_opportunity_chain_sha256 = self._validated_opportunity_chain.hex()
         reference_refresh_chain_sha256 = self._reference_refresh_chain.hex()
         audit_outcome_chain_sha256 = self._audit_outcome_chain.hex()
+        audit_compatibility_chain_sha256 = self._audit_compatibility_chain.hex()
+        reported_top_transition_chain_sha256 = self._reported_top_transition_chain.hex()
         audit_outcomes = tuple(self._audit_outcomes)
+        audit_mismatch_diagnostics = tuple(self._audit_mismatch_diagnostics)
+        audit_mismatch_cause_counts = tuple(
+            (cause, self._audit_mismatch_cause_counts[cause])
+            for cause in sorted(AuditMismatchCause, key=lambda item: item.value)
+        )
+        reported_top_transition_entry_counts = tuple(
+            (source, self._reported_top_transition_entry_counts[source])
+            for source in sorted(
+                ReportedTopTransitionEntrySource,
+                key=lambda item: item.value,
+            )
+        )
+        reported_top_transition_reason_counts = tuple(
+            (reason, self._reported_top_transition_reason_counts[reason])
+            for reason in sorted(
+                ReportedTopTransitionReason,
+                key=lambda item: item.value,
+            )
+        )
+        reported_top_transitions = self.reported_top_transitions
+        reported_top_transition_outcomes = tuple(self._reported_top_transition_outcomes)
         audit_ineligible_instrument_ids = tuple(
             item.value for item in self.audit_ineligible_instruments
         )
@@ -2342,10 +3368,17 @@ class CanonicalProcessor:
             }
             for request_id in sorted(self._pending_rest_audits)
         )
-        pending_best_bid_ask_state = tuple(
-            self._pending_best_bid_ask[instrument_id]
+        transition_resync_state = tuple(
+            instrument_id.value
             for instrument_id in sorted(
-                self._pending_best_bid_ask,
+                self._transition_resync_instruments,
+                key=lambda item: item.value,
+            )
+        )
+        post_snapshot_baseline_state = tuple(
+            self._post_snapshot_baselines[market_id]
+            for market_id in sorted(
+                self._post_snapshot_baselines,
                 key=lambda item: item.value,
             )
         )
@@ -2359,6 +3392,7 @@ class CanonicalProcessor:
         terminal_hash = canonical_sha256(
             {
                 "config_hash": self._config.config_hash.value,
+                "v1_audit_generation_rebase_enabled": (self._allow_v1_audit_generation_rebase),
                 "counters": {
                     "candidates": self._candidate_count,
                     "canonical_events": self._canonical_events,
@@ -2369,6 +3403,8 @@ class CanonicalProcessor:
                     "reference_refresh_requests": self._reference_refresh_count,
                     "reference_updates": self._reference_updates,
                     "rest_audit_failed": self._rest_audit_failed,
+                    "audit_start_generation_rebases": (self._audit_start_generation_rebases),
+                    "audit_mismatch_causes": audit_mismatch_cause_counts,
                     "rest_audit_matches": self._rest_audit_matches,
                     "rest_audit_mismatches": self._rest_audit_mismatches,
                     "rest_audit_raced": self._rest_audit_raced,
@@ -2376,6 +3412,42 @@ class CanonicalProcessor:
                     "pending_rest_audits": len(self._pending_rest_audits),
                     "staged_rest_audit_responses": len(self._pending_rest_audit_responses),
                     "audit_ineligible_books": audit_ineligible_books,
+                    "pending_reported_top_transitions": len(reported_top_transitions),
+                    "reported_top_no_pending_recognized": (
+                        self._reported_top_no_pending_recognized
+                    ),
+                    "reported_top_no_pending_rejected": self._reported_top_no_pending_rejected,
+                    "reported_top_transition_duration_max_ns": (
+                        self._reported_top_transition_duration_max_ns
+                    ),
+                    "reported_top_transition_duration_total_ns": (
+                        self._reported_top_transition_duration_total_ns
+                    ),
+                    "reported_top_transition_duration_lower_bound_count": (
+                        self._reported_top_transition_duration_lower_bound_count
+                    ),
+                    "reported_top_transition_entry_counts": (reported_top_transition_entry_counts),
+                    "reported_top_transition_frames": self._reported_top_transition_frames,
+                    "reported_top_transition_reason_counts": (
+                        reported_top_transition_reason_counts
+                    ),
+                    "reported_top_transition_research_eligibility_restored": (
+                        self._reported_top_transition_research_eligibility_restored
+                    ),
+                    "reported_top_transitions_converged": (
+                        self._reported_top_transitions_converged
+                    ),
+                    "reported_top_transitions_expired": self._reported_top_transitions_expired,
+                    "reported_top_transitions_invalidated": (
+                        self._reported_top_transitions_invalidated
+                    ),
+                    "reported_top_transitions_resnapshotted": (
+                        self._reported_top_transitions_resnapshotted
+                    ),
+                    "reported_top_transitions_started": self._reported_top_transitions_started,
+                    "reported_top_transitions_superseded": (
+                        self._reported_top_transitions_superseded
+                    ),
                     "resyncs": self._resyncs,
                     "scans": self._scan_count,
                     "scan_dispositions": scan_disposition_counts,
@@ -2388,6 +3460,8 @@ class CanonicalProcessor:
                     "raw_input": raw_input_chain_sha256,
                     "reference_refresh": reference_refresh_chain_sha256,
                     "rest_audit_outcome": audit_outcome_chain_sha256,
+                    "rest_audit_compatibility": audit_compatibility_chain_sha256,
+                    "reported_top_transition": reported_top_transition_chain_sha256,
                     "scan": scan_chain_sha256,
                     "validated_opportunity": validated_opportunity_chain_sha256,
                 },
@@ -2396,7 +3470,9 @@ class CanonicalProcessor:
                 "audit_ineligible_instrument_ids": audit_ineligible_instrument_ids,
                 "audit_economic_generations": audit_economic_generation_state,
                 "pending_rest_audits": pending_rest_audit_state,
-                "pending_best_bid_ask": pending_best_bid_ask_state,
+                "reported_top_transitions": reported_top_transitions,
+                "reported_top_transition_resync_instruments": transition_resync_state,
+                "post_snapshot_baselines": post_snapshot_baseline_state,
                 "rest_audit_protocol_mode": self._rest_audit_protocol_mode,
                 "rest_audit_run_deadline": (
                     None
@@ -2425,8 +3501,32 @@ class CanonicalProcessor:
             rest_audit_mismatches=self._rest_audit_mismatches,
             rest_audit_raced=self._rest_audit_raced,
             rest_audit_failed=self._rest_audit_failed,
+            audit_start_generation_rebases=self._audit_start_generation_rebases,
+            audit_mismatch_cause_counts=audit_mismatch_cause_counts,
             pending_rest_audits=len(self._pending_rest_audits),
             audit_ineligible_books=audit_ineligible_books,
+            reported_top_transitions_started=self._reported_top_transitions_started,
+            reported_top_transitions_converged=self._reported_top_transitions_converged,
+            reported_top_transitions_superseded=self._reported_top_transitions_superseded,
+            reported_top_transitions_resnapshotted=self._reported_top_transitions_resnapshotted,
+            reported_top_transitions_expired=self._reported_top_transitions_expired,
+            reported_top_transitions_invalidated=self._reported_top_transitions_invalidated,
+            reported_top_transition_frames=self._reported_top_transition_frames,
+            reported_top_transition_duration_total_ns=(
+                self._reported_top_transition_duration_total_ns
+            ),
+            reported_top_transition_duration_max_ns=(self._reported_top_transition_duration_max_ns),
+            reported_top_transition_duration_lower_bound_count=(
+                self._reported_top_transition_duration_lower_bound_count
+            ),
+            reported_top_transition_entry_counts=reported_top_transition_entry_counts,
+            reported_top_transition_reason_counts=reported_top_transition_reason_counts,
+            reported_top_transition_research_eligibility_restored=(
+                self._reported_top_transition_research_eligibility_restored
+            ),
+            reported_top_no_pending_recognized=self._reported_top_no_pending_recognized,
+            reported_top_no_pending_rejected=self._reported_top_no_pending_rejected,
+            pending_reported_top_transitions=len(reported_top_transitions),
             reference_refresh_requests=self._reference_refresh_count,
             unique_opportunity_lifecycles=len(lifecycles),
             healthy_books=healthy_books,
@@ -2437,6 +3537,7 @@ class CanonicalProcessor:
             validated_opportunity_chain_sha256=validated_opportunity_chain_sha256,
             reference_refresh_chain_sha256=reference_refresh_chain_sha256,
             audit_outcome_chain_sha256=audit_outcome_chain_sha256,
+            reported_top_transition_chain_sha256=reported_top_transition_chain_sha256,
             lifecycle_state_sha256=lifecycle_state_sha256,
             scan_results_truncated=self._scan_count > len(self._scan_results),
             opportunity_hashes_truncated=(
@@ -2446,9 +3547,25 @@ class CanonicalProcessor:
                 self._reference_refresh_count > len(self._reference_refresh_requests)
             ),
             audit_outcomes_truncated=self._rest_audits > len(self._audit_outcomes),
+            audit_mismatch_diagnostics_truncated=(
+                self._rest_audit_mismatches > len(self._audit_mismatch_diagnostics)
+            ),
+            reported_top_transition_outcomes_truncated=(
+                (
+                    self._reported_top_transitions_converged
+                    + self._reported_top_transitions_superseded
+                    + self._reported_top_transitions_resnapshotted
+                    + self._reported_top_transitions_expired
+                    + self._reported_top_transitions_invalidated
+                )
+                > len(self._reported_top_transition_outcomes)
+            ),
             terminal_hash=terminal_hash,
             opportunity_hashes=opportunity_hashes,
             audit_outcomes=audit_outcomes,
+            audit_mismatch_diagnostics=audit_mismatch_diagnostics,
+            reported_top_transitions=reported_top_transitions,
+            reported_top_transition_outcomes=reported_top_transition_outcomes,
         )
 
 

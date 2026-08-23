@@ -42,9 +42,11 @@ from multi_market_arbitrage.pipeline import (
     AuditExpiryCommand,
     AuditFailureCommand,
     AuditFailureReason,
+    AuditMismatchCause,
     AuditOutcome,
     AuditStartEvidence,
     CanonicalProcessor,
+    ProcessedEnvelope,
     ScanTriggerReason,
     WebSocketAdmissionWatermark,
 )
@@ -1382,6 +1384,12 @@ def test_rest_audit_counts_matches_and_invalidates_on_exact_mismatch() -> None:
     assert mismatch_result.success
     assert mismatch_result.needs_resync
     assert mismatch_result.audit_outcomes[0].outcome is AuditOutcome.MISMATCH
+    diagnostic = mismatch_result.audit_outcomes[0].mismatch_diagnostic
+    assert diagnostic is not None
+    assert diagnostic.cause is AuditMismatchCause.TRUE_EXACT_DEPTH_DIVERGENCE
+    assert diagnostic.exact_depth_difference.difference_count == 1
+    assert diagnostic.response_source.ingest_id == mismatching.ingest_id
+    assert diagnostic.response_source.payload_sha256 == mismatching.payload_sha256
     assert mismatch_result.scan_count == 1
     assert not mismatch_result.book_freshness_updates
     assert mismatch_result.scan_triggers[0].reasons == (ScanTriggerReason.REST_AUDIT,)
@@ -1392,9 +1400,56 @@ def test_rest_audit_counts_matches_and_invalidates_on_exact_mismatch() -> None:
     assert summary.rest_audit_mismatches == 1
     assert summary.rest_audit_raced == 0
     assert summary.rest_audit_failed == 0
+    assert dict(summary.audit_mismatch_cause_counts) == {
+        cause: int(cause is AuditMismatchCause.TRUE_EXACT_DEPTH_DIVERGENCE)
+        for cause in AuditMismatchCause
+    }
+    assert summary.audit_mismatch_diagnostics == (diagnostic,)
+    assert not summary.audit_mismatch_diagnostics_truncated
     assert summary.pending_rest_audits == 0
     assert summary.parse_failures == 0
     assert summary.scans == scans_before + 2
+
+
+def test_equal_depth_reference_scalar_mismatch_remains_immediate_unknown() -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId("processor-rest-audit-scalar-mismatch")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="scalar-mismatch-audit",
+    )
+    assert processor.process_replayed(intent).success
+    scalar_mismatch = _fixture("polymarket_rest_book_yes.json").replace(
+        b'"tick_size": "0.01"',
+        b'"tick_size": "0.001"',
+    )
+
+    result = processor.process_replayed(
+        _audit_response(
+            run_id,
+            5,
+            start,
+            scalar_mismatch,
+            boundary=0,
+        )
+    )
+
+    assert result.success
+    assert result.needs_resync
+    assert len(result.audit_outcomes) == 1
+    outcome = result.audit_outcomes[0]
+    assert outcome.outcome is AuditOutcome.MISMATCH
+    diagnostic = outcome.mismatch_diagnostic
+    assert diagnostic is not None
+    assert diagnostic.cause is AuditMismatchCause.UNKNOWN
+    assert diagnostic.exact_depth_difference.difference_count == 0
+    assert dict(processor.summary().audit_mismatch_cause_counts) == {
+        cause: int(cause is AuditMismatchCause.UNKNOWN) for cause in AuditMismatchCause
+    }
 
 
 def test_rest_audit_fence_distinguishes_economic_race_from_last_trade() -> None:
@@ -2144,3 +2199,88 @@ def test_terminal_hash_binds_hidden_audit_economic_generation_state() -> None:
     assert after_identity.generation == before_identity.generation + 1
     assert after.terminal_hash != before.terminal_hash
     assert replace(after, terminal_hash=before.terminal_hash) == before
+
+
+def test_v1_audit_generation_rebase_is_limited_to_exact_failed_producer() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("processor-v1-audit-generation-rebase")
+
+    def stage_with_recorded_generation(
+        source_commit: str | None,
+    ) -> tuple[CanonicalProcessor, ProcessedEnvelope]:
+        processor = CanonicalProcessor(
+            config,
+            source_journal_git_commit=source_commit,
+        )
+        assert all(processor.process_replayed(envelope).success for envelope in _bootstrap(run_id))
+        start, _envelope_template = _audit_start(
+            processor,
+            run_id,
+            4,
+            request_id="v1-generation-rebase",
+        )
+        recorded = replace(
+            start,
+            starting_book=replace(
+                start.starting_book,
+                generation=start.starting_book.generation + 1,
+            ),
+        )
+        envelope = _envelope(
+            run_id,
+            4,
+            CONTROL_REST_AUDIT_START,
+            recorded.to_payload(),
+            connection_id=recorded.connection_id,
+            monotonic_ns=recorded.request_started_monotonic_ns,
+        )
+        return processor, processor.process_replayed(envelope)
+
+    legacy, legacy_result = stage_with_recorded_generation(
+        "a382b93220011428703fe02483f7034f59c1f045"
+    )
+    ordinary, ordinary_result = stage_with_recorded_generation(None)
+    near_miss, near_miss_result = stage_with_recorded_generation(
+        "a382b93220011428703fe02483f7034f59c1f0450"
+    )
+    economic_mismatch = CanonicalProcessor(
+        config,
+        source_journal_git_commit="a382b93220011428703fe02483f7034f59c1f045",
+    )
+    assert all(
+        economic_mismatch.process_replayed(envelope).success for envelope in _bootstrap(run_id)
+    )
+    mismatch_start, _ = _audit_start(
+        economic_mismatch,
+        run_id,
+        4,
+        request_id="v1-economic-mismatch",
+    )
+    mismatch_start = replace(
+        mismatch_start,
+        starting_book=replace(
+            mismatch_start.starting_book,
+            generation=mismatch_start.starting_book.generation + 1,
+            economic_content_sha256="f" * 64,
+        ),
+    )
+    economic_mismatch_result = economic_mismatch.process_replayed(
+        _envelope(
+            run_id,
+            4,
+            CONTROL_REST_AUDIT_START,
+            mismatch_start.to_payload(),
+            connection_id=mismatch_start.connection_id,
+            monotonic_ns=mismatch_start.request_started_monotonic_ns,
+        )
+    )
+
+    assert legacy_result.success
+    assert legacy.summary().audit_start_generation_rebases == 1
+    assert not ordinary_result.success
+    assert ordinary_result.error_type == "NormalizationError"
+    assert ordinary.summary().audit_start_generation_rebases == 0
+    assert not near_miss_result.success
+    assert near_miss.summary().audit_start_generation_rebases == 0
+    assert not economic_mismatch_result.success
+    assert economic_mismatch.summary().audit_start_generation_rebases == 0

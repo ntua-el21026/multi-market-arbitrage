@@ -7,6 +7,7 @@ from .models import (
     BookMutationKind,
     ImmutableOrderBookSnapshot,
     InvalidationReason,
+    PriceChangePreview,
     RestAuditStatus,
     RestBookAuditResult,
 )
@@ -21,6 +22,7 @@ __all__ = [
     "CanonicalL2BookOwner",
     "ImmutableOrderBookSnapshot",
     "InvalidationReason",
+    "PriceChangePreview",
     "RestAuditStatus",
     "RestBookAuditResult",
 ]

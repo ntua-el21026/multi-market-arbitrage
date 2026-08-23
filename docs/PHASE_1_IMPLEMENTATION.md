@@ -104,10 +104,15 @@ uncompressed per observation run.
 absolute-deadline, exponential-backoff, deterministic-jitter, `Retry-After`, and
 per-endpoint sliding-window policy. Its source URL and `rate_limit_checked_on`
 date make the external venue evidence reviewable rather than an architectural
-constant. `[health]` independently bounds checkpoint cadence, queue capacity,
-checkpoint count, file size, and minimum free-disk headroom. The committed
-checkpoint cadence is ten seconds. A bounded live calibration rejected the
-initial five-second choice because its conservative six-hour projection
+constant. `[health]` independently bounds checkpoint and availability-ledger
+queue capacity, record count, file size, cadence, and minimum free-disk
+headroom. The committed checkpoint cadence is ten seconds. Availability
+evidence has a separate 64-command queue, 8,192-interval count bound, and
+64 MiB file bound. Reported-top uncertainty is independently capped at eight
+accepted frames and two monotonic seconds by `[polymarket]`; configuration
+rejects a time bound longer than the five-second maximum book age. A bounded
+live calibration rejected the initial five-second checkpoint choice because its
+conservative six-hour projection
 threatened the 64 MiB health-evidence limit; the ten-second cadence preserves
 incident reconstruction while retaining strict file and count headroom.
 `snapshot_audit_freshness_guard_seconds` is a four-second audit-launch guard,
@@ -263,32 +268,39 @@ not consume last trade. No periodic blind scan loop exists.
 
 The documented custom-feature `best_bid_ask` message is normalized as its own
 canonical economic event. It has exact best-bid, best-ask, and spread values but
-no quantities, so it cannot authoritatively create, resize, or remove depth and
-does not refresh the scanner's L2 age. A matching report is retained as
-canonical evidence without a book mutation. A changed report advances the
-REST-audit fence and temporarily makes that instrument audit-ineligible until
-an ordered exact quantity-bearing `price_change`, full snapshot, or equivalent
-authoritative depth evidence reconciles the signal. A later quantity-free BBO
-cannot clear the unresolved state even if its prices return to the local top.
-An ordinary REST audit cannot clear it either: a lagging REST body equal to
-stale local L2 is classified as non-comparable instead of `MATCH`. This
-accommodates the observed
-BBO-before-`price_change` delivery order without allowing an unresolved
-top-of-book change into research. Accepted BBO messages update a separate
-relevant-L2 receive clock used only to restart the audit race-retry quiet
-interval; they do not extend the leg hard expiry.
+no quantities, so it cannot create, resize, or remove canonical depth and does
+not refresh scanner L2 age. A report equal to derived L2 is retained without a
+book mutation. A different complete top starts one immutable
+`ReportedTopTransition` for that instrument. The transition binds its target,
+starting top/generation/economic hash, first/latest raw and canonical sources,
+connection and monotonic epoch, admission/ingest ordinals, receive times, and
+the configured frame/time bounds. The committed bounds admit at most eight
+transition frames within two monotonic seconds.
 
-Live evidence also shows that a single announced top can be realized across
-successive exact `price_change` frames: the venue can first add the new top
-level while the old top still exists, then delete the old level. The owner may
-defer only the reported-top equality check for such an intermediate mutation,
-and only when its complete reported bid/ask exactly equals the unresolved BBO.
-The exact quantity and raw/canonical provenance are still applied, while the
-pending marker continues to block audits and research. Reconciliation occurs
-only after derived L2 reaches the announced top (or a later full snapshot or a
-different, ordinarily validated complete top supersedes it). With no exact
-pending BBO, every reported-top disagreement remains a protocol violation;
-precision, crossed-book, bounds, and provenance checks are unchanged.
+While a transition is pending, the instrument is excluded from both REST-audit
+eligibility and scanner research eligibility. Same-target BBO or exact
+`price_change` frames advance the bounded evidence; exact quantity-bearing
+changes still mutate depth and provenance. Research eligibility returns only
+after exact derived-L2 convergence, a valid superseding target already equal to
+exact L2, or an authoritative snapshot. Returning to the starting top with
+another quantity-free BBO is not convergence, and an ordinary REST audit cannot
+clear the uncertainty.
+Conflicting targets, crossed/invalid exact state, connection/epoch changes, or
+frame/time exhaustion invalidate the instrument and require resnapshot.
+
+The only no-pending exception is the source-proven post-snapshot catch-up
+recognizer for the three failed-corpus shapes. It requires a complete two-leg
+ordinal-1 snapshot followed immediately on the same connection/epoch by an
+ordinal-2 two-event price-change frame. Both binary legs, complementary
+one-tick reported targets, equal positive quantities, opposite sides, unchanged
+baseline identities, and the observed target/deep-change pairing must all
+match. The recognizer binds the ordinal-1 baseline into the transition. Any
+other no-pending reported-top disagreement is rejected, invalidates exact state,
+and waits for an authoritative snapshot; there is no generic tolerance path.
+
+Accepted reported-top frames update a separate relevant-L2 receive clock used
+only to restart the audit race-retry quiet interval. They do not extend the
+book-age hard expiry or the transition's first-receive deadline.
 
 Scan triggers and reasons are included in deterministic processing results.
 Invalid, stale, unresolved, reference-indeterminate, or cost-indeterminate
@@ -303,11 +315,24 @@ the next integrity deadline as the minimum of:
 - the absolute operator run deadline;
 - the next configured periodic REST audit; and
 - the guarded audit-launch time before the earliest actual receive-time
-  freshness expiry among required healthy books.
+  freshness expiry among required healthy books; and
+- the earliest current `ReportedTopTransition` monotonic deadline.
 
 The guard is only a scheduling lead. The canonical processor retains the exact
 hard maximum-book-age comparison, so a slow audit that crosses the five-second
 boundary cannot make a late WebSocket L2 update acceptable.
+
+Transition time expiry has its own durable
+`mma.control.reported-top-transition-expired.v1` command. The coordinator emits
+it only after the deferred item and ingress FIFO are empty, so a frame admitted
+before the deadline is processed first even if an audit response/control is
+being classified after that deadline. Ordered WebSocket frames enforce the
+bound inline; unrelated REST/control records never expire a transition. On an
+exact transition/run-deadline tie, acquisition stops at the paired cutoff,
+already admitted input drains, and any still-due transition expiry is preserved
+at that cutoff before the generation returns. Replay therefore consumes the
+same transition ID, instrument, epoch, deadline, decision time, and close source
+instead of consulting its scheduler clock.
 
 Routine audit HTTP I/O does not close or cancel a healthy WebSocket generation.
 The dedicated acquisition task continues to receive, timestamp, and admit
@@ -384,6 +409,19 @@ The typed outcomes are:
 - `FAILED`: HTTP, deadline, response, watermark, socket-generation, local
   comparability, race-budget, or run-end evidence could not establish a safe
   result.
+
+Every newly produced `MISMATCH` carries a bounded
+`mma-rest-audit-mismatch-diagnostic-v1` record. It binds the classified cause,
+local and normalized REST book identities, an exact depth-difference digest and
+counts, bounded representative level differences, local/REST raw-source
+summaries, the response source, and bounded context identities. Causes are
+`REPORTED_TOP_TRANSITION`, `TRUE_EXACT_DEPTH_DIVERGENCE`,
+`FRESHNESS_RESPONSE_WINDOW_BOUNDARY`, `REFERENCE_PRECISION_TRANSITION`,
+`LOCAL_BOOK_DEFECT`, or `UNKNOWN`. Cumulative cause counts and the audit-outcome
+chain survive resnapshot; recent full diagnostics are bounded to 4,096 and
+expose truncation explicitly. Health checkpoints retain cumulative counts and
+one compact deterministic representative per cause rather than copying the
+full diagnostic history.
 
 The audit generation advances for level, health, or reference mutations and for
 changed/unresolved top-of-book signals; its comparison hash excludes receive
@@ -539,6 +577,21 @@ bytes, row groups, rows, and result rows are checked before materialization or
 return. SQL is one read-only statement; mutation, extension, external scan, and
 direct-file surfaces fail closed.
 
+`mma scan-report` now uses the incremental `phase1-scan-report-v2` path rather
+than materializing the wide scan dataset through DuckDB. It first validates the
+analytical completion/fragment inventory, schema, row counts, confinement, and
+resource bounds, then projects only seven required columns and iterates each
+fragment by row group in at most 4,096-row/64 MiB record batches. Counts and the
+terminal sequence digest are accumulated online; distinct opportunity/lifecycle
+identities, dispositions, and terminal samples have independent hard bounds.
+For at most 4,096 rows it retains the complete legacy terminal-hash tuple;
+larger reports expose `terminal_hashes_complete=false`, a complete ordered
+sequence SHA-256, and at most 32 deterministic samples. The inventory is
+revalidated after iteration to reject concurrent mutation. The report includes
+compressed, full-declared, selected-column, batch, identity, row-group, and row
+resource evidence and is printed by the CLI; it does not create another data
+subtree or raise the existing 512 MiB registered-byte limit.
+
 ## Public-input resource limits
 
 The public HTTP client requests `Accept-Encoding: identity` and rejects any
@@ -552,16 +605,23 @@ economic state.
 
 ## Supervised Gate-1 health evidence
 
-The observer emits versioned `gate1-health-checkpoint-v1` JSONL evidence at the
-configured ten-second cadence and once for the terminal capture boundary. At
-the exact acquisition cutoff it synchronously cancels periodic production
-before draining already accepted audit work; after that drain it emits one
-checkpoint timestamped with the frozen cutoff. This prevents a later periodic
-record from preceding a backdated terminal record while still including
-classifications for exact response bodies completed before the cutoff. The
-producer creates an immutable point-in-time snapshot and performs one
-`put_nowait`; a dedicated single-owner task performs canonical serialization,
-append, and file `fsync`.
+The observer emits versioned `gate1-health-checkpoint-v2` JSONL evidence at the
+configured ten-second cadence and once for the terminal capture boundary. Every
+record carries `emitted_at_utc_ns`, `emitted_monotonic_epoch_id` equal to the
+collector run ID, and `emitted_monotonic_ns`. Writer admission requires the
+run-scoped monotonic value to increase strictly; UTC may regress without being
+used for causal ordering. Historical v1 files remain distinguishable/readable,
+but the compatibility validator reports monotonic chronology unavailable and
+never invents v2 timestamps for them.
+
+At the exact acquisition cutoff the observer synchronously cancels periodic
+production before draining already accepted audit work; after that drain it
+emits one checkpoint timestamped with the frozen paired UTC/monotonic cutoff.
+This prevents a later periodic record from preceding a backdated terminal
+record while still including classifications for exact response bodies
+completed before the cutoff. The producer creates an immutable point-in-time
+snapshot and performs one `put_nowait`; a dedicated single-owner task performs
+canonical serialization, append, and file `fsync`.
 The queue, checkpoint count, and file bytes are bounded. Output starts as a
 run-scoped `.jsonl.partial` and is atomically renamed to `.jsonl` with a
 directory sync only after clean completion; the summary records counts,
@@ -590,6 +650,71 @@ saturation, count/file exhaustion, storage failure, missing explicit target,
 book/integrity problems, persistence faults, raw-cap pressure, and insufficient
 disk are never silently treated as healthy.
 
+Each book record exposes a bounded current transition health record containing
+its identity, status/reason, target, source ordinals, age/deadline, accepted and
+remaining frames, entry source, and optional baseline-evidence identity. The
+audit group exposes transition totals/durations plus cumulative mismatch-cause
+counts, exact count reconciliation, diagnostic truncation state, and one compact
+representative identity per cause. The resource group embeds one startup-captured
+`gate1-host-runtime-identity-v1` record binding code/config/lock, Python/GIL,
+`uv`, host, CPU, memory, kernel, and filesystem with explicit unknown fields.
+Only an exact 40-character lowercase hexadecimal Git commit that equals
+`git rev-parse HEAD` in the resolved repository is accepted as exact Gate code
+identity. A sentinel such as `unavailable`, an abbreviated/malformed value, or
+a claimed SHA that cannot be bound to that `HEAD` becomes `null` in both the
+checkpoint and embedded host identity. The identity also records the configured
+source root, resolved repository root and imported package root, proves both
+source roots are inside that repository, and separately records tracked and
+non-ignored-untracked cleanliness. Missing probes, a commit/package binding
+mismatch, or a dirty tree emit `CODE_IDENTITY_UNAVAILABLE`,
+`SOURCE_IDENTITY_UNAVAILABLE`, `SOURCE_IDENTITY_MISMATCH`, or
+`SOURCE_TREE_DIRTY` as applicable. These reasons are sticky and Gate-only: they
+do not stop or relabel raw capture and do not by themselves make current
+research ineligible.
+An off-loop supervised sampler records Linux `/proc/self/statm` current RSS (or
+an explicit unavailable source), normalized `ru_maxrss`, CPU, disk, and a
+constant-memory current-RSS trend: start/end/max, largest step, OLS bytes/second,
+and the 16 largest discontinuities. The observer freezes the sampler cache at
+the terminal capture cutoff. Checkpoint construction rejects a resource sample,
+trend bound, or discontinuity that postdates its emission; if no pre-cutoff
+sample exists, health evidence fails closed instead of backdating a later
+sample.
+
+### Separate availability ledger
+
+Availability intervals are not mixed into checkpoint JSONL. A second bounded,
+single-owner writer publishes
+`gate1-availability-interval-v1` records to the run-scoped
+`availability-intervals.jsonl.partial`/`.jsonl` pair. Each record binds the
+connection/socket generation, paired UTC and run-epoch monotonic start/end,
+exact monotonic duration, typed initiating cause and reason, bounded source and
+instrument identities, affected scopes, recovery action/outcome, restored
+research eligibility, and whether the interval remained open at shutdown.
+An unrecovered interval is closed at the exact terminal capture cutoff with
+`open_at_shutdown=true`; routine REST audit activity does not create WebSocket
+downtime.
+
+The interval opens at the paired timestamp of the initiating evidence, not
+after already-admitted work drains: the failing raw receive for ingress,
+protocol, reference, and lifecycle paths; REST response receipt for an audit
+mismatch; the explicit decision timestamp for freshness or idle transition
+expiry; and acquisition termination for transport failure. Ordered draining
+may therefore continue while the interval is already open without shifting its
+causal start.
+
+Interval admission is non-blocking and separately bounded by queue, count, and
+file bytes. Serialization, append, and `fsync` run off the capture path, and
+clean completion uses the same partial-file identity and atomic-publication
+checks as checkpoint evidence. Writer counts, total unavailable duration,
+longest interval, and shutdown-open count reconcile against runtime aggregates;
+queue/storage/invariant failure or a discrepancy blocks automatic Gate evidence
+eligibility without changing authoritative raw capture.
+
+The paired health benchmark measures interval construction and serialization,
+non-blocking admission and producer CPU, actual enqueue-through-`fsync` write
+latency, and exact JSONL file growth per interval in addition to checkpoint
+cadence/overhead.
+
 The health path is derived diagnostic evidence. It never mutates canonical
 state and is not permitted to block socket acquisition or raw durability.
 
@@ -608,7 +733,9 @@ data/
 │   └── complete_set_scans/
 ├── health/
 │   ├── run-<collector-run-id>.health-checkpoints.jsonl.partial
-│   └── run-<collector-run-id>.health-checkpoints.jsonl
+│   ├── run-<collector-run-id>.health-checkpoints.jsonl
+│   ├── run-<collector-run-id>.availability-intervals.jsonl.partial
+│   └── run-<collector-run-id>.availability-intervals.jsonl
 └── calibration/
     └── <fresh-run>/
         ├── calibration.json

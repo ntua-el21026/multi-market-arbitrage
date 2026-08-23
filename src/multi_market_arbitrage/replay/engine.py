@@ -106,10 +106,15 @@ def _run_replay(
     collector_run_id: CollectorRunId,
     config: Phase1Config,
     envelopes: Iterator[RawEventEnvelope],
+    source_journal_git_commit: str | None,
     first_envelope: RawEventEnvelope | None = None,
     analytical_outputs: Phase1AnalyticalOutputs | None = None,
 ) -> ReplayResult:
-    processor = CanonicalProcessor(config, analytical_outputs=analytical_outputs)
+    processor = CanonicalProcessor(
+        config,
+        analytical_outputs=analytical_outputs,
+        source_journal_git_commit=source_journal_git_commit,
+    )
     raw_record_count = 0
     first_ingest_seq: int | None = None
     last_ingest_seq: int | None = None
@@ -179,11 +184,14 @@ def replay_journal(
 
     _validate_replay_config(config)
     reader = JournalReader(journal_root, collector_run_id)
+    heads = reader.completion_heads()
+    source_journal_git_commit = heads[0].git_commit if len(heads) == 1 else None
     return _run_replay(
         journal_root=journal_root,
         collector_run_id=collector_run_id,
         config=config,
         envelopes=reader.iter_verified(include_partial=include_partial),
+        source_journal_git_commit=source_journal_git_commit,
     )
 
 
@@ -245,6 +253,7 @@ def rebuild_analytical_from_journal(
             collector_run_id=collector_run_id,
             config=config,
             envelopes=iterator,
+            source_journal_git_commit=source_head.git_commit,
             first_envelope=first_envelope,
             analytical_outputs=outputs,
         )

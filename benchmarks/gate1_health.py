@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -37,10 +38,18 @@ from multi_market_arbitrage.core.time import (  # noqa: E402
 from multi_market_arbitrage.ingestion import RawEventEnvelope  # noqa: E402
 from multi_market_arbitrage.journal import JournalMetricsSnapshot  # noqa: E402
 from multi_market_arbitrage.observability import (  # noqa: E402
+    AvailabilityCause,
+    AvailabilityEvidenceRuntimeSnapshot,
+    AvailabilityInterval,
+    AvailabilityRecoveryAction,
+    AvailabilityRecoveryOutcome,
+    AvailabilityScope,
     HealthCheckpoint,
     HealthEvidenceRuntimeSnapshot,
     HistogramSnapshot,
+    HostRuntimeIdentity,
     InMemoryMetrics,
+    SupervisedAvailabilityIntervalWriter,
     SupervisedHealthCheckpointWriter,
 )
 from multi_market_arbitrage.pipeline import (  # noqa: E402
@@ -52,6 +61,7 @@ from multi_market_arbitrage.pipeline import (  # noqa: E402
 from multi_market_arbitrage.pipeline.health import (  # noqa: E402
     ObservationRuntimeHealthSnapshot,
     ProcessResourceSnapshot,
+    ProcessResourceTrendSnapshot,
     build_observation_health_checkpoint,
 )
 from multi_market_arbitrage.pipeline.ingress import RawIngressMetricsSnapshot  # noqa: E402
@@ -308,10 +318,60 @@ def _production_checkpoint_builder(
         metrics.observe_histogram("mma_scanner_latency_ns", scanner_ns)
         metrics.observe_histogram("mma_receive_to_scan_complete_ns", t_obs_ns)
     resources = ProcessResourceSnapshot(
+        sampled_monotonic_ns=5_000_000_000,
         free_disk_bytes=100 * 1024 * 1024 * 1024,
         cpu_user_seconds=4.0,
         cpu_system_seconds=1.0,
+        current_rss_bytes=120 * 1024 * 1024,
         peak_rss_bytes=128 * 1024 * 1024,
+        current_rss_source="benchmark-fixture",
+    )
+    resource_trend = ProcessResourceTrendSnapshot(
+        sample_count=12,
+        known_rss_sample_count=12,
+        first_sample_monotonic_ns=1_000_000_000,
+        last_sample_monotonic_ns=5_000_000_000,
+        start_rss_bytes=118 * 1024 * 1024,
+        end_rss_bytes=120 * 1024 * 1024,
+        maximum_current_rss_bytes=121 * 1024 * 1024,
+        largest_absolute_step_bytes=1024 * 1024,
+        linear_slope_bytes_per_second=512 * 1024,
+    )
+    availability_writer = AvailabilityEvidenceRuntimeSnapshot(
+        healthy=True,
+        queue_depth=0,
+        queue_high_water=0,
+        accepted=0,
+        written=0,
+        rejected=0,
+        file_bytes=0,
+        unavailable_duration_nanoseconds=0,
+        longest_interval_nanoseconds=0,
+        open_at_shutdown_intervals=0,
+        failure_type=None,
+    )
+    host_identity = HostRuntimeIdentity(
+        code_commit=git_commit,
+        config_sha256=config.config_hash.value,
+        lock_sha256="b" * 64,
+        python="CPython benchmark fixture",
+        python_gil_enabled=True,
+        uv="uv benchmark fixture",
+        hostname="benchmark-host",
+        cpu_model="benchmark-cpu",
+        logical_cpu_count=8,
+        total_memory_bytes=16 * 1024 * 1024 * 1024,
+        kernel="Linux benchmark fixture",
+        filesystem="benchmark-filesystem",
+        source_root="/workspace",
+        repository_root="/workspace",
+        repository_head_commit=git_commit,
+        imported_package_root="/workspace/src/multi_market_arbitrage",
+        code_commit_matches_repository=True,
+        source_binding_valid=True,
+        tracked_source_clean=True,
+        untracked_source_clean=True,
+        unknown_fields=(),
     )
 
     def build() -> HealthCheckpoint:
@@ -326,9 +386,12 @@ def _production_checkpoint_builder(
             journal_failure_type=None,
             analytical=analytical,
             health_writer=health_writer,
+            availability_writer=availability_writer,
             public_reads=public_reads,
             metrics=metrics,
             resources=resources,
+            resource_trend=resource_trend,
+            host_identity=host_identity,
             book_last_valid_receive_monotonic_ns=book_last_valid_receive_monotonic_ns,
             emitted_at=UtcTimestamp(1_787_198_410_000_000_000),
             monotonic_now_ns=5_000_000_000,
@@ -360,6 +423,59 @@ def _cpu_nanoseconds_per_operation(measurement: Mapping[str, int | float]) -> fl
     if count <= 0:
         raise ValueError("health benchmark measurement count must be positive")
     return int(measurement["measurement_cpu_ns"]) / count
+
+
+def _availability_interval(
+    run_id: CollectorRunId,
+    index: int,
+) -> AvailabilityInterval:
+    """Build one production-schema interval with deterministic non-overlapping bounds."""
+
+    if index < 0:
+        raise ValueError("availability benchmark index cannot be negative")
+    started_monotonic_ns = 10_000_000 + (index * 1_000)
+    ended_monotonic_ns = started_monotonic_ns + 500
+    started_utc_ns = 1_787_198_400_000_000_000 + (index * 1_000)
+    ended_utc_ns = started_utc_ns + 500
+    return AvailabilityInterval(
+        interval_id=f"health-benchmark-availability-{index:08d}",
+        collector_run_id=run_id,
+        socket_generation=1,
+        connection_id="health-benchmark-connection",
+        started_at=UtcTimestamp(started_utc_ns),
+        started_monotonic=MonotonicTimestamp(run_id.value, started_monotonic_ns),
+        ended_at=UtcTimestamp(ended_utc_ns),
+        ended_monotonic=MonotonicTimestamp(run_id.value, ended_monotonic_ns),
+        duration_nanoseconds=ended_monotonic_ns - started_monotonic_ns,
+        cause=AvailabilityCause.EXTERNAL_CONNECTION_TRANSPORT,
+        reason_code="BENCHMARK_EXTERNAL_CONNECTION_TRANSPORT",
+        source_evidence_ids=(f"ingest-seq:{index}",),
+        affected_instruments=("benchmark-instrument",),
+        affected_scopes=(
+            AvailabilityScope.WEBSOCKET_CAPTURE,
+            AvailabilityScope.CANONICAL_BOOKS,
+            AvailabilityScope.SCANNER_RESEARCH_ELIGIBILITY,
+        ),
+        recovery_action=AvailabilityRecoveryAction.RECONNECT_AND_RESNAPSHOT,
+        recovery_outcome=AvailabilityRecoveryOutcome.RESTORED,
+        research_eligibility_restored=True,
+        open_at_shutdown=False,
+    )
+
+
+def _file_growth_summary(samples: list[int]) -> dict[str, int | float]:
+    if not samples or any(value <= 0 for value in samples):
+        raise ValueError("availability file-growth samples must be positive")
+    return {
+        "count": len(samples),
+        "minimum_bytes_per_interval": min(samples),
+        "p50_bytes_per_interval": _nearest_rank(samples, 0.50),
+        "p95_bytes_per_interval": _nearest_rank(samples, 0.95),
+        "p99_bytes_per_interval": _nearest_rank(samples, 0.99),
+        "maximum_bytes_per_interval": max(samples),
+        "mean_bytes_per_interval": statistics.fmean(samples),
+        "total_bytes": sum(samples),
+    }
 
 
 def _cadence_projection(
@@ -415,8 +531,15 @@ async def _measure_actual_writes(
     samples: list[int] = []
     cpu_started = time.process_time_ns()
     for expected in range(1, repetitions + 1):
+        current_checkpoint = replace(
+            checkpoint,
+            emitted_monotonic=MonotonicTimestamp(
+                checkpoint.collector_run_id.value,
+                checkpoint.emitted_monotonic.nanoseconds + expected,
+            ),
+        )
         started = time.perf_counter_ns()
-        if not writer.enqueue_nowait(checkpoint):
+        if not writer.enqueue_nowait(current_checkpoint):
             raise RuntimeError("health write benchmark unexpectedly rejected a checkpoint")
         while writer.runtime_snapshot.written < expected:
             if not writer.runtime_snapshot.healthy:
@@ -428,6 +551,52 @@ async def _measure_actual_writes(
     if not result.gate1_evidence_eligible:
         raise RuntimeError("health write benchmark did not publish eligible evidence")
     return _summary(samples, cpu_ns=cpu_ns), result.file_bytes
+
+
+async def _measure_actual_availability_writes(
+    root: Path,
+    run_id: CollectorRunId,
+    *,
+    repetitions: int,
+) -> tuple[dict[str, int | float], dict[str, int | float], int]:
+    """Measure enqueue-through-fsync latency and exact JSONL growth per interval."""
+
+    writer = SupervisedAvailabilityIntervalWriter(
+        root=root,
+        collector_run_id=run_id,
+        queue_capacity=8,
+        maximum_intervals=repetitions,
+        maximum_file_bytes=64 * 1024 * 1024,
+    )
+    await writer.start()
+    latency_samples: list[int] = []
+    file_growth_samples: list[int] = []
+    prior_file_bytes = 0
+    cpu_started = time.process_time_ns()
+    for expected in range(1, repetitions + 1):
+        interval = _availability_interval(run_id, expected)
+        started = time.perf_counter_ns()
+        if not writer.enqueue_nowait(interval):
+            raise RuntimeError("availability benchmark unexpectedly rejected an interval")
+        while writer.runtime_snapshot.written < expected:
+            if not writer.runtime_snapshot.healthy:
+                raise RuntimeError("availability benchmark writer degraded")
+            await asyncio.sleep(0)
+        snapshot = writer.runtime_snapshot
+        latency_samples.append(time.perf_counter_ns() - started)
+        file_growth_samples.append(snapshot.file_bytes - prior_file_bytes)
+        prior_file_bytes = snapshot.file_bytes
+    cpu_ns = time.process_time_ns() - cpu_started
+    result = await writer.close(completed=True)
+    if not result.gate1_evidence_eligible:
+        raise RuntimeError("availability benchmark did not publish eligible evidence")
+    if result.file_bytes != sum(file_growth_samples):
+        raise RuntimeError("availability benchmark file-growth accounting diverged")
+    return (
+        _summary(latency_samples, cpu_ns=cpu_ns),
+        _file_growth_summary(file_growth_samples),
+        result.file_bytes,
+    )
 
 
 async def _run(output: Path) -> dict[str, object]:
@@ -457,8 +626,20 @@ async def _run(output: Path) -> dict[str, object]:
         maximum_checkpoints=5_000,
         maximum_file_bytes=64 * 1024 * 1024,
     )
+    enqueue_checkpoints = iter(
+        tuple(
+            replace(
+                checkpoint,
+                emitted_monotonic=MonotonicTimestamp(
+                    run_id.value,
+                    checkpoint.emitted_monotonic.nanoseconds + index,
+                ),
+            )
+            for index in range(1, 5_001)
+        )
+    )
     enqueue = _measure_sync(
-        lambda: enqueue_writer.enqueue_nowait(checkpoint),
+        lambda: enqueue_writer.enqueue_nowait(next(enqueue_checkpoints)),
         warmups=0,
         repetitions=5_000,
     )
@@ -467,12 +648,62 @@ async def _run(output: Path) -> dict[str, object]:
         checkpoint,
         repetitions=64,
     )
+    availability_interval = _availability_interval(run_id, 0)
+    serialized_availability_interval = (
+        canonical_json_bytes(availability_interval.to_record()) + b"\n"
+    )
+    availability_construction = _measure_sync(
+        lambda: _availability_interval(run_id, 0),
+        warmups=200,
+        repetitions=2_000,
+    )
+    availability_serialization = _measure_sync(
+        lambda: canonical_json_bytes(availability_interval.to_record()),
+        warmups=200,
+        repetitions=2_000,
+    )
+    availability_enqueue_writer = SupervisedAvailabilityIntervalWriter(
+        root=output / "unused-availability-enqueue-root",
+        collector_run_id=run_id,
+        queue_capacity=5_000,
+        maximum_intervals=5_000,
+        maximum_file_bytes=64 * 1024 * 1024,
+    )
+    availability_enqueue_intervals = iter(
+        tuple(_availability_interval(run_id, index) for index in range(1, 5_001))
+    )
+
+    def enqueue_availability_interval() -> None:
+        if not availability_enqueue_writer.enqueue_nowait(next(availability_enqueue_intervals)):
+            raise RuntimeError("availability enqueue benchmark rejected an interval")
+
+    availability_enqueue = _measure_sync(
+        enqueue_availability_interval,
+        warmups=0,
+        repetitions=5_000,
+    )
+    (
+        availability_writes,
+        availability_file_growth,
+        availability_written_bytes,
+    ) = await _measure_actual_availability_writes(
+        output / "actual-availability-writes",
+        run_id,
+        repetitions=64,
+    )
     selected_cadence_ns = int(config.health.checkpoint_interval_seconds * 1_000_000_000)
     producer_wall_mean_ns = float(construction["mean_ns"]) + float(enqueue["mean_ns"])
     producer_cpu_per_checkpoint_ns = _cpu_nanoseconds_per_operation(
         construction
     ) + _cpu_nanoseconds_per_operation(enqueue)
     writer_cpu_per_checkpoint_ns = _cpu_nanoseconds_per_operation(writes)
+    availability_producer_wall_mean_ns = float(availability_construction["mean_ns"]) + float(
+        availability_enqueue["mean_ns"]
+    )
+    availability_producer_cpu_per_interval_ns = _cpu_nanoseconds_per_operation(
+        availability_construction
+    ) + _cpu_nanoseconds_per_operation(availability_enqueue)
+    availability_writer_cpu_per_interval_ns = _cpu_nanoseconds_per_operation(availability_writes)
     cadence_results = [
         _cadence_projection(
             cadence_seconds=cadence,
@@ -506,6 +737,18 @@ async def _run(output: Path) -> dict[str, object]:
         "nonblocking_enqueue": enqueue,
         "actual_enqueue_to_fsync_write": writes,
         "actual_written_bytes": written_bytes,
+        "availability_interval_bytes": len(serialized_availability_interval),
+        "availability_interval_construction": availability_construction,
+        "availability_interval_serialization": availability_serialization,
+        "availability_nonblocking_enqueue": availability_enqueue,
+        "availability_actual_enqueue_to_fsync_write": availability_writes,
+        "availability_actual_file_growth": availability_file_growth,
+        "availability_actual_written_bytes": availability_written_bytes,
+        "availability_producer_overhead": {
+            "producer_cpu_ns_per_interval": (availability_producer_cpu_per_interval_ns),
+            "producer_wall_mean_ns_per_interval": (availability_producer_wall_mean_ns),
+            "writer_cpu_ns_per_interval": availability_writer_cpu_per_interval_ns,
+        },
         "cadence_projection": cadence_results,
         "selected_cadence_seconds": config.health.checkpoint_interval_seconds,
         "selected_cadence_overhead": {
@@ -534,13 +777,38 @@ def _render_report(result: dict[str, object]) -> str:
     enqueue = result["nonblocking_enqueue"]
     writes = result["actual_enqueue_to_fsync_write"]
     overhead = result["selected_cadence_overhead"]
+    availability_construction = result["availability_interval_construction"]
+    availability_enqueue = result["availability_nonblocking_enqueue"]
+    availability_writes = result["availability_actual_enqueue_to_fsync_write"]
+    availability_growth = result["availability_actual_file_growth"]
+    availability_overhead = result["availability_producer_overhead"]
     if (
         not isinstance(construction, dict)
         or not isinstance(enqueue, dict)
         or not isinstance(writes, dict)
         or not isinstance(overhead, dict)
+        or not isinstance(availability_construction, dict)
+        or not isinstance(availability_enqueue, dict)
+        or not isinstance(availability_writes, dict)
+        or not isinstance(availability_growth, dict)
+        or not isinstance(availability_overhead, dict)
     ):
         raise TypeError("health benchmark result shape is invalid")
+    availability_mean_growth = float(
+        cast(int | float, availability_growth["mean_bytes_per_interval"])
+    )
+    availability_producer_wall = float(
+        cast(
+            int | float,
+            availability_overhead["producer_wall_mean_ns_per_interval"],
+        )
+    )
+    availability_producer_cpu = float(
+        cast(int | float, availability_overhead["producer_cpu_ns_per_interval"])
+    )
+    availability_writer_cpu = float(
+        cast(int | float, availability_overhead["writer_cpu_ns_per_interval"])
+    )
     lines = [
         "# Gate-1 health checkpoint benchmark",
         "",
@@ -560,6 +828,23 @@ def _render_report(result: dict[str, object]) -> str:
         f"- Dedicated writer mean CPU duty at selected cadence: "
         f"{float(cast(int | float, overhead['writer_one_core_parts_per_million'])):.3f} "
         "ppm of one core",
+        "",
+        "## Availability interval ledger",
+        "",
+        f"- Interval size: {result['availability_interval_bytes']} bytes",
+        f"- Construction p50/p95/p99: {availability_construction['p50_ns']} / "
+        f"{availability_construction['p95_ns']} / "
+        f"{availability_construction['p99_ns']} ns",
+        f"- Non-blocking enqueue p50/p95/p99: {availability_enqueue['p50_ns']} / "
+        f"{availability_enqueue['p95_ns']} / {availability_enqueue['p99_ns']} ns",
+        f"- Enqueue-to-fsync-write p50/p95/p99: {availability_writes['p50_ns']} / "
+        f"{availability_writes['p95_ns']} / {availability_writes['p99_ns']} ns",
+        f"- Actual fsynced file growth: {availability_growth['total_bytes']} bytes "
+        f"across {availability_growth['count']} intervals "
+        f"(mean {availability_mean_growth:.3f} bytes/interval)",
+        f"- Producer build + enqueue wall mean: {availability_producer_wall:.3f} ns/interval",
+        f"- Producer build + enqueue CPU mean: {availability_producer_cpu:.3f} ns/interval",
+        f"- Dedicated writer CPU mean: {availability_writer_cpu:.3f} ns/interval",
         "",
         "| Cadence | Periodic + final checkpoints | Projected bytes | Count bound | File bound |",
         "|---:|---:|---:|:---:|:---:|",

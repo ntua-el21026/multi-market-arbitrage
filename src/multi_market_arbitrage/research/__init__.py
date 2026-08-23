@@ -1,5 +1,22 @@
 """Phase 1 provenance-explicit analytical research outputs."""
 
+from .audit_mismatch import (
+    AUDIT_MISMATCH_LINEAGE_REPORT_SCHEMA,
+    AuditMismatchCauseCount,
+    AuditMismatchDifferenceCounts,
+    AuditMismatchLineageReason,
+    AuditMismatchLineageReport,
+    AuditMismatchLineageResult,
+    AuditMismatchObservation,
+    AuditMismatchReportError,
+    AuditMismatchReportLimits,
+    AuditMismatchReportResourceError,
+    AuditMismatchReportResources,
+    AuditVenueStateRelation,
+    build_audit_mismatch_lineage_report,
+    build_journal_audit_mismatch_lineage_report,
+    load_instrumented_replay_mismatch_observations,
+)
 from .calibration import (
     STDIO_STREAM_LOG_STORAGE_MODEL,
     BoundedTreeUsage,
@@ -23,7 +40,17 @@ from .calibration import (
     write_calibration_artifacts,
 )
 from .outputs import Phase1AnalyticalOutputs, ResearchOutputSummary
-from .report import ScanDispositionCount, ScanReport, build_scan_report
+from .report import (
+    COMPLETE_SET_SCAN_SCHEMA_VERSION,
+    SCAN_REPORT_SCHEMA_VERSION,
+    ScanDispositionCount,
+    ScanReport,
+    ScanReportLimits,
+    ScanReportResourceError,
+    ScanReportResources,
+    ScanTerminalHashSample,
+    build_scan_report,
+)
 from .supervised import (
     AnalyticalQueueSnapshot,
     AnalyticalRuntimeSnapshot,
@@ -32,9 +59,23 @@ from .supervised import (
 from .validation import DataValidationReport, validate_data
 
 __all__ = [
+    "AUDIT_MISMATCH_LINEAGE_REPORT_SCHEMA",
+    "COMPLETE_SET_SCAN_SCHEMA_VERSION",
+    "SCAN_REPORT_SCHEMA_VERSION",
     "STDIO_STREAM_LOG_STORAGE_MODEL",
     "AnalyticalQueueSnapshot",
     "AnalyticalRuntimeSnapshot",
+    "AuditMismatchCauseCount",
+    "AuditMismatchDifferenceCounts",
+    "AuditMismatchLineageReason",
+    "AuditMismatchLineageReport",
+    "AuditMismatchLineageResult",
+    "AuditMismatchObservation",
+    "AuditMismatchReportError",
+    "AuditMismatchReportLimits",
+    "AuditMismatchReportResourceError",
+    "AuditMismatchReportResources",
+    "AuditVenueStateRelation",
     "BoundedTreeUsage",
     "CalibrationArtifacts",
     "CalibrationDecision",
@@ -54,10 +95,17 @@ __all__ = [
     "ResearchOutputSummary",
     "ScanDispositionCount",
     "ScanReport",
+    "ScanReportLimits",
+    "ScanReportResourceError",
+    "ScanReportResources",
+    "ScanTerminalHashSample",
     "SupervisedAnalyticalOutputs",
     "bounded_tree_usage",
+    "build_audit_mismatch_lineage_report",
     "build_calibration_report",
+    "build_journal_audit_mismatch_lineage_report",
     "build_scan_report",
+    "load_instrumented_replay_mismatch_observations",
     "project_measurement",
     "render_calibration_markdown",
     "validate_data",

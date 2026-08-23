@@ -3,18 +3,51 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Final
+from typing import Final, Protocol
 
-from multi_market_arbitrage.core.ids import ConnectionId, IngestId, InstrumentId, is_sha256_hex
-from multi_market_arbitrage.core.serialization import canonical_json_bytes
+from multi_market_arbitrage.core.exact import ExactDecimal, Price, Quantity
+from multi_market_arbitrage.core.ids import (
+    ConnectionId,
+    IngestId,
+    InstrumentId,
+    MarketId,
+    is_sha256_hex,
+)
+from multi_market_arbitrage.core.provenance import RawSourceRef
+from multi_market_arbitrage.core.serialization import canonical_json_bytes, canonical_sha256
 from multi_market_arbitrage.core.time import UtcTimestamp
 
 AUDIT_START_SCHEMA: Final = "mma-rest-audit-start-v1"
 AUDIT_FAILURE_SCHEMA: Final = "mma-rest-audit-failure-v1"
 AUDIT_EXPIRY_SCHEMA: Final = "mma-rest-audit-expiry-v1"
 AUDIT_CLASSIFICATION_SCHEMA: Final = "mma-rest-audit-classification-v1"
+AUDIT_MISMATCH_DIAGNOSTIC_SCHEMA: Final = "mma-rest-audit-mismatch-diagnostic-v1"
+AUDIT_REST_BOOK_IDENTITY_SCHEMA: Final = "mma-rest-audit-rest-book-identity-v1"
+AUDIT_EXACT_DEPTH_DIFFERENCE_SCHEMA: Final = "mma-rest-audit-depth-difference-v1"
+AUDIT_RAW_SOURCE_SUMMARY_SCHEMA: Final = "mma-rest-audit-raw-source-summary-v1"
+
+# These limits match or exceed the corresponding owner bounds while ensuring
+# diagnostic construction cannot become a history-sized allocation.
+AUDIT_MISMATCH_MAX_LEVELS_PER_SIDE: Final = 4_096
+AUDIT_MISMATCH_MAX_REPRESENTATIVE_DIFFERENCES: Final = 16
+AUDIT_MISMATCH_MAX_RAW_SOURCES: Final = 8_193
+AUDIT_MISMATCH_MAX_REPRESENTATIVE_RAW_SOURCES: Final = 16
+AUDIT_MISMATCH_MAX_CONTEXT_IDENTITIES: Final = 16
+
+_EXACT_DEPTH_IDENTITY_DOMAIN: Final = b"mma-rest-audit-exact-depth-v1\0"
+_EXACT_DEPTH_DIFFERENCE_DOMAIN: Final = b"mma-rest-audit-depth-difference-v1\0"
+_RAW_SOURCE_SUMMARY_DOMAIN: Final = b"mma-rest-audit-raw-source-summary-v1\0"
+
+
+class _AuditBookLevel(Protocol):
+    @property
+    def price(self) -> Price: ...
+
+    @property
+    def quantity(self) -> Quantity: ...
 
 
 class AuditOutcome(StrEnum):
@@ -39,6 +72,29 @@ class AuditFailureReason(StrEnum):
     RACE_RETRY_EXHAUSTED = "RACE_RETRY_EXHAUSTED"
     RUN_ENDED = "RUN_ENDED"
     BOOK_FRESHNESS_EXPIRED = "BOOK_FRESHNESS_EXPIRED"
+
+
+class AuditMismatchCause(StrEnum):
+    """Finite, metric-safe causes for a proven REST/local mismatch.
+
+    The processor owns classification because it has the race fence,
+    transition, freshness, and reference context.  The exact comparison
+    helpers below deliberately do not infer a cause from depth alone.
+    """
+
+    REPORTED_TOP_TRANSITION = "REPORTED_TOP_TRANSITION"
+    TRUE_EXACT_DEPTH_DIVERGENCE = "TRUE_EXACT_DEPTH_DIVERGENCE"
+    FRESHNESS_RESPONSE_WINDOW_BOUNDARY = "FRESHNESS_RESPONSE_WINDOW_BOUNDARY"
+    REFERENCE_PRECISION_TRANSITION = "REFERENCE_PRECISION_TRANSITION"
+    LOCAL_BOOK_DEFECT = "LOCAL_BOOK_DEFECT"
+    UNKNOWN = "UNKNOWN"
+
+
+class AuditBookSide(StrEnum):
+    """Canonical side labels used by bounded mismatch samples."""
+
+    BID = "BID"
+    ASK = "ASK"
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +128,447 @@ class AuditBookIdentity:
             raise ValueError("audit book generation cannot be negative")
         if not is_sha256_hex(self.economic_content_sha256):
             raise ValueError("audit economic-content identity must be SHA-256 hex")
+
+
+@dataclass(frozen=True, slots=True)
+class AuditExactDepthIdentity:
+    """Exact, order-independent identity of normalized bid and ask levels."""
+
+    bid_level_count: int
+    ask_level_count: int
+    content_sha256: str
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.bid_level_count <= AUDIT_MISMATCH_MAX_LEVELS_PER_SIDE:
+            raise ValueError("audit bid-level count exceeds its diagnostic bound")
+        if not 0 <= self.ask_level_count <= AUDIT_MISMATCH_MAX_LEVELS_PER_SIDE:
+            raise ValueError("audit ask-level count exceeds its diagnostic bound")
+        if not is_sha256_hex(self.content_sha256):
+            raise ValueError("audit exact-depth identity must be SHA-256 hex")
+
+
+@dataclass(frozen=True, slots=True)
+class AuditLevelDifference:
+    """One bounded representative exact-level difference."""
+
+    side: AuditBookSide
+    price: Price
+    local_quantity: Quantity | None
+    rest_quantity: Quantity | None
+
+    def __post_init__(self) -> None:
+        if self.local_quantity is None and self.rest_quantity is None:
+            raise ValueError("audit level difference must identify at least one level")
+        if self.local_quantity == self.rest_quantity:
+            raise ValueError("audit level difference cannot contain equal quantities")
+
+
+@dataclass(frozen=True, slots=True)
+class AuditExactDepthDifference:
+    """Bounded summary and full digest of an exact local/REST depth comparison."""
+
+    local_depth: AuditExactDepthIdentity
+    rest_depth: AuditExactDepthIdentity
+    bid_difference_count: int
+    ask_difference_count: int
+    local_only_count: int
+    rest_only_count: int
+    quantity_difference_count: int
+    difference_sha256: str
+    representatives: tuple[AuditLevelDifference, ...]
+    schema: str = field(init=False, default=AUDIT_EXACT_DEPTH_DIFFERENCE_SCHEMA)
+
+    def __post_init__(self) -> None:
+        counts = (
+            self.bid_difference_count,
+            self.ask_difference_count,
+            self.local_only_count,
+            self.rest_only_count,
+            self.quantity_difference_count,
+        )
+        if min(counts) < 0:
+            raise ValueError("audit difference counts cannot be negative")
+        if self.difference_count != (
+            self.local_only_count + self.rest_only_count + self.quantity_difference_count
+        ):
+            raise ValueError("audit depth-difference counts do not reconcile")
+        maximum_possible = (
+            self.local_depth.bid_level_count
+            + self.local_depth.ask_level_count
+            + self.rest_depth.bid_level_count
+            + self.rest_depth.ask_level_count
+        )
+        if self.difference_count > maximum_possible:
+            raise ValueError("audit depth-difference count exceeds the compared inputs")
+        if not is_sha256_hex(self.difference_sha256):
+            raise ValueError("audit depth-difference identity must be SHA-256 hex")
+        if len(self.representatives) > AUDIT_MISMATCH_MAX_REPRESENTATIVE_DIFFERENCES:
+            raise ValueError("audit depth-difference representatives exceed their bound")
+        if len(self.representatives) > self.difference_count:
+            raise ValueError("audit depth-difference sample exceeds its population")
+        if self.difference_count == 0 and self.representatives:
+            raise ValueError("equal audit depths cannot carry difference representatives")
+
+    @property
+    def difference_count(self) -> int:
+        return self.bid_difference_count + self.ask_difference_count
+
+    @property
+    def representatives_truncated(self) -> bool:
+        return len(self.representatives) < self.difference_count
+
+
+@dataclass(frozen=True, slots=True)
+class AuditRawSourceSummary:
+    """Bounded representatives plus a full ordered digest of raw identities."""
+
+    source_count: int
+    ordered_sha256: str
+    representatives: tuple[RawSourceRef, ...]
+    schema: str = field(init=False, default=AUDIT_RAW_SOURCE_SUMMARY_SCHEMA)
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.source_count <= AUDIT_MISMATCH_MAX_RAW_SOURCES:
+            raise ValueError("audit raw-source count exceeds its bound")
+        if not is_sha256_hex(self.ordered_sha256):
+            raise ValueError("audit raw-source identity must be SHA-256 hex")
+        if len(self.representatives) > AUDIT_MISMATCH_MAX_REPRESENTATIVE_RAW_SOURCES:
+            raise ValueError("audit raw-source representatives exceed their bound")
+        if len(self.representatives) > self.source_count:
+            raise ValueError("audit raw-source sample exceeds its population")
+        if len({source.ingest_id for source in self.representatives}) != len(self.representatives):
+            raise ValueError("audit raw-source representatives contain duplicate identities")
+
+    @property
+    def representatives_truncated(self) -> bool:
+        return len(self.representatives) < self.source_count
+
+
+@dataclass(frozen=True, slots=True)
+class AuditRestBookIdentity:
+    """Exact normalized REST identity, separate from the opaque venue hash."""
+
+    instrument_id: InstrumentId
+    market_id: MarketId
+    depth: AuditExactDepthIdentity
+    tick_size: ExactDecimal
+    minimum_order_size: Quantity
+    neg_risk: bool
+    normalized_content_sha256: str
+    schema: str = field(init=False, default=AUDIT_REST_BOOK_IDENTITY_SCHEMA)
+
+    def __post_init__(self) -> None:
+        if not is_sha256_hex(self.normalized_content_sha256):
+            raise ValueError("audit normalized REST identity must be SHA-256 hex")
+        if self.normalized_content_sha256 != _rest_book_content_sha256(
+            instrument_id=self.instrument_id,
+            market_id=self.market_id,
+            depth=self.depth,
+            tick_size=self.tick_size,
+            minimum_order_size=self.minimum_order_size,
+            neg_risk=self.neg_risk,
+        ):
+            raise ValueError("audit normalized REST identity does not match its exact content")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        instrument_id: InstrumentId,
+        market_id: MarketId,
+        depth: AuditExactDepthIdentity,
+        tick_size: ExactDecimal,
+        minimum_order_size: Quantity,
+        neg_risk: bool,
+    ) -> AuditRestBookIdentity:
+        return cls(
+            instrument_id=instrument_id,
+            market_id=market_id,
+            depth=depth,
+            tick_size=tick_size,
+            minimum_order_size=minimum_order_size,
+            neg_risk=neg_risk,
+            normalized_content_sha256=_rest_book_content_sha256(
+                instrument_id=instrument_id,
+                market_id=market_id,
+                depth=depth,
+                tick_size=tick_size,
+                minimum_order_size=minimum_order_size,
+                neg_risk=neg_risk,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AuditMismatchDiagnostic:
+    """Immutable, bounded evidence retained with one proven mismatch outcome."""
+
+    cause: AuditMismatchCause
+    local_book: AuditBookIdentity
+    rest_book: AuditRestBookIdentity
+    exact_depth_difference: AuditExactDepthDifference
+    local_raw_sources: AuditRawSourceSummary
+    rest_raw_sources: AuditRawSourceSummary
+    response_source: RawSourceRef
+    context_evidence_sha256s: tuple[str, ...] = ()
+    schema: str = field(init=False, default=AUDIT_MISMATCH_DIAGNOSTIC_SCHEMA)
+
+    def __post_init__(self) -> None:
+        if self.local_book.instrument_id != self.rest_book.instrument_id:
+            raise ValueError("audit local and REST identities belong to different instruments")
+        if self.exact_depth_difference.rest_depth != self.rest_book.depth:
+            raise ValueError("audit REST identity and depth comparison disagree")
+        if (
+            self.cause is AuditMismatchCause.TRUE_EXACT_DEPTH_DIVERGENCE
+            and self.exact_depth_difference.difference_count == 0
+        ):
+            raise ValueError("true exact-depth divergence requires an exact level difference")
+        if len(self.context_evidence_sha256s) > AUDIT_MISMATCH_MAX_CONTEXT_IDENTITIES:
+            raise ValueError("audit mismatch context identities exceed their bound")
+        if any(not is_sha256_hex(value) for value in self.context_evidence_sha256s):
+            raise ValueError("audit mismatch context identities must be SHA-256 hex")
+        normalized_context = tuple(sorted(set(self.context_evidence_sha256s)))
+        object.__setattr__(self, "context_evidence_sha256s", normalized_context)
+
+
+def _normalized_exact_side(
+    levels: Sequence[_AuditBookLevel],
+    *,
+    reverse: bool,
+) -> tuple[tuple[Price, Quantity], ...]:
+    if len(levels) > AUDIT_MISMATCH_MAX_LEVELS_PER_SIDE:
+        raise ValueError("audit book side exceeds 4096 exact levels")
+    by_price: dict[Price, Quantity] = {}
+    for level in levels:
+        price = level.price
+        quantity = level.quantity
+        if price in by_price:
+            raise ValueError("audit book side contains a duplicate exact price")
+        by_price[price] = quantity
+    return tuple(
+        sorted(
+            by_price.items(),
+            key=lambda item: item[0].value,
+            reverse=reverse,
+        )
+    )
+
+
+def _depth_identity_from_normalized(
+    bids: tuple[tuple[Price, Quantity], ...],
+    asks: tuple[tuple[Price, Quantity], ...],
+) -> AuditExactDepthIdentity:
+    digest = hashlib.sha256()
+    digest.update(_EXACT_DEPTH_IDENTITY_DOMAIN)
+    for side, levels in ((AuditBookSide.BID, bids), (AuditBookSide.ASK, asks)):
+        side_bytes = side.value.encode("ascii")
+        digest.update(len(side_bytes).to_bytes(8, "big"))
+        digest.update(side_bytes)
+        digest.update(len(levels).to_bytes(8, "big"))
+        for price, quantity in levels:
+            payload = canonical_json_bytes(
+                {
+                    "price": price,
+                    "quantity": quantity,
+                }
+            )
+            digest.update(len(payload).to_bytes(8, "big"))
+            digest.update(payload)
+    return AuditExactDepthIdentity(
+        bid_level_count=len(bids),
+        ask_level_count=len(asks),
+        content_sha256=digest.hexdigest(),
+    )
+
+
+def audit_exact_depth_identity(
+    bids: Sequence[_AuditBookLevel],
+    asks: Sequence[_AuditBookLevel],
+) -> AuditExactDepthIdentity:
+    """Return a bounded, order-independent exact identity for two book sides."""
+
+    normalized_bids = _normalized_exact_side(bids, reverse=True)
+    normalized_asks = _normalized_exact_side(asks, reverse=False)
+    return _depth_identity_from_normalized(normalized_bids, normalized_asks)
+
+
+def compare_audit_exact_depth(
+    *,
+    local_bids: Sequence[_AuditBookLevel],
+    local_asks: Sequence[_AuditBookLevel],
+    rest_bids: Sequence[_AuditBookLevel],
+    rest_asks: Sequence[_AuditBookLevel],
+) -> AuditExactDepthDifference:
+    """Compare exact levels without inferring a processor-context mismatch cause."""
+
+    normalized_local_bids = _normalized_exact_side(local_bids, reverse=True)
+    normalized_local_asks = _normalized_exact_side(local_asks, reverse=False)
+    normalized_rest_bids = _normalized_exact_side(rest_bids, reverse=True)
+    normalized_rest_asks = _normalized_exact_side(rest_asks, reverse=False)
+    local_depth = _depth_identity_from_normalized(normalized_local_bids, normalized_local_asks)
+    rest_depth = _depth_identity_from_normalized(normalized_rest_bids, normalized_rest_asks)
+
+    digest = hashlib.sha256()
+    digest.update(_EXACT_DEPTH_DIFFERENCE_DOMAIN)
+    representatives: list[AuditLevelDifference] = []
+    bid_difference_count = 0
+    ask_difference_count = 0
+    local_only_count = 0
+    rest_only_count = 0
+    quantity_difference_count = 0
+
+    side_inputs = (
+        (AuditBookSide.BID, normalized_local_bids, normalized_rest_bids, True),
+        (AuditBookSide.ASK, normalized_local_asks, normalized_rest_asks, False),
+    )
+    for side, local_levels, rest_levels, reverse in side_inputs:
+        local_by_price = dict(local_levels)
+        rest_by_price = dict(rest_levels)
+        prices = sorted(
+            local_by_price.keys() | rest_by_price.keys(),
+            key=lambda price: price.value,
+            reverse=reverse,
+        )
+        for price in prices:
+            local_quantity = local_by_price.get(price)
+            rest_quantity = rest_by_price.get(price)
+            if local_quantity == rest_quantity:
+                continue
+            difference = AuditLevelDifference(
+                side=side,
+                price=price,
+                local_quantity=local_quantity,
+                rest_quantity=rest_quantity,
+            )
+            payload = canonical_json_bytes(difference)
+            digest.update(len(payload).to_bytes(8, "big"))
+            digest.update(payload)
+            if len(representatives) < AUDIT_MISMATCH_MAX_REPRESENTATIVE_DIFFERENCES:
+                representatives.append(difference)
+            if side is AuditBookSide.BID:
+                bid_difference_count += 1
+            else:
+                ask_difference_count += 1
+            if local_quantity is None:
+                rest_only_count += 1
+            elif rest_quantity is None:
+                local_only_count += 1
+            else:
+                quantity_difference_count += 1
+
+    return AuditExactDepthDifference(
+        local_depth=local_depth,
+        rest_depth=rest_depth,
+        bid_difference_count=bid_difference_count,
+        ask_difference_count=ask_difference_count,
+        local_only_count=local_only_count,
+        rest_only_count=rest_only_count,
+        quantity_difference_count=quantity_difference_count,
+        difference_sha256=digest.hexdigest(),
+        representatives=tuple(representatives),
+    )
+
+
+def _bounded_raw_sources(raw_sources: Iterable[RawSourceRef]) -> tuple[RawSourceRef, ...]:
+    bounded: list[RawSourceRef] = []
+    seen_ingest_ids: set[IngestId] = set()
+    for source in raw_sources:
+        if source.ingest_id in seen_ingest_ids:
+            raise ValueError("audit raw sources contain a duplicate ingest identity")
+        if len(bounded) >= AUDIT_MISMATCH_MAX_RAW_SOURCES:
+            raise ValueError("audit raw sources exceed 8193 identities")
+        seen_ingest_ids.add(source.ingest_id)
+        bounded.append(source)
+    return tuple(bounded)
+
+
+def summarize_audit_raw_sources(
+    raw_sources: Iterable[RawSourceRef],
+) -> AuditRawSourceSummary:
+    """Digest all ordered raw identities while retaining only a bounded sample."""
+
+    sources = _bounded_raw_sources(raw_sources)
+    digest = hashlib.sha256()
+    digest.update(_RAW_SOURCE_SUMMARY_DOMAIN)
+    for source in sources:
+        payload = canonical_json_bytes(source)
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    return AuditRawSourceSummary(
+        source_count=len(sources),
+        ordered_sha256=digest.hexdigest(),
+        representatives=sources[:AUDIT_MISMATCH_MAX_REPRESENTATIVE_RAW_SOURCES],
+    )
+
+
+def _rest_book_content_sha256(
+    *,
+    instrument_id: InstrumentId,
+    market_id: MarketId,
+    depth: AuditExactDepthIdentity,
+    tick_size: ExactDecimal,
+    minimum_order_size: Quantity,
+    neg_risk: bool,
+) -> str:
+    return canonical_sha256(
+        {
+            "depth": depth,
+            "instrument_id": instrument_id,
+            "market_id": market_id,
+            "minimum_order_size": minimum_order_size,
+            "neg_risk": neg_risk,
+            "schema": AUDIT_REST_BOOK_IDENTITY_SCHEMA,
+            "tick_size": tick_size,
+        }
+    )
+
+
+def build_audit_mismatch_diagnostic(
+    *,
+    cause: AuditMismatchCause,
+    local_book: AuditBookIdentity,
+    local_bids: Sequence[_AuditBookLevel],
+    local_asks: Sequence[_AuditBookLevel],
+    local_raw_sources: Iterable[RawSourceRef],
+    rest_instrument_id: InstrumentId,
+    rest_market_id: MarketId,
+    rest_bids: Sequence[_AuditBookLevel],
+    rest_asks: Sequence[_AuditBookLevel],
+    rest_tick_size: ExactDecimal,
+    rest_minimum_order_size: Quantity,
+    rest_neg_risk: bool,
+    rest_raw_sources: Iterable[RawSourceRef],
+    response_source: RawSourceRef,
+    context_evidence_sha256s: tuple[str, ...] = (),
+) -> AuditMismatchDiagnostic:
+    """Build self-contained mismatch evidence from processor-owned exact inputs."""
+
+    difference = compare_audit_exact_depth(
+        local_bids=local_bids,
+        local_asks=local_asks,
+        rest_bids=rest_bids,
+        rest_asks=rest_asks,
+    )
+    rest_sources = _bounded_raw_sources(rest_raw_sources)
+    if response_source not in rest_sources:
+        raise ValueError("audit REST sources do not contain the response raw identity")
+    return AuditMismatchDiagnostic(
+        cause=cause,
+        local_book=local_book,
+        rest_book=AuditRestBookIdentity.create(
+            instrument_id=rest_instrument_id,
+            market_id=rest_market_id,
+            depth=difference.rest_depth,
+            tick_size=rest_tick_size,
+            minimum_order_size=rest_minimum_order_size,
+            neg_risk=rest_neg_risk,
+        ),
+        exact_depth_difference=difference,
+        local_raw_sources=summarize_audit_raw_sources(local_raw_sources),
+        rest_raw_sources=summarize_audit_raw_sources(rest_sources),
+        response_source=response_source,
+        context_evidence_sha256s=context_evidence_sha256s,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,6 +762,9 @@ class AuditOutcomeEvidence:
     barrier_processed_ordinal: int | None
     barrier_book: AuditBookIdentity | None
     requires_resync: bool
+    # Optional only for source compatibility with pre-v1 producers.  New
+    # MISMATCH producers should always attach the deterministic diagnostic.
+    mismatch_diagnostic: AuditMismatchDiagnostic | None = None
 
     def __post_init__(self) -> None:
         if not self.request_id or len(self.request_id) > 128:
@@ -315,23 +815,57 @@ class AuditOutcomeEvidence:
             self.requires_resync
         ):
             raise ValueError("only a proven MISMATCH audit may require resynchronization")
+        if self.mismatch_diagnostic is not None:
+            if self.outcome is not AuditOutcome.MISMATCH:
+                raise ValueError("only a MISMATCH audit may carry a mismatch diagnostic")
+            if (
+                self.barrier_book is None
+                or self.barrier_book != self.mismatch_diagnostic.local_book
+            ):
+                raise ValueError("audit mismatch diagnostic must bind the barrier book identity")
+            response_source = self.mismatch_diagnostic.response_source
+            if self.response_ingest_id != response_source.ingest_id:
+                raise ValueError("audit mismatch diagnostic identifies another response ingest")
+            if self.raw_response_sha256 != response_source.payload_sha256:
+                raise ValueError("audit mismatch diagnostic identifies another response payload")
 
 
 __all__ = [
     "AUDIT_CLASSIFICATION_SCHEMA",
+    "AUDIT_EXACT_DEPTH_DIFFERENCE_SCHEMA",
     "AUDIT_EXPIRY_SCHEMA",
     "AUDIT_FAILURE_SCHEMA",
+    "AUDIT_MISMATCH_DIAGNOSTIC_SCHEMA",
+    "AUDIT_MISMATCH_MAX_CONTEXT_IDENTITIES",
+    "AUDIT_MISMATCH_MAX_LEVELS_PER_SIDE",
+    "AUDIT_MISMATCH_MAX_RAW_SOURCES",
+    "AUDIT_MISMATCH_MAX_REPRESENTATIVE_DIFFERENCES",
+    "AUDIT_MISMATCH_MAX_REPRESENTATIVE_RAW_SOURCES",
+    "AUDIT_RAW_SOURCE_SUMMARY_SCHEMA",
+    "AUDIT_REST_BOOK_IDENTITY_SCHEMA",
     "AUDIT_START_SCHEMA",
     "AuditBookIdentity",
+    "AuditBookSide",
     "AuditClassificationCommand",
+    "AuditExactDepthDifference",
+    "AuditExactDepthIdentity",
     "AuditExpiryCommand",
     "AuditFailureCommand",
     "AuditFailureReason",
     "AuditHttpFailureHandoff",
     "AuditHttpHandoff",
     "AuditHttpResponseHandoff",
+    "AuditLevelDifference",
+    "AuditMismatchCause",
+    "AuditMismatchDiagnostic",
     "AuditOutcome",
     "AuditOutcomeEvidence",
+    "AuditRawSourceSummary",
+    "AuditRestBookIdentity",
     "AuditStartEvidence",
     "WebSocketAdmissionWatermark",
+    "audit_exact_depth_identity",
+    "build_audit_mismatch_diagnostic",
+    "compare_audit_exact_depth",
+    "summarize_audit_raw_sources",
 ]

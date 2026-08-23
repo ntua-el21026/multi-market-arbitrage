@@ -1,0 +1,426 @@
+{
+  "schema_version": "gate1-failed-corpus-v1",
+  "description": "Sanitized byte-exact price_change corpus for the four primary Gate-1 invariant failures. Full book snapshots and machine-local paths are intentionally excluded.",
+  "fixture_encoding": {
+    "container": "base64-with-final-lf",
+    "decoded_media_type": "application/json",
+    "decoded_payload_has_trailing_lf": false,
+    "verification": "Strip ASCII whitespace from the container, strict Base64-decode it, then verify decoded_bytes and decoded_sha256."
+  },
+  "provenance": {
+    "collector_run_id": "01a02ba9-7bc0-7a86-b920-893b695d9ba4",
+    "terminal_manifest_sha256": "3c257054460124ed00522b89147d76c63153f41ae0bc44369559c69365ffb3fc",
+    "source_segments": {
+      "segment_20000_29999": {
+        "basename": "run-b1840523474a34dd.polymarket-public.00000000000000020000-00000000000000029999.jsonl.zst",
+        "sha256": "609dbcfdfc11e437ae548724bcab8bfac5b351ed09a0bec404050f0a82955165"
+      },
+      "segment_50000_59999": {
+        "basename": "run-b1840523474a34dd.polymarket-public.00000000000000050000-00000000000000059999.jsonl.zst",
+        "sha256": "83b81dd33f7b58cfc64de9392984e7661a61fcfed27358b55eb9f8d4c81a3895"
+      },
+      "segment_80000_89999": {
+        "basename": "run-b1840523474a34dd.polymarket-public.00000000000000080000-00000000000000089999.jsonl.zst",
+        "sha256": "ba8dbc482bd2b03b6527adf888dc67acbfe47ac84bb953e3e9d5204198bf009c"
+      }
+    }
+  },
+  "evidence_backed_bounds": {
+    "interpretation": "Regression bounds for a typed post-snapshot catch-up state, not a venue-delivery guarantee.",
+    "max_accepted_transition_frames": 8,
+    "max_elapsed_from_first_uncertain_delta_ns": 2000000000,
+    "expire_when_elapsed_ns_greater_than_or_equal_to_bound": true,
+    "same_connection_and_socket_generation_required": true,
+    "max_observed_transition_frames_including_target": 6,
+    "max_observed_target_to_authoritative_resnapshot_ns_across_primary_cases": 1933511686,
+    "all_primary_cases_covered": true
+  },
+  "recognizer_requirements_for_no_pending_cases": [
+    "same connection, socket generation, and monotonic epoch",
+    "first websocket delta at admission ordinal 2 immediately after a complete two-book snapshot at ordinal 1",
+    "both binary legs present with complementary prices, equal positive quantities, and complementary sides",
+    "complete mutually complementary non-crossed reported BBO",
+    "strict tick, quantity, and provenance validation succeeds",
+    "exactly one reported side per leg differs from the full-book baseline by one tick",
+    "no intervening websocket frame or transition"
+  ],
+  "safety_contract": {
+    "recognized_effect": "Enter a typed uncertain catch-up state; never fabricate or overwrite full-book top depth from reported BBO.",
+    "during_uncertainty": "Keep scanner, research admission, and REST MATCH blocked.",
+    "convergence": "Only an authoritative full resnapshot establishes the next trusted book.",
+    "unmatched_or_expired": "Invalidate and request resynchronization.",
+    "pending_case_20066": "The exact transaction crosses the book and must become typed INVALIDATED(CROSSED_BOOK) followed by resynchronization."
+  },
+  "cases": [
+    {
+      "ingest_seq": 20066,
+      "fixture": "primary-20066-price-change.json.b64",
+      "decoded_bytes": 625,
+      "decoded_sha256": "67733552fefa017753557840caee222a86ae2f1a538cc86ce0437d00c7f383dc",
+      "source_segment": "segment_20000_29999",
+      "ingest_id": "01a02be2-ba66-7d0b-8626-11dad6fc5003",
+      "connection_id": "01a02bdc-2e4a-7e76-95a3-25130c4c01a0",
+      "socket_generation_one_based": 15,
+      "websocket_admission_ordinal": 318,
+      "received_wall_time_utc_ns": 1787442674277119385,
+      "received_monotonic_ns": 3885419317523,
+      "pending_bbo_present": true,
+      "full_book_top_before": {
+        "yes": {
+          "bid": "0.014",
+          "ask": "0.016"
+        }
+      },
+      "reported_bbo": {
+        "yes": {
+          "bid": "0.016",
+          "ask": "0.017"
+        },
+        "no": {
+          "bid": "0.983",
+          "ask": "0.984"
+        }
+      },
+      "derived_top_after_exact_mutation": {
+        "yes": {
+          "bid": "0.016",
+          "ask": "0.016"
+        }
+      },
+      "classification": "pending-bbo transaction produces a crossed full book",
+      "expected_typed_outcome": "INVALIDATED(CROSSED_BOOK) then RESYNC",
+      "nearby_audit": {
+        "previous": {
+          "ingest_seq": 20063,
+          "outcome": "MATCH"
+        },
+        "next": {
+          "ingest_seq": 20079,
+          "outcome": "MATCH"
+        }
+      },
+      "authoritative_resnapshot": {
+        "ingest_seq": 20073,
+        "payload_sha256": "714b7728e9370b5ea02e03be452a14f3f76eb52893459ee5cd80ab233d6aef64",
+        "target_to_resnapshot_ns": 1933511686
+      },
+      "scanner_at_failure": {
+        "state": "BLOCKED",
+        "reasons": [
+          "INTERLEG_SKEW_EXCEEDED",
+          "UNHEALTHY_BOOK"
+        ]
+      }
+    },
+    {
+      "ingest_seq": 26146,
+      "fixture": "primary-26146-price-change.json.b64",
+      "decoded_bytes": 617,
+      "decoded_sha256": "0e47341a1638f0f1058b9825cedc2f2e3eb43f18a35d2ada20816e3536c621ed",
+      "source_segment": "segment_20000_29999",
+      "ingest_id": "01a02bf4-e0a3-764f-9b3a-afef510b448f",
+      "connection_id": "01a02bf4-cfe1-7f0c-8cea-890fc7a9bd41",
+      "socket_generation_one_based": 17,
+      "websocket_admission_ordinal": 2,
+      "received_wall_time_utc_ns": 1787443863715496858,
+      "received_monotonic_ns": 5007965082008,
+      "pending_bbo_present": false,
+      "complete_snapshot_before": {
+        "ingest_seq": 26127,
+        "ingest_id": "01a02bf4-d1c0-7555-a3ae-3f5d507e00f4",
+        "payload_sha256": "92f6cc94fde8c96df2d6a6da001e19a2840a63e744baeb1708c5567508640031",
+        "websocket_admission_ordinal": 1,
+        "same_connection": true,
+        "snapshot_to_target_ns": 3811212319,
+        "top": {
+          "yes": {
+            "bid": "0.016",
+            "ask": "0.018"
+          },
+          "no": {
+            "bid": "0.982",
+            "ask": "0.984"
+          }
+        }
+      },
+      "reported_bbo": {
+        "yes": {
+          "bid": "0.017",
+          "ask": "0.018"
+        },
+        "no": {
+          "bid": "0.982",
+          "ask": "0.983"
+        }
+      },
+      "exact_changes": [
+        {
+          "leg": "no",
+          "side": "BUY",
+          "price": "0.16",
+          "size": "3500"
+        },
+        {
+          "leg": "yes",
+          "side": "SELL",
+          "price": "0.84",
+          "size": "3500"
+        }
+      ],
+      "classification": "narrow post-snapshot no-pending catch-up candidate",
+      "expected_typed_outcome": "UNCERTAIN_POST_SNAPSHOT_CATCH_UP until authoritative resnapshot",
+      "observed_transition_frames_including_target": 1,
+      "nearby_successful_control": {
+        "reported_bbo_ingest_seqs": [
+          26112,
+          26113
+        ],
+        "exact_change_ingest_seq": 26114,
+        "bbo_to_exact_convergence_ns": 16706
+      },
+      "nearby_audit": {
+        "previous": {
+          "ingest_seq": 26143,
+          "outcome": "MATCH"
+        },
+        "next": {
+          "ingest_seq": 26159,
+          "outcome": "MATCH"
+        }
+      },
+      "authoritative_resnapshot": {
+        "ingest_seq": 26153,
+        "payload_sha256": "92bd8a644a36e74a1a3368f87982e10a0ff2b6c8adc958424007726586b690ca",
+        "target_to_resnapshot_ns": 936433594,
+        "top": {
+          "yes": {
+            "bid": "0.017",
+            "ask": "0.018"
+          },
+          "no": {
+            "bid": "0.982",
+            "ask": "0.983"
+          }
+        }
+      },
+      "scanner_at_failure": {
+        "state": "BLOCKED",
+        "reasons": [
+          "INTERLEG_SKEW_EXCEEDED",
+          "UNHEALTHY_BOOK"
+        ]
+      }
+    },
+    {
+      "ingest_seq": 57885,
+      "fixture": "primary-57885-price-change.json.b64",
+      "decoded_bytes": 617,
+      "decoded_sha256": "f365d00574684efd35154f018e5a5cd34579747f8dea7e2e9498c2bf33523c3f",
+      "source_segment": "segment_50000_59999",
+      "ingest_id": "01a02c50-de55-7958-84dc-4f6d54addd6e",
+      "connection_id": "01a02c50-be53-7cae-9252-4141a7c32e56",
+      "socket_generation_one_based": 38,
+      "websocket_admission_ordinal": 2,
+      "received_wall_time_utc_ns": 1787449892437400596,
+      "received_monotonic_ns": 10680077288091,
+      "pending_bbo_present": false,
+      "complete_snapshot_before": {
+        "ingest_seq": 57858,
+        "ingest_id": "01a02c50-c039-73f5-b1ca-63d087b2e344",
+        "payload_sha256": "25b7ba3a28ae026c8a900088633609901431ea91fb9f753360535b9fdcf49611",
+        "websocket_admission_ordinal": 1,
+        "same_connection": true,
+        "snapshot_to_target_ns": 5688293772,
+        "top": {
+          "yes": {
+            "bid": "0.016",
+            "ask": "0.018"
+          },
+          "no": {
+            "bid": "0.982",
+            "ask": "0.984"
+          }
+        }
+      },
+      "reported_bbo": {
+        "yes": {
+          "bid": "0.017",
+          "ask": "0.018"
+        },
+        "no": {
+          "bid": "0.982",
+          "ask": "0.983"
+        }
+      },
+      "exact_changes": [
+        {
+          "leg": "no",
+          "side": "BUY",
+          "price": "0.16",
+          "size": "3500"
+        },
+        {
+          "leg": "yes",
+          "side": "SELL",
+          "price": "0.84",
+          "size": "3500"
+        }
+      ],
+      "classification": "narrow post-snapshot no-pending catch-up candidate",
+      "expected_typed_outcome": "UNCERTAIN_POST_SNAPSHOT_CATCH_UP until authoritative resnapshot",
+      "observed_transition_frames_including_target": 1,
+      "nearby_successful_control": {
+        "reported_bbo_ingest_seqs": [
+          57843,
+          57844
+        ],
+        "exact_change_ingest_seq": 57845,
+        "bbo_to_exact_convergence_ns": 5546192
+      },
+      "nearby_audit": {
+        "previous": {
+          "ingest_seq": 57880,
+          "outcome": "MATCH"
+        },
+        "next": {
+          "ingest_seq": 57889,
+          "outcome": "RACED"
+        }
+      },
+      "authoritative_resnapshot": {
+        "ingest_seq": 57896,
+        "payload_sha256": "f271899c2a73e23323138fb14b077b1398943949feb827fb776e827165630f4d",
+        "target_to_resnapshot_ns": 1089442261,
+        "top": {
+          "yes": {
+            "bid": "0.016",
+            "ask": "0.018"
+          },
+          "no": {
+            "bid": "0.982",
+            "ask": "0.984"
+          }
+        }
+      },
+      "scanner_at_failure": {
+        "state": "BLOCKED",
+        "reasons": [
+          "INTERLEG_SKEW_EXCEEDED",
+          "UNHEALTHY_BOOK"
+        ]
+      }
+    },
+    {
+      "ingest_seq": 84229,
+      "fixture": "primary-84229-price-change.json.b64",
+      "decoded_bytes": 625,
+      "decoded_sha256": "91972e74475b9c9ce4f679d9e51203001948a6f05badbfe58594399557a447db",
+      "source_segment": "segment_80000_89999",
+      "ingest_id": "01a02c9e-12a3-77dc-b2f4-e02b3c24d2b9",
+      "connection_id": "01a02c9e-0774-7ae4-a378-4ec56fc0da58",
+      "socket_generation_one_based": 111,
+      "websocket_admission_ordinal": 2,
+      "received_wall_time_utc_ns": 1787454952098969571,
+      "received_monotonic_ns": 15422441176267,
+      "pending_bbo_present": false,
+      "complete_snapshot_before": {
+        "ingest_seq": 84216,
+        "ingest_id": "01a02c9e-08dd-75d0-852f-8151c5fe6c62",
+        "payload_sha256": "b68f7628ea3d5c4a1d582fa6a0b3e51bbbcfc96a7222c87d56a0e236368a8a7f",
+        "websocket_admission_ordinal": 1,
+        "same_connection": true,
+        "snapshot_to_target_ns": 2501707009,
+        "top": {
+          "yes": {
+            "bid": "0.016",
+            "ask": "0.017"
+          },
+          "no": {
+            "bid": "0.983",
+            "ask": "0.984"
+          }
+        }
+      },
+      "reported_bbo": {
+        "yes": {
+          "bid": "0.016",
+          "ask": "0.018"
+        },
+        "no": {
+          "bid": "0.982",
+          "ask": "0.984"
+        }
+      },
+      "exact_changes": [
+        {
+          "leg": "yes",
+          "side": "SELL",
+          "price": "0.018",
+          "size": "2524.08"
+        },
+        {
+          "leg": "no",
+          "side": "BUY",
+          "price": "0.982",
+          "size": "2524.08"
+        }
+      ],
+      "classification": "narrow post-snapshot no-pending catch-up candidate with same-target continuation",
+      "expected_typed_outcome": "UNCERTAIN_POST_SNAPSHOT_CATCH_UP until authoritative resnapshot",
+      "observed_transition_frames_including_target": 6,
+      "same_target_continuation": {
+        "ingest_seqs": [
+          84230,
+          84231,
+          84232,
+          84233,
+          84234
+        ],
+        "websocket_admission_ordinals": [
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "max_target_to_continuation_ns": 5669683
+      },
+      "nearby_successful_control": {
+        "reported_bbo_ingest_seqs": [
+          84201,
+          84202
+        ],
+        "exact_change_ingest_seq": 84203,
+        "bbo_to_exact_convergence_ns": 343102
+      },
+      "nearby_audit": {
+        "previous": {
+          "ingest_seq": 84226,
+          "outcome": "MATCH"
+        }
+      },
+      "authoritative_resnapshot": {
+        "ingest_seq": 84241,
+        "payload_sha256": "06a120f9fa21352f03082f7e2ce84b812a6e76dd552e2c37e349f24d1834a28c",
+        "target_to_resnapshot_ns": 1030001677,
+        "top": {
+          "yes": {
+            "bid": "0.016",
+            "ask": "0.018"
+          },
+          "no": {
+            "bid": "0.982",
+            "ask": "0.984"
+          }
+        }
+      },
+      "scanner_at_failure": {
+        "state": "BLOCKED",
+        "reasons": [
+          "INTERLEG_SKEW_EXCEEDED",
+          "UNHEALTHY_BOOK"
+        ]
+      }
+    }
+  ]
+}

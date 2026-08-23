@@ -11,7 +11,7 @@ import asyncio
 import hashlib
 import os
 import stat
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
@@ -20,11 +20,14 @@ from typing import Final
 
 from multi_market_arbitrage.core.ids import CollectorRunId
 from multi_market_arbitrage.core.serialization import canonical_json_bytes
-from multi_market_arbitrage.core.time import UtcTimestamp
+from multi_market_arbitrage.core.time import MonotonicTimestamp, UtcTimestamp
 from multi_market_arbitrage.journal.recovery import fsync_directory
 
-HEALTH_CHECKPOINT_SCHEMA_VERSION: Final = "gate1-health-checkpoint-v1"
-HEALTH_EVIDENCE_SUMMARY_VERSION: Final = "gate1-health-evidence-summary-v1"
+from .host import normalize_git_commit
+
+HEALTH_CHECKPOINT_V1_SCHEMA_VERSION: Final = "gate1-health-checkpoint-v1"
+HEALTH_CHECKPOINT_SCHEMA_VERSION: Final = "gate1-health-checkpoint-v2"
+HEALTH_EVIDENCE_SUMMARY_VERSION: Final = "gate1-health-evidence-summary-v2"
 
 
 class HealthDecisionReason(StrEnum):
@@ -32,6 +35,10 @@ class HealthDecisionReason(StrEnum):
 
     SOCKET_DISCONNECTED = "SOCKET_DISCONNECTED"
     TARGET_NOT_EXPLICIT = "TARGET_NOT_EXPLICIT"
+    CODE_IDENTITY_UNAVAILABLE = "CODE_IDENTITY_UNAVAILABLE"
+    SOURCE_IDENTITY_UNAVAILABLE = "SOURCE_IDENTITY_UNAVAILABLE"
+    SOURCE_IDENTITY_MISMATCH = "SOURCE_IDENTITY_MISMATCH"
+    SOURCE_TREE_DIRTY = "SOURCE_TREE_DIRTY"
     BOOK_NOT_HEALTHY = "BOOK_NOT_HEALTHY"
     INGRESS_DATA_LOSS = "INGRESS_DATA_LOSS"
     INGRESS_QUEUE_SATURATED = "INGRESS_QUEUE_SATURATED"
@@ -41,6 +48,9 @@ class HealthDecisionReason(StrEnum):
     ANALYTICAL_QUEUE_SATURATED = "ANALYTICAL_QUEUE_SATURATED"
     HEALTH_EVIDENCE_UNHEALTHY = "HEALTH_EVIDENCE_UNHEALTHY"
     HEALTH_QUEUE_SATURATED = "HEALTH_QUEUE_SATURATED"
+    AVAILABILITY_EVIDENCE_UNHEALTHY = "AVAILABILITY_EVIDENCE_UNHEALTHY"
+    AVAILABILITY_QUEUE_SATURATED = "AVAILABILITY_QUEUE_SATURATED"
+    AVAILABILITY_RECONCILIATION_FAILED = "AVAILABILITY_RECONCILIATION_FAILED"
     HTTP_INTEGRITY_UNAVAILABLE = "HTTP_INTEGRITY_UNAVAILABLE"
     HTTP_FINAL_FAILURE = "HTTP_FINAL_FAILURE"
     AUDIT_MISMATCH = "AUDIT_MISMATCH"
@@ -74,6 +84,13 @@ class HealthDecisionInputs:
     raw_run_cap_bytes: int
     free_disk_bytes: int
     minimum_free_disk_bytes: int
+    availability_writer_healthy: bool = True
+    availability_queue_saturated: bool = False
+    availability_reconciled: bool = True
+    code_identity_valid: bool = True
+    source_identity_known: bool = True
+    source_identity_mismatch: bool = False
+    source_tree_dirty: bool = False
 
     def __post_init__(self) -> None:
         counts = (
@@ -108,6 +125,14 @@ def evaluate_health_decision(inputs: HealthDecisionInputs) -> HealthDecision:
     reasons: set[HealthDecisionReason] = set()
     if not inputs.explicit_target:
         reasons.add(HealthDecisionReason.TARGET_NOT_EXPLICIT)
+    if not inputs.code_identity_valid:
+        reasons.add(HealthDecisionReason.CODE_IDENTITY_UNAVAILABLE)
+    if not inputs.source_identity_known:
+        reasons.add(HealthDecisionReason.SOURCE_IDENTITY_UNAVAILABLE)
+    if inputs.source_identity_mismatch:
+        reasons.add(HealthDecisionReason.SOURCE_IDENTITY_MISMATCH)
+    if inputs.source_tree_dirty:
+        reasons.add(HealthDecisionReason.SOURCE_TREE_DIRTY)
     if not inputs.socket_connected:
         reasons.add(HealthDecisionReason.SOCKET_DISCONNECTED)
     if not inputs.all_required_books_healthy:
@@ -128,6 +153,12 @@ def evaluate_health_decision(inputs: HealthDecisionInputs) -> HealthDecision:
         reasons.add(HealthDecisionReason.HEALTH_EVIDENCE_UNHEALTHY)
     if inputs.health_queue_saturated:
         reasons.add(HealthDecisionReason.HEALTH_QUEUE_SATURATED)
+    if not inputs.availability_writer_healthy:
+        reasons.add(HealthDecisionReason.AVAILABILITY_EVIDENCE_UNHEALTHY)
+    if inputs.availability_queue_saturated:
+        reasons.add(HealthDecisionReason.AVAILABILITY_QUEUE_SATURATED)
+    if not inputs.availability_reconciled:
+        reasons.add(HealthDecisionReason.AVAILABILITY_RECONCILIATION_FAILED)
     if inputs.audit_mismatches:
         reasons.add(HealthDecisionReason.AUDIT_MISMATCH)
     if inputs.audit_failures:
@@ -189,8 +220,9 @@ class HealthCheckpoint:
 
     collector_run_id: CollectorRunId
     emitted_at: UtcTimestamp
+    emitted_monotonic: MonotonicTimestamp
     runtime_role: str
-    git_commit: str
+    git_commit: str | None
     code_version: str
     config_hash: str
     target: dict[str, object]
@@ -213,12 +245,21 @@ class HealthCheckpoint:
     def __post_init__(self) -> None:
         if self.schema_version != HEALTH_CHECKPOINT_SCHEMA_VERSION:
             raise ValueError("unsupported health-checkpoint schema version")
-        if not self.runtime_role or not self.git_commit or not self.code_version:
+        if self.emitted_monotonic.epoch_id != self.collector_run_id.value:
+            raise ValueError("health-checkpoint monotonic evidence belongs to another run epoch")
+        if not self.runtime_role or not self.code_version:
             raise ValueError("health-checkpoint identity fields must be non-empty")
+        if self.git_commit is not None and normalize_git_commit(self.git_commit) is None:
+            raise ValueError("health-checkpoint code identity must be an exact Git commit")
         if not self.config_hash:
             raise ValueError("health-checkpoint config hash must be non-empty")
         if len(set(self.reason_codes)) != len(self.reason_codes):
             raise ValueError("health-checkpoint reason codes must be unique")
+        code_identity_unavailable = (
+            HealthDecisionReason.CODE_IDENTITY_UNAVAILABLE in self.reason_codes
+        )
+        if (self.git_commit is None) != code_identity_unavailable:
+            raise ValueError("health-checkpoint unknown code identity must have a typed reason")
         if self.gate1_eligible_so_far and (
             not self.capture_healthy or not self.research_eligible or self.reason_codes
         ):
@@ -239,6 +280,8 @@ class HealthCheckpoint:
                 "research_eligible": self.research_eligible,
             },
             "emitted_at_utc_ns": self.emitted_at.nanoseconds_since_epoch,
+            "emitted_monotonic_epoch_id": self.emitted_monotonic.epoch_id,
+            "emitted_monotonic_ns": self.emitted_monotonic.nanoseconds,
             "git_commit": self.git_commit,
             "http": self.http,
             "identity": {
@@ -284,6 +327,89 @@ class HealthEvidenceSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class HealthCheckpointChronology:
+    """Compatibility-aware chronology interpretation for one checkpoint file."""
+
+    schema_version: str
+    checkpoint_count: int
+    monotonic_chronology_available: bool
+    first_emitted_monotonic: MonotonicTimestamp | None
+    last_emitted_monotonic: MonotonicTimestamp | None
+    limitation: str | None
+
+
+def _record_integer(record: Mapping[str, object], key: str) -> int:
+    value = record.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"health checkpoint {key} must be an integer")
+    return value
+
+
+def validate_health_checkpoint_chronology(
+    records: Iterable[Mapping[str, object]],
+) -> HealthCheckpointChronology:
+    """Validate v2 monotonic chronology without inventing timestamps for v1.
+
+    Historical v1 files remain readable evidence, but their omitted monotonic
+    emission timestamps are reported as unavailable and cannot satisfy the v2
+    Gate chronology requirement.
+    """
+
+    materialized = tuple(records)
+    if not materialized:
+        raise ValueError("health checkpoint evidence must contain at least one record")
+    versions = {record.get("schema_version") for record in materialized}
+    if len(versions) != 1:
+        raise ValueError("health checkpoint evidence cannot mix schema versions")
+    version = next(iter(versions))
+    if version == HEALTH_CHECKPOINT_V1_SCHEMA_VERSION:
+        forbidden = {
+            "emitted_monotonic_epoch_id",
+            "emitted_monotonic_ns",
+        }
+        if any(forbidden.intersection(record) for record in materialized):
+            raise ValueError("v1 checkpoint cannot claim v2 monotonic emission fields")
+        return HealthCheckpointChronology(
+            schema_version=HEALTH_CHECKPOINT_V1_SCHEMA_VERSION,
+            checkpoint_count=len(materialized),
+            monotonic_chronology_available=False,
+            first_emitted_monotonic=None,
+            last_emitted_monotonic=None,
+            limitation="v1 evidence did not retain monotonic checkpoint emission timestamps",
+        )
+    if version != HEALTH_CHECKPOINT_SCHEMA_VERSION:
+        raise ValueError("unsupported health-checkpoint schema version")
+    timestamps: list[MonotonicTimestamp] = []
+    collector_run_id: str | None = None
+    for record in materialized:
+        raw_run_id = record.get("collector_run_id")
+        raw_epoch = record.get("emitted_monotonic_epoch_id")
+        if not isinstance(raw_run_id, str) or not raw_run_id:
+            raise ValueError("health checkpoint collector_run_id must be non-empty")
+        if not isinstance(raw_epoch, str) or not raw_epoch:
+            raise ValueError("health checkpoint monotonic epoch must be non-empty")
+        if collector_run_id is None:
+            collector_run_id = raw_run_id
+        if raw_run_id != collector_run_id or raw_epoch != raw_run_id:
+            raise ValueError("health checkpoint monotonic epoch/run identity mismatch")
+        timestamp = MonotonicTimestamp(
+            epoch_id=raw_epoch,
+            nanoseconds=_record_integer(record, "emitted_monotonic_ns"),
+        )
+        if timestamps and timestamp.nanoseconds <= timestamps[-1].nanoseconds:
+            raise ValueError("health checkpoint monotonic chronology must strictly advance")
+        timestamps.append(timestamp)
+    return HealthCheckpointChronology(
+        schema_version=HEALTH_CHECKPOINT_SCHEMA_VERSION,
+        checkpoint_count=len(timestamps),
+        monotonic_chronology_available=True,
+        first_emitted_monotonic=timestamps[0],
+        last_emitted_monotonic=timestamps[-1],
+        limitation=None,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class _Stop:
     pass
 
@@ -324,6 +450,7 @@ class SupervisedHealthCheckpointWriter:
         self._failure_type: str | None = None
         self._descriptor: int | None = None
         self._file_identity: tuple[int, int] | None = None
+        self._last_accepted_monotonic_ns: int | None = None
 
     async def start(self) -> None:
         if self._task is not None or self._closed:
@@ -359,6 +486,11 @@ class SupervisedHealthCheckpointWriter:
         if self._closed or not self._healthy:
             self._rejected += 1
             return False
+        previous_ns = self._last_accepted_monotonic_ns
+        if previous_ns is not None and checkpoint.emitted_monotonic.nanoseconds <= previous_ns:
+            self._rejected += 1
+            self._degrade(RuntimeError("health-checkpoint monotonic chronology regressed"))
+            return False
         try:
             self._queue.put_nowait(checkpoint)
         except asyncio.QueueFull:
@@ -366,6 +498,7 @@ class SupervisedHealthCheckpointWriter:
             self._degrade(RuntimeError("health-checkpoint queue saturated"))
             return False
         self._accepted += 1
+        self._last_accepted_monotonic_ns = checkpoint.emitted_monotonic.nanoseconds
         self._queue_high_water = max(self._queue_high_water, self._queue.qsize())
         return True
 
@@ -479,14 +612,17 @@ class SupervisedHealthCheckpointWriter:
         if self._closed:
             raise RuntimeError("health-checkpoint writer is already closed")
         self._closed = True
-        if not completed:
-            self._degrade(RuntimeError("observation did not complete cleanly"))
         task = self._task
         if task is None:
             raise RuntimeError("health-checkpoint writer was not started")
         if not task.done():
             await self._queue.put(_STOP)
         await asyncio.shield(task)
+        # Drain already accepted terminal evidence before marking an incomplete
+        # observation fail-closed.  Otherwise cancellation timing decides
+        # whether the planned-shutdown checkpoint survives in the partial file.
+        if not completed:
+            self._degrade(RuntimeError("observation did not complete cleanly"))
         content_sha256: str | None = None
         published_path = self._partial_path
         if self._healthy:
@@ -643,7 +779,10 @@ class PeriodicHealthCheckpointEmitter:
 
 __all__ = [
     "HEALTH_CHECKPOINT_SCHEMA_VERSION",
+    "HEALTH_CHECKPOINT_V1_SCHEMA_VERSION",
+    "HEALTH_EVIDENCE_SUMMARY_VERSION",
     "HealthCheckpoint",
+    "HealthCheckpointChronology",
     "HealthDecision",
     "HealthDecisionInputs",
     "HealthDecisionReason",
@@ -652,4 +791,5 @@ __all__ = [
     "PeriodicHealthCheckpointEmitter",
     "SupervisedHealthCheckpointWriter",
     "evaluate_health_decision",
+    "validate_health_checkpoint_chronology",
 ]

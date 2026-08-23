@@ -665,10 +665,12 @@ def test_sealed_multiframe_intermediate_without_pending_bbo_remains_fail_closed(
         _envelope(run_id, 4, WS_MARKET, _SEALED_CALIBRATION_SEQ_482)
     )
 
-    assert not rejected.success
+    # Expected venue-side uncertainty is represented as a typed, fail-closed
+    # resync state.  It is not an envelope parse/programming failure.
+    assert rejected.success
     assert rejected.needs_resync
-    assert rejected.error_type == "BookStateError"
-    assert processor.summary().parse_failures == 1
+    assert rejected.error_type is None
+    assert processor.summary().parse_failures == 0
     assert processor.summary().invalidations == 2
     assert processor.summary().healthy_books == 0
     assert len(rejected.affected_instrument_ids) == 2

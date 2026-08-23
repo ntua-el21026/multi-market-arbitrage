@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import json
+import shutil
+import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -15,10 +18,19 @@ import pytest
 
 from multi_market_arbitrage.core.config import Phase1Config, load_phase1_config
 from multi_market_arbitrage.core.health import ComponentHealth
-from multi_market_arbitrage.core.ids import CollectorRunId, ConnectionId, InstrumentId
+from multi_market_arbitrage.core.ids import (
+    CollectorRunId,
+    ConnectionId,
+    InstrumentId,
+    SubscriptionId,
+)
 from multi_market_arbitrage.core.time import UtcTimestamp
-from multi_market_arbitrage.journal import RawJournalWriter
+from multi_market_arbitrage.journal import JournalBackpressureError, RawJournalWriter
 from multi_market_arbitrage.observability import (
+    AVAILABILITY_EVIDENCE_SUMMARY_VERSION,
+    HEALTH_EVIDENCE_SUMMARY_VERSION,
+    AvailabilityCause,
+    AvailabilityEvidenceSummary,
     HealthDecision,
     HealthDecisionReason,
     HealthEvidenceSummary,
@@ -31,14 +43,19 @@ from multi_market_arbitrage.pipeline.channels import (
     REST_BOOK,
 )
 from multi_market_arbitrage.pipeline.health import ObservationRuntimeHealth
-from multi_market_arbitrage.pipeline.ingress import BoundedRawIngress
+from multi_market_arbitrage.pipeline.ingress import BoundedRawIngress, RawIngressBackpressureError
 from multi_market_arbitrage.pipeline.observe import PolymarketObservationService
 from multi_market_arbitrage.pipeline.targeting import (
     ObservationTargetMode,
     ResolvedPolymarketTarget,
 )
+from multi_market_arbitrage.reference import POLYMARKET_VENUE_ID
 from multi_market_arbitrage.research import ResearchOutputSummary, SupervisedAnalyticalOutputs
 from multi_market_arbitrage.venues.polymarket import (
+    PolymarketPublicClient,
+    PolymarketWebSocketFailureCategory,
+    PolymarketWebSocketProtocolError,
+    PolymarketWebSocketTransportError,
     PublicReadMetricsSnapshot,
     PublicReadPolicy,
     ReceivedWebSocketMessage,
@@ -46,6 +63,380 @@ from multi_market_arbitrage.venues.polymarket import (
 from multi_market_arbitrage.venues.polymarket.schemas import parse_gamma_markets
 
 FIXTURES = Path(__file__).parents[1] / "golden" / "fixtures"
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_cause", "expected_reason"),
+    [
+        pytest.param(
+            PolymarketWebSocketProtocolError(
+                category=PolymarketWebSocketFailureCategory.PROTOCOL,
+                retryable=False,
+                detail="fixture protocol failure",
+            ),
+            AvailabilityCause.PROTOCOL_SCHEMA_INVARIANT,
+            "PolymarketWebSocketProtocolError:PROTOCOL",
+            id="websocket-protocol",
+        ),
+        pytest.param(
+            PolymarketWebSocketTransportError(
+                category=PolymarketWebSocketFailureCategory.CONNECTION_CLOSED,
+                retryable=True,
+                detail="fixture transport failure",
+            ),
+            AvailabilityCause.EXTERNAL_CONNECTION_TRANSPORT,
+            "PolymarketWebSocketTransportError:CONNECTION_CLOSED",
+            id="websocket-transport",
+        ),
+        pytest.param(
+            JournalBackpressureError("fixture journal saturation"),
+            AvailabilityCause.BACKPRESSURE_RESOURCE,
+            "JOURNAL_BACKPRESSURE",
+            id="journal-backpressure",
+        ),
+        pytest.param(
+            RawIngressBackpressureError("fixture ingress saturation"),
+            AvailabilityCause.BACKPRESSURE_RESOURCE,
+            "RAW_INGRESS_QUEUE_EXHAUSTED",
+            id="raw-ingress-backpressure",
+        ),
+        pytest.param(
+            asyncio.CancelledError(),
+            AvailabilityCause.PLANNED_OPERATOR_SHUTDOWN,
+            "OBSERVATION_TASK_CANCELLED",
+            id="planned-cancellation",
+        ),
+        pytest.param(
+            LookupError("fixture unknown failure"),
+            AvailabilityCause.UNKNOWN,
+            "LookupError",
+            id="unknown",
+        ),
+    ],
+)
+def test_error_availability_routing_is_typed_and_source_bound(
+    error: BaseException,
+    expected_cause: AvailabilityCause,
+    expected_reason: str,
+) -> None:
+    connection_id = ConnectionId("availability-routing")
+
+    interruption = observe_module._availability_interruption_for_error(  # pyright: ignore[reportPrivateUsage]
+        error,
+        connection_id=connection_id,
+        asset_ids=("token-yes", "token-no"),
+    )
+
+    assert interruption.cause is expected_cause
+    assert interruption.reason_code == expected_reason
+    assert interruption.source_evidence_ids == ("connection:availability-routing",)
+    if expected_cause is AvailabilityCause.PLANNED_OPERATOR_SHUTDOWN:
+        assert interruption.affected_instruments == ()
+    else:
+        assert interruption.affected_instruments == (
+            InstrumentId.from_native(POLYMARKET_VENUE_ID, "token-yes"),
+            InstrumentId.from_native(POLYMARKET_VENUE_ID, "token-no"),
+        )
+
+
+def test_raw_ingress_backpressure_causal_moment_uses_failing_receive_stamp() -> None:
+    wall_time = UtcTimestamp(1_787_198_400_123_456_789)
+    error = RawIngressBackpressureError(
+        "fixture ingress saturation",
+        received_wall_time=wall_time,
+        received_monotonic_ns=123_456_789,
+    )
+
+    moment = observe_module._causal_moment_for_error(error)  # pyright: ignore[reportPrivateUsage]
+
+    assert moment.wall_time == wall_time
+    assert moment.monotonic_ns == 123_456_789
+
+
+@pytest.mark.asyncio
+async def test_pre_readiness_ingress_backpressure_opens_at_failing_receive_stamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, service = _configured_service(tmp_path)
+    received_at = UtcTimestamp(1_787_198_400_123_456_789)
+    received_monotonic_ns = time.monotonic_ns()
+
+    class _IngressFailureBeforeReady:
+        def __init__(self, asset_ids: tuple[str, ...], **kwargs: object) -> None:
+            del asset_ids, kwargs
+            self.subscription_semantics_sha256 = "a" * 64
+
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            del admit, ready
+            raise RawIngressBackpressureError(
+                "fixture pre-readiness overflow",
+                received_wall_time=received_at,
+                received_monotonic_ns=received_monotonic_ns,
+            )
+
+    monkeypatch.setattr(
+        observe_module,
+        "PolymarketMarketWebSocket",
+        _IngressFailureBeforeReady,
+    )
+    runtime_health = ObservationRuntimeHealth()
+    connection_id = ConnectionId("pre-ready-ingress-overflow")
+    loop = asyncio.get_running_loop()
+
+    with pytest.raises(RawIngressBackpressureError):
+        await service._run_generation(  # pyright: ignore[reportPrivateUsage]
+            client=cast(PolymarketPublicClient, object()),
+            capture=object(),  # pyright: ignore[reportArgumentType]
+            selected=(),
+            asset_ids=("token-yes",),
+            deadline=loop.time() + 1.0,
+            deadline_ns=time.monotonic_ns() + 1_000_000_000,
+            periodic_audit_due_ns=time.monotonic_ns() + 1_000_000_000,
+            connection_id=connection_id,
+            subscription_id=SubscriptionId("pre-ready-ingress-overflow-subscription"),
+            unavailable_started_ns=None,
+            runtime_health=runtime_health,
+        )
+
+    snapshot = runtime_health.snapshot(now_ns=received_monotonic_ns)
+    assert snapshot.current_unavailable_cause is AvailabilityCause.BACKPRESSURE_RESOURCE
+    assert snapshot.current_unavailable_reason_code == "RAW_INGRESS_QUEUE_EXHAUSTED"
+    assert snapshot.current_unavailable_started_monotonic_ns == received_monotonic_ns
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_cause"),
+    [
+        pytest.param(
+            PolymarketWebSocketProtocolError(
+                category=PolymarketWebSocketFailureCategory.PROTOCOL,
+                retryable=False,
+                detail="fixture pre-readiness protocol failure",
+            ),
+            AvailabilityCause.PROTOCOL_SCHEMA_INVARIANT,
+            id="protocol",
+        ),
+        pytest.param(
+            PolymarketWebSocketTransportError(
+                category=PolymarketWebSocketFailureCategory.CONNECTION_CLOSED,
+                retryable=True,
+                detail="fixture pre-readiness transport failure",
+            ),
+            AvailabilityCause.EXTERNAL_CONNECTION_TRANSPORT,
+            id="transport",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_pre_readiness_websocket_failure_routes_at_acquisition_end(
+    failure: BaseException,
+    expected_cause: AvailabilityCause,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, service = _configured_service(tmp_path)
+
+    class _WebSocketFailureBeforeReady:
+        def __init__(self, asset_ids: tuple[str, ...], **kwargs: object) -> None:
+            del asset_ids, kwargs
+            self.subscription_semantics_sha256 = "c" * 64
+
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            del admit, ready
+            raise failure
+
+    monkeypatch.setattr(
+        observe_module,
+        "PolymarketMarketWebSocket",
+        _WebSocketFailureBeforeReady,
+    )
+    runtime_health = ObservationRuntimeHealth()
+    loop = asyncio.get_running_loop()
+    before_failure_ns = time.monotonic_ns()
+    with pytest.raises(type(failure)):
+        await service._run_generation(  # pyright: ignore[reportPrivateUsage]
+            client=cast(PolymarketPublicClient, object()),
+            capture=object(),  # pyright: ignore[reportArgumentType]
+            selected=(),
+            asset_ids=("token-yes",),
+            deadline=loop.time() + 1.0,
+            deadline_ns=time.monotonic_ns() + 1_000_000_000,
+            periodic_audit_due_ns=time.monotonic_ns() + 1_000_000_000,
+            connection_id=ConnectionId("pre-ready-websocket-failure"),
+            subscription_id=SubscriptionId("pre-ready-websocket-failure-subscription"),
+            unavailable_started_ns=None,
+            runtime_health=runtime_health,
+        )
+    after_failure_ns = time.monotonic_ns()
+
+    snapshot = runtime_health.snapshot(now_ns=after_failure_ns)
+    assert snapshot.current_unavailable_cause is expected_cause
+    assert snapshot.current_unavailable_started_monotonic_ns is not None
+    assert (
+        before_failure_ns <= snapshot.current_unavailable_started_monotonic_ns <= after_failure_ns
+    )
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_cause"),
+    [
+        pytest.param(
+            JournalBackpressureError("fixture journal saturation"),
+            AvailabilityCause.BACKPRESSURE_RESOURCE,
+            id="journal-backpressure",
+        ),
+        pytest.param(
+            LookupError("fixture unknown processing failure"),
+            AvailabilityCause.UNKNOWN,
+            id="unknown",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_processing_failure_opens_at_owner_detection_boundary(
+    failure: BaseException,
+    expected_cause: AvailabilityCause,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, service = _configured_service(tmp_path)
+    connection_id = ConnectionId("processing-causal-boundary")
+    instrument_id = InstrumentId.from_native(POLYMARKET_VENUE_ID, "token-yes")
+
+    class _Processor:
+        reported_top_transitions: tuple[object, ...] = ()
+
+        def audit_book_identity(self, native_asset_id: str) -> object:
+            assert native_asset_id == "token-yes"
+            return type("BookIdentity", (), {"instrument_id": instrument_id})()
+
+    class _FailingCapture:
+        def __init__(self) -> None:
+            self.processor = _Processor()
+            self.book_freshness_receive_ns_by_instrument = {instrument_id: time.monotonic_ns()}
+            self.relevant_l2_receive_ns_by_instrument = {instrument_id: time.monotonic_ns()}
+
+        async def preserve_websocket_batch(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise failure
+
+    class _OneFrameSocket:
+        def __init__(self, asset_ids: tuple[str, ...], **kwargs: object) -> None:
+            del asset_ids, kwargs
+            self.subscription_semantics_sha256 = "b" * 64
+
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            ready.set()
+            admit(
+                ReceivedWebSocketMessage(
+                    payload_bytes=b"fixture",
+                    received_wall_time=UtcTimestamp.now(),
+                    received_monotonic_ns=time.monotonic_ns(),
+                    message_type="TEXT",
+                )
+            )
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(observe_module, "PolymarketMarketWebSocket", _OneFrameSocket)
+    runtime_health = ObservationRuntimeHealth()
+    loop = asyncio.get_running_loop()
+    before_detection_ns = time.monotonic_ns()
+    with pytest.raises(type(failure)):
+        await service._run_generation(  # pyright: ignore[reportPrivateUsage]
+            client=cast(PolymarketPublicClient, object()),
+            capture=_FailingCapture(),  # pyright: ignore[reportArgumentType]
+            selected=(),
+            asset_ids=("token-yes",),
+            deadline=loop.time() + 1.0,
+            deadline_ns=time.monotonic_ns() + 1_000_000_000,
+            periodic_audit_due_ns=time.monotonic_ns() + 1_000_000_000,
+            connection_id=connection_id,
+            subscription_id=SubscriptionId("processing-causal-boundary-subscription"),
+            unavailable_started_ns=None,
+            runtime_health=runtime_health,
+        )
+    after_detection_ns = time.monotonic_ns()
+
+    snapshot = runtime_health.snapshot(now_ns=after_detection_ns)
+    assert snapshot.current_unavailable_cause is expected_cause
+    assert snapshot.current_unavailable_started_monotonic_ns is not None
+    assert (
+        before_detection_ns
+        <= snapshot.current_unavailable_started_monotonic_ns
+        <= after_detection_ns
+    )
+
+
+@pytest.fixture(autouse=True)
+def bind_imported_source_to_test_repository(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    host_module = importlib.import_module("multi_market_arbitrage.observability.host")
+    imported_package_root = tmp_path / "src" / "multi_market_arbitrage"
+    monkeypatch.setattr(
+        host_module,
+        "_imported_package_root",
+        lambda: str(imported_package_root),
+    )
+
+
+def _git(repository: Path, *arguments: str) -> str:
+    executable = shutil.which("git")
+    if executable is None:
+        raise RuntimeError("test requires Git")
+    completed = subprocess.run(  # noqa: S603 - test-owned repository and fixed executable
+        [executable, *arguments],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    return completed.stdout.strip()
+
+
+def _initialize_clean_source(repository: Path) -> str:
+    _git(repository, "init", "--quiet")
+    marker = repository / ".source-fixture"
+    marker.write_text("clean source\n", encoding="utf-8")
+    package_marker = repository / "src" / "multi_market_arbitrage" / "__init__.py"
+    package_marker.parent.mkdir(parents=True)
+    package_marker.write_text("# test-owned imported package root\n", encoding="utf-8")
+    _git(
+        repository,
+        "add",
+        marker.name,
+        str(package_marker.relative_to(repository)),
+    )
+    _git(
+        repository,
+        "-c",
+        "user.name=Observe Health Test",
+        "-c",
+        "user.email=observe-health@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "fixture",
+    )
+    return _git(repository, "rev-parse", "HEAD")
 
 
 def test_gate1_checkpoint_decision_is_sticky_after_transient_staleness() -> None:
@@ -144,7 +535,7 @@ def test_recovered_protocol_history_restores_current_capture_but_not_gate1() -> 
 def test_terminal_protocol_history_does_not_reblock_recovered_current_state() -> None:
     run_id = CollectorRunId("terminal-protocol-recovery")
     evidence = HealthEvidenceSummary(
-        schema_version="gate1-health-evidence-summary-v1",
+        schema_version=HEALTH_EVIDENCE_SUMMARY_VERSION,
         collector_run_id=run_id,
         path=Path("health.jsonl"),
         completed=True,
@@ -155,6 +546,23 @@ def test_terminal_protocol_history_does_not_reblock_recovered_current_state() ->
         queue_high_water=1,
         file_bytes=1,
         content_sha256="a" * 64,
+        failure_type=None,
+    )
+    availability_evidence = AvailabilityEvidenceSummary(
+        schema_version=AVAILABILITY_EVIDENCE_SUMMARY_VERSION,
+        collector_run_id=run_id,
+        path=Path("availability.jsonl"),
+        completed=True,
+        gate1_evidence_eligible=True,
+        accepted=0,
+        written=0,
+        rejected=0,
+        queue_high_water=0,
+        file_bytes=0,
+        unavailable_duration_nanoseconds=0,
+        longest_interval_nanoseconds=0,
+        open_at_shutdown_intervals=0,
+        content_sha256="b" * 64,
         failure_type=None,
     )
     analytical = ResearchOutputSummary(
@@ -173,6 +581,8 @@ def test_terminal_protocol_history_does_not_reblock_recovered_current_state() ->
     final = observe_module._final_health_decision(  # pyright: ignore[reportPrivateUsage]
         recovered,
         evidence=evidence,
+        availability_evidence=availability_evidence,
+        availability_reconciled=True,
         analytical_outputs=analytical,
         terminal_runtime_reasons=(HealthDecisionReason.PROTOCOL_DEVIATION,),
     )
@@ -185,6 +595,8 @@ def test_terminal_protocol_history_does_not_reblock_recovered_current_state() ->
     lost = observe_module._final_health_decision(  # pyright: ignore[reportPrivateUsage]
         recovered,
         evidence=evidence,
+        availability_evidence=availability_evidence,
+        availability_reconciled=True,
         analytical_outputs=analytical,
         terminal_runtime_reasons=(HealthDecisionReason.INGRESS_DATA_LOSS,),
     )
@@ -232,7 +644,10 @@ def _target() -> ResolvedPolymarketTarget:
 
 def _configured_service(
     tmp_path: Path,
+    *,
+    code_commit: str | None = None,
 ) -> tuple[Phase1Config, PolymarketObservationService]:
+    source_commit = _initialize_clean_source(tmp_path)
     config = load_phase1_config(Path("config/phase1.toml"))
     config = config.model_copy(
         update={"health": config.health.model_copy(update={"checkpoint_interval_seconds": 0.01})}
@@ -240,7 +655,7 @@ def _configured_service(
     return config, PolymarketObservationService(
         config,
         workspace_root=tmp_path,
-        code_commit="fixture",
+        code_commit=(source_commit if code_commit is None else code_commit),
     )
 
 
@@ -460,6 +875,84 @@ async def _subcadence_disconnect_recovery_stream_fixture(
 
 
 @pytest.mark.asyncio
+async def test_task_cancellation_durably_finalizes_planned_shutdown_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, service = _configured_service(tmp_path)
+    generation_started = asyncio.Event()
+
+    async def cancellable_generation(
+        service: PolymarketObservationService,
+        **kwargs: object,
+    ) -> object:
+        del service
+        runtime_health = cast(ObservationRuntimeHealth, kwargs["runtime_health"])
+        connection_id = cast(ConnectionId, kwargs["connection_id"])
+        ingress = BoundedRawIngress(
+            max_items=8,
+            max_bytes=1_024,
+            connection_id=connection_id,
+        )
+        runtime_health.begin_generation(connection_id, ingress)
+        runtime_health.mark_connected(
+            now_ns=time.monotonic_ns(),
+            now_utc=UtcTimestamp.now(),
+        )
+        generation_started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("cancelled generation unexpectedly returned")
+
+    monkeypatch.setattr(observe_module, "PolymarketPublicClient", _PublicClient)
+    monkeypatch.setattr(
+        PolymarketObservationService,
+        "_bootstrap_explicit",
+        _healthy_bootstrap_fixture,
+    )
+    monkeypatch.setattr(
+        PolymarketObservationService,
+        "_run_generation",
+        cancellable_generation,
+    )
+
+    task = asyncio.create_task(
+        service.run(duration_seconds=2.0, gamma_market_id="101"),
+        name="planned-observation-cancellation",
+    )
+    await asyncio.wait_for(generation_started.wait(), timeout=5)
+    await asyncio.sleep(0.03)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+
+    health_root = tmp_path / config.storage.health_directory
+    availability_paths = tuple(health_root.glob("run-*.availability-intervals.jsonl.partial"))
+    assert len(availability_paths) == 1
+    availability_records = tuple(
+        json.loads(line) for line in availability_paths[0].read_text(encoding="utf-8").splitlines()
+    )
+    assert len(availability_records) == 1
+    availability = availability_records[0]
+    assert availability["cause_type"] == AvailabilityCause.PLANNED_OPERATOR_SHUTDOWN.value
+    assert availability["reason_code"] == "OBSERVATION_TASK_CANCELLED"
+    assert availability["open_at_shutdown"] is True
+    assert availability["recovery_outcome"] == "NOT_RESTORED_AT_SHUTDOWN"
+    assert availability["research_eligibility_restored"] is False
+    assert availability["started_monotonic_ns"] == availability["ended_monotonic_ns"]
+
+    checkpoint_paths = tuple(health_root.glob("run-*.health-checkpoints.jsonl.partial"))
+    assert len(checkpoint_paths) == 1
+    checkpoint_records = tuple(
+        json.loads(line) for line in checkpoint_paths[0].read_text(encoding="utf-8").splitlines()
+    )
+    assert checkpoint_records
+    terminal = checkpoint_records[-1]
+    assert terminal["emitted_monotonic_ns"] == availability["ended_monotonic_ns"]
+    assert terminal["capture"]["current_unavailable_cause"] is None
+    assert terminal["recovery"]["availability"]["open_at_shutdown_intervals"] == 1
+
+
+@pytest.mark.asyncio
 async def test_observation_emits_periodic_and_final_health_with_shared_http_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -483,6 +976,10 @@ async def test_observation_emits_periodic_and_final_health_with_shared_http_poli
     assert summary.health_evidence.gate1_evidence_eligible
     assert summary.health_evidence.written >= 2
     assert summary.health_evidence.path.exists()
+    assert summary.availability_evidence.completed
+    assert summary.availability_evidence.gate1_evidence_eligible
+    assert summary.availability_evidence.written == 0
+    assert summary.availability_evidence.path.read_bytes() == b""
     records = tuple(
         json.loads(line)
         for line in summary.health_evidence.path.read_text(encoding="utf-8").splitlines()
@@ -497,6 +994,79 @@ async def test_observation_emits_periodic_and_final_health_with_shared_http_poli
     policy = _PublicClient.constructor_kwargs["public_read_policy"]
     assert isinstance(policy, PublicReadPolicy)
     assert policy.maximum_attempts == config.polymarket.public_reads.maximum_attempts
+
+
+@pytest.mark.asyncio
+async def test_unavailable_code_identity_blocks_terminal_gate_without_blocking_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, service = _configured_service(tmp_path, code_commit="unavailable")
+    monkeypatch.setattr(observe_module, "PolymarketPublicClient", _PublicClient)
+    monkeypatch.setattr(
+        PolymarketObservationService,
+        "_bootstrap_explicit",
+        _healthy_bootstrap_fixture,
+    )
+    monkeypatch.setattr(
+        PolymarketObservationService,
+        "_observe_websocket",
+        _connected_stream_fixture,
+    )
+
+    summary = await service.run(duration_seconds=2.0, gamma_market_id="101")
+
+    final = json.loads(summary.health_evidence.path.read_text(encoding="utf-8").splitlines()[-1])
+    host_identity = final["resources"]["host_runtime_identity"]
+    assert final["git_commit"] is None
+    assert host_identity["code_commit"] is None
+    assert "code_commit" in host_identity["unknown_fields"]
+    assert final["decisions"]["capture_healthy"] is True
+    assert final["decisions"]["research_eligible"] is True
+    assert final["decisions"]["gate1_eligible_so_far"] is False
+    assert final["decisions"]["reason_codes"] == ["CODE_IDENTITY_UNAVAILABLE"]
+    assert summary.host_runtime_identity.code_commit is None
+    assert summary.journal_metrics.durable >= 4
+    assert summary.health_decision.capture_healthy is True
+    assert summary.health_decision.research_eligible is True
+    assert summary.health_decision.gate1_eligible_so_far is False
+    assert summary.health_decision.reason_codes == (HealthDecisionReason.CODE_IDENTITY_UNAVAILABLE,)
+
+
+@pytest.mark.asyncio
+async def test_dirty_source_tree_blocks_terminal_gate_without_blocking_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, service = _configured_service(tmp_path)
+    (tmp_path / "untracked-after-service-construction.txt").write_text(
+        "dirty\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(observe_module, "PolymarketPublicClient", _PublicClient)
+    monkeypatch.setattr(
+        PolymarketObservationService,
+        "_bootstrap_explicit",
+        _healthy_bootstrap_fixture,
+    )
+    monkeypatch.setattr(
+        PolymarketObservationService,
+        "_observe_websocket",
+        _connected_stream_fixture,
+    )
+
+    summary = await service.run(duration_seconds=2.0, gamma_market_id="101")
+
+    final = json.loads(summary.health_evidence.path.read_text(encoding="utf-8").splitlines()[-1])
+    host_identity = final["resources"]["host_runtime_identity"]
+    assert host_identity["tracked_source_clean"] is True
+    assert host_identity["untracked_source_clean"] is False
+    assert final["decisions"]["capture_healthy"] is True
+    assert final["decisions"]["research_eligible"] is True
+    assert final["decisions"]["gate1_eligible_so_far"] is False
+    assert final["decisions"]["reason_codes"] == ["SOURCE_TREE_DIRTY"]
+    assert summary.journal_metrics.durable >= 4
+    assert summary.health_decision.reason_codes == (HealthDecisionReason.SOURCE_TREE_DIRTY,)
 
 
 @pytest.mark.asyncio
@@ -526,6 +1096,12 @@ async def test_subcadence_disconnect_recovery_remains_gate1_ineligible(
     assert final["decisions"]["research_eligible"] is True
     assert final["decisions"]["gate1_eligible_so_far"] is False
     assert final["decisions"]["reason_codes"] == ["SOCKET_DISCONNECTED"]
+    assert final["recovery"]["availability"]["aggregate_reconciled"] is True
+    assert summary.availability_evidence.written == 1
+    assert (
+        summary.availability_evidence.unavailable_duration_nanoseconds
+        == summary.runtime_health.unavailable_total_nanoseconds
+    )
     assert summary.health_decision.capture_healthy is True
     assert summary.health_decision.research_eligible is True
     assert summary.health_decision.gate1_eligible_so_far is False
@@ -533,7 +1109,7 @@ async def test_subcadence_disconnect_recovery_remains_gate1_ineligible(
 
 
 @pytest.mark.asyncio
-async def test_immediate_capture_end_waits_for_initial_resource_sample_before_terminal_health(
+async def test_immediate_capture_end_rejects_resource_sample_after_terminal_cutoff(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -562,7 +1138,7 @@ async def test_immediate_capture_end_waits_for_initial_resource_sample_before_te
         runtime_health: ObservationRuntimeHealth,
         on_capture_cutoff: Callable[[observe_module._CaptureCutoffMoment], None],  # pyright: ignore[reportPrivateUsage]
     ) -> observe_module._StreamResult:  # pyright: ignore[reportPrivateUsage]
-        del service, client, capture, selected, asset_ids, deadline, logger, on_capture_cutoff
+        del service, client, capture, selected, asset_ids, deadline, logger
         connection_id = ConnectionId.new()
         ingress = BoundedRawIngress(
             max_items=8,
@@ -575,6 +1151,11 @@ async def test_immediate_capture_end_waits_for_initial_resource_sample_before_te
             continuity_interrupted=False,
             now_ns=time.monotonic_ns(),
         )
+        cutoff = observe_module._CaptureCutoffMoment(  # pyright: ignore[reportPrivateUsage]
+            wall_time=UtcTimestamp.now(),
+            monotonic_ns=time.monotonic_ns(),
+        )
+        on_capture_cutoff(cutoff)
         capture_ended.set()
         return observe_module._StreamResult(  # pyright: ignore[reportPrivateUsage]
             reconnects=0,
@@ -582,6 +1163,7 @@ async def test_immediate_capture_end_waits_for_initial_resource_sample_before_te
             selected_market_resolved=False,
             deviations=(),
             ingress_metrics=ingress.metrics,
+            capture_cutoff=cutoff,
         )
 
     monkeypatch.setattr(health_module, "capture_process_resources", gated_sample)
@@ -601,18 +1183,16 @@ async def test_immediate_capture_end_waits_for_initial_resource_sample_before_te
     try:
         await asyncio.wait_for(capture_ended.wait(), timeout=5)
         await asyncio.wait_for(sample_started.wait(), timeout=5)
-        await asyncio.sleep(0)
-        assert not task.done()
+        summary = await asyncio.wait_for(task, timeout=5)
     finally:
         release_sample.set()
-    summary = await asyncio.wait_for(task, timeout=10)
 
-    assert summary.health_evidence.gate1_evidence_eligible
-    assert summary.health_evidence.failure_type is None
-    assert summary.health_evidence.written == 1
-    final = json.loads(summary.health_evidence.path.read_text(encoding="utf-8"))
-    assert final["capture"]["connected"] is True
-    assert len(final["books"]) == 2
+    assert not summary.health_evidence.gate1_evidence_eligible
+    assert summary.health_evidence.failure_type == "RuntimeError"
+    assert summary.health_evidence.written == 0
+    assert summary.resource_trend.sample_count == 0
+    assert summary.analytical_outputs.research_eligible
+    assert HealthDecisionReason.HEALTH_EVIDENCE_UNHEALTHY in (summary.health_decision.reason_codes)
 
 
 @pytest.mark.asyncio
@@ -760,6 +1340,35 @@ async def test_terminal_disconnect_is_preserved_in_final_health_checkpoint(
 ) -> None:
     _, service = _configured_service(tmp_path)
     original_raw_close = RawJournalWriter.close
+    original_resource_sample = health_module.capture_process_resources
+    resource_sample_completed = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def observable_resource_sample(path: Path) -> health_module.ProcessResourceSnapshot:
+        result = original_resource_sample(path)
+        loop.call_soon_threadsafe(resource_sample_completed.set)
+        return result
+
+    async def bootstrap_after_resource_sample(
+        service: PolymarketObservationService,
+        *,
+        client: object,
+        capture: object,
+        processor: object,
+        gamma_market_id: str,
+        deadline: float | None = None,
+    ) -> tuple[tuple[object, ...], tuple[str, ...], ResolvedPolymarketTarget]:
+        result = await _bootstrap_fixture(
+            service,
+            client=client,
+            capture=capture,
+            processor=processor,
+            gamma_market_id=gamma_market_id,
+            deadline=deadline,
+        )
+        await asyncio.wait_for(resource_sample_completed.wait(), timeout=5)
+        await asyncio.sleep(0)
+        return result
 
     async def delayed_raw_close(
         writer: RawJournalWriter,
@@ -771,9 +1380,14 @@ async def test_terminal_disconnect_is_preserved_in_final_health_checkpoint(
 
     monkeypatch.setattr(observe_module, "PolymarketPublicClient", _PublicClient)
     monkeypatch.setattr(
+        health_module,
+        "capture_process_resources",
+        observable_resource_sample,
+    )
+    monkeypatch.setattr(
         PolymarketObservationService,
         "_bootstrap_explicit",
-        _bootstrap_fixture,
+        bootstrap_after_resource_sample,
     )
     monkeypatch.setattr(
         PolymarketObservationService,
@@ -797,14 +1411,17 @@ async def test_terminal_disconnect_is_preserved_in_final_health_checkpoint(
     unavailable_started_monotonic_ns = (
         summary.runtime_health.current_unavailable_started_monotonic_ns
     )
-    assert unavailable_started_monotonic_ns is not None
+    assert unavailable_started_monotonic_ns is None
+    assert final["capture"]["current_unavailable_nanoseconds"] is None
     assert (
         summary.runtime_health.longest_unavailable_nanoseconds
         == final["capture"]["longest_unavailable_nanoseconds"]
     )
-    terminal_monotonic_ns = (
-        unavailable_started_monotonic_ns + final["capture"]["current_unavailable_nanoseconds"]
-    )
+    assert summary.availability_evidence.open_at_shutdown_intervals == 1
+    availability_record = json.loads(summary.availability_evidence.path.read_text(encoding="utf-8"))
+    terminal_monotonic_ns = availability_record["ended_monotonic_ns"]
+    assert terminal_monotonic_ns == final["emitted_monotonic_ns"]
+    unavailable_started_monotonic_ns = availability_record["started_monotonic_ns"]
     inferred_started_monotonic_ns = terminal_monotonic_ns - summary.actual_duration_nanoseconds
     assert run_invoked_monotonic_ns <= inferred_started_monotonic_ns <= terminal_monotonic_ns
     assert "SOCKET_DISCONNECTED" in final["decisions"]["reason_codes"]
@@ -833,7 +1450,7 @@ async def test_terminal_health_uses_paired_capture_cutoff_before_audit_drain(
     service = PolymarketObservationService(
         config,
         workspace_root=tmp_path,
-        code_commit="fixture",
+        code_commit=_git(tmp_path, "rev-parse", "HEAD"),
     )
     cutoff_holder: list[observe_module._CaptureCutoffMoment] = []  # pyright: ignore[reportPrivateUsage]
     drain_completed_wall_times: list[UtcTimestamp] = []
@@ -1141,7 +1758,7 @@ async def test_initial_resource_sample_timeout_degrades_health_but_completes_raw
     assert summary.journal_metrics.writer_failures == 0
     assert summary.analytical_outputs.research_eligible
     assert not summary.health_evidence.gate1_evidence_eligible
-    assert summary.health_evidence.failure_type == "TimeoutError"
+    assert summary.health_evidence.failure_type == "RuntimeError"
     assert HealthDecisionReason.HEALTH_EVIDENCE_UNHEALTHY in (summary.health_decision.reason_codes)
 
 

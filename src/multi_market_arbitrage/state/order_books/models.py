@@ -106,6 +106,18 @@ class RestBookAuditResult:
 
 
 @dataclass(frozen=True, slots=True)
+class PriceChangePreview:
+    """Non-mutating exact result used by the bounded transition recognizer."""
+
+    instrument_id: InstrumentId
+    market_id: MarketId
+    best_bid: Price | None
+    best_ask: Price | None
+    crossed: bool
+    levels_changed: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ImmutableOrderBookSnapshot:
     instrument_id: InstrumentId
     market_id: MarketId
@@ -215,6 +227,7 @@ __all__ = [
     "BookMutationKind",
     "ImmutableOrderBookSnapshot",
     "InvalidationReason",
+    "PriceChangePreview",
     "RestAuditStatus",
     "RestBookAuditResult",
 ]

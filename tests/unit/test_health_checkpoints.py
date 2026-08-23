@@ -1,22 +1,27 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 from pathlib import Path
 
 import pytest
 
 from multi_market_arbitrage.core.ids import CollectorRunId
-from multi_market_arbitrage.core.time import UtcTimestamp
+from multi_market_arbitrage.core.time import MonotonicTimestamp, UtcTimestamp
 from multi_market_arbitrage.observability import (
     HEALTH_CHECKPOINT_SCHEMA_VERSION,
+    HEALTH_CHECKPOINT_V1_SCHEMA_VERSION,
     HealthCheckpoint,
     HealthDecisionInputs,
     HealthDecisionReason,
     PeriodicHealthCheckpointEmitter,
     SupervisedHealthCheckpointWriter,
     evaluate_health_decision,
+    validate_health_checkpoint_chronology,
 )
+
+_MONOTONIC_SEQUENCE = itertools.count(1)
 
 
 def _checkpoint(
@@ -24,10 +29,15 @@ def _checkpoint(
     *,
     gate1_eligible: bool = True,
     reasons: tuple[HealthDecisionReason, ...] = (),
+    emitted_monotonic_ns: int | None = None,
 ) -> HealthCheckpoint:
+    monotonic_ns = (
+        next(_MONOTONIC_SEQUENCE) if emitted_monotonic_ns is None else emitted_monotonic_ns
+    )
     return HealthCheckpoint(
         collector_run_id=run_id,
         emitted_at=UtcTimestamp.now(),
+        emitted_monotonic=MonotonicTimestamp(run_id.value, monotonic_ns),
         runtime_role="OBSERVE",
         git_commit="a" * 40,
         code_version="phase1-test",
@@ -98,6 +108,56 @@ def test_scoped_health_decision_keeps_writer_failure_off_capture_path() -> None:
         HealthDecisionReason.HEALTH_EVIDENCE_UNHEALTHY,
         HealthDecisionReason.HEALTH_QUEUE_SATURATED,
     )
+
+
+def test_availability_evidence_failure_is_gate_only_and_explicit() -> None:
+    decision = evaluate_health_decision(
+        _decision_inputs(
+            availability_writer_healthy=False,
+            availability_queue_saturated=True,
+            availability_reconciled=False,
+        )
+    )
+
+    assert decision.capture_healthy is True
+    assert decision.research_eligible is True
+    assert decision.gate1_eligible_so_far is False
+    assert set(decision.reason_codes) == {
+        HealthDecisionReason.AVAILABILITY_EVIDENCE_UNHEALTHY,
+        HealthDecisionReason.AVAILABILITY_QUEUE_SATURATED,
+        HealthDecisionReason.AVAILABILITY_RECONCILIATION_FAILED,
+    }
+
+
+def test_unknown_code_identity_is_gate_only_and_explicit() -> None:
+    decision = evaluate_health_decision(_decision_inputs(code_identity_valid=False))
+
+    assert decision.capture_healthy is True
+    assert decision.research_eligible is True
+    assert decision.gate1_eligible_so_far is False
+    assert decision.reason_codes == (HealthDecisionReason.CODE_IDENTITY_UNAVAILABLE,)
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        (
+            {"source_identity_known": False},
+            HealthDecisionReason.SOURCE_IDENTITY_UNAVAILABLE,
+        ),
+        ({"source_tree_dirty": True}, HealthDecisionReason.SOURCE_TREE_DIRTY),
+    ],
+)
+def test_source_identity_failure_is_gate_only_and_explicit(
+    changes: dict[str, object],
+    reason: HealthDecisionReason,
+) -> None:
+    decision = evaluate_health_decision(_decision_inputs(**changes))
+
+    assert decision.capture_healthy is True
+    assert decision.research_eligible is True
+    assert decision.gate1_eligible_so_far is False
+    assert decision.reason_codes == (reason,)
 
 
 @pytest.mark.parametrize(
@@ -250,7 +310,64 @@ async def test_health_writer_publishes_bounded_canonical_jsonl(tmp_path: Path) -
     record = json.loads(summary.path.read_text(encoding="utf-8"))
     assert record["schema_version"] == HEALTH_CHECKPOINT_SCHEMA_VERSION
     assert record["collector_run_id"] == run_id.value
+    assert record["emitted_monotonic_epoch_id"] == run_id.value
+    assert isinstance(record["emitted_monotonic_ns"], int)
     assert record["decisions"]["gate1_eligible_so_far"] is True
+
+
+def test_checkpoint_v2_chronology_uses_monotonic_when_utc_regresses() -> None:
+    run_id = CollectorRunId.new()
+    first = _checkpoint(run_id, emitted_monotonic_ns=10).to_record()
+    second = _checkpoint(run_id, emitted_monotonic_ns=20).to_record()
+    first["emitted_at_utc_ns"] = 200
+    second["emitted_at_utc_ns"] = 100
+
+    chronology = validate_health_checkpoint_chronology((first, second))
+
+    assert chronology.monotonic_chronology_available is True
+    assert chronology.first_emitted_monotonic == MonotonicTimestamp(run_id.value, 10)
+    assert chronology.last_emitted_monotonic == MonotonicTimestamp(run_id.value, 20)
+
+
+def test_checkpoint_v1_compatibility_does_not_synthesize_monotonic_evidence() -> None:
+    records = (
+        {
+            "collector_run_id": "historical-run",
+            "emitted_at_utc_ns": 200,
+            "schema_version": HEALTH_CHECKPOINT_V1_SCHEMA_VERSION,
+        },
+        {
+            "collector_run_id": "historical-run",
+            "emitted_at_utc_ns": 100,
+            "schema_version": HEALTH_CHECKPOINT_V1_SCHEMA_VERSION,
+        },
+    )
+
+    chronology = validate_health_checkpoint_chronology(records)
+
+    assert chronology.monotonic_chronology_available is False
+    assert chronology.first_emitted_monotonic is None
+    assert chronology.last_emitted_monotonic is None
+    assert chronology.limitation is not None
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["epoch", "regression"],
+)
+def test_checkpoint_v2_chronology_rejects_epoch_mismatch_or_regression(
+    mutation: str,
+) -> None:
+    run_id = CollectorRunId.new()
+    first = _checkpoint(run_id, emitted_monotonic_ns=10).to_record()
+    second = _checkpoint(run_id, emitted_monotonic_ns=20).to_record()
+    if mutation == "epoch":
+        second["emitted_monotonic_epoch_id"] = "another-run"
+    else:
+        second["emitted_monotonic_ns"] = 10
+
+    with pytest.raises(ValueError, match=r"epoch|chronology"):
+        validate_health_checkpoint_chronology((first, second))
 
 
 @pytest.mark.asyncio

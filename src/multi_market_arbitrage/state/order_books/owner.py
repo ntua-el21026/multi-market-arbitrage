@@ -23,7 +23,6 @@ from multi_market_arbitrage.core.provenance import (
 from multi_market_arbitrage.core.serialization import canonical_sha256
 from multi_market_arbitrage.core.time import UtcTimestamp
 from multi_market_arbitrage.normalization import (
-    BestBidAskEvent,
     BookSide,
     CanonicalBookLevel,
     CanonicalEvent,
@@ -44,6 +43,7 @@ from .models import (
     BookMutationKind,
     ImmutableOrderBookSnapshot,
     InvalidationReason,
+    PriceChangePreview,
     RestAuditStatus,
     RestBookAuditResult,
 )
@@ -651,7 +651,7 @@ class CanonicalL2BookOwner:
         payload: PriceChangeEvent,
         *,
         event: CanonicalEvent,
-        pending_best_bid_ask: BestBidAskEvent | None = None,
+        reported_top_transition_target: tuple[Price, Price] | None = None,
     ) -> BookMutation:
         if self._health is not BookHealth.HEALTHY:
             raise BookStateError("price change requires a healthy snapshot baseline")
@@ -665,6 +665,9 @@ class CanonicalL2BookOwner:
                 self.invalidate(InvalidationReason.UNKNOWN_PRECISION)
                 raise
             target = bid_updates if change.side is BookSide.BID else ask_updates
+            if change.price.value in target:
+                self.invalidate(InvalidationReason.PROTOCOL_VIOLATION)
+                raise BookStateError("price change contains a duplicate side/price update")
             if change.price.value not in target and len(target) >= _MAX_LEVELS_PER_SIDE:
                 self.invalidate(InvalidationReason.PROTOCOL_VIOLATION)
                 raise BookStateError(
@@ -691,11 +694,9 @@ class CanonicalL2BookOwner:
             and last_change.reported_best_ask != derived_best_ask
         )
         may_defer_reported_top_validation = (
-            pending_best_bid_ask is not None
-            and pending_best_bid_ask.instrument_id == self._instrument_id
-            and pending_best_bid_ask.market_id == self._market_id
-            and last_change.reported_best_bid == pending_best_bid_ask.best_bid
-            and last_change.reported_best_ask == pending_best_bid_ask.best_ask
+            reported_top_transition_target is not None
+            and last_change.reported_best_bid == reported_top_transition_target[0]
+            and last_change.reported_best_ask == reported_top_transition_target[1]
         )
         if reported_top_disagrees and not may_defer_reported_top_validation:
             self.invalidate(InvalidationReason.PROTOCOL_VIOLATION)
@@ -757,6 +758,55 @@ class CanonicalL2BookOwner:
         if current_evidence != previous_evidence:
             kinds |= BookMutationKind.FRESHNESS | BookMutationKind.PROVENANCE
         return self._mutation(kinds)
+
+    def preview_price_change(
+        self,
+        payload: PriceChangeEvent,
+        *,
+        event: CanonicalEvent,
+    ) -> PriceChangePreview:
+        """Validate and derive one update without mutating canonical state.
+
+        This deliberately does not relax any owner invariant.  The processor
+        uses the result only to decide whether an exact, corpus-backed
+        reported-top recognizer may enter fail-closed auxiliary state.
+        """
+
+        if self._health is not BookHealth.HEALTHY:
+            raise BookStateError("price change requires a healthy snapshot baseline")
+        if payload.instrument_id != self._instrument_id or payload.market_id != self._market_id:
+            raise BookStateError("price change identifies a different instrument or market")
+        bid_updates: dict[ExactDecimal, Quantity] = {}
+        ask_updates: dict[ExactDecimal, Quantity] = {}
+        for change in payload.changes:
+            level = CanonicalBookLevel(change.price, change.new_quantity)
+            self._validate_level(level)
+            target = bid_updates if change.side is BookSide.BID else ask_updates
+            if change.price.value in target:
+                raise BookStateError("price change contains a duplicate side/price update")
+            if change.price.value not in target and len(target) >= _MAX_LEVELS_PER_SIDE:
+                raise BookStateError(
+                    "price change contains more than 4096 distinct updates on one side"
+                )
+            target[change.price.value] = change.new_quantity
+        bids = _merge_side(self._bids, bid_updates, reverse=True)
+        asks = _merge_side(self._asks, ask_updates, reverse=False)
+        source_provenance = _event_provenance(event)
+        _require_raw_source_compatibility(self._state_source_provenance, source_provenance)
+        return PriceChangePreview(
+            instrument_id=self._instrument_id,
+            market_id=self._market_id,
+            best_bid=None if not bids else bids[0].price,
+            best_ask=None if not asks else asks[0].price,
+            crossed=self._crossed(bids, asks),
+            levels_changed=bids is not self._bids or asks is not self._asks,
+        )
+
+    @property
+    def tick_size(self) -> ExactDecimal | None:
+        """Return the currently bound exact tick for conservative recognition."""
+
+        return self._tick_size
 
     def apply_tick_size_change(
         self, payload: TickSizeChangeEvent, *, event: CanonicalEvent

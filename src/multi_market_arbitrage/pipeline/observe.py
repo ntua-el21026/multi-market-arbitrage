@@ -8,11 +8,12 @@ import logging
 import math
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
+from typing import cast
 
 from multi_market_arbitrage.core.config import Phase1Config, Phase1RuntimeRole
 from multi_market_arbitrage.core.health import ComponentHealth
@@ -39,16 +40,26 @@ from multi_market_arbitrage.journal import (
 )
 from multi_market_arbitrage.normalization import CanonicalEventType
 from multi_market_arbitrage.observability import (
+    AVAILABILITY_EVIDENCE_SUMMARY_VERSION,
+    HEALTH_EVIDENCE_SUMMARY_VERSION,
+    AvailabilityCause,
+    AvailabilityEvidenceRuntimeSnapshot,
+    AvailabilityEvidenceSummary,
+    AvailabilityRecoveryAction,
+    AvailabilityScope,
     HealthCheckpoint,
     HealthDecision,
     HealthDecisionReason,
     HealthEvidenceRuntimeSnapshot,
     HealthEvidenceSummary,
+    HostRuntimeIdentity,
     InMemoryMetrics,
     MetricsSnapshot,
     PeriodicHealthCheckpointEmitter,
     StructuredLogger,
+    SupervisedAvailabilityIntervalWriter,
     SupervisedHealthCheckpointWriter,
+    capture_host_runtime_identity,
     configure_json_logger,
 )
 from multi_market_arbitrage.reference import POLYMARKET_VENUE_ID
@@ -89,6 +100,7 @@ from .audit import (
 from .channels import (
     CLOB_MARKET_PREFIX,
     CONTROL_BOOK_INVALIDATION,
+    CONTROL_REPORTED_TOP_TRANSITION_EXPIRED,
     CONTROL_REST_AUDIT_CLASSIFY,
     CONTROL_REST_AUDIT_EXPIRED,
     CONTROL_REST_AUDIT_FAILED,
@@ -103,9 +115,12 @@ from .channels import (
 )
 from .freshness import IntegrityDeadline, IntegrityDeadlineReason
 from .health import (
+    AvailabilityInterruption,
     ObservationRuntimeHealth,
     ObservationRuntimeHealthSnapshot,
+    ProcessResourceSamplerSnapshot,
     ProcessResourceSnapshot,
+    ProcessResourceTrendSnapshot,
     SupervisedProcessResourceSampler,
     build_observation_health_checkpoint,
 )
@@ -127,6 +142,11 @@ from .targeting import (
     TargetSelectionError,
     require_supported_gamma_market,
     resolve_polymarket_target,
+)
+from .transitions import (
+    ReportedTopTransition,
+    ReportedTopTransitionExpiryCommand,
+    ReportedTopTransitionOutcome,
 )
 
 
@@ -160,12 +180,105 @@ def _empty_ingress_metrics() -> RawIngressMetricsSnapshot:
     )
 
 
+def _reported_top_transition_outcomes(
+    processor: object,
+) -> tuple[ReportedTopTransitionOutcome, ...]:
+    """Read optional transition evidence from production or narrow test owners."""
+
+    summary_method = getattr(processor, "summary", None)
+    if not callable(summary_method):
+        return ()
+    summary: object = summary_method()
+    raw_outcomes: object = getattr(summary, "reported_top_transition_outcomes", ())
+    if not isinstance(raw_outcomes, tuple):
+        return ()
+    outcomes: list[ReportedTopTransitionOutcome] = []
+    for outcome in cast(tuple[object, ...], raw_outcomes):
+        if not isinstance(outcome, ReportedTopTransitionOutcome):
+            return ()
+        outcomes.append(outcome)
+    return tuple(outcomes)
+
+
+def _reported_top_transitions(
+    processor: object,
+) -> tuple[ReportedTopTransition, ...]:
+    """Read current transition deadlines from production or narrow test owners."""
+
+    raw_transitions: object = getattr(processor, "reported_top_transitions", ())
+    if not isinstance(raw_transitions, tuple):
+        return ()
+    transitions: list[ReportedTopTransition] = []
+    for transition in cast(tuple[object, ...], raw_transitions):
+        if not isinstance(transition, ReportedTopTransition):
+            return ()
+        transitions.append(transition)
+    return tuple(transitions)
+
+
 @dataclass(frozen=True, slots=True)
 class _CaptureCutoffMoment:
     """Wall and monotonic clocks sampled when capture admission stops."""
 
     wall_time: UtcTimestamp
     monotonic_ns: int
+
+
+def _availability_interruption_for_error(
+    error: BaseException,
+    *,
+    connection_id: ConnectionId,
+    asset_ids: tuple[str, ...],
+) -> AvailabilityInterruption:
+    affected_instruments = tuple(
+        InstrumentId.from_native(POLYMARKET_VENUE_ID, asset_id) for asset_id in asset_ids
+    )
+    if isinstance(error, PolymarketWebSocketProtocolError):
+        return AvailabilityInterruption(
+            cause=AvailabilityCause.PROTOCOL_SCHEMA_INVARIANT,
+            reason_code=f"{type(error).__name__}:{error.category.value}",
+            source_evidence_ids=(f"connection:{connection_id.value}",),
+            affected_instruments=affected_instruments,
+        )
+    if isinstance(error, PolymarketWebSocketError):
+        return AvailabilityInterruption(
+            cause=AvailabilityCause.EXTERNAL_CONNECTION_TRANSPORT,
+            reason_code=f"{type(error).__name__}:{error.category.value}",
+            source_evidence_ids=(f"connection:{connection_id.value}",),
+            affected_instruments=affected_instruments,
+        )
+    if isinstance(error, (JournalBackpressureError, RawIngressBackpressureError)):
+        return AvailabilityInterruption(
+            cause=AvailabilityCause.BACKPRESSURE_RESOURCE,
+            reason_code=(
+                "JOURNAL_BACKPRESSURE"
+                if isinstance(error, JournalBackpressureError)
+                else "RAW_INGRESS_QUEUE_EXHAUSTED"
+            ),
+            source_evidence_ids=(f"connection:{connection_id.value}",),
+            affected_instruments=affected_instruments,
+        )
+    if isinstance(error, asyncio.CancelledError):
+        return AvailabilityInterruption(
+            cause=AvailabilityCause.PLANNED_OPERATOR_SHUTDOWN,
+            reason_code="OBSERVATION_TASK_CANCELLED",
+            source_evidence_ids=(f"connection:{connection_id.value}",),
+        )
+    return AvailabilityInterruption(
+        cause=AvailabilityCause.UNKNOWN,
+        reason_code=type(error).__name__,
+        source_evidence_ids=(f"connection:{connection_id.value}",),
+        affected_instruments=affected_instruments,
+    )
+
+
+def _causal_moment_for_error(error: BaseException) -> _CaptureCutoffMoment:
+    if isinstance(error, RawIngressBackpressureError):
+        received_at = error.received_wall_time
+        received_monotonic_ns = error.received_monotonic_ns
+        if received_at is not None and received_monotonic_ns is not None:
+            return _CaptureCutoffMoment(received_at, received_monotonic_ns)
+    return _CaptureCutoffMoment(UtcTimestamp.now(), time.monotonic_ns())
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +288,8 @@ class _GenerationResult:
     refresh_requests: tuple[ReferenceRefreshRequest, ...] = ()
     ingress_metrics: RawIngressMetricsSnapshot = field(default_factory=_empty_ingress_metrics)
     capture_cutoff: _CaptureCutoffMoment | None = None
+    interruption: AvailabilityInterruption | None = None
+    interruption_started_at: _CaptureCutoffMoment | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,8 +313,10 @@ class _HealthCheckpointMoment:
     journal_failure_type: str | None
     analytical: AnalyticalRuntimeSnapshot
     health_writer: HealthEvidenceRuntimeSnapshot
+    availability_writer: AvailabilityEvidenceRuntimeSnapshot
     public_reads: PublicReadMetricsSnapshot
     resources: ProcessResourceSnapshot | None
+    resource_trend: ProcessResourceTrendSnapshot
     book_last_valid_receive_monotonic_ns: tuple[tuple[InstrumentId, int], ...]
 
 
@@ -343,6 +460,7 @@ class ObservationSummary:
     processor: ProcessorSummary
     analytical_outputs: ResearchOutputSummary
     health_evidence: HealthEvidenceSummary
+    availability_evidence: AvailabilityEvidenceSummary
     health_decision: HealthDecision
     public_read_metrics: PublicReadMetricsSnapshot
     runtime_health: ObservationRuntimeHealthSnapshot
@@ -352,6 +470,8 @@ class ObservationSummary:
     selected_market_resolved: bool
     protocol_deviations: tuple[str, ...]
     websocket_observation_nanoseconds: int
+    host_runtime_identity: HostRuntimeIdentity
+    resource_trend: ProcessResourceTrendSnapshot
 
 
 class _RawCaptureBoundary:
@@ -667,7 +787,7 @@ def _failed_health_summary(
     runtime = writer.runtime_snapshot
     path = root / (f"run-{collector_run_id.value}.health-checkpoints.jsonl.partial")
     return HealthEvidenceSummary(
-        schema_version="gate1-health-evidence-summary-v1",
+        schema_version=HEALTH_EVIDENCE_SUMMARY_VERSION,
         collector_run_id=collector_run_id,
         path=path,
         completed=False,
@@ -682,12 +802,69 @@ def _failed_health_summary(
     )
 
 
+def _failed_availability_summary(
+    *,
+    root: Path,
+    collector_run_id: CollectorRunId,
+    writer: SupervisedAvailabilityIntervalWriter,
+    error: BaseException,
+) -> AvailabilityEvidenceSummary:
+    """Represent an interval-owner failure without failing raw acquisition."""
+
+    writer.record_failure(error)
+    runtime = writer.runtime_snapshot
+    path = root / (f"run-{collector_run_id.value}.availability-intervals.jsonl.partial")
+    return AvailabilityEvidenceSummary(
+        schema_version=AVAILABILITY_EVIDENCE_SUMMARY_VERSION,
+        collector_run_id=collector_run_id,
+        path=path,
+        completed=False,
+        gate1_evidence_eligible=False,
+        accepted=runtime.accepted,
+        written=runtime.written,
+        rejected=runtime.rejected,
+        queue_high_water=runtime.queue_high_water,
+        file_bytes=runtime.file_bytes,
+        unavailable_duration_nanoseconds=runtime.unavailable_duration_nanoseconds,
+        longest_interval_nanoseconds=runtime.longest_interval_nanoseconds,
+        open_at_shutdown_intervals=runtime.open_at_shutdown_intervals,
+        content_sha256=None,
+        failure_type=runtime.failure_type or type(error).__name__,
+    )
+
+
+def _availability_evidence_reconciled(
+    evidence: AvailabilityEvidenceSummary,
+    runtime: ObservationRuntimeHealthSnapshot,
+) -> bool:
+    """Compare close-time ledger semantics with the authoritative aggregates."""
+
+    return (
+        evidence.gate1_evidence_eligible
+        and runtime.availability_ledger_healthy
+        and evidence.accepted == evidence.written
+        and evidence.rejected == 0
+        and evidence.written == runtime.availability_records_emitted
+        and evidence.written == runtime.unavailable_intervals
+        and evidence.unavailable_duration_nanoseconds == runtime.unavailable_total_nanoseconds
+        and evidence.longest_interval_nanoseconds == runtime.longest_unavailable_nanoseconds
+        and evidence.open_at_shutdown_intervals == runtime.availability_open_at_shutdown_intervals
+        and runtime.current_unavailable_started_monotonic_ns is None
+    )
+
+
 def _final_health_decision(
     checkpoint_decision: HealthDecision | None,
     *,
     evidence: HealthEvidenceSummary,
+    availability_evidence: AvailabilityEvidenceSummary,
+    availability_reconciled: bool,
     analytical_outputs: ResearchOutputSummary,
     terminal_runtime_reasons: tuple[HealthDecisionReason, ...] = (),
+    code_identity_valid: bool = True,
+    source_identity_known: bool = True,
+    source_identity_mismatch: bool = False,
+    source_tree_dirty: bool = False,
 ) -> HealthDecision:
     """Reconcile the last checkpoint with close-time derived-owner outcomes."""
 
@@ -696,8 +873,20 @@ def _final_health_decision(
             HealthDecisionReason.HEALTH_EVIDENCE_UNHEALTHY,
             *terminal_runtime_reasons,
         }
+        if not code_identity_valid:
+            reasons.add(HealthDecisionReason.CODE_IDENTITY_UNAVAILABLE)
+        if not source_identity_known:
+            reasons.add(HealthDecisionReason.SOURCE_IDENTITY_UNAVAILABLE)
+        if source_identity_mismatch:
+            reasons.add(HealthDecisionReason.SOURCE_IDENTITY_MISMATCH)
+        if source_tree_dirty:
+            reasons.add(HealthDecisionReason.SOURCE_TREE_DIRTY)
         if not analytical_outputs.research_eligible:
             reasons.add(HealthDecisionReason.ANALYTICAL_UNHEALTHY)
+        if not availability_evidence.gate1_evidence_eligible:
+            reasons.add(HealthDecisionReason.AVAILABILITY_EVIDENCE_UNHEALTHY)
+        if not availability_reconciled:
+            reasons.add(HealthDecisionReason.AVAILABILITY_RECONCILIATION_FAILED)
         return HealthDecision(
             capture_healthy=False,
             research_eligible=False,
@@ -706,6 +895,14 @@ def _final_health_decision(
         )
     reasons = set(checkpoint_decision.reason_codes)
     reasons.update(terminal_runtime_reasons)
+    if not code_identity_valid:
+        reasons.add(HealthDecisionReason.CODE_IDENTITY_UNAVAILABLE)
+    if not source_identity_known:
+        reasons.add(HealthDecisionReason.SOURCE_IDENTITY_UNAVAILABLE)
+    if source_identity_mismatch:
+        reasons.add(HealthDecisionReason.SOURCE_IDENTITY_MISMATCH)
+    if source_tree_dirty:
+        reasons.add(HealthDecisionReason.SOURCE_TREE_DIRTY)
     terminal_current_blockers = tuple(
         reason
         for reason in terminal_runtime_reasons
@@ -715,6 +912,10 @@ def _final_health_decision(
     research_eligible = checkpoint_decision.research_eligible and not terminal_current_blockers
     if not evidence.gate1_evidence_eligible:
         reasons.add(HealthDecisionReason.HEALTH_EVIDENCE_UNHEALTHY)
+    if not availability_evidence.gate1_evidence_eligible:
+        reasons.add(HealthDecisionReason.AVAILABILITY_EVIDENCE_UNHEALTHY)
+    if not availability_reconciled:
+        reasons.add(HealthDecisionReason.AVAILABILITY_RECONCILIATION_FAILED)
     if not analytical_outputs.research_eligible:
         reasons.add(HealthDecisionReason.ANALYTICAL_UNHEALTHY)
         research_eligible = False
@@ -724,6 +925,8 @@ def _final_health_decision(
         gate1_eligible_so_far=(
             checkpoint_decision.gate1_eligible_so_far
             and evidence.gate1_evidence_eligible
+            and availability_evidence.gate1_evidence_eligible
+            and availability_reconciled
             and analytical_outputs.research_eligible
             and not reasons
         ),
@@ -811,14 +1014,21 @@ class PolymarketObservationService:
         ):
             raise ValueError("explicit Gamma market ID must be a non-empty trimmed string")
         loop = asyncio.get_running_loop()
+        journal_root = self._path(self._config.storage.journal_directory)
+        analytical_root = self._path(self._config.storage.analytical_directory)
+        health_root = self._path(self._config.storage.health_directory)
+        host_runtime_identity = await asyncio.to_thread(
+            capture_host_runtime_identity,
+            workspace_root=self._workspace_root,
+            storage_path=journal_root,
+            code_commit=self._code_commit,
+            config_sha256=self._config.config_hash.value,
+        )
         started_monotonic_ns = time.monotonic_ns()
         deadline = loop.time() + duration_seconds
         started = UtcTimestamp.now()
         run_id = CollectorRunId.new()
         logger = self._logger.bind(collector_run_id=run_id)
-        journal_root = self._path(self._config.storage.journal_directory)
-        analytical_root = self._path(self._config.storage.analytical_directory)
-        health_root = self._path(self._config.storage.health_directory)
         partition_date = started.to_datetime().date().isoformat()
         persistent_outputs = Phase1AnalyticalOutputs(
             root=analytical_root,
@@ -878,7 +1088,6 @@ class PolymarketObservationService:
         )
         stream_result = _StreamResult(0, False, False, ())
         deviations: list[str] = []
-        runtime_health = ObservationRuntimeHealth()
         websocket_observation_nanoseconds = 0
         public_read_metrics = PublicReadMetricsSnapshot(
             endpoints=(),
@@ -892,13 +1101,28 @@ class PolymarketObservationService:
             maximum_checkpoints=self._config.health.maximum_checkpoints,
             maximum_file_bytes=self._config.health.maximum_file_bytes,
         )
+        availability_writer = SupervisedAvailabilityIntervalWriter(
+            root=health_root,
+            collector_run_id=run_id,
+            queue_capacity=self._config.health.availability_queue_capacity,
+            maximum_intervals=self._config.health.maximum_availability_intervals,
+            maximum_file_bytes=self._config.health.maximum_availability_file_bytes,
+        )
+        runtime_health = ObservationRuntimeHealth(
+            collector_run_id=run_id,
+            availability_writer=availability_writer,
+        )
         health_emitter: PeriodicHealthCheckpointEmitter | None = None
         health_started = False
         health_start_error: BaseException | None = None
+        availability_started = False
+        availability_start_error: BaseException | None = None
         latest_health_decision: HealthDecision | None = None
         health_checkpoint_builder: Callable[[], HealthCheckpoint] | None = None
         terminal_health_moment: _HealthCheckpointMoment | None = None
         terminal_capture_cutoff: _CaptureCutoffMoment | None = None
+        terminal_resource_snapshot: ProcessResourceSamplerSnapshot | None = None
+        terminal_health_finalizer: Callable[[], Awaitable[None]] | None = None
         resource_sampler: SupervisedProcessResourceSampler | None = None
         resource_sampler_started = False
         capture = _RawCaptureBoundary(
@@ -920,6 +1144,20 @@ class PolymarketObservationService:
                 await writer.close(completed=False)
             persistent_outputs.abort(failure_type="ObservationStartupError")
             raise
+        try:
+            await availability_writer.start()
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            availability_start_error = error
+            availability_writer.record_failure(error)
+            logger.error(
+                "health_evidence_failed",
+                "availability evidence owner failed; raw capture remains active",
+                exception_type=type(error).__name__,
+            )
+        else:
+            availability_started = True
         try:
             async with PolymarketPublicClient(
                 gamma_url=self._config.polymarket.gamma_base_url,
@@ -947,12 +1185,15 @@ class PolymarketObservationService:
                 def build_health_checkpoint() -> HealthCheckpoint:
                     nonlocal latest_health_decision
                     moment = terminal_health_moment
-                    monotonic_now_ns = (
-                        time.monotonic_ns() if moment is None else moment.monotonic_now_ns
-                    )
-                    resources = (
-                        resource_sampler.snapshot.latest if moment is None else moment.resources
-                    )
+                    if moment is None:
+                        sampled_resources = resource_sampler.snapshot
+                        resources = sampled_resources.latest
+                        resource_trend = sampled_resources.trend
+                        monotonic_now_ns = time.monotonic_ns()
+                    else:
+                        resources = moment.resources
+                        resource_trend = moment.resource_trend
+                        monotonic_now_ns = moment.monotonic_now_ns
                     if resources is None:
                         raise RuntimeError("resource sampler has not published a sample")
                     runtime_snapshot = (
@@ -981,6 +1222,11 @@ class PolymarketObservationService:
                             if moment is None
                             else moment.health_writer
                         ),
+                        availability_writer=(
+                            availability_writer.runtime_snapshot
+                            if moment is None
+                            else moment.availability_writer
+                        ),
                         public_reads=(
                             client.public_read_metrics_snapshot()
                             if moment is None
@@ -988,6 +1234,8 @@ class PolymarketObservationService:
                         ),
                         metrics=self._metrics,
                         resources=resources,
+                        resource_trend=resource_trend,
+                        host_identity=host_runtime_identity,
                         book_last_valid_receive_monotonic_ns=(
                             capture.book_freshness_receive_ns_by_instrument
                             if moment is None
@@ -1024,12 +1272,13 @@ class PolymarketObservationService:
                 ) -> None:
                     """Seal periodic evidence synchronously at the acquisition cutoff."""
 
-                    nonlocal terminal_capture_cutoff
+                    nonlocal terminal_capture_cutoff, terminal_resource_snapshot
                     if terminal_capture_cutoff is not None:
                         if terminal_capture_cutoff != cutoff:
                             raise RuntimeError("capture cutoff changed after it was sealed")
                         return
                     terminal_capture_cutoff = cutoff
+                    terminal_resource_snapshot = resource_sampler.snapshot
                     if not health_started:
                         return
                     if health_emitter is None:
@@ -1040,7 +1289,12 @@ class PolymarketObservationService:
                     """Freeze capture state, then admit exactly one terminal checkpoint."""
 
                     nonlocal terminal_capture_cutoff, terminal_health_moment
+                    nonlocal terminal_resource_snapshot
                     if terminal_capture_cutoff is None:
+                        # Read the sampler cache before sampling the fallback
+                        # cutoff so the cached resource evidence cannot postdate
+                        # that boundary.
+                        terminal_resource_snapshot = resource_sampler.snapshot
                         if stream_result.capture_cutoff is not None:
                             terminal_capture_cutoff = stream_result.capture_cutoff
                         else:
@@ -1049,13 +1303,17 @@ class PolymarketObservationService:
                                 wall_time=UtcTimestamp.now(),
                                 monotonic_ns=cutoff_monotonic_ns,
                             )
+                    cutoff_monotonic_ns = terminal_capture_cutoff.monotonic_ns
+                    cutoff_emitted_at = terminal_capture_cutoff.wall_time
+                    runtime_health.finalize_open_interval(
+                        cutoff_at=cutoff_emitted_at,
+                        cutoff_monotonic_ns=cutoff_monotonic_ns,
+                    )
                     if target is None or not health_started:
                         return
                     if health_emitter is None:
                         raise RuntimeError("started health evidence has no emitter")
 
-                    cutoff_monotonic_ns = terminal_capture_cutoff.monotonic_ns
-                    cutoff_emitted_at = terminal_capture_cutoff.wall_time
                     cutoff_runtime = runtime_health.snapshot(now_ns=cutoff_monotonic_ns)
                     cutoff_journal = writer.metrics
                     cutoff_journal_failure_type = (
@@ -1063,6 +1321,7 @@ class PolymarketObservationService:
                     )
                     cutoff_analytical = outputs.runtime_snapshot
                     cutoff_health_writer = health_writer.runtime_snapshot
+                    cutoff_availability_writer = availability_writer.runtime_snapshot
                     cutoff_public_reads = client.public_read_metrics_snapshot()
                     cutoff_book_receive_times = tuple(
                         sorted(
@@ -1070,25 +1329,21 @@ class PolymarketObservationService:
                             key=lambda item: item[0].value,
                         )
                     )
-                    cutoff_resources = resource_sampler.snapshot.latest
+                    if terminal_resource_snapshot is None:
+                        raise RuntimeError("terminal resource snapshot was not frozen")
+                    cutoff_resources = terminal_resource_snapshot.latest
+                    cutoff_resource_trend = terminal_resource_snapshot.trend
 
                     # Cancel the periodic producer at the capture boundary.  The
                     # writer remains open so raw/analytical owners may close and
                     # the health file may be published later without rebuilding.
                     await health_emitter.stop_periodic_emission()
-                    if cutoff_resources is None and resource_sampler_started:
-                        try:
-                            async with asyncio.timeout(
-                                max(
-                                    1.0,
-                                    self._config.health.checkpoint_interval_seconds,
-                                )
-                            ):
-                                cutoff_resources = (
-                                    await resource_sampler.wait_for_initial_attempt()
-                                ).latest
-                        except TimeoutError as error:
-                            health_writer.record_failure(error)
+                    if cutoff_resources is None:
+                        health_writer.record_failure(
+                            RuntimeError(
+                                "no resource sample existed at the terminal capture cutoff"
+                            )
+                        )
                     terminal_health_moment = _HealthCheckpointMoment(
                         emitted_at=cutoff_emitted_at,
                         monotonic_now_ns=cutoff_monotonic_ns,
@@ -1097,11 +1352,15 @@ class PolymarketObservationService:
                         journal_failure_type=cutoff_journal_failure_type,
                         analytical=cutoff_analytical,
                         health_writer=cutoff_health_writer,
+                        availability_writer=cutoff_availability_writer,
                         public_reads=cutoff_public_reads,
                         resources=cutoff_resources,
+                        resource_trend=cutoff_resource_trend,
                         book_last_valid_receive_monotonic_ns=(cutoff_book_receive_times),
                     )
                     health_emitter.emit_terminal_now()
+
+                terminal_health_finalizer = emit_terminal_health_checkpoint
 
                 health_emitter = PeriodicHealthCheckpointEmitter(
                     writer=health_writer,
@@ -1180,6 +1439,15 @@ class PolymarketObservationService:
                 await emit_terminal_health_checkpoint()
                 run_completed = True
                 public_read_metrics = client.public_read_metrics_snapshot()
+        except asyncio.CancelledError:
+            # Cancellation is a planned capture cutoff, not permission to skip
+            # the terminal availability interval and checkpoint.  The
+            # WebSocket coordinator seals the cutoff only after its acquisition
+            # owner has stopped; finalize and admit that evidence before any
+            # writer is closed as incomplete.
+            if terminal_health_finalizer is not None:
+                await terminal_health_finalizer()
+            raise
         except Exception as error:
             logger.error(
                 "observation_failed",
@@ -1218,6 +1486,30 @@ class PolymarketObservationService:
                             if isinstance(error, (KeyboardInterrupt, SystemExit)):
                                 raise
                             health_writer.record_failure(error)
+                    if availability_started:
+                        try:
+                            availability_evidence = await availability_writer.close(
+                                completed=(run_completed and raw_completion_sha256 is not None),
+                            )
+                        except BaseException as error:
+                            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                                raise
+                            availability_evidence = _failed_availability_summary(
+                                root=health_root,
+                                collector_run_id=run_id,
+                                writer=availability_writer,
+                                error=error,
+                            )
+                    else:
+                        availability_failure = availability_start_error or RuntimeError(
+                            "availability evidence owner was not started"
+                        )
+                        availability_evidence = _failed_availability_summary(
+                            root=health_root,
+                            collector_run_id=run_id,
+                            writer=availability_writer,
+                            error=availability_failure,
+                        )
                     if health_started:
                         if health_emitter is None:
                             raise RuntimeError("started health evidence has no emitter")
@@ -1251,6 +1543,8 @@ class PolymarketObservationService:
                         )
         if analytical_summary is None:
             raise RuntimeError("analytical output close did not produce a summary")
+        if resource_sampler is None:
+            raise RuntimeError("completed observation lacks a resource sampler")
         if (
             target is None
             and latest_health_decision is None
@@ -1273,6 +1567,10 @@ class PolymarketObservationService:
             summary_cutoff_monotonic_ns - started_monotonic_ns,
         )
         runtime_health_snapshot = runtime_health.snapshot(now_ns=summary_cutoff_monotonic_ns)
+        availability_reconciled = _availability_evidence_reconciled(
+            availability_evidence,
+            runtime_health_snapshot,
+        )
         terminal_runtime_reasons: list[HealthDecisionReason] = []
         if not runtime_health_snapshot.socket_connected:
             terminal_runtime_reasons.append(HealthDecisionReason.SOCKET_DISCONNECTED)
@@ -1286,8 +1584,17 @@ class PolymarketObservationService:
         health_decision = _final_health_decision(
             latest_health_decision,
             evidence=health_evidence,
+            availability_evidence=availability_evidence,
+            availability_reconciled=availability_reconciled,
             analytical_outputs=analytical_summary,
             terminal_runtime_reasons=tuple(terminal_runtime_reasons),
+            code_identity_valid=host_runtime_identity.code_commit is not None,
+            source_identity_known=host_runtime_identity.source_identity_known,
+            source_identity_mismatch=host_runtime_identity.source_identity_mismatch,
+            source_tree_dirty=(
+                host_runtime_identity.tracked_source_clean is False
+                or host_runtime_identity.untracked_source_clean is False
+            ),
         )
         status = (
             ComponentHealth.HEALTHY
@@ -1297,6 +1604,8 @@ class PolymarketObservationService:
                 and not deviations
                 and analytical_summary.research_eligible
                 and health_evidence.gate1_evidence_eligible
+                and availability_evidence.gate1_evidence_eligible
+                and availability_reconciled
                 and health_decision.capture_healthy
                 and health_decision.research_eligible
             )
@@ -1328,6 +1637,7 @@ class PolymarketObservationService:
             processor=processor_summary,
             analytical_outputs=analytical_summary,
             health_evidence=health_evidence,
+            availability_evidence=availability_evidence,
             health_decision=health_decision,
             public_read_metrics=public_read_metrics,
             runtime_health=runtime_health_snapshot,
@@ -1337,6 +1647,12 @@ class PolymarketObservationService:
             selected_market_resolved=stream_result.selected_market_resolved,
             protocol_deviations=tuple(deviations),
             websocket_observation_nanoseconds=websocket_observation_nanoseconds,
+            host_runtime_identity=host_runtime_identity,
+            resource_trend=(
+                resource_sampler.snapshot.trend
+                if terminal_health_moment is None
+                else terminal_health_moment.resource_trend
+            ),
         )
 
     @staticmethod
@@ -1907,6 +2223,8 @@ class PolymarketObservationService:
         last_accepted_receive_monotonic_ns: int | None,
         connection_id: ConnectionId,
         subscription_id: SubscriptionId,
+        decision_at: UtcTimestamp,
+        decision_monotonic_ns: int,
     ) -> ProcessedEnvelope:
         command = AuditExpiryCommand(
             native_asset_id=native_asset_id,
@@ -1920,6 +2238,36 @@ class PolymarketObservationService:
             connection_id=connection_id,
             subscription_id=subscription_id,
             transport_metadata={"native_asset_id": native_asset_id},
+            received_wall_time=decision_at,
+            received_monotonic_ns=decision_monotonic_ns,
+        )
+
+    @staticmethod
+    async def _preserve_reported_top_transition_expiry(
+        *,
+        capture: _RawCaptureBoundary,
+        transition: ReportedTopTransition,
+        decision_at: UtcTimestamp,
+        decision_monotonic_ns: int,
+        connection_id: ConnectionId,
+        subscription_id: SubscriptionId,
+    ) -> ProcessedEnvelope:
+        command = ReportedTopTransitionExpiryCommand(
+            transition_id=transition.transition_id,
+            instrument_id=transition.instrument_id,
+            monotonic_epoch_id=transition.monotonic_epoch_id,
+            deadline_monotonic_ns=transition.deadline_monotonic_ns,
+            decision_monotonic_ns=decision_monotonic_ns,
+        )
+        return await capture.preserve_then_process(
+            channel=CONTROL_REPORTED_TOP_TRANSITION_EXPIRED,
+            payload=command.to_payload(),
+            transport_type="CONTROL",
+            semantics_hash=_semantics(CONTROL_REPORTED_TOP_TRANSITION_EXPIRED),
+            connection_id=connection_id,
+            subscription_id=subscription_id,
+            received_wall_time=decision_at,
+            received_monotonic_ns=decision_monotonic_ns,
         )
 
     @staticmethod
@@ -2089,9 +2437,10 @@ class PolymarketObservationService:
         runtime_health.begin_generation(connection_id, ingress)
         ready = asyncio.Event()
         acquisition_ended_monotonic_ns: int | None = None
+        acquisition_ended_at: _CaptureCutoffMoment | None = None
 
         async def acquire() -> None:
-            nonlocal acquisition_ended_monotonic_ns
+            nonlocal acquisition_ended_at, acquisition_ended_monotonic_ns
             # `raw_messages` is retained solely for existing adapter fixtures;
             # production uses pump_received so stamping+admission has no yield gap.
             try:
@@ -2109,7 +2458,11 @@ class PolymarketObservationService:
                         )
                     )
             finally:
-                acquisition_ended_monotonic_ns = time.monotonic_ns()
+                acquisition_ended_at = _CaptureCutoffMoment(
+                    wall_time=UtcTimestamp.now(),
+                    monotonic_ns=time.monotonic_ns(),
+                )
+                acquisition_ended_monotonic_ns = acquisition_ended_at.monotonic_ns
 
         acquisition_task = asyncio.create_task(
             acquire(),
@@ -2130,6 +2483,8 @@ class PolymarketObservationService:
         pending_exit: _GenerationExit | None = None
         capture_cutoff: _CaptureCutoffMoment | None = None
         pending_transport_error: PolymarketWebSocketError | None = None
+        pending_interruption: AvailabilityInterruption | None = None
+        pending_interruption_started_at: _CaptureCutoffMoment | None = None
         deviations: list[str] = []
         refresh_requests: list[ReferenceRefreshRequest] = []
         # One binary market has exactly two explicitly selected legs.  Both
@@ -2151,6 +2506,70 @@ class PolymarketObservationService:
         selected_gamma_ids = {market.gamma_market_id for market in selected}
         selected_condition_ids = {market.condition_id for market in selected}
         selected_asset_ids = {asset_id for market in selected for asset_id in market.clob_token_ids}
+
+        def register_interruption(
+            interruption: AvailabilityInterruption,
+            *,
+            started_at: _CaptureCutoffMoment,
+        ) -> None:
+            nonlocal pending_interruption, pending_interruption_started_at
+            if pending_interruption is not None:
+                return
+            pending_interruption = interruption
+            pending_interruption_started_at = started_at
+            runtime_health.mark_interrupted(
+                now_ns=started_at.monotonic_ns,
+                now_utc=started_at.wall_time,
+                interruption=interruption,
+            )
+
+        def current_transition_deadline_ns() -> int:
+            return min(
+                (
+                    transition.deadline_monotonic_ns
+                    for transition in _reported_top_transitions(capture.processor)
+                ),
+                default=deadline_ns,
+            )
+
+        def due_transitions(decision_monotonic_ns: int) -> tuple[ReportedTopTransition, ...]:
+            return tuple(
+                sorted(
+                    (
+                        transition
+                        for transition in _reported_top_transitions(capture.processor)
+                        if transition.deadline_monotonic_ns <= decision_monotonic_ns
+                    ),
+                    key=lambda transition: (
+                        transition.deadline_monotonic_ns,
+                        transition.instrument_id.value,
+                        transition.transition_id,
+                    ),
+                )
+            )
+
+        async def expire_due_transitions(
+            *,
+            decision_at: UtcTimestamp,
+            decision_monotonic_ns: int,
+        ) -> tuple[tuple[ReportedTopTransition, ProcessedEnvelope], ...]:
+            expired: list[tuple[ReportedTopTransition, ProcessedEnvelope]] = []
+            for transition in due_transitions(decision_monotonic_ns):
+                result = await self._preserve_reported_top_transition_expiry(
+                    capture=capture,
+                    transition=transition,
+                    decision_at=decision_at,
+                    decision_monotonic_ns=decision_monotonic_ns,
+                    connection_id=connection_id,
+                    subscription_id=subscription_id,
+                )
+                if not result.success or not result.needs_resync:
+                    raise RuntimeError("reported-top expiry control failed canonical processing")
+                self._metrics.increment_counter(
+                    "mma_reported_top_transition_supervisor_expiries_total"
+                )
+                expired.append((transition, result))
+            return tuple(expired)
 
         def refresh_matches_selected(request: ReferenceRefreshRequest) -> bool:
             return (
@@ -2201,6 +2620,15 @@ class PolymarketObservationService:
                 ),
             )
 
+        def deferred_retry_order(native_asset_id: str) -> tuple[int, int]:
+            return (
+                leg_hard_expiry_ns(
+                    native_asset_id,
+                    now_ns=time.monotonic_ns(),
+                ),
+                stable_asset_order[native_asset_id],
+            )
+
         def ordered_cycle_assets(*, now_ns: int) -> tuple[str, ...]:
             return tuple(
                 sorted(
@@ -2213,6 +2641,7 @@ class PolymarketObservationService:
             )
 
         def current_deadline(*, now_ns: int) -> IntegrityDeadline:
+            transition_deadline_ns = current_transition_deadline_ns()
             if audit_cycle_active:
                 retry_deadlines: list[int] = []
                 if not first_attempts_pending:
@@ -2227,13 +2656,21 @@ class PolymarketObservationService:
                             )
                         )
                 retry_deadline_ns = min(retry_deadlines, default=deadline_ns)
-                next_ns = min(deadline_ns, retry_deadline_ns)
+                next_ns = min(
+                    deadline_ns,
+                    transition_deadline_ns,
+                    retry_deadline_ns,
+                )
                 return IntegrityDeadline(
                     deadline_ns=next_ns,
                     reason=(
                         IntegrityDeadlineReason.RUN_DEADLINE
                         if next_ns == deadline_ns
-                        else IntegrityDeadlineReason.RACE_RETRY
+                        else (
+                            IntegrityDeadlineReason.REPORTED_TOP_TRANSITION
+                            if next_ns == transition_deadline_ns
+                            else IntegrityDeadlineReason.RACE_RETRY
+                        )
                     ),
                 )
             freshness_deadlines: list[int] = []
@@ -2261,9 +2698,16 @@ class PolymarketObservationService:
                 and all(expiry_ns > deadline_ns for expiry_ns in hard_expiries)
             ):
                 periodic_deadline_ns = deadline_ns
-            next_ns = min(deadline_ns, periodic_deadline_ns, freshness_deadline_ns)
+            next_ns = min(
+                deadline_ns,
+                transition_deadline_ns,
+                periodic_deadline_ns,
+                freshness_deadline_ns,
+            )
             if next_ns == deadline_ns:
                 reason = IntegrityDeadlineReason.RUN_DEADLINE
+            elif next_ns == transition_deadline_ns:
+                reason = IntegrityDeadlineReason.REPORTED_TOP_TRANSITION
             elif next_ns == periodic_deadline_ns:
                 reason = IntegrityDeadlineReason.PERIODIC_AUDIT
             else:
@@ -2279,6 +2723,9 @@ class PolymarketObservationService:
                 audit_cycle_active = False
                 periodic_audit_due_ns = time.monotonic_ns() + integrity_interval_ns
 
+        def finish_first_attempt(native_asset_id: str) -> None:
+            first_attempts_pending.discard(native_asset_id)
+
         def suppress_deferred_race_retries(*, reason: str) -> None:
             for asset_id, action in tuple(deferred_retry_actions.items()):
                 if not action.terminal:
@@ -2291,17 +2738,36 @@ class PolymarketObservationService:
         async def mark_expired_leg(native_asset_id: str, *, reason: str) -> None:
             nonlocal pending_exit
             freshness_ns = leg_freshness_ns(native_asset_id)
+            decision_at = UtcTimestamp.now()
+            decision_monotonic_ns = time.monotonic_ns()
             result = await self._preserve_audit_expiry(
                 capture=capture,
                 native_asset_id=native_asset_id,
                 last_accepted_receive_monotonic_ns=freshness_ns,
                 connection_id=connection_id,
                 subscription_id=subscription_id,
+                decision_at=decision_at,
+                decision_monotonic_ns=decision_monotonic_ns,
             )
             if not result.success:
                 raise RuntimeError("audit expiry control failed canonical processing")
             if result.needs_resync:
                 pending_exit = _GenerationExit.RESYNC_REQUIRED
+                register_interruption(
+                    AvailabilityInterruption(
+                        cause=AvailabilityCause.PROTOCOL_SCHEMA_INVARIANT,
+                        reason_code="BOOK_FRESHNESS_EXPIRED",
+                        source_evidence_ids=(f"ingest-seq:{result.ingest_seq}",),
+                        affected_instruments=(
+                            InstrumentId.from_native(POLYMARKET_VENUE_ID, native_asset_id),
+                        ),
+                        recovery_action=AvailabilityRecoveryAction.RESNAPSHOT,
+                    ),
+                    started_at=_CaptureCutoffMoment(
+                        wall_time=decision_at,
+                        monotonic_ns=decision_monotonic_ns,
+                    ),
+                )
             expired_freshness_markers[native_asset_id] = freshness_ns
             self._metrics.increment_counter(
                 "mma_rest_audit_legs_suppressed_total",
@@ -2804,7 +3270,11 @@ class PolymarketObservationService:
                     ingress_metrics=ingress.metrics,
                     capture_cutoff=capture_cutoff,
                 )
-            runtime_health.mark_connected(now_ns=time.monotonic_ns())
+            connected_monotonic_ns = time.monotonic_ns()
+            runtime_health.mark_connected(
+                now_ns=connected_monotonic_ns,
+                now_utc=UtcTimestamp.now(),
+            )
             if unavailable_started_ns is not None:
                 self._metrics.observe_histogram(
                     "mma_socket_unavailable_ns",
@@ -2863,8 +3333,6 @@ class PolymarketObservationService:
                                 "mma_rest_audit_outcomes_total",
                                 labels={"outcome": outcome.outcome.value},
                             )
-                        if pending.start.attempt == 1:
-                            first_attempts_pending.discard(pending.start.native_asset_id)
                         expired_freshness_markers[pending.start.native_asset_id] = (
                             pending.freshness_marker_ns
                         )
@@ -2934,7 +3402,7 @@ class PolymarketObservationService:
                     outcome = result.audit_outcomes[-1]
                     start = earliest.start
                     if start.attempt == 1:
-                        first_attempts_pending.discard(start.native_asset_id)
+                        finish_first_attempt(start.native_asset_id)
                     self._metrics.increment_counter(
                         "mma_rest_audit_outcomes_total",
                         labels={"outcome": outcome.outcome.value},
@@ -2945,6 +3413,24 @@ class PolymarketObservationService:
                     )
                     if outcome.outcome is AuditOutcome.MISMATCH:
                         pending_exit = _GenerationExit.RESYNC_REQUIRED
+                        source_evidence_ids = [f"audit-request:{start.request_id}"]
+                        if outcome.response_ingest_id is not None:
+                            source_evidence_ids.append(
+                                f"response-ingest:{outcome.response_ingest_id.value}"
+                            )
+                        register_interruption(
+                            AvailabilityInterruption(
+                                cause=(AvailabilityCause.AUDIT_MISMATCH_RESYNCHRONIZATION),
+                                reason_code="REST_AUDIT_MISMATCH",
+                                source_evidence_ids=tuple(source_evidence_ids),
+                                affected_instruments=(start.starting_book.instrument_id,),
+                                recovery_action=AvailabilityRecoveryAction.RESNAPSHOT,
+                            ),
+                            started_at=_CaptureCutoffMoment(
+                                wall_time=response.received_wall_time,
+                                monotonic_ns=response.received_monotonic_ns,
+                            ),
+                        )
                         deviations.append(f"REST audit MISMATCH at ingest_seq={result.ingest_seq}")
                         finish_cycle_leg(start.native_asset_id)
                         await stop_acquisition()
@@ -2995,10 +3481,7 @@ class PolymarketObservationService:
                 ):
                     for asset_id in sorted(
                         deferred_retry_actions,
-                        key=lambda item: (
-                            leg_hard_expiry_ns(item, now_ns=time.monotonic_ns()),
-                            stable_asset_order[item],
-                        ),
+                        key=deferred_retry_order,
                     ):
                         if len(pending_audits) >= 2:
                             break
@@ -3047,6 +3530,23 @@ class PolymarketObservationService:
                             launched = await launch_audit(asset_id, attempt=action.attempt)
                             if launched is _AuditLaunchResult.FAILED_CLOSED:
                                 pending_exit = _GenerationExit.RESYNC_REQUIRED
+                                register_interruption(
+                                    AvailabilityInterruption(
+                                        cause=AvailabilityCause.PROTOCOL_SCHEMA_INVARIANT,
+                                        reason_code="AUDIT_LOCAL_STATE_NOT_COMPARABLE",
+                                        affected_instruments=(
+                                            InstrumentId.from_native(
+                                                POLYMARKET_VENUE_ID,
+                                                asset_id,
+                                            ),
+                                        ),
+                                        recovery_action=AvailabilityRecoveryAction.RESNAPSHOT,
+                                    ),
+                                    started_at=_CaptureCutoffMoment(
+                                        wall_time=UtcTimestamp.now(),
+                                        monotonic_ns=time.monotonic_ns(),
+                                    ),
+                                )
                                 await stop_acquisition()
                                 break
                             if launched is _AuditLaunchResult.RUN_ENDED:
@@ -3066,12 +3566,34 @@ class PolymarketObservationService:
                 ):
                     try:
                         acquisition_task.result()
-                    except RawIngressBackpressureError:
+                    except RawIngressBackpressureError as error:
                         pending_exit = _GenerationExit.INGRESS_OVERFLOW
+                        register_interruption(
+                            _availability_interruption_for_error(
+                                error,
+                                connection_id=connection_id,
+                                asset_ids=asset_ids,
+                            ),
+                            started_at=_causal_moment_for_error(error),
+                        )
                         deviations.append("bounded application ingress queue exhausted")
                         runtime_health.record_data_loss()
                         self._metrics.increment_counter("mma_ingress_overflows_total")
                     except PolymarketWebSocketError as error:
+                        interruption_started_at = (
+                            acquisition_ended_at
+                            if acquisition_ended_at is not None
+                            else _causal_moment_for_error(error)
+                        )
+                        runtime_health.mark_interrupted(
+                            now_ns=interruption_started_at.monotonic_ns,
+                            now_utc=interruption_started_at.wall_time,
+                            interruption=_availability_interruption_for_error(
+                                error,
+                                connection_id=connection_id,
+                                asset_ids=asset_ids,
+                            ),
+                        )
                         pending_transport_error = error
                     else:
                         if ingress.empty:
@@ -3096,12 +3618,58 @@ class PolymarketObservationService:
                         # The next coordinator turn either launches a quiet
                         # retry or records that its leg hard expiry won.
                         continue
+                    elif due.reason is IntegrityDeadlineReason.REPORTED_TOP_TRANSITION:
+                        # Never let a timer control overtake an already admitted
+                        # WebSocket frame.  A pre-deadline frame may converge the
+                        # transition; a post-deadline frame durably closes it
+                        # through the normal processor route.
+                        if deferred_item is None and ingress.empty:
+                            decision_monotonic_ns = time.monotonic_ns()
+                            decision_at = UtcTimestamp.now()
+                            expired = await expire_due_transitions(
+                                decision_at=decision_at,
+                                decision_monotonic_ns=decision_monotonic_ns,
+                            )
+                            if expired:
+                                pending_exit = _GenerationExit.RESYNC_REQUIRED
+                                register_interruption(
+                                    AvailabilityInterruption(
+                                        cause=(AvailabilityCause.REPORTED_TOP_TRANSITION_EXPIRY),
+                                        reason_code="TIME_BOUND_EXPIRED",
+                                        source_evidence_ids=tuple(
+                                            evidence_id
+                                            for transition, result in expired
+                                            for evidence_id in (
+                                                (
+                                                    "reported-top-transition:"
+                                                    f"{transition.transition_id}"
+                                                ),
+                                                (f"expiry-control-ingest-seq:{result.ingest_seq}"),
+                                            )
+                                        ),
+                                        affected_instruments=tuple(
+                                            transition.instrument_id
+                                            for transition, _result in expired
+                                        ),
+                                        recovery_action=(AvailabilityRecoveryAction.RESNAPSHOT),
+                                    ),
+                                    started_at=_CaptureCutoffMoment(
+                                        wall_time=decision_at,
+                                        monotonic_ns=decision_monotonic_ns,
+                                    ),
+                                )
+                                deviations.append(
+                                    "reported-top transition time bound expired under "
+                                    "idle supervision"
+                                )
+                                await stop_acquisition()
                     else:
                         audit_cycle_active = True
                         self._metrics.increment_counter("mma_rest_audit_cycles_total")
                         ordered_assets = ordered_cycle_assets(now_ns=now_ns)
-                        cycle_unfinished_assets.update(ordered_assets)
-                        first_attempts_pending.update(ordered_assets)
+                        for ordered_asset_id in ordered_assets:
+                            cycle_unfinished_assets.add(ordered_asset_id)
+                            first_attempts_pending.add(ordered_asset_id)
                         staged_first_attempts: list[_StagedAuditRequest] = []
                         staging_abort_reason: AuditFailureReason | None = None
                         for asset_id in ordered_assets:
@@ -3111,9 +3679,26 @@ class PolymarketObservationService:
                                 deferred_starts=staged_first_attempts,
                             )
                             if launched is not _AuditLaunchResult.STARTED:
-                                first_attempts_pending.discard(asset_id)
+                                finish_first_attempt(asset_id)
                             if launched is _AuditLaunchResult.FAILED_CLOSED:
                                 pending_exit = _GenerationExit.RESYNC_REQUIRED
+                                register_interruption(
+                                    AvailabilityInterruption(
+                                        cause=AvailabilityCause.PROTOCOL_SCHEMA_INVARIANT,
+                                        reason_code="AUDIT_LOCAL_STATE_NOT_COMPARABLE",
+                                        affected_instruments=(
+                                            InstrumentId.from_native(
+                                                POLYMARKET_VENUE_ID,
+                                                asset_id,
+                                            ),
+                                        ),
+                                        recovery_action=AvailabilityRecoveryAction.RESNAPSHOT,
+                                    ),
+                                    started_at=_CaptureCutoffMoment(
+                                        wall_time=UtcTimestamp.now(),
+                                        monotonic_ns=time.monotonic_ns(),
+                                    ),
+                                )
                                 staging_abort_reason = AuditFailureReason.LOCAL_STATE_NOT_COMPARABLE
                                 await stop_acquisition()
                                 break
@@ -3208,16 +3793,27 @@ class PolymarketObservationService:
                         AuditFailureReason.SOCKET_GENERATION_CHANGED
                     ):
                         continue
-                    if not isinstance(pending_exit, _GenerationExit):  # pragma: no cover
-                        raise AssertionError("generation exit reason disappeared")
                     exit_reason: _GenerationExit = pending_exit
                     suppress_deferred_race_retries(reason="generation_exit")
+                    if exit_reason is _GenerationExit.DEADLINE:
+                        if capture_cutoff is None:
+                            raise RuntimeError("deadline exit lacks its paired capture cutoff")
+                        terminal_expired = await expire_due_transitions(
+                            decision_at=capture_cutoff.wall_time,
+                            decision_monotonic_ns=capture_cutoff.monotonic_ns,
+                        )
+                        if terminal_expired:
+                            deviations.append(
+                                "reported-top transition time bound expired at the capture cutoff"
+                            )
                     return _GenerationResult(
                         exit_reason,
                         deviations=tuple(deviations),
                         refresh_requests=tuple(refresh_requests),
                         ingress_metrics=ingress.metrics,
                         capture_cutoff=capture_cutoff,
+                        interruption=pending_interruption,
+                        interruption_started_at=pending_interruption_started_at,
                     )
                 elif pending_transport_error is not None:
                     if pending_audits and await drain_completed_exit_handoffs():
@@ -3232,8 +3828,16 @@ class PolymarketObservationService:
                     suppress_deferred_race_retries(reason="generation_exit")
                     try:
                         acquisition_task.result()
-                    except RawIngressBackpressureError:
+                    except RawIngressBackpressureError as error:
                         pending_exit = _GenerationExit.INGRESS_OVERFLOW
+                        register_interruption(
+                            _availability_interruption_for_error(
+                                error,
+                                connection_id=connection_id,
+                                asset_ids=asset_ids,
+                            ),
+                            started_at=_causal_moment_for_error(error),
+                        )
                         deviations.append("bounded application ingress queue exhausted")
                         runtime_health.record_data_loss()
                         self._metrics.increment_counter("mma_ingress_overflows_total")
@@ -3377,7 +3981,11 @@ class PolymarketObservationService:
                     "mma_ingress_queue_high_water",
                     ingress.metrics.queue_high_water,
                 )
-                for result in results:
+                for item, result in zip(batch, results, strict=True):
+                    result_started_at = _CaptureCutoffMoment(
+                        wall_time=item.message.received_wall_time,
+                        monotonic_ns=item.message.received_monotonic_ns,
+                    )
                     relevant_refresh = False
                     for request in result.reference_refresh_requests:
                         self._metrics.increment_counter(
@@ -3400,10 +4008,121 @@ class PolymarketObservationService:
                         )
                     if result.needs_resync:
                         pending_exit = _GenerationExit.RESYNC_REQUIRED
+                        if pending_interruption is None:
+                            transition_outcomes = tuple(
+                                outcome
+                                for outcome in _reported_top_transition_outcomes(capture.processor)
+                                if outcome.close_source is not None
+                                and outcome.close_source.ingest_seq == result.ingest_seq
+                                and outcome.status.value == "EXPIRED"
+                            )
+                            error_type = (
+                                result.error_type or "CANONICAL_RESYNC_REQUIRED"
+                                if not transition_outcomes
+                                else transition_outcomes[0].reason.value
+                            )
+                            cause = (
+                                AvailabilityCause.PROTOCOL_SCHEMA_INVARIANT
+                                if not transition_outcomes
+                                else AvailabilityCause.REPORTED_TOP_TRANSITION_EXPIRY
+                            )
+                            source_evidence_ids = [f"ingest-seq:{result.ingest_seq}"]
+                            source_evidence_ids.extend(
+                                f"reported-top-transition:{outcome.transition_id}"
+                                for outcome in transition_outcomes
+                            )
+                            if transition_outcomes:
+                                close_source = transition_outcomes[0].close_source
+                                if close_source is None:  # pragma: no cover - filtered above
+                                    raise AssertionError(
+                                        "reported-top expiry lost its close source"
+                                    )
+                                result_started_at = _CaptureCutoffMoment(
+                                    wall_time=close_source.received_at,
+                                    monotonic_ns=(close_source.received_monotonic.nanoseconds),
+                                )
+                                source_evidence_ids.append(
+                                    f"close-source-ingest:{close_source.raw_source.ingest_id.value}"
+                                )
+                            register_interruption(
+                                AvailabilityInterruption(
+                                    cause=cause,
+                                    reason_code=error_type,
+                                    source_evidence_ids=tuple(source_evidence_ids),
+                                    affected_instruments=result.affected_instrument_ids,
+                                    recovery_action=AvailabilityRecoveryAction.RESNAPSHOT,
+                                ),
+                                started_at=result_started_at,
+                            )
                     elif relevant_refresh and pending_exit is None:
                         pending_exit = _GenerationExit.REFERENCE_REFRESH
+                        relevant_requests = tuple(
+                            request
+                            for request in result.reference_refresh_requests
+                            if refresh_matches_selected(request)
+                        )
+                        lifecycle = any(
+                            request.event_type is CanonicalEventType.MARKET_RESOLVED
+                            for request in relevant_requests
+                        )
+                        affected_native_ids = tuple(
+                            dict.fromkeys(
+                                native_id
+                                for request in relevant_requests
+                                for native_id in request.native_asset_ids
+                            )
+                        )
+                        register_interruption(
+                            AvailabilityInterruption(
+                                cause=(
+                                    AvailabilityCause.TARGET_LIFECYCLE
+                                    if lifecycle
+                                    else AvailabilityCause.PROTOCOL_SCHEMA_INVARIANT
+                                ),
+                                reason_code=(
+                                    "TARGET_LIFECYCLE_REFERENCE_REFRESH"
+                                    if lifecycle
+                                    else "REFERENCE_PRECISION_REFRESH"
+                                ),
+                                source_evidence_ids=tuple(
+                                    f"canonical-event:{request.source_event_id.value}"
+                                    for request in relevant_requests
+                                ),
+                                affected_instruments=tuple(
+                                    InstrumentId.from_native(POLYMARKET_VENUE_ID, native_id)
+                                    for native_id in affected_native_ids
+                                ),
+                                affected_scopes=(
+                                    AvailabilityScope.WEBSOCKET_CAPTURE,
+                                    AvailabilityScope.CANONICAL_BOOKS,
+                                    AvailabilityScope.AUDIT_ELIGIBILITY,
+                                    AvailabilityScope.SCANNER_RESEARCH_ELIGIBILITY,
+                                    *((AvailabilityScope.TARGET,) if lifecycle else ()),
+                                ),
+                                recovery_action=(
+                                    AvailabilityRecoveryAction.REFERENCE_REFRESH_AND_RESNAPSHOT
+                                ),
+                            ),
+                            started_at=result_started_at,
+                        )
                 if pending_exit is not None:
                     await stop_acquisition()
+        except BaseException as error:
+            interruption_started_at = (
+                acquisition_ended_at
+                if acquisition_ended_at is not None and isinstance(error, PolymarketWebSocketError)
+                else _causal_moment_for_error(error)
+            )
+            runtime_health.mark_interrupted(
+                now_ns=interruption_started_at.monotonic_ns,
+                now_utc=interruption_started_at.wall_time,
+                interruption=_availability_interruption_for_error(
+                    error,
+                    connection_id=connection_id,
+                    asset_ids=asset_ids,
+                ),
+            )
+            raise
         finally:
             if pending_ingress_get_task is not None and not pending_ingress_get_task.done():
                 pending_ingress_get_task.cancel()
@@ -3468,19 +4187,48 @@ class PolymarketObservationService:
                         runtime_health=runtime_health,
                         on_capture_cutoff=on_capture_cutoff,
                     )
-                except BaseException:
+                except BaseException as error:
+                    interruption = _availability_interruption_for_error(
+                        error,
+                        connection_id=connection_id,
+                        asset_ids=asset_ids,
+                    )
+                    interruption_moment = _causal_moment_for_error(error)
+                    if isinstance(error, asyncio.CancelledError) and on_capture_cutoff is not None:
+                        # _run_generation has completed its finally block here,
+                        # so acquisition can no longer admit a post-cutoff
+                        # frame.  Freeze terminal evidence at this boundary.
+                        on_capture_cutoff(interruption_moment)
                     runtime_health.finish_generation(
                         continuity_interrupted=True,
-                        now_ns=time.monotonic_ns(),
+                        now_ns=interruption_moment.monotonic_ns,
+                        now_utc=interruption_moment.wall_time,
+                        interruption=interruption,
                     )
                     raise
-                runtime_health.finish_generation(
-                    continuity_interrupted=generation.reason is not _GenerationExit.DEADLINE,
-                    now_ns=(
+                interruption_moment = generation.interruption_started_at
+                generation_end_monotonic_ns = (
+                    interruption_moment.monotonic_ns
+                    if interruption_moment is not None
+                    else (
                         time.monotonic_ns()
                         if generation.capture_cutoff is None
                         else generation.capture_cutoff.monotonic_ns
+                    )
+                )
+                runtime_health.finish_generation(
+                    continuity_interrupted=generation.reason is not _GenerationExit.DEADLINE,
+                    now_ns=generation_end_monotonic_ns,
+                    now_utc=(
+                        interruption_moment.wall_time
+                        if interruption_moment is not None
+                        else (
+                            UtcTimestamp.now()
+                            if generation.capture_cutoff is None
+                            else generation.capture_cutoff.wall_time
+                        )
                     ),
+                    interruption=generation.interruption,
                 )
                 ingress_metrics = _merge_ingress_metrics(
                     ingress_metrics,
@@ -3496,7 +4244,9 @@ class PolymarketObservationService:
                         ingress_metrics,
                         generation.capture_cutoff,
                     )
-                unavailable_started_ns = time.monotonic_ns()
+                unavailable_started_ns = (
+                    runtime_health.snapshot().current_unavailable_started_monotonic_ns
+                )
                 if generation.reason is _GenerationExit.REFERENCE_REFRESH:
                     selected_resolved = await self._handle_refresh_requests(
                         requests=generation.refresh_requests,
@@ -3508,6 +4258,11 @@ class PolymarketObservationService:
                         metrics_already_recorded=True,
                     )
                     if selected_resolved:
+                        target_ended_monotonic_ns = time.monotonic_ns()
+                        runtime_health.finish_target_lifecycle(
+                            ended_at=UtcTimestamp.now(),
+                            ended_monotonic_ns=target_ended_monotonic_ns,
+                        )
                         return _StreamResult(
                             reconnects,
                             True,
@@ -3549,7 +4304,9 @@ class PolymarketObservationService:
                     ingress_metrics,
                 )
             except PolymarketWebSocketError as error:
-                unavailable_started_ns = time.monotonic_ns()
+                unavailable_started_ns = (
+                    runtime_health.snapshot().current_unavailable_started_monotonic_ns
+                )
                 await capture.preserve_invalidation(InvalidationReason.DISCONNECT)
                 deviations.append(type(error).__name__)
                 if isinstance(error, PolymarketWebSocketProtocolError):

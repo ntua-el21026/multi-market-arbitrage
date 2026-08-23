@@ -94,6 +94,9 @@ At minimum:
 - irrelevant last trade;
 - tick/quantity/crossing/provenance failure;
 - frame/time bound expiry;
+- idle durable expiry and exact run-cutoff tie;
+- an audit/control fence cannot overtake an admitted pre-deadline convergence
+  frame;
 - disconnect and authoritative resnapshot;
 - audit while pending;
 - exact convergence;
@@ -146,16 +149,29 @@ Do not test success by raising the resource limit.
 Required:
 
 - checkpoint v2 UTC plus monotonic epoch/ns;
+- explicit v1 compatibility without synthesized monotonic chronology;
 - monotonic chronology under UTC regression;
 - final cutoff consistency;
 - interval start/end/cause/recovery;
 - open interval at shutdown;
 - aggregate/ledger reconciliation;
+- exact causal interval starts before ordered drain for mismatch, freshness,
+  backpressure, protocol/reference/lifecycle, and transport paths;
 - routine audit not counted as WS downtime;
 - external/protocol/mismatch/transition/resource cause classes;
 - current/peak RSS and host identity;
+- terminal resource-cache freeze and rejection of samples/trend chronology
+  after the checkpoint cutoff;
+- valid 40-hex versus unavailable/malformed/mismatched code identity, exact
+  binding to repository `HEAD`, imported-package containment, tracked and
+  non-ignored-untracked cleanliness, and unknown probe handling, including the
+  terminal Gate-only decision and continued raw capture;
 - writer failure without raw-capture contamination;
 - sticky Gate reason history.
+
+The paired health benchmark regression covers availability-interval
+construction/serialization, non-blocking producer enqueue and CPU, actual
+enqueue-through-`fsync` latency, and exact file growth as well as checkpoints.
 
 ## 14. Long-run stability tests
 

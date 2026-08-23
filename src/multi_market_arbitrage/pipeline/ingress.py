@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 from multi_market_arbitrage.core.ids import ConnectionId
+from multi_market_arbitrage.core.time import UtcTimestamp
 from multi_market_arbitrage.venues.polymarket import ReceivedWebSocketMessage
 
 from .audit import WebSocketAdmissionWatermark
@@ -15,6 +16,19 @@ from .audit import WebSocketAdmissionWatermark
 
 class RawIngressBackpressureError(RuntimeError):
     """The application ingress boundary cannot admit another complete frame."""
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        received_wall_time: UtcTimestamp | None = None,
+        received_monotonic_ns: int | None = None,
+    ) -> None:
+        if (received_wall_time is None) != (received_monotonic_ns is None):
+            raise ValueError("backpressure receive timestamps must be paired")
+        self.received_wall_time = received_wall_time
+        self.received_monotonic_ns = received_monotonic_ns
+        super().__init__(detail)
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,7 +114,9 @@ class BoundedRawIngress:
         if self._queue.full() or payload_size > self._max_bytes - self._queued_bytes:
             self._overflows += 1
             raise RawIngressBackpressureError(
-                "bounded raw ingress queue exhausted; state continuity is unknown"
+                "bounded raw ingress queue exhausted; state continuity is unknown",
+                received_wall_time=message.received_wall_time,
+                received_monotonic_ns=message.received_monotonic_ns,
             )
         item = RawIngressItem(
             message=message,

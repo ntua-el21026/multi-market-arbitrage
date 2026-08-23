@@ -248,8 +248,16 @@ class PolymarketConfig(_StrictFrozenModel):
     maximum_http_response_bytes: PositiveStrictInt = 8 * 1024 * 1024
     maximum_websocket_message_bytes: PositiveStrictInt = 1024 * 1024
     maximum_ingress_queue_bytes: PositiveStrictInt = 64 * 1024 * 1024
+    reported_top_transition_max_frames: Annotated[int, Field(strict=True, ge=1, le=64)] = 8
+    reported_top_transition_max_seconds: PositiveFiniteFloat = 2.0
     public_reads: PublicReadConfig
     snapshot_audit_max_race_retries: Annotated[int, Field(strict=True, ge=0, le=16)] = 4
+
+    @model_validator(mode="after")
+    def _reported_top_transition_bounds(self) -> Self:
+        if self.reported_top_transition_max_seconds > 5.0:
+            raise ValueError("reported-top transition duration cannot exceed five seconds")
+        return self
 
     @field_validator("gamma_base_url", "clob_base_url")
     @classmethod
@@ -331,6 +339,9 @@ class HealthConfig(_StrictFrozenModel):
     queue_capacity: PositiveStrictInt = 64
     maximum_checkpoints: PositiveStrictInt = 8_192
     maximum_file_bytes: PositiveStrictInt = 64 * 1024 * 1024
+    availability_queue_capacity: PositiveStrictInt = 64
+    maximum_availability_intervals: PositiveStrictInt = 8_192
+    maximum_availability_file_bytes: PositiveStrictInt = 64 * 1024 * 1024
     minimum_free_disk_bytes: PositiveStrictInt = 1024 * 1024 * 1024
 
     @model_validator(mode="after")
@@ -341,6 +352,8 @@ class HealthConfig(_StrictFrozenModel):
             raise ValueError("health checkpoint interval cannot exceed thirty seconds")
         if self.maximum_file_bytes > 256 * 1024 * 1024:
             raise ValueError("health evidence file cannot exceed 256 MiB")
+        if self.maximum_availability_file_bytes > 256 * 1024 * 1024:
+            raise ValueError("availability evidence file cannot exceed 256 MiB")
         return self
 
 
@@ -383,6 +396,11 @@ class Phase1Config(_StrictFrozenModel):
             raise ValueError(
                 "snapshot audit race-retry quiet interval must be below freshness guard"
             )
+        if (
+            self.polymarket.reported_top_transition_max_seconds
+            > self.scanner.maximum_book_age_seconds
+        ):
+            raise ValueError("reported-top transition duration cannot exceed maximum book age")
         return self
 
     @classmethod

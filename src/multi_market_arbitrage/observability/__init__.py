@@ -1,8 +1,25 @@
 """Structured logging and lightweight in-memory metrics."""
 
+from .availability import (
+    AVAILABILITY_EVIDENCE_SUMMARY_VERSION,
+    AVAILABILITY_INTERVAL_SCHEMA_VERSION,
+    AvailabilityCause,
+    AvailabilityEvidenceRuntimeSnapshot,
+    AvailabilityEvidenceSummary,
+    AvailabilityInterval,
+    AvailabilityLedgerReconciliation,
+    AvailabilityRecoveryAction,
+    AvailabilityRecoveryOutcome,
+    AvailabilityScope,
+    SupervisedAvailabilityIntervalWriter,
+    reconcile_availability_intervals,
+)
 from .checkpoints import (
     HEALTH_CHECKPOINT_SCHEMA_VERSION,
+    HEALTH_CHECKPOINT_V1_SCHEMA_VERSION,
+    HEALTH_EVIDENCE_SUMMARY_VERSION,
     HealthCheckpoint,
+    HealthCheckpointChronology,
     HealthDecision,
     HealthDecisionInputs,
     HealthDecisionReason,
@@ -11,6 +28,14 @@ from .checkpoints import (
     PeriodicHealthCheckpointEmitter,
     SupervisedHealthCheckpointWriter,
     evaluate_health_decision,
+    validate_health_checkpoint_chronology,
+)
+from .host import (
+    HOST_RUNTIME_IDENTITY_SCHEMA_VERSION,
+    HostRuntimeIdentity,
+    capture_host_runtime_identity,
+    filesystem_identity,
+    normalize_git_commit,
 )
 from .metrics import HistogramSnapshot, InMemoryMetrics, MetricKey, MetricsSnapshot
 from .structured_logging import (
@@ -22,23 +47,44 @@ from .structured_logging import (
 )
 
 __all__ = [
+    "AVAILABILITY_EVIDENCE_SUMMARY_VERSION",
+    "AVAILABILITY_INTERVAL_SCHEMA_VERSION",
     "HEALTH_CHECKPOINT_SCHEMA_VERSION",
+    "HEALTH_CHECKPOINT_V1_SCHEMA_VERSION",
+    "HEALTH_EVIDENCE_SUMMARY_VERSION",
+    "HOST_RUNTIME_IDENTITY_SCHEMA_VERSION",
     "SAFE_LOG_FIELDS",
     "AllowlistJsonFormatter",
+    "AvailabilityCause",
+    "AvailabilityEvidenceRuntimeSnapshot",
+    "AvailabilityEvidenceSummary",
+    "AvailabilityInterval",
+    "AvailabilityLedgerReconciliation",
+    "AvailabilityRecoveryAction",
+    "AvailabilityRecoveryOutcome",
+    "AvailabilityScope",
     "HealthCheckpoint",
+    "HealthCheckpointChronology",
     "HealthDecision",
     "HealthDecisionInputs",
     "HealthDecisionReason",
     "HealthEvidenceRuntimeSnapshot",
     "HealthEvidenceSummary",
     "HistogramSnapshot",
+    "HostRuntimeIdentity",
     "InMemoryMetrics",
     "MetricKey",
     "MetricsSnapshot",
     "PeriodicHealthCheckpointEmitter",
     "StructuredLogger",
+    "SupervisedAvailabilityIntervalWriter",
     "SupervisedHealthCheckpointWriter",
     "UnsafeLogFieldError",
+    "capture_host_runtime_identity",
     "configure_json_logger",
     "evaluate_health_decision",
+    "filesystem_identity",
+    "normalize_git_commit",
+    "reconcile_availability_intervals",
+    "validate_health_checkpoint_chronology",
 ]
