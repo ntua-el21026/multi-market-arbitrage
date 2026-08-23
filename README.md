@@ -4,7 +4,7 @@ Multi-venue quantitative arbitrage, market-making, and delta-neutral trading res
 
 **Initial venues:** Polymarket, Kalshi, Kraken  
 **Architecture:** Python modular monolith  
-**Current project state:** Phase 1 public-observation implementation<br>
+**Current project state:** Phase 1 implementation complete; six-hour Gate-1 soak completed; independent artifact acceptance pending  
 **Live trading:** Structurally unavailable in Phase 1
 
 ## Engineering priorities
@@ -27,17 +27,32 @@ An apparent arbitrage is not treated as executable until data health, settlement
 - [`docs/SYSTEM_DESIGN.md`](docs/SYSTEM_DESIGN.md) — canonical architecture
 - [`docs/INVARIANTS.md`](docs/INVARIANTS.md) — hard system invariants
 - [`docs/GLOSSARY.md`](docs/GLOSSARY.md) — canonical terminology
-- [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) — staged engineering plan
-- [`docs/CODEX_PHASE_1_SPEC.md`](docs/CODEX_PHASE_1_SPEC.md) — first implementation scope
-- [`docs/PHASE_1_PERFORMANCE_BASELINE.md`](docs/PHASE_1_PERFORMANCE_BASELINE.md) — measured A/B/C acceptance baseline
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) — gate-driven path to controlled live deployment
+- [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) — staged engineering sequence and current gate
+- [`docs/PHASE_2_RESEARCH_AND_SPEC.md`](docs/PHASE_2_RESEARCH_AND_SPEC.md) — planning-only Kalshi/Kraken/semantic specification; implementation is blocked until Gate 1 passes
+- [`docs/EXTERNAL_REFERENCE_BACKLOG.md`](docs/EXTERNAL_REFERENCE_BACKLOG.md) — non-normative external systems, strategy priorities, and future ADR candidates
+- [`docs/CODEX_PHASE_1_SPEC.md`](docs/CODEX_PHASE_1_SPEC.md) — Phase 1 implementation scope
+- [`docs/GATE_1_SOAK_SPEC.md`](docs/GATE_1_SOAK_SPEC.md) — normative six-hour soak acceptance contract
+- [`docs/PHASE_1_PERFORMANCE_BASELINE.md`](docs/PHASE_1_PERFORMANCE_BASELINE.md) — measured Phase 1 performance evidence
 - [`docs/ADR_INDEX.md`](docs/ADR_INDEX.md) — architecture decision index
 
 Historical pass reports and adversarial reviews live under `docs/design_freeze/`. They are audit evidence, not current implementation authority.
 
+## Current gate
+
+The six-hour Polymarket soak was executed from accepted implementation commit:
+
+```text
+a382b93220011428703fe02483f7034f59c1f045
+```
+
+Gate 1 remains **pending** until the completed artifacts pass the independent validation, dual-replay, analytical-rebuild, raw-immutability, health-evidence, hard-fail, and no-live-capability review defined in `GATE_1_SOAK_SPEC.md`.
+
+Phase 2 research and specification may proceed in parallel. Production Kalshi/Kraken code must not be promoted or merged until Gate 1 is accepted.
+
 ## Phase 1 development
 
-The reproducible implementation baseline is ordinary-GIL CPython 3.14.7 with
-`uv==0.12.5`, exact direct dependency pins, and a committed transitive lock:
+The reproducible implementation baseline is ordinary-GIL CPython 3.14.7 with `uv==0.12.5`, exact direct dependency pins, and a committed transitive lock:
 
 ```bash
 uv python install
@@ -57,21 +72,9 @@ uv run --frozen --all-groups mma validate-data data
 uv run --frozen --all-groups mma scan-report data/analytical
 ```
 
-Gate-1 evidence requires `--gamma-market-id`; the resolved Gamma, condition,
-event-where-applicable, YES/NO token, reference-version, and semantic identities
-are frozen into the run evidence. An omitted direct parent-event relation is
-resolved by one bounded exact-ID Gamma list read and fails closed if that
-relationship is missing or ambiguous. Omitting the flag retains bounded discovery only for
-developer smoke work and is explicitly ineligible for Gate-1. The recommended
-pre-soak calibration is 180–300 seconds against the same explicit target; it
-requires an exact clean Git checkout, projects the six-hour workload
-conservatively, and is not the six-hour soak.
+Gate-1 evidence requires `--gamma-market-id`; the resolved Gamma, condition, event-where-applicable, YES/NO token, reference-version, and semantic identities are frozen into the run evidence. Omitting the flag retains bounded discovery only for developer smoke work and is explicitly ineligible for Gate 1.
 
-See [`docs/PHASE_1_IMPLEMENTATION.md`](docs/PHASE_1_IMPLEMENTATION.md) for
-configuration, validation, storage, replay, official protocol evidence, and
-the explicit Phase 1 safety boundary. The runtime, dependency, evidence, and
-rollback decision is recorded in
-[`ADR-0051`](docs/adr/0051-cpython-3-14-7-and-reproducible-toolchain.md).
+See [`docs/PHASE_1_IMPLEMENTATION.md`](docs/PHASE_1_IMPLEMENTATION.md) for configuration, validation, storage, replay, official protocol evidence, and the explicit Phase 1 safety boundary.
 
 ## Repository policy
 

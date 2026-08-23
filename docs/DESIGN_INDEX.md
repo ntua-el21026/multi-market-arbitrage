@@ -8,10 +8,14 @@ Implementation work should read:
 2. `SYSTEM_DESIGN.md`
 3. `INVARIANTS.md`
 4. `GLOSSARY.md`
-5. `IMPLEMENTATION_PLAN.md`
-6. the topic documents relevant to the task
-7. `ADR_INDEX.md` and referenced ADRs
-8. historical `design_freeze/` files only when decision history is needed
+5. `ROADMAP.md`
+6. `IMPLEMENTATION_PLAN.md`
+7. the current phase specification relevant to the task
+8. the topic documents relevant to the task
+9. `ADR_INDEX.md` and referenced accepted/non-superseded ADRs
+10. historical `design_freeze/` files only when decision history is needed
+
+If current normative documents conflict, implementation must stop and report the contradiction rather than silently choosing precedence.
 
 ## 2. Core architecture
 
@@ -26,7 +30,7 @@ Implementation work should read:
 | `DATA_ARCHITECTURE.md` | Raw/canonical/derived persistence |
 | `CONCURRENCY_AND_OWNERSHIP.md` | Async tasks, state ownership, backpressure |
 | `ERROR_MODEL.md` | Failure classes, retries, typed errors |
-| `SEMANTIC_MATCHING.md` | Cross-contract economic relations |
+| `SEMANTIC_MATCHING.md` | Cross-contract relations, proof status, and outcome partitions |
 | `STRATEGY_CONTRACTS.md` | Scanner/strategy boundaries |
 
 ## 3. Research
@@ -42,6 +46,7 @@ Implementation work should read:
 | `CAPACITY_AND_SCALING.md` | Capacity and capital-time |
 | `TESTING_STRATEGY.md` | Tests/fault injection |
 | `PERFORMANCE.md` | Benchmarking/profiling |
+| `EXTERNAL_REFERENCE_BACKLOG.md` | Non-normative external systems, patterns, strategy ranking, and future ADR candidates |
 
 ## 4. Future live execution
 
@@ -58,19 +63,20 @@ Implementation work should read:
 | `INCIDENT_RESPONSE.md` | Incident containment |
 | `DISASTER_RECOVERY.md` | Backup/restore/recovery |
 | `DEPLOYMENT_ARCHITECTURE.md` | Deployment topology |
-| `LIVE_READINESS_AND_PHASE_GATES.md` | Promotion gates |
+| `LIVE_READINESS_AND_PHASE_GATES.md` | Detailed promotion gates |
 | `PHASE_GATES.md` | Compact gate index |
-| `ROADMAP.md` | Long-term roadmap |
+| `ROADMAP.md` | Long-term gate-driven roadmap |
 
-## 5. Implementation
+## 5. Implementation and phase specifications
 
 | Document | Scope |
 |---|---|
-| `IMPLEMENTATION_PLAN.md` | Engineering milestone sequence |
-| `CODEX_PHASE_1_SPEC.md` | Exact first Codex scope |
-| `PHASE_1_IMPLEMENTATION.md` | Current Phase-1 implementation behavior and operator guide |
-| `PHASE_1_PERFORMANCE_BASELINE.md` | Measured Phase-1 performance/reproducibility evidence |
+| `IMPLEMENTATION_PLAN.md` | Engineering milestone sequence and current gate |
+| `CODEX_PHASE_1_SPEC.md` | Exact Phase 1 implementation scope |
+| `PHASE_1_IMPLEMENTATION.md` | Current Phase 1 implementation behavior and operator guide |
+| `PHASE_1_PERFORMANCE_BASELINE.md` | Measured Phase 1 performance/reproducibility evidence |
 | `GATE_1_SOAK_SPEC.md` | Normative preconditions, evidence, and pass/fail criteria for the six-hour Polymarket soak |
+| `PHASE_2_RESEARCH_AND_SPEC.md` | Planning-only Kalshi/Kraken/semantic scope; production implementation is blocked until Gate 1 passes |
 
 ## 6. Governance
 
@@ -81,8 +87,10 @@ Implementation work should read:
 | `GLOSSARY.md` | Canonical terminology |
 | `ADR_INDEX.md` | ADR status/index |
 
+`EXTERNAL_REFERENCE_BACKLOG.md` is advisory evidence and a decision backlog. It cannot override current normative documents or accepted ADRs.
+
 ## 7. Historical audit
 
 `docs/design_freeze/` contains Pass 1–3 candidate/final reports, adversarial reviews, dated official-doc notes, and the final cross-pass review.
 
-Historical terminology is not implementation authority.
+Historical terminology is not implementation authority. Design Freeze v0.1 remains immutable; additive current ADRs and phase specifications may extend it.

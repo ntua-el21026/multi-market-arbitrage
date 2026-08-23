@@ -4,150 +4,347 @@
 
 Implement by vertical correctness slices, not by maximizing feature count.
 
-Every stage ends with tests and an explicit gate.
+Every stage ends with tests, reproducible evidence, and an explicit gate. A stage is not accepted merely because code exists or a process exits successfully.
 
-## Phase F0 — Repository/tooling foundation
+## 1. Current implementation status
 
-Build:
-- `pyproject.toml`;
-- `uv.lock`;
-- pinned Python baseline;
-- package skeleton;
-- Ruff;
-- strict Pyright;
-- pytest;
-- Hypothesis;
-- pre-commit;
-- GitHub Actions;
+| Slice | Status |
+|---|---|
+| F0 — Repository/tooling foundation | Implemented |
+| F1 — Canonical core | Implemented |
+| F2 — Immutable raw journal | Implemented |
+| F3 — Canonical analytical storage | Implemented |
+| P1 — Polymarket read-only vertical slice | Implemented |
+| P2 — Ordinary-binary complete-set scanner | Implemented |
+| P3 — Deterministic replay/rebuild | Implemented |
+| P4 — Six-hour Polymarket Gate-1 soak | Executed; independent artifact acceptance pending |
+| V1 — Kalshi read-only vertical slice | Specification/research only until Gate 1 passes |
+| V2 — Kraken read-only vertical slice | Planned after Kalshi validates shared interfaces |
+
+The six-hour soak ran from accepted implementation commit `a382b93220011428703fe02483f7034f59c1f045`. Gate 1 remains pending until the artifacts satisfy `GATE_1_SOAK_SPEC.md`.
+
+## 2. Completed foundation slices
+
+### Phase F0 — Repository/tooling foundation
+
+Implemented:
+
+- `pyproject.toml` and `uv.lock`;
+- pinned ordinary-GIL CPython baseline;
+- Ruff and strict Pyright;
+- pytest and Hypothesis;
+- pre-commit and GitHub Actions;
 - structured logging;
-- typed configuration.
+- strict typed configuration;
+- deterministic dependency/SCA gates.
 
-No venue code yet.
+### Phase F1 — Canonical core
 
-## Phase F1 — Canonical core
+Implemented:
 
-Implement:
 - exact numeric types;
-- stable IDs/version IDs;
+- stable IDs and version IDs;
 - time/clock abstractions;
 - raw/canonical event envelopes;
 - provenance;
-- validation result/reason types;
+- typed validation results and reason codes;
 - health types;
-- deterministic serialization/hashing.
+- deterministic serialization and hashing.
 
-Property tests are mandatory.
+### Phase F2 — Immutable raw journal
 
-## Phase F2 — Raw journal
+Implemented:
 
-Implement:
-- bounded writer queue;
-- append-only `.partial`;
+- bounded queue and group durability;
+- append-only `.partial` segments;
 - Zstandard sealed segments;
-- manifests/checksums;
+- manifests and SHA-256 chains;
 - durability watermark;
 - crash recovery;
-- fault injection.
+- fault injection and bounded storage.
 
-## Phase F3 — Canonical analytical storage
+### Phase F3 — Canonical analytical storage
 
-Implement:
-- Parquet schemas/writers;
-- DuckDB query setup;
+Implemented:
+
+- Parquet schemas and writers;
+- DuckDB query layer;
 - dataset manifests;
-- small-file batching;
-- rebuildability from raw.
+- bounded batching;
+- supervised derived-output isolation;
+- deterministic rebuild from raw.
 
-## Phase P1 — Polymarket read-only vertical slice
+## 3. Completed Polymarket implementation slices
 
-Implement:
-- current official public market discovery/reference retrieval;
-- raw public market stream capture;
+### Phase P1 — Polymarket read-only vertical slice
+
+Implemented:
+
+- current public market/reference retrieval;
+- raw public market-stream capture;
 - adapter DTO decoding;
 - stable market/instrument mapping;
 - versioned precision/cost/settlement reference handling;
-- canonical order-book state;
-- health/resync;
-- data-quality metrics.
+- canonical L2 ownership;
+- bounded receive-watermark-fenced integrity audits;
+- typed HTTP/WS failures and bounded safe-public-read retry;
+- scoped health evidence and explicit target identity.
 
-No authentication or order placement.
+No authentication or order placement exists.
 
-## Phase P2 — Observation-only complete-set scanner
+### Phase P2 — Observation-only complete-set scanner
 
-Implement:
-- binary/eligible payoff relation validation;
+Implemented for ordinary same-condition binary YES/NO markets:
+
+- proven binary complement relation;
 - theoretical economics;
-- full-depth `BOOK_UPPER_BOUND`;
-- cost-context validation;
+- exact full-depth `BOOK_UPPER_BOUND`;
+- contextual cost validation;
 - capacity curve;
 - opportunity lifecycle;
+- exact optimized breakpoint/range evaluation with exhaustive differential oracle;
 - zero live mutation.
 
-Unknown cost/semantics fails closed.
+Negative-risk and multi-outcome markets remain deliberately unsupported.
 
-## Phase P3 — Deterministic replay
+### Phase P3 — Deterministic replay
 
-Replay recorded Polymarket data through the same canonical state/scanner logic.
+Implemented:
 
-Require identical state/opportunity hashes across repeated runs.
+- production-path replay from verified raw records;
+- identical canonical/scanner logic;
+- terminal state/opportunity hashes;
+- analytical rebuild from completed raw runs;
+- bounded validation and query paths.
 
-## Phase P4 — Polymarket soak/data quality
+### Phase P4 — Polymarket soak/data quality
 
-Gate-1 evidence is governed by `GATE_1_SOAK_SPEC.md` and ADR-0052.
+The pre-soak engineering baseline and acceptance criteria are defined by:
 
-The Phase-P4 pre-soak engineering baseline now contains:
+- `PHASE_1_IMPLEMENTATION.md`;
+- `PHASE_1_PERFORMANCE_BASELINE.md`;
+- ADR-0052;
+- `GATE_1_SOAK_SPEC.md`.
 
-- continuous healthy WebSocket acquisition during routine REST integrity audits;
-- exact receive-watermark-fenced `MATCH` / `MISMATCH` / `RACED` / `FAILED`
-  audit semantics with replay evidence and bounded race retry;
-- separate typed HTTP and WebSocket failure/metric/recovery domains;
-- bounded, deadline- and rate-aware retry only for fixed safe public reads,
-  using dated official external-limit evidence;
-- periodic scoped machine-readable health evidence through its own supervised,
-  bounded, non-blocking owner;
-- explicit fail-closed Gate-1 target selection and identity instead of listing
-  order, with discovery retained only as non-Gate-1 developer mode;
-- a bounded target-specific workload/storage calibration command that publishes
-  hash-bound reports and fails rather than enlarging the raw/file/disk limits;
-- an exact integer-lattice depth/fee-regime scanner optimizer, with the
-  exhaustive implementation retained as the differential oracle; and
-- separate benchmark harnesses for scanner and health-path evidence while
-  preserving historical baselines.
+The six-hour run has completed. Required closure work is now:
 
-Engineering presence is not Gate-1 acceptance. Before the final six-hour soak,
-the exact final SHA must still pass the full CI/static/SCA/security/replay
-gates, a new bounded explicit-target public smoke, target-specific 180–300
-second calibration with acceptable six-hour projection, independent replay/
-rebuild/data validation, and pre-soak audit review. No unexecuted evidence gate
-may be inferred from this implementation status.
+1. verify process/run/config/target identity;
+2. inspect complete logs and all health checkpoints;
+3. validate raw and analytical data;
+4. quantify coverage, audits, retries, gaps, latency, resources, and opportunity results;
+5. replay twice independently;
+6. rebuild analytical output from raw;
+7. verify raw immutability;
+8. repeat the no-live negative-capability audit;
+9. evaluate every hard-fail condition;
+10. issue `PASS`, `FAIL`, or `INCONCLUSIVE` with evidence.
 
-Then run the six-hour soak and collect at least:
+No Phase 2 production implementation is promoted before this decision.
 
-- WebSocket coverage/unavailable intervals;
-- reconnects and resynchronizations;
-- REST audit outcomes/races/failures/retries;
-- invalidations and reference changes;
-- queue depth/high-water and backpressure evidence;
-- raw storage growth/durability metrics;
-- analytical health/completion metrics;
-- periodic health checkpoints;
-- scanner lifecycle statistics;
-- receive-to-scan latency distributions;
-- CPU/memory/disk behavior;
-- deterministic replay/rebuild/data-validation evidence.
+## 4. Parallel work policy while Gate 1 is pending
 
-Gate 1 is an independent evidence review, not a green process exit. Missing intervals remain explicit; no later REST snapshot may retroactively claim that an unobserved interval was complete.
+Allowed in parallel:
 
-Only after the six-hour artifacts satisfy `GATE_1_SOAK_SPEC.md` should Gate 1 be considered passed.
+- inspect current official Kalshi and Kraken documentation;
+- build dated venue capability/economics matrices;
+- map native schemas to current canonical contracts;
+- design adapter conformance, fixtures, fault tests, replay tests, and soak gates;
+- design the Polymarket–Kalshi semantic benchmark;
+- specify Polymarket/Kalshi multi-outcome and partition proof requirements;
+- draft additive future ADR options without accepting them.
 
-## Next — Kalshi/Kraken
+Not allowed before Gate-1 acceptance:
 
-Do not implement them in Phase 1.
+- merge production Kalshi/Kraken adapter code into `main`;
+- change canonical models to fit an unverified venue assumption;
+- introduce authenticated trading;
+- implement execution, paper trading, market making, or live state;
+- weaken Phase 1 evidence requirements.
 
-After Polymarket contracts and Gate-1 evidence are accepted, integrate Kalshi/Kraken against those stable interfaces and re-verify current official venue documentation at implementation time.
+The planning contract is `PHASE_2_RESEARCH_AND_SPEC.md`.
 
-## Future — simulation/shadow/live
+## 5. Next implementation slice V1 — Kalshi read-only
 
-Follow `ROADMAP.md` and phase gates.
+Begin only after Gate 1 passes.
 
-Execution code is deliberately postponed.
+Implementation order:
+
+1. current official documentation and dated capability/economics evidence;
+2. native public DTOs isolated at the adapter boundary;
+3. exact fixed-point/dollar-string parsing and explicit YES-price convention;
+4. market/event/reference identity mapping;
+5. public snapshot and sequenced-delta L2 reconstruction;
+6. gap detection and snapshot recovery;
+7. lifecycle, settlement, cancellation, precision, fee, and rate-limit versions;
+8. raw journal and canonical analytical storage;
+9. deterministic replay;
+10. conformance, property, golden, and fault-injection tests;
+11. bounded smoke/calibration/soak evidence.
+
+Ordinary binary markets come first. Event-level multi-market partitions and multivariate/combo semantics remain research-only until the semantic proof layer is ready.
+
+**Gate contribution:** G2.
+
+## 6. Next implementation slice V2 — Kraken read-only
+
+Begin after Kalshi has validated the shared interfaces or a reviewed ADR resolves any justified common-model change.
+
+Implementation order:
+
+1. spot instrument/reference data;
+2. spot L2 books and trades;
+3. derivative instrument/reference data;
+4. perpetual/futures L2 books and trades;
+5. mark/index prices;
+6. funding and basis data;
+7. contract size, margin, collateral, lifecycle, precision, and fees;
+8. sequence/checksum handling where officially supported;
+9. optional selected-market L3 calibration capture;
+10. raw journal, canonical storage, deterministic replay, tests, and soak.
+
+**Gate:** completes G2.
+
+## 7. Semantic and multi-outcome slice S1
+
+After the necessary venue data exists:
+
+### Cross-venue benchmark
+
+Build a manually verified Polymarket–Kalshi dataset with relation and proof-status labels. Candidate-generation tools are evaluated on precision/recall, but only `PROVEN` relations may drive automated economics.
+
+### Polymarket partitions
+
+Implement negative-risk/multi-outcome support only from a proven `OutcomePartition`, including membership, exclusivity, exhaustiveness, payout, cancellation, exceptional states, and versioned evidence.
+
+### Kalshi partitions
+
+Treat separately:
+
+- event-level groups of binary markets that may form a proven partition;
+- multivariate/combo markets with their own payoff graph.
+
+Grouping or metadata flags are candidate evidence only.
+
+### Logical constraints
+
+Add implication, disjointness, conjunction, and partition relations through the common semantic graph rather than ad hoc scanner rules.
+
+**Gate contribution:** G3.
+
+## 8. Empirical opportunity census R1
+
+Before execution implementation, measure:
+
+- full-depth edge `E(q)`;
+- frequency and lifecycle;
+- edge decay/half-life versus latency;
+- capacity;
+- fees and rebates separately;
+- settlement and capital lock;
+- capital-time return;
+- concentration;
+- blocked and indeterminate reasons;
+- data coverage and missing intervals.
+
+Research families:
+
+1. Polymarket ordinary complete sets;
+2. Polymarket negative-risk/multi-outcome;
+3. Polymarket–Kalshi proven-relation opportunities;
+4. Kalshi structural constraints;
+5. Kraken basis/funding carry;
+6. passive complete-set and maker microstructure.
+
+**Gate:** completes G3.
+
+## 9. Execution-realistic simulator X1
+
+Implement only after multi-venue data and the edge census justify it.
+
+Required:
+
+- causal latency chain;
+- arrival-state aggressive fills;
+- own liquidity consumption;
+- partial fills;
+- passive queue models;
+- cancel races;
+- multi-leg non-atomic execution;
+- residual exposure and hedge/unwind policies;
+- shared liquidity and capital;
+- settlement delay and capital-time;
+- pessimistic/base/optimistic fill regimes.
+
+Before authenticated execution, accept reviewed ADRs for:
+
+- multi-leg execution-group intent and FSMs;
+- venue capability/economics snapshots;
+- capital/collateral topology;
+- causal latency provenance.
+
+**Gate contribution:** G4.
+
+## 10. Strategy promotion and shadow paper
+
+Recommended strategy order:
+
+1. ordinary complete-set;
+2. negative-risk/multi-outcome structural arbitrage;
+3. Polymarket ↔ Kalshi proven-equivalent arbitrage;
+4. Kraken basis/funding carry;
+5. passive complete-set accumulation;
+6. inventory-aware market making;
+7. logical/conditional arbitrage;
+8. prediction-market ↔ crypto relative value;
+9. statistical/ML strategies last.
+
+Promotion requires current fees/full depth, chronological OOS evidence, pessimistic execution stress, acceptable capital-time returns, controlled concentration, and retained experiment/calibration lineage.
+
+Shadow paper uses the intended strategy/risk/order lifecycle but no mutation.
+
+**Gate:** G4.
+
+## 11. Live execution engineering
+
+Only after research/shadow evidence:
+
+- durable operational state;
+- durable intent and decision evidence;
+- atomic risk reservations;
+- order and execution-group state machines;
+- authenticated account/private streams;
+- explicit unknown mutation states;
+- reconciliation;
+- double-entry ledger;
+- continuous risk and kill controls;
+- secrets isolation and no-withdrawal capability;
+- backup, recovery, runbooks, and drills.
+
+Live remains disabled until Gate 6.
+
+## 12. Limited live and scaling
+
+Sequence:
+
+1. one venue/account/market/tiny order;
+2. intentional fill/cancel/restart/reconciliation tests;
+3. one tightly capped structural strategy;
+4. no automatic scaling;
+5. compare live slippage, fill, and latency errors against the simulator;
+6. scale only from clean evidence;
+7. add market making only after passive-fill calibration;
+8. add portfolio allocation only after multiple strategies have live evidence.
+
+## 13. Deferred until measured need
+
+- fourth venue;
+- Rust/C++ kernels;
+- microservices;
+- Kafka/Redpanda;
+- Kubernetes;
+- ClickHouse/server databases;
+- complex dashboards;
+- autonomous LLM trading;
+- directional ML/RL;
+- generic connector breadth;
+- portfolio optimizer before validated strategies.
