@@ -60,6 +60,7 @@ If current normative documents conflict, stop and report the contradiction.
 | `GATE_1_REMEDIATION_SPEC.md` | Normative current correction/rerun scope |
 | ADR-0052 | Continuous capture, audit fencing and Gate-1 evidence |
 | ADR-0053 | Bounded reported-top transition state |
+| ADR-0054 | Audit divergence state and Gate eligibility |
 
 ## 5. Future phase specifications
 

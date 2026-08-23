@@ -268,3 +268,120 @@ thresholds, and edge/no-edge outcomes. Targeted cases also include an ambiguous
 That adversarial case is an explicit caveat: the planner preserves exactness
 and the configured work bound, but it is not guaranteed to be sublinear for
 every fee-state pattern.
+
+## 16. Gate-1 audit cadence evidence
+
+The retained failed six-hour and corrected 30-minute stability runs were
+analyzed against the current policy and two conservative alternatives without
+changing raw evidence or replay semantics.
+
+| Policy | Periodic cap | Freshness launch age | Steady two-leg initial-request ceiling | Decision |
+|---|---:|---:|---:|---|
+| Current | 30 s | 1.0 s | 20/10 s | Keep |
+| Alternative 1 | 15 s | 1.0 s | 20/10 s | No observed frozen-trajectory benefit |
+| Alternative 2 | 30 s | 0.5 s | 40/10 s | Reject; doubles steady initial-request ceiling |
+
+The launch age follows from the unchanged five-second maximum book age minus
+the guard. Both retained trajectories were freshness-boundary dominated, so
+the 15-second periodic cap would not have launched earlier. Increasing the
+guard from four to 4.5 seconds would double the nominal initial-request load
+and expose more cross-transport transition samples without evidence of a
+correctness benefit. No option reduces audit frequency to hide mismatches.
+
+| Corpus | CLOB book requests/10 s average | Maximum audit starts/10 s | Mismatch/1,000 | Raced/1,000 | Research-eligible coverage |
+|---|---:|---:|---:|---:|---:|
+| Failed six-hour | 16.833 | 22 | 7.269 | 12.347 | 98.5078% |
+| Corrected 30-minute stability | 16.794 | 22 | 6.664 | 14.329 | 99.4806% |
+
+The committed local CLOB book limit is 100 requests/10 seconds. Measured exact
+HTTP response p95/p99/max was `0.153975/0.211087/0.693587 s` for the failed run
+and `0.152817/0.217746/1.265220 s` for the stability run. Response-to-durable-
+classification p95/p99/max was `0.024104/0.030584/0.670032 s` and
+`0.019074/0.023212/0.197331 s`, respectively. The minimum residual to hard
+expiry at classification was `1.001434 s` and `2.724947 s`.
+All-record receive-to-durable p95/p99/max was
+`0.020247/0.025798/0.669841 s` and `0.017149/0.019897/0.738697 s`; this broader
+histogram is not an audit-component-only measurement.
+
+These are observed and frozen-trajectory measurements, not a causal forecast
+of the alternative schedules. They cannot supply hypothetical REST bodies,
+WebSocket ordering, mismatch identities or recovery counts. The recommendation
+is therefore to keep the 30-second periodic cap and four-second guard.
+
+Both retained corpora use historical v1 audit controls. They can support the
+aggregate cadence and latency measurements above, but cannot provide modern
+per-trigger effective-interval, outcome, latency, or freshness-budget
+distributions; no trigger is inferred from their timing. A fresh v2 smoke and
+stability artifact must report starts, outcomes and mismatch/race/failure rates
+by trigger; effective audit interval p50/p95/p99/max by trigger; HTTP latency
+and remaining freshness budget by trigger; request load; freshness safety
+margin; and resulting research-eligible coverage. Until that artifact exists,
+those per-trigger performance results remain unclaimed.
+
+## 17. ADR-0054 benchmark gate
+
+Before the final public candidate is accepted, the exact implementation SHA
+must benchmark and report:
+
+- mismatch diagnostic and pending-divergence construction;
+- authoritative-resolution construction and lifecycle-chain update;
+- completing v2 replacement full-snapshot processing as a zero-scan operation
+  that retains capture/ineligibility, followed separately by bounded release-
+  control construction, canonical serialization, durable-route processing,
+  validation, state release and the first permitted recovery scan;
+- v2 audit trigger encoding and trigger/outcome reconciliation;
+- health decision and checkpoint-v3 construction/serialization;
+- deterministic selection/serialization of every bounded current compact
+  pending representative and the one latest compact resolution representative,
+  including truncated-resolution-history behavior;
+- terminal summary/hash construction;
+- causal lineage reporting over both retained corpora;
+- replay throughput plus current/peak RSS.
+
+Report p50/p95/p99/max where a latency distribution is meaningful, CPU and
+allocation/retained-memory evidence where useful, and explicit input/count/
+memory bounds. Compare the ordinary no-divergence path with mismatch-open and
+authoritative-close paths. The replacement benchmark must report snapshot-only
+and release-control costs separately and validate the digest plus exact
+connection, raw-source and decision-time bindings for its bounded production
+capture. Dedicated correctness and fault-injection tests, rather than latency
+samples, enforce the 65,536-byte parser ceiling and missing, malformed, tampered,
+wrong-connection, future, cross-epoch and stale rejection without state mutation.
+Lifecycle validation must prove availability ends at the control decision time
+only after successful processing, and that a slow canonical return beyond the
+freshness bound emits no control or scan. Correctness tests also enforce the
+admitted-prefix fence, explicit post-resolution admission/connection chronology,
+latest-L2 decision chronology, same-key incremental application, cause/scope
+blockers and deterministic multi-capture release; these scheduler invariants are
+not inferred from latency samples. Historical
+v1 auto-release may be benchmarked only as byte-faithful replay compatibility,
+never as a new-producer path. Checkpoints serialize bounded current pending
+objects
+as compact raw-linked `gate1-audit-divergence-pending-representative-v1` records
+and at most one latest compact
+`gate1-audit-divergence-resolution-representative-v1`. These are bounded
+projections: exact totals, complete bounded pending/resolution objects in the
+processor summary and terminal hash, and the complete lifecycle chain remain
+authoritative. Storage-capacity evidence must saturate the benchmark fixture's
+two-pending-representative bound through the real checkpoint serializer. Because
+market-scoped recovery permits only one pending record for the current single
+Gate-1 target at a time, that two-record portion must be labeled as a bounded
+synthetic `ProcessorSummary` projection assembled from independently valid raw-
+linked lifecycle records, not as replay evidence.
+Do not increase queue, response, storage, book-age
+or memory limits to obtain a favorable result. No benchmark result is claimed
+in this normative section until its exact command, source identity and output
+artifact have been retained.
+
+Run the benchmark only into a fresh or empty directory:
+
+```bash
+audit_benchmark_output="$(mktemp -d)"
+uv run --frozen --all-groups --no-sync python benchmarks/gate1_audit_divergence.py \
+  --output "${audit_benchmark_output}"
+```
+
+Retain `gate1_audit_divergence_results.json`,
+`gate1_audit_divergence_report.md`, and
+`gate1_audit_divergence_artifacts.sha256` together with the exact source
+identity. This section intentionally records no unexecuted benchmark result.

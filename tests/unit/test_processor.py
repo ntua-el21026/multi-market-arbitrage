@@ -17,7 +17,7 @@ from multi_market_arbitrage.core.ids import (
     InstrumentId,
     SubscriptionId,
 )
-from multi_market_arbitrage.core.provenance import Provenance
+from multi_market_arbitrage.core.provenance import Provenance, RawSourceRef
 from multi_market_arbitrage.core.serialization import canonical_json_bytes
 from multi_market_arbitrage.core.time import MonotonicTimestamp, UtcTimestamp
 from multi_market_arbitrage.ingestion import RawEventEnvelope
@@ -30,6 +30,7 @@ from multi_market_arbitrage.pipeline import (
     CONTROL_REST_AUDIT_CLASSIFY,
     CONTROL_REST_AUDIT_EXPIRED,
     CONTROL_REST_AUDIT_FAILED,
+    CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
     CONTROL_REST_AUDIT_START,
     GAMMA_EVENT_PREFIX,
     GAMMA_MARKET_PREFIX,
@@ -51,6 +52,13 @@ from multi_market_arbitrage.pipeline import (
     WebSocketAdmissionWatermark,
 )
 from multi_market_arbitrage.pipeline import processor as processor_module
+from multi_market_arbitrage.pipeline.audit import (
+    AUDIT_REPLACEMENT_CAPTURE_MAX_BYTES,
+    AUDIT_START_V1_SCHEMA,
+    AUDIT_START_V2_SCHEMA,
+    AuditReplacementReleaseCommand,
+    AuditTriggerReason,
+)
 from multi_market_arbitrage.reference import POLYMARKET_VENUE_ID, ReferenceBundle
 from multi_market_arbitrage.research import Phase1AnalyticalOutputs
 from multi_market_arbitrage.scanners.polymarket_complete_set import (
@@ -138,6 +146,21 @@ def _price_change_payload(
             "market": "0xcondition",
             "price_changes": changes,
             "timestamp": timestamp,
+        }
+    )
+
+
+def _websocket_book_payload(rest_payload: bytes, *, label: str) -> bytes:
+    rest = cast(dict[str, object], json.loads(rest_payload))
+    return canonical_json_bytes(
+        {
+            "asks": rest["asks"],
+            "asset_id": rest["asset_id"],
+            "bids": rest["bids"],
+            "event_type": "book",
+            "hash": f"processor-replacement-{label}",
+            "market": rest["market"],
+            "timestamp": rest["timestamp"],
         }
     )
 
@@ -238,6 +261,8 @@ def _audit_start(
     response_deadline_monotonic_ns: int | None = None,
     run_deadline_monotonic_ns: int | None = None,
     request_started_monotonic_ns: int | None = None,
+    trigger_reason: AuditTriggerReason = AuditTriggerReason.OTHER_TYPED_REASON,
+    schema: str = AUDIT_START_V2_SCHEMA,
 ) -> tuple[AuditStartEvidence, RawEventEnvelope]:
     connection_id = ConnectionId("processor-test-connection")
     processed = processor.processed_websocket_watermark(connection_id)
@@ -255,6 +280,8 @@ def _audit_start(
         ),
         starting_processed_watermark=processed,
         starting_book=processor.audit_book_identity(native_asset_id),
+        trigger_reason=trigger_reason,
+        schema=schema,
     )
     return start, _envelope(
         run_id,
@@ -1390,7 +1417,7 @@ def test_rest_audit_counts_matches_and_invalidates_on_exact_mismatch() -> None:
     assert diagnostic.exact_depth_difference.difference_count == 1
     assert diagnostic.response_source.ingest_id == mismatching.ingest_id
     assert diagnostic.response_source.payload_sha256 == mismatching.payload_sha256
-    assert mismatch_result.scan_count == 1
+    assert mismatch_result.scan_count == 0
     assert not mismatch_result.book_freshness_updates
     assert mismatch_result.scan_triggers[0].reasons == (ScanTriggerReason.REST_AUDIT,)
     assert owner.snapshot().health is BookHealth.INVALID
@@ -1408,7 +1435,1109 @@ def test_rest_audit_counts_matches_and_invalidates_on_exact_mismatch() -> None:
     assert not summary.audit_mismatch_diagnostics_truncated
     assert summary.pending_rest_audits == 0
     assert summary.parse_failures == 0
-    assert summary.scans == scans_before + 2
+    assert summary.scans == scans_before + 1
+
+
+def test_v1_audit_start_replays_byte_exact_with_unknown_legacy_trigger() -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId("processor-v1-audit-trigger")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="historical-v1-audit",
+        trigger_reason=AuditTriggerReason.UNKNOWN_LEGACY,
+        schema=AUDIT_START_V1_SCHEMA,
+    )
+    record = json.loads(start.to_payload())
+    assert record["schema"] == AUDIT_START_V1_SCHEMA
+    assert "trigger_reason" not in record
+    assert processor.process_replayed(intent).success
+    failure = _envelope(
+        run_id,
+        5,
+        CONTROL_REST_AUDIT_FAILED,
+        AuditFailureCommand(
+            request_id=start.request_id,
+            reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+        ).to_payload(),
+        connection_id=start.connection_id,
+    )
+    result = processor.process_replayed(failure)
+    summary = processor.summary()
+
+    assert result.success
+    assert result.audit_outcomes[0].audit_start_schema == AUDIT_START_V1_SCHEMA
+    assert result.audit_outcomes[0].trigger_reason is AuditTriggerReason.UNKNOWN_LEGACY
+    assert dict(summary.audit_start_trigger_counts)[AuditTriggerReason.UNKNOWN_LEGACY] == 1
+    assert (
+        AuditTriggerReason.UNKNOWN_LEGACY,
+        AuditOutcome.FAILED,
+        1,
+    ) in summary.audit_outcome_trigger_counts
+
+
+@pytest.mark.parametrize(
+    "trigger_reason",
+    tuple(
+        trigger
+        for trigger in AuditTriggerReason
+        if trigger is not AuditTriggerReason.UNKNOWN_LEGACY
+    ),
+)
+def test_v2_audit_trigger_encoding_and_outcome_retention_are_deterministic(
+    trigger_reason: AuditTriggerReason,
+) -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId(f"processor-v2-trigger-{trigger_reason.value.lower()}")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id=f"v2-{trigger_reason.value.lower()}",
+        trigger_reason=trigger_reason,
+    )
+    payload = start.to_payload()
+    record = json.loads(payload)
+    assert payload == start.to_payload()
+    assert payload == canonical_json_bytes(record)
+    assert record["schema"] == AUDIT_START_V2_SCHEMA
+    assert record["trigger_reason"] == trigger_reason.value
+    assert processor.process_replayed(intent).success
+
+    failure = _envelope(
+        run_id,
+        5,
+        CONTROL_REST_AUDIT_FAILED,
+        AuditFailureCommand(
+            request_id=start.request_id,
+            reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+        ).to_payload(),
+        connection_id=start.connection_id,
+    )
+    result = processor.process_replayed(failure)
+    summary = processor.summary()
+
+    assert result.success
+    assert result.audit_outcomes[0].audit_start_schema == AUDIT_START_V2_SCHEMA
+    assert result.audit_outcomes[0].trigger_reason is trigger_reason
+    assert dict(summary.audit_start_trigger_counts)[trigger_reason] == 1
+    assert (trigger_reason, AuditOutcome.FAILED, 1) in (summary.audit_outcome_trigger_counts)
+
+
+def test_mismatch_divergence_closes_only_on_separate_authoritative_rest_snapshot() -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId("processor-audit-divergence-resnapshot")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    assert not processor.audit_recovery_blocks_native_asset("token-yes")
+    assert not processor.audit_recovery_blocks_native_asset("token-no")
+    mismatched_payload = _fixture("polymarket_rest_book_yes.json").replace(
+        b'"price": "0.40", "size": "10"',
+        b'"price": "0.40", "size": "11"',
+    )
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="periodic-divergence",
+        trigger_reason=AuditTriggerReason.PERIODIC,
+    )
+    assert processor.process_replayed(intent).success
+    mismatch = _audit_response(
+        run_id,
+        5,
+        start,
+        mismatched_payload,
+        boundary=0,
+    )
+    mismatch_result = processor.process_replayed(mismatch)
+    pending_summary = processor.summary()
+
+    assert mismatch_result.needs_resync
+    assert pending_summary.audit_divergences_observed == 1
+    assert pending_summary.audit_divergences_pending == 1
+    assert pending_summary.audit_divergences_unresolved == 1
+    assert pending_summary.audit_divergences_resolved_by_authoritative_resnapshot == 0
+    assert pending_summary.audit_divergences_resolved_same_generation == 0
+    assert pending_summary.audit_divergence_lifecycle_reconciled
+    pending = pending_summary.audit_divergence_pending_records[0]
+    assert pending.request_id == start.request_id
+    assert pending.audit_start_control_source.ingest_id == intent.ingest_id
+    assert pending.audit_outcome.trigger_reason is AuditTriggerReason.PERIODIC
+    assert pending.classification_control_source is None
+    diagnostic = pending.audit_outcome.mismatch_diagnostic
+    assert diagnostic is not None
+    assert pending.classification_source == diagnostic.response_source
+    assert (
+        pending.classification_received_monotonic_ns
+        == pending.audit_outcome.response_received_monotonic_ns
+    )
+    assert processor.audit_recovery_blocks_native_asset("token-yes")
+    assert processor.audit_recovery_blocks_native_asset("token-no")
+
+    _, blocked_intent = _audit_start(
+        processor,
+        run_id,
+        6,
+        request_id="blocked-while-divergence-pending",
+        trigger_reason=AuditTriggerReason.FRESHNESS_GUARD,
+    )
+    blocked = processor.process_replayed(blocked_intent)
+    blocked_summary = processor.summary()
+    assert not blocked.success
+    assert blocked.error_type == "NormalizationError"
+    assert blocked_summary.audit_divergences_pending == 1
+    assert dict(blocked_summary.audit_start_trigger_counts)[AuditTriggerReason.PERIODIC] == 1
+    assert dict(blocked_summary.audit_start_trigger_counts)[AuditTriggerReason.FRESHNESS_GUARD] == 0
+
+    resnapshot = _envelope(run_id, 7, REST_BOOK, mismatched_payload)
+    assert processor.process_replayed(resnapshot).success
+    recovered = processor.summary()
+
+    assert recovered.audit_divergences_observed == 1
+    assert recovered.audit_divergences_pending == 0
+    assert recovered.audit_divergences_unresolved == 0
+    assert recovered.audit_divergences_resolved_by_authoritative_resnapshot == 1
+    assert recovered.audit_divergence_lifecycle_reconciled
+    assert recovered.audit_replacement_captures_pending == 1
+    assert processor.audit_ineligible_instruments == (pending.instrument_id,)
+    assert processor.audit_recovery_blocks_native_asset("token-yes")
+    assert processor.audit_recovery_blocks_native_asset("token-no")
+    assert not recovered.audit_divergence_pending_records
+    resolution = recovered.audit_divergence_resolution_records[0]
+    assert resolution.divergence_id == pending.divergence_id
+    assert resolution.request_id == start.request_id
+    assert resolution.mismatch_response_source.ingest_id == mismatch.ingest_id
+    assert resolution.authoritative_snapshot_source.ingest_id == resnapshot.ingest_id
+    assert resolution.authoritative_snapshot_source.payload_sha256 == resnapshot.payload_sha256
+    assert resolution.trigger_reason is AuditTriggerReason.PERIODIC
+    assert resolution.observed_divergence == pending
+    assert resolution.authoritative_rest_book.depth.content_sha256
+    assert resolution.recovered_book.instrument_id == pending.instrument_id
+    assert recovered.audit_divergence_history_chain_sha256 != (
+        pending_summary.audit_divergence_history_chain_sha256
+    )
+
+    _, premature_audit = _audit_start(
+        processor,
+        run_id,
+        8,
+        request_id="blocked-before-replacement-capture",
+        trigger_reason=AuditTriggerReason.RESYNC_VERIFICATION,
+    )
+    refused = processor.process_replayed(premature_audit)
+    assert not refused.success
+    assert refused.error_type == "NormalizationError"
+    assert processor.summary().audit_replacement_captures_pending == 1
+
+    _, refused_sibling_audit = _audit_start(
+        processor,
+        run_id,
+        9,
+        request_id="blocked-sibling-before-replacement-capture",
+        native_asset_id="token-no",
+        trigger_reason=AuditTriggerReason.RESYNC_VERIFICATION,
+    )
+    sibling_refused = processor.process_replayed(refused_sibling_audit)
+    assert not sibling_refused.success
+    assert sibling_refused.error_type == "NormalizationError"
+
+    replacement_connection = ConnectionId("processor-test-replacement-connection")
+    maximum_age_ns = int(
+        load_phase1_config(Path("config/phase1.toml")).scanner.maximum_book_age_seconds
+        * 1_000_000_000
+    )
+    first_yes = processor.process_replayed(
+        _envelope(
+            run_id,
+            10,
+            WS_MARKET,
+            _websocket_book_payload(mismatched_payload, label="first-yes"),
+            monotonic_ns=1_000,
+            connection_id=replacement_connection,
+            transport_metadata={"websocket_admission_ordinal": 1},
+        )
+    )
+    stale_sibling = processor.process_replayed(
+        _envelope(
+            run_id,
+            11,
+            WS_MARKET,
+            _websocket_book_payload(_no_book(), label="late-no"),
+            monotonic_ns=1_000 + maximum_age_ns + 1,
+            connection_id=replacement_connection,
+            transport_metadata={"websocket_admission_ordinal": 2},
+        )
+    )
+    assert first_yes.success
+    assert stale_sibling.success
+    assert first_yes.scan_count == 0
+    assert stale_sibling.scan_count == 0
+    assert processor.summary().audit_replacement_captures_pending == 1
+    assert processor.audit_ineligible_instruments == (pending.instrument_id,)
+
+    fresh_yes = processor.process_replayed(
+        _envelope(
+            run_id,
+            12,
+            WS_MARKET,
+            _websocket_book_payload(mismatched_payload, label="fresh-yes"),
+            monotonic_ns=1_000 + maximum_age_ns + 2,
+            connection_id=replacement_connection,
+            transport_metadata={"websocket_admission_ordinal": 3},
+        )
+    )
+    assert fresh_yes.success
+    assert fresh_yes.scan_count == 0
+    assert processor.summary().audit_replacement_captures_pending == 1
+    assert processor.audit_ineligible_instruments == (pending.instrument_id,)
+
+    release_monotonic_ns = 1_000 + maximum_age_ns + 2
+    release_commands = processor.audit_replacement_release_commands(
+        connection_id=replacement_connection,
+        decision_monotonic=MonotonicTimestamp(run_id.value, release_monotonic_ns),
+    )
+    assert len(release_commands) == 1
+    release_command = release_commands[0]
+    assert release_command.divergence_id == pending.divergence_id
+    assert release_command.instrument_id == pending.instrument_id
+    released = processor.process_replayed(
+        _envelope(
+            run_id,
+            13,
+            CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
+            release_command.to_payload(),
+            monotonic_ns=release_monotonic_ns,
+            connection_id=replacement_connection,
+        )
+    )
+    assert released.success
+    assert released.scan_count == 1
+    assert processor.summary().audit_replacement_captures_pending == 0
+    assert processor.audit_ineligible_instruments == ()
+
+
+def test_v1_replacement_capture_auto_release_remains_byte_replay_compatible() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("processor-v1-replacement-auto-release")
+    processor = CanonicalProcessor(config)
+    envelopes = list(_bootstrap(run_id))
+    for envelope in envelopes:
+        assert processor.process_replayed(envelope).success
+
+    mismatched_payload = _fixture("polymarket_rest_book_yes.json").replace(
+        b'"price": "0.40", "size": "10"',
+        b'"price": "0.40", "size": "11"',
+    )
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="historical-v1-divergence",
+        trigger_reason=AuditTriggerReason.UNKNOWN_LEGACY,
+        schema=AUDIT_START_V1_SCHEMA,
+    )
+    mismatch = _audit_response(run_id, 5, start, mismatched_payload, boundary=0)
+    resnapshot = _envelope(run_id, 6, REST_BOOK, mismatched_payload)
+    replacement_connection = ConnectionId("historical-v1-replacement")
+    replacement_yes = _envelope(
+        run_id,
+        7,
+        WS_MARKET,
+        _websocket_book_payload(mismatched_payload, label="historical-v1-yes"),
+        monotonic_ns=2_000,
+        connection_id=replacement_connection,
+        transport_metadata={"websocket_admission_ordinal": 1},
+    )
+    replacement_no = _envelope(
+        run_id,
+        8,
+        WS_MARKET,
+        _websocket_book_payload(_no_book(), label="historical-v1-no"),
+        monotonic_ns=2_001,
+        connection_id=replacement_connection,
+        transport_metadata={"websocket_admission_ordinal": 2},
+    )
+    envelopes.extend((intent, mismatch, resnapshot, replacement_yes, replacement_no))
+
+    assert processor.process_replayed(intent).success
+    assert processor.process_replayed(mismatch).needs_resync
+    assert processor.process_replayed(resnapshot).success
+    assert processor.process_replayed(replacement_yes).scan_count == 0
+    final_snapshot = processor.process_replayed(replacement_no)
+    assert final_snapshot.success
+    assert final_snapshot.scan_count == 1
+    assert processor.summary().audit_replacement_captures_pending == 0
+    assert processor.audit_ineligible_instruments == ()
+    assert (
+        processor.audit_replacement_release_commands(
+            connection_id=replacement_connection,
+            decision_monotonic=MonotonicTimestamp(run_id.value, 2_001),
+        )
+        == ()
+    )
+
+    replay = CanonicalProcessor(config)
+    assert all(replay.process_replayed(envelope).success for envelope in envelopes)
+    assert replay.summary() == processor.summary()
+    assert replay.summary().terminal_hash == processor.summary().terminal_hash
+
+
+def _pending_v2_replacement_release(
+    label: str,
+) -> tuple[
+    Phase1Config,
+    CollectorRunId,
+    CanonicalProcessor,
+    ConnectionId,
+    AuditReplacementReleaseCommand,
+]:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId(f"processor-v2-release-{label}")
+    processor = CanonicalProcessor(config)
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+
+    mismatched_payload = _fixture("polymarket_rest_book_yes.json").replace(
+        b'"price": "0.40", "size": "10"',
+        b'"price": "0.40", "size": "11"',
+    )
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id=f"v2-release-{label}",
+        trigger_reason=AuditTriggerReason.PERIODIC,
+    )
+    assert processor.process_replayed(intent).success
+    assert processor.process_replayed(
+        _audit_response(run_id, 5, start, mismatched_payload, boundary=0)
+    ).needs_resync
+    assert processor.process_replayed(_envelope(run_id, 6, REST_BOOK, mismatched_payload)).success
+    replacement_connection = ConnectionId(f"v2-release-{label}-connection")
+    assert processor.process_replayed(
+        _envelope(
+            run_id,
+            7,
+            WS_MARKET,
+            _websocket_book_payload(mismatched_payload, label="release-yes"),
+            monotonic_ns=2_000,
+            connection_id=replacement_connection,
+            transport_metadata={"websocket_admission_ordinal": 1},
+        )
+    ).success
+    final_snapshot = processor.process_replayed(
+        _envelope(
+            run_id,
+            8,
+            WS_MARKET,
+            _websocket_book_payload(_no_book(), label="release-no"),
+            monotonic_ns=2_001,
+            connection_id=replacement_connection,
+            transport_metadata={"websocket_admission_ordinal": 2},
+        )
+    )
+    assert final_snapshot.success
+    assert final_snapshot.scan_count == 0
+    commands = processor.audit_replacement_release_commands(
+        connection_id=replacement_connection,
+        decision_monotonic=MonotonicTimestamp(run_id.value, 2_001),
+    )
+    assert len(commands) == 1
+    return config, run_id, processor, replacement_connection, commands[0]
+
+
+@pytest.mark.parametrize(
+    "invalid_snapshot",
+    [
+        "missing_admission_ordinal",
+        "pre_resolution_monotonic",
+        "pre_resolution_ingest",
+        "original_connection",
+        "reused_pre_open_connection",
+    ],
+)
+def test_v2_replacement_capture_rejects_unbound_or_pre_resolution_snapshot(
+    invalid_snapshot: str,
+) -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId(f"processor-v2-capture-reject-{invalid_snapshot}")
+    processor = CanonicalProcessor(config)
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+
+    prior_connection = ConnectionId(f"v2-prior-{invalid_snapshot}")
+    next_sequence = 4
+    if invalid_snapshot == "reused_pre_open_connection":
+        prior = _envelope(
+            run_id,
+            next_sequence,
+            WS_MARKET,
+            _websocket_book_payload(
+                _fixture("polymarket_rest_book_yes.json"),
+                label="pre-open-connection",
+            ),
+            connection_id=prior_connection,
+            transport_metadata={"websocket_admission_ordinal": 1},
+        )
+        assert processor.process_replayed(prior).success
+        next_sequence += 1
+
+    mismatched_payload = _fixture("polymarket_rest_book_yes.json").replace(
+        b'"price": "0.40", "size": "10"',
+        b'"price": "0.40", "size": "11"',
+    )
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        next_sequence,
+        request_id=f"v2-capture-reject-{invalid_snapshot}",
+        trigger_reason=AuditTriggerReason.PERIODIC,
+    )
+    assert processor.process_replayed(intent).success
+    assert processor.process_replayed(
+        _audit_response(run_id, next_sequence + 1, start, mismatched_payload, boundary=0)
+    ).needs_resync
+    resolution = _envelope(run_id, next_sequence + 2, REST_BOOK, mismatched_payload)
+    assert processor.process_replayed(resolution).success
+    assert processor.summary().audit_replacement_captures_pending == 1
+
+    before = processor.summary()
+    before_snapshots = processor.snapshots()
+    sequence = next_sequence + 3
+    monotonic_ns = resolution.received_monotonic.nanoseconds + 1
+    replacement_connection = ConnectionId(f"v2-new-{invalid_snapshot}")
+    metadata: dict[str, str | int | bool] | None = {
+        "websocket_admission_ordinal": 1,
+    }
+    if invalid_snapshot == "missing_admission_ordinal":
+        metadata = None
+    elif invalid_snapshot == "pre_resolution_monotonic":
+        monotonic_ns = resolution.received_monotonic.nanoseconds - 1
+    elif invalid_snapshot == "pre_resolution_ingest":
+        sequence = resolution.ingest_seq
+    elif invalid_snapshot == "original_connection":
+        replacement_connection = start.connection_id
+    elif invalid_snapshot == "reused_pre_open_connection":
+        replacement_connection = prior_connection
+        metadata = {"websocket_admission_ordinal": 2}
+
+    rejected = processor.process_replayed(
+        _envelope(
+            run_id,
+            sequence,
+            WS_MARKET,
+            _websocket_book_payload(
+                _fixture("polymarket_rest_book_yes.json").replace(
+                    b'"price": "0.40", "size": "10"',
+                    b'"price": "0.40", "size": "11"',
+                ),
+                label=invalid_snapshot,
+            ),
+            monotonic_ns=monotonic_ns,
+            connection_id=replacement_connection,
+            transport_metadata=metadata,
+        )
+    )
+    after = processor.summary()
+
+    assert not rejected.success
+    assert rejected.error_type == "NormalizationError"
+    assert rejected.scan_count == 0
+    assert after.scans == before.scans
+    assert after.canonical_events == before.canonical_events
+    assert processor.snapshots() == before_snapshots
+    assert after.audit_replacement_captures_pending == 1
+    assert after.audit_ineligible_books == 1
+    assert not processor.audit_replacement_release_commands(
+        connection_id=replacement_connection,
+        decision_monotonic=MonotonicTimestamp(
+            run_id.value,
+            monotonic_ns,
+        ),
+    )
+
+    if invalid_snapshot == "reused_pre_open_connection":
+        valid_connection = ConnectionId("v2-actual-post-open-connection")
+        assert processor.process_replayed(
+            _envelope(
+                run_id,
+                next_sequence + 4,
+                WS_MARKET,
+                _websocket_book_payload(mismatched_payload, label="post-open-yes"),
+                monotonic_ns=2_000,
+                connection_id=valid_connection,
+                transport_metadata={"websocket_admission_ordinal": 1},
+            )
+        ).success
+        assert processor.process_replayed(
+            _envelope(
+                run_id,
+                next_sequence + 5,
+                WS_MARKET,
+                _websocket_book_payload(_no_book(), label="post-open-no"),
+                monotonic_ns=2_001,
+                connection_id=valid_connection,
+                transport_metadata={"websocket_admission_ordinal": 2},
+            )
+        ).success
+        commands = processor.audit_replacement_release_commands(
+            connection_id=valid_connection,
+            decision_monotonic=MonotonicTimestamp(run_id.value, 2_001),
+        )
+        assert len(commands) == 1
+        capture_record = commands[0].capture_record
+        assert capture_record["pre_open_connection_count"] == 1
+        assert (
+            capture_record["pre_open_connection_ids_sha256"]
+            == hashlib.sha256(
+                canonical_json_bytes(
+                    {
+                        "connection_ids": (prior_connection.value,),
+                        "schema": "mma-audit-replacement-pre-open-connections-v1",
+                    }
+                )
+            ).hexdigest()
+        )
+        assert capture_record["resolution_ingest_seq"] == resolution.ingest_seq
+        assert capture_record["resolution_source"] == {
+            "ingest_id": resolution.ingest_id.value,
+            "payload_sha256": resolution.payload_sha256,
+        }
+
+
+@pytest.mark.parametrize("invalid_time", ["cross_epoch", "future", "stale"])
+def test_v2_replacement_release_control_rejects_invalid_freshness_chronology(
+    invalid_time: str,
+) -> None:
+    config, run_id, processor, replacement_connection, valid = _pending_v2_replacement_release(
+        invalid_time
+    )
+    maximum_age_ns = int(config.scanner.maximum_book_age_seconds * 1_000_000_000)
+    if invalid_time == "cross_epoch":
+        invalid = replace(valid, monotonic_epoch_id=f"{run_id.value}-other")
+        envelope_monotonic_ns = valid.decision_monotonic_ns
+    elif invalid_time == "future":
+        invalid = replace(valid, decision_monotonic_ns=2_000)
+        envelope_monotonic_ns = 2_000
+    else:
+        invalid = replace(valid, decision_monotonic_ns=2_001 + maximum_age_ns + 1)
+        envelope_monotonic_ns = invalid.decision_monotonic_ns
+
+    rejected = processor.process_replayed(
+        _envelope(
+            run_id,
+            9,
+            CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
+            invalid.to_payload(),
+            monotonic_ns=envelope_monotonic_ns,
+            connection_id=replacement_connection,
+        )
+    )
+    assert not rejected.success
+    assert rejected.error_type == "NormalizationError"
+    assert processor.summary().audit_replacement_captures_pending == 1
+    assert processor.audit_ineligible_instruments
+
+
+def test_v2_replacement_release_rejects_decision_before_latest_required_l2() -> None:
+    _, run_id, processor, replacement_connection, stale_command = _pending_v2_replacement_release(
+        "future-current-book"
+    )
+    intervening = processor.process_replayed(
+        _envelope(
+            run_id,
+            9,
+            WS_MARKET,
+            _price_change_payload(
+                bid_size="5",
+                timestamp="1787198403000",
+            ),
+            monotonic_ns=3_000,
+            connection_id=replacement_connection,
+            transport_metadata={"websocket_admission_ordinal": 3},
+        )
+    )
+    assert intervening.success
+    assert intervening.scan_count == 0
+    assert not processor.audit_replacement_release_commands(
+        connection_id=replacement_connection,
+        decision_monotonic=MonotonicTimestamp(
+            run_id.value,
+            stale_command.decision_monotonic_ns,
+        ),
+    )
+    before = processor.summary()
+
+    rejected = processor.process_replayed(
+        _envelope(
+            run_id,
+            10,
+            CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
+            stale_command.to_payload(),
+            monotonic_ns=stale_command.decision_monotonic_ns,
+            connection_id=replacement_connection,
+        )
+    )
+    after = processor.summary()
+
+    assert not rejected.success
+    assert rejected.error_type == "NormalizationError"
+    assert rejected.scan_count == 0
+    assert after.scans == before.scans
+    assert after.audit_replacement_captures_pending == 1
+    assert after.audit_ineligible_books == 1
+
+
+def test_v2_replacement_release_waits_for_sibling_reported_top_reconciliation() -> None:
+    _, run_id, processor, replacement_connection, stale_command = _pending_v2_replacement_release(
+        "sibling-reported-top"
+    )
+    sibling_transition = processor.process_replayed(
+        _envelope(
+            run_id,
+            9,
+            WS_MARKET,
+            canonical_json_bytes(
+                {
+                    "asset_id": "token-no",
+                    "best_ask": "0.35",
+                    "best_bid": "0.31",
+                    "event_type": "best_bid_ask",
+                    "market": "0xcondition",
+                    "spread": "0.04",
+                    "timestamp": "1787198402002",
+                }
+            ),
+            monotonic_ns=2_002,
+            connection_id=replacement_connection,
+            transport_metadata={"websocket_admission_ordinal": 3},
+        )
+    )
+    assert sibling_transition.success
+    assert sibling_transition.scan_count == 0
+    assert len(processor.reported_top_transitions) == 1
+    assert not processor.audit_replacement_release_commands(
+        connection_id=replacement_connection,
+        decision_monotonic=MonotonicTimestamp(run_id.value, 2_002),
+    )
+
+    rejected = processor.process_replayed(
+        _envelope(
+            run_id,
+            10,
+            CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
+            stale_command.to_payload(),
+            monotonic_ns=stale_command.decision_monotonic_ns,
+            connection_id=replacement_connection,
+        )
+    )
+    assert not rejected.success
+    assert rejected.scan_count == 0
+    assert processor.summary().audit_replacement_captures_pending == 1
+
+    reconciled = processor.process_replayed(
+        _envelope(
+            run_id,
+            11,
+            WS_MARKET,
+            _websocket_book_payload(_no_book(), label="sibling-reconciled"),
+            monotonic_ns=2_003,
+            connection_id=replacement_connection,
+            transport_metadata={"websocket_admission_ordinal": 4},
+        )
+    )
+    assert reconciled.success
+    assert reconciled.scan_count == 0
+    assert not processor.reported_top_transitions
+    commands = processor.audit_replacement_release_commands(
+        connection_id=replacement_connection,
+        decision_monotonic=MonotonicTimestamp(run_id.value, 2_003),
+    )
+    assert len(commands) == 1
+
+    released = processor.process_replayed(
+        _envelope(
+            run_id,
+            12,
+            CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
+            commands[0].to_payload(),
+            monotonic_ns=2_003,
+            connection_id=replacement_connection,
+        )
+    )
+    assert released.success
+    assert released.scan_count == 1
+    assert processor.summary().audit_replacement_captures_pending == 0
+    assert not processor.audit_ineligible_instruments
+
+
+def test_v2_multi_capture_group_restores_only_after_final_control() -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId("processor-v2-multi-capture-release")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    yes_payload = _fixture("polymarket_rest_book_yes.json").replace(
+        b'"price": "0.40", "size": "10"',
+        b'"price": "0.40", "size": "11"',
+    )
+    no_payload = _no_book().replace(
+        b'"price":"0.30","size":"20"',
+        b'"price":"0.30","size":"21"',
+    )
+    yes_start, yes_intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="multi-capture-yes",
+        trigger_reason=AuditTriggerReason.PERIODIC,
+    )
+    no_start, no_intent = _audit_start(
+        processor,
+        run_id,
+        5,
+        request_id="multi-capture-no",
+        native_asset_id="token-no",
+        trigger_reason=AuditTriggerReason.PERIODIC,
+    )
+    assert processor.process_replayed(yes_intent).success
+    assert processor.process_replayed(no_intent).success
+    assert processor.process_replayed(
+        _audit_response(run_id, 6, yes_start, yes_payload, boundary=0)
+    ).needs_resync
+    assert processor.process_replayed(
+        _audit_response(run_id, 7, no_start, no_payload, boundary=0)
+    ).needs_resync
+    assert processor.process_replayed(_envelope(run_id, 8, REST_BOOK, yes_payload)).success
+    assert processor.process_replayed(_envelope(run_id, 9, REST_BOOK, no_payload)).success
+    assert processor.summary().audit_replacement_captures_pending == 2
+
+    replacement_connection = ConnectionId("processor-v2-multi-capture-connection")
+    assert (
+        processor.process_replayed(
+            _envelope(
+                run_id,
+                10,
+                WS_MARKET,
+                _websocket_book_payload(yes_payload, label="multi-yes"),
+                monotonic_ns=2_000,
+                connection_id=replacement_connection,
+                transport_metadata={"websocket_admission_ordinal": 1},
+            )
+        ).scan_count
+        == 0
+    )
+    assert (
+        processor.process_replayed(
+            _envelope(
+                run_id,
+                11,
+                WS_MARKET,
+                _websocket_book_payload(no_payload, label="multi-no"),
+                monotonic_ns=2_001,
+                connection_id=replacement_connection,
+                transport_metadata={"websocket_admission_ordinal": 2},
+            )
+        ).scan_count
+        == 0
+    )
+    commands = processor.audit_replacement_release_commands(
+        connection_id=replacement_connection,
+        decision_monotonic=MonotonicTimestamp(run_id.value, 2_001),
+    )
+    assert len(commands) == 2
+
+    first = processor.process_replayed(
+        _envelope(
+            run_id,
+            12,
+            CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
+            commands[0].to_payload(),
+            monotonic_ns=2_001,
+            connection_id=replacement_connection,
+        )
+    )
+    assert first.success
+    assert first.scan_count == 0
+    assert processor.summary().audit_replacement_captures_pending == 1
+    second = processor.process_replayed(
+        _envelope(
+            run_id,
+            13,
+            CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
+            commands[1].to_payload(),
+            monotonic_ns=2_001,
+            connection_id=replacement_connection,
+        )
+    )
+    assert second.success
+    assert second.scan_count == 1
+    assert processor.summary().audit_replacement_captures_pending == 0
+    assert not processor.audit_ineligible_instruments
+
+
+@pytest.mark.parametrize(
+    "invalid_evidence",
+    [
+        "wrong_connection",
+        "wrong_receive_boundary",
+        "tampered_capture_preimage",
+        "tampered_capture_digest",
+        "noncanonical_payload",
+        "pre_capture_ingest_boundary",
+    ],
+)
+def test_v2_replacement_release_rejects_invalid_durable_evidence_without_mutation(
+    invalid_evidence: str,
+) -> None:
+    _, run_id, processor, replacement_connection, valid = _pending_v2_replacement_release(
+        invalid_evidence
+    )
+    payload = valid.to_payload()
+    envelope_sequence = 9
+    envelope_connection = replacement_connection
+    envelope_monotonic_ns = valid.decision_monotonic_ns
+    if invalid_evidence == "wrong_connection":
+        envelope_connection = ConnectionId("wrong-release-control-connection")
+    elif invalid_evidence == "wrong_receive_boundary":
+        envelope_monotonic_ns += 1
+    elif invalid_evidence == "tampered_capture_preimage":
+        record = cast(dict[str, object], json.loads(payload))
+        capture_record = cast(dict[str, object], record["capture_record"])
+        capture_record["original_connection_id"] = "tampered-original-connection"
+        payload = canonical_json_bytes(record)
+    elif invalid_evidence == "tampered_capture_digest":
+        record = cast(dict[str, object], json.loads(payload))
+        record["capture_state_sha256"] = "0" * 64
+        payload = canonical_json_bytes(record)
+    elif invalid_evidence == "pre_capture_ingest_boundary":
+        envelope_sequence = 8
+    else:
+        payload = b" " + payload
+    before = processor.summary()
+
+    rejected = processor.process_replayed(
+        _envelope(
+            run_id,
+            envelope_sequence,
+            CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
+            payload,
+            monotonic_ns=envelope_monotonic_ns,
+            connection_id=envelope_connection,
+        )
+    )
+    after = processor.summary()
+
+    assert not rejected.success
+    assert rejected.error_type == "NormalizationError"
+    assert rejected.scan_count == 0
+    assert after.scans == before.scans
+    assert (
+        after.audit_replacement_captures_pending == before.audit_replacement_captures_pending == 1
+    )
+    assert after.audit_ineligible_books == before.audit_ineligible_books == 1
+    assert processor.audit_replacement_release_commands(
+        connection_id=replacement_connection,
+        decision_monotonic=MonotonicTimestamp(
+            run_id.value,
+            valid.decision_monotonic_ns,
+        ),
+    ) == (valid,)
+
+
+def test_audit_replacement_release_capture_record_has_exact_parser_bound() -> None:
+    _, _, _, _, valid = _pending_v2_replacement_release("capture-record-bound")
+    capture_record = valid.capture_record
+    capture_record["original_connection_id"] = ""
+    base_size = len(canonical_json_bytes(capture_record))
+    capture_record["original_connection_id"] = "x" * (
+        AUDIT_REPLACEMENT_CAPTURE_MAX_BYTES - base_size
+    )
+    bounded = AuditReplacementReleaseCommand.create(
+        divergence_id=valid.divergence_id,
+        instrument_id=valid.instrument_id,
+        market_id=valid.market_id,
+        replacement_connection_id=valid.replacement_connection_id,
+        capture_record=capture_record,
+        monotonic_epoch_id=valid.monotonic_epoch_id,
+        decision_monotonic_ns=valid.decision_monotonic_ns,
+    )
+
+    assert len(bounded.capture_record_json.encode("utf-8")) == (AUDIT_REPLACEMENT_CAPTURE_MAX_BYTES)
+    assert (
+        AuditReplacementReleaseCommand(
+            divergence_id=bounded.divergence_id,
+            instrument_id=bounded.instrument_id,
+            market_id=bounded.market_id,
+            replacement_connection_id=bounded.replacement_connection_id,
+            capture_state_sha256=bounded.capture_state_sha256,
+            capture_record_json=bounded.capture_record_json,
+            monotonic_epoch_id=bounded.monotonic_epoch_id,
+            decision_monotonic_ns=bounded.decision_monotonic_ns,
+        )
+        == bounded
+    )
+
+    oversized_record = bounded.capture_record
+    oversized_record["original_connection_id"] = (
+        cast(
+            str,
+            oversized_record["original_connection_id"],
+        )
+        + "x"
+    )
+    with pytest.raises(ValueError, match="capture record exceeds its bound"):
+        AuditReplacementReleaseCommand.create(
+            divergence_id=valid.divergence_id,
+            instrument_id=valid.instrument_id,
+            market_id=valid.market_id,
+            replacement_connection_id=valid.replacement_connection_id,
+            capture_record=oversized_record,
+            monotonic_epoch_id=valid.monotonic_epoch_id,
+            decision_monotonic_ns=valid.decision_monotonic_ns,
+        )
+
+
+def test_failed_resnapshot_and_disconnect_leave_divergence_pending_until_recovery() -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId("processor-divergence-failed-recovery")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    mismatched_payload = _fixture("polymarket_rest_book_yes.json").replace(
+        b'"price": "0.40", "size": "10"',
+        b'"price": "0.40", "size": "11"',
+    )
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="failed-authoritative-recovery",
+        trigger_reason=AuditTriggerReason.FRESHNESS_GUARD,
+    )
+    assert processor.process_replayed(intent).success
+    mismatch = _audit_response(run_id, 5, start, mismatched_payload, boundary=0)
+    assert processor.process_replayed(mismatch).needs_resync
+
+    malformed_resnapshot = _envelope(run_id, 6, REST_BOOK, b"{}")
+    failed = processor.process_replayed(malformed_resnapshot)
+    after_failure = processor.summary()
+    assert not failed.success
+    assert failed.error_type == "PolymarketSchemaError"
+    assert after_failure.audit_divergences_pending == 1
+    assert after_failure.audit_divergences_unresolved == 1
+    assert after_failure.audit_divergences_resolved_by_authoritative_resnapshot == 0
+    assert after_failure.audit_divergence_lifecycle_reconciled
+
+    disconnect = _envelope(
+        run_id,
+        7,
+        CONTROL_BOOK_INVALIDATION,
+        canonical_json_bytes({"reason": InvalidationReason.DISCONNECT.value}),
+    )
+    assert processor.process_replayed(disconnect).success
+    after_disconnect = processor.summary()
+    assert after_disconnect.audit_divergences_pending == 1
+    assert after_disconnect.audit_divergences_unresolved == 1
+    assert all(owner.health is BookHealth.INVALID for owner in processor.owners)
+
+    authoritative_resnapshot = _envelope(run_id, 8, REST_BOOK, mismatched_payload)
+    assert processor.process_replayed(authoritative_resnapshot).success
+    recovered = processor.summary()
+    assert recovered.audit_divergences_pending == 0
+    assert recovered.audit_divergences_unresolved == 0
+    assert recovered.audit_divergences_resolved_by_authoritative_resnapshot == 1
+    assert recovered.audit_divergence_lifecycle_reconciled
+
+
+def test_deferred_mismatch_binds_exact_classification_control_provenance() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    processor = CanonicalProcessor(config)
+    run_id = CollectorRunId("processor-deferred-divergence-provenance")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    mismatched_payload = _fixture("polymarket_rest_book_yes.json").replace(
+        b'"price": "0.40", "size": "10"',
+        b'"price": "0.40", "size": "11"',
+    )
+    hard_expiry_ns = _bootstrap_hard_expiry_ns(config)
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="deferred-divergence",
+        hard_expiry_monotonic_ns=hard_expiry_ns,
+        response_deadline_monotonic_ns=900,
+        trigger_reason=AuditTriggerReason.RESYNC_VERIFICATION,
+    )
+    assert processor.process_replayed(intent).success
+    response = _audit_response(
+        run_id,
+        5,
+        start,
+        mismatched_payload,
+        boundary=0,
+        classification_deferred=True,
+    )
+    staged = processor.process_replayed(response)
+    assert staged.success
+    assert not staged.audit_outcomes
+    classification = AuditClassificationCommand(
+        request_id=start.request_id,
+        response_ingest_seq=response.ingest_seq,
+        classification_monotonic_ns=800,
+        hard_expiry_monotonic_ns=hard_expiry_ns,
+    )
+    classification_envelope = _envelope(
+        run_id,
+        6,
+        CONTROL_REST_AUDIT_CLASSIFY,
+        classification.to_payload(),
+        monotonic_ns=classification.classification_monotonic_ns,
+        connection_id=start.connection_id,
+    )
+    classified = processor.process_replayed(classification_envelope)
+    summary = processor.summary()
+
+    assert classified.success
+    assert classified.audit_outcomes[0].outcome is AuditOutcome.MISMATCH
+    pending = summary.audit_divergence_pending_records[0]
+    expected_classification_source = RawSourceRef(
+        ingest_id=classification_envelope.ingest_id,
+        payload_sha256=classification_envelope.payload_sha256,
+    )
+    assert pending.classification_source == expected_classification_source
+    assert pending.classification_control_source == expected_classification_source
+    assert pending.classification_received_wall_time == classification_envelope.received_wall_time
+    assert (
+        pending.classification_received_monotonic_ns == classification.classification_monotonic_ns
+    )
+    diagnostic = pending.audit_outcome.mismatch_diagnostic
+    assert diagnostic is not None
+    assert diagnostic.response_source.ingest_id == response.ingest_id
+    assert pending.audit_start_control_source.ingest_id == intent.ingest_id
+    assert pending.audit_outcome.trigger_reason is AuditTriggerReason.RESYNC_VERIFICATION
+
+    resnapshot = _envelope(
+        run_id,
+        7,
+        REST_BOOK,
+        mismatched_payload,
+        monotonic_ns=classification.classification_monotonic_ns + 1,
+    )
+    assert processor.process_replayed(resnapshot).success
+    resolution = processor.summary().audit_divergence_resolution_records[0]
+    with pytest.raises(ValueError, match="precedes its classification"):
+        replace(
+            resolution,
+            resolved_monotonic_ns=classification.classification_monotonic_ns - 1,
+        )
 
 
 def test_equal_depth_reference_scalar_mismatch_remains_immediate_unknown() -> None:
@@ -1450,6 +2579,70 @@ def test_equal_depth_reference_scalar_mismatch_remains_immediate_unknown() -> No
     assert dict(processor.summary().audit_mismatch_cause_counts) == {
         cause: int(cause is AuditMismatchCause.UNKNOWN) for cause in AuditMismatchCause
     }
+
+
+def test_unknown_v2_divergence_cannot_restore_research_eligibility() -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId("processor-unknown-v2-release-blocked")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="unknown-v2-release-blocked",
+        trigger_reason=AuditTriggerReason.PERIODIC,
+    )
+    assert processor.process_replayed(intent).success
+    scalar_mismatch = _fixture("polymarket_rest_book_yes.json").replace(
+        b'"tick_size": "0.01"',
+        b'"tick_size": "0.001"',
+    )
+    mismatch = processor.process_replayed(
+        _audit_response(run_id, 5, start, scalar_mismatch, boundary=0)
+    )
+    assert mismatch.needs_resync
+    diagnostic = mismatch.audit_outcomes[0].mismatch_diagnostic
+    assert diagnostic is not None
+    assert diagnostic.cause is AuditMismatchCause.UNKNOWN
+    authoritative = _fixture("polymarket_rest_book_yes.json")
+    assert processor.process_replayed(_envelope(run_id, 6, REST_BOOK, authoritative)).success
+
+    replacement_connection = ConnectionId("unknown-v2-replacement")
+    first = processor.process_replayed(
+        _envelope(
+            run_id,
+            7,
+            WS_MARKET,
+            _websocket_book_payload(authoritative, label="unknown-yes"),
+            monotonic_ns=2_000,
+            connection_id=replacement_connection,
+            transport_metadata={"websocket_admission_ordinal": 1},
+        )
+    )
+    second = processor.process_replayed(
+        _envelope(
+            run_id,
+            8,
+            WS_MARKET,
+            _websocket_book_payload(_no_book(), label="unknown-no"),
+            monotonic_ns=2_001,
+            connection_id=replacement_connection,
+            transport_metadata={"websocket_admission_ordinal": 2},
+        )
+    )
+
+    assert first.success
+    assert second.success
+    assert first.scan_count == second.scan_count == 0
+    assert not processor.audit_replacement_release_commands(
+        connection_id=replacement_connection,
+        decision_monotonic=MonotonicTimestamp(run_id.value, 2_001),
+    )
+    summary = processor.summary()
+    assert summary.audit_divergences_unknown == 1
+    assert summary.audit_replacement_captures_pending == 1
+    assert summary.audit_ineligible_books == 1
 
 
 def test_rest_audit_fence_distinguishes_economic_race_from_last_trade() -> None:

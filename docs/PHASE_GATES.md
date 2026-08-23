@@ -8,7 +8,10 @@ This is the compact operational index. Detailed requirements are in `LIVE_READIN
 G1 — Polymarket Observation: FAIL
 ```
 
-The first six-hour soak is retained as failure evidence. ADR-0053 and `GATE_1_REMEDIATION_SPEC.md` govern the correction and mandatory rerun.
+The first six-hour soak is retained as failure evidence. ADR-0053, ADR-0054 and
+`GATE_1_REMEDIATION_SPEC.md` govern the correction and mandatory rerun. Final
+offline gates plus a new exact-SHA 60-second smoke and 45–60 minute stability
+observation remain pending; no replacement six-hour soak has been run.
 
 | Gate | Name | Current status | Real orders allowed? |
 |---|---|---|---:|

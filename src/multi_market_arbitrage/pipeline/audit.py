@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Final, Protocol
+from typing import Final, Protocol, cast
 
 from multi_market_arbitrage.core.exact import ExactDecimal, Price, Quantity
 from multi_market_arbitrage.core.ids import (
@@ -20,14 +21,22 @@ from multi_market_arbitrage.core.provenance import RawSourceRef
 from multi_market_arbitrage.core.serialization import canonical_json_bytes, canonical_sha256
 from multi_market_arbitrage.core.time import UtcTimestamp
 
-AUDIT_START_SCHEMA: Final = "mma-rest-audit-start-v1"
+AUDIT_START_V1_SCHEMA: Final = "mma-rest-audit-start-v1"
+AUDIT_START_V2_SCHEMA: Final = "mma-rest-audit-start-v2"
+# New producers use v2.  The explicit v1 constant remains available to readers
+# that must interpret immutable historical controls without upgrading them.
+AUDIT_START_SCHEMA: Final = AUDIT_START_V2_SCHEMA
 AUDIT_FAILURE_SCHEMA: Final = "mma-rest-audit-failure-v1"
 AUDIT_EXPIRY_SCHEMA: Final = "mma-rest-audit-expiry-v1"
 AUDIT_CLASSIFICATION_SCHEMA: Final = "mma-rest-audit-classification-v1"
+AUDIT_REPLACEMENT_RELEASE_SCHEMA: Final = "mma-rest-audit-replacement-release-v1"
 AUDIT_MISMATCH_DIAGNOSTIC_SCHEMA: Final = "mma-rest-audit-mismatch-diagnostic-v1"
 AUDIT_REST_BOOK_IDENTITY_SCHEMA: Final = "mma-rest-audit-rest-book-identity-v1"
 AUDIT_EXACT_DEPTH_DIFFERENCE_SCHEMA: Final = "mma-rest-audit-depth-difference-v1"
 AUDIT_RAW_SOURCE_SUMMARY_SCHEMA: Final = "mma-rest-audit-raw-source-summary-v1"
+AUDIT_DIVERGENCE_PENDING_SCHEMA: Final = "mma-rest-audit-divergence-pending-v1"
+AUDIT_DIVERGENCE_RESOLUTION_SCHEMA: Final = "mma-rest-audit-divergence-resolution-v1"
+AUDIT_REPLACEMENT_CAPTURE_MAX_BYTES: Final = 65_536
 
 # These limits match or exceed the corresponding owner bounds while ensuring
 # diagnostic construction cannot become a history-sized allocation.
@@ -57,6 +66,26 @@ class AuditOutcome(StrEnum):
     MISMATCH = "MISMATCH"
     RACED = "RACED"
     FAILED = "FAILED"
+
+
+class AuditTriggerReason(StrEnum):
+    """Finite reason that caused an audit request to be launched."""
+
+    PERIODIC = "PERIODIC"
+    FRESHNESS_GUARD = "FRESHNESS_GUARD"
+    RACE_RETRY = "RACE_RETRY"
+    RESYNC_VERIFICATION = "RESYNC_VERIFICATION"
+    STARTUP_BASELINE = "STARTUP_BASELINE"
+    OTHER_TYPED_REASON = "OTHER_TYPED_REASON"
+    # Historical v1 controls omitted a trigger.  Replay makes that absence
+    # explicit; it never guesses a modern reason from surrounding timing.
+    UNKNOWN_LEGACY = "UNKNOWN_LEGACY"
+
+
+class AuditDivergenceResolutionStatus(StrEnum):
+    """ADR-0054 resolution outcomes implemented by the immediate fallback."""
+
+    AUTHORITATIVE_RESNAPSHOT = "AUTHORITATIVE_RESNAPSHOT"
 
 
 class AuditFailureReason(StrEnum):
@@ -583,6 +612,8 @@ class AuditStartEvidence:
     starting_admission_watermark: WebSocketAdmissionWatermark
     starting_processed_watermark: WebSocketAdmissionWatermark
     starting_book: AuditBookIdentity
+    trigger_reason: AuditTriggerReason = AuditTriggerReason.OTHER_TYPED_REASON
+    schema: str = AUDIT_START_SCHEMA
 
     def __post_init__(self) -> None:
         if not self.request_id or len(self.request_id) > 128:
@@ -599,21 +630,32 @@ class AuditStartEvidence:
             raise ValueError("audit processed watermark belongs to another connection")
         if self.starting_processed_watermark.ordinal > self.starting_admission_watermark.ordinal:
             raise ValueError("processed watermark cannot exceed admitted watermark")
+        if self.schema == AUDIT_START_V1_SCHEMA:
+            if self.trigger_reason is not AuditTriggerReason.UNKNOWN_LEGACY:
+                raise ValueError("v1 audit start must expose UNKNOWN_LEGACY trigger")
+        elif self.schema == AUDIT_START_V2_SCHEMA:
+            if self.trigger_reason is AuditTriggerReason.UNKNOWN_LEGACY:
+                raise ValueError("v2 audit start cannot claim a legacy-unknown trigger")
+        else:
+            raise ValueError("audit start schema is unsupported")
 
     def to_record(self) -> dict[str, object]:
-        return {
+        record: dict[str, object] = {
             "attempt": self.attempt,
             "connection_id": self.connection_id.value,
             "instrument_id": self.starting_book.instrument_id.value,
             "native_asset_id": self.native_asset_id,
             "request_id": self.request_id,
             "request_started_monotonic_ns": self.request_started_monotonic_ns,
-            "schema": AUDIT_START_SCHEMA,
+            "schema": self.schema,
             "starting_admission_ordinal": self.starting_admission_watermark.ordinal,
             "starting_book_economic_sha256": (self.starting_book.economic_content_sha256),
             "starting_book_generation": self.starting_book.generation,
             "starting_processed_ordinal": self.starting_processed_watermark.ordinal,
         }
+        if self.schema == AUDIT_START_V2_SCHEMA:
+            record["trigger_reason"] = self.trigger_reason.value
+        return record
 
     def to_payload(self) -> bytes:
         return canonical_json_bytes(self.to_record())
@@ -698,6 +740,112 @@ class AuditClassificationCommand:
 
 
 @dataclass(frozen=True, slots=True)
+class AuditReplacementReleaseCommand:
+    """Durable coordinator proof that releases one replacement capture.
+
+    ``capture_state_sha256`` commits the exact bounded capture record, including
+    every required full-snapshot raw source, admission ordinal, ingest sequence,
+    connection, and monotonic receive timestamp.  The control receive boundary
+    is the single coordinator freshness decision used by both live processing
+    and deterministic replay.
+    """
+
+    divergence_id: str
+    instrument_id: InstrumentId
+    market_id: MarketId
+    replacement_connection_id: ConnectionId
+    capture_state_sha256: str
+    capture_record_json: str
+    monotonic_epoch_id: str
+    decision_monotonic_ns: int
+
+    def __post_init__(self) -> None:
+        if not is_sha256_hex(self.divergence_id):
+            raise ValueError("audit replacement release divergence ID must be SHA-256 hex")
+        if not is_sha256_hex(self.capture_state_sha256):
+            raise ValueError("audit replacement release capture identity must be SHA-256 hex")
+        capture_record_bytes = self.capture_record_json.encode("utf-8")
+        if not 0 < len(capture_record_bytes) <= AUDIT_REPLACEMENT_CAPTURE_MAX_BYTES:
+            raise ValueError("audit replacement release capture record exceeds its bound")
+        try:
+            raw_capture_record: object = json.loads(self.capture_record_json)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise ValueError("audit replacement release capture record is invalid") from error
+        if not isinstance(raw_capture_record, dict):
+            raise ValueError("audit replacement release capture record shape is invalid")
+        capture_record = cast(dict[str, object], raw_capture_record)
+        if set(capture_record) != {
+            "captured_snapshot_sources",
+            "divergence_id",
+            "market_id",
+            "mismatch_cause",
+            "original_connection_id",
+            "pre_open_connection_count",
+            "pre_open_connection_ids_sha256",
+            "replacement_connection_id",
+            "resolution_ingest_seq",
+            "resolution_monotonic",
+            "resolution_source",
+            "required_instrument_ids",
+        }:
+            raise ValueError("audit replacement release capture record shape is invalid")
+        if canonical_json_bytes(capture_record) != capture_record_bytes:
+            raise ValueError("audit replacement release capture record must be canonical")
+        if hashlib.sha256(capture_record_bytes).hexdigest() != self.capture_state_sha256:
+            raise ValueError("audit replacement release capture record differs from its digest")
+        if not self.monotonic_epoch_id or len(self.monotonic_epoch_id) > 256:
+            raise ValueError("audit replacement release monotonic epoch is invalid")
+        if self.decision_monotonic_ns < 0:
+            raise ValueError("audit replacement release decision time cannot be negative")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        divergence_id: str,
+        instrument_id: InstrumentId,
+        market_id: MarketId,
+        replacement_connection_id: ConnectionId,
+        capture_record: object,
+        monotonic_epoch_id: str,
+        decision_monotonic_ns: int,
+    ) -> AuditReplacementReleaseCommand:
+        capture_record_bytes = canonical_json_bytes(capture_record)
+        return cls(
+            divergence_id=divergence_id,
+            instrument_id=instrument_id,
+            market_id=market_id,
+            replacement_connection_id=replacement_connection_id,
+            capture_state_sha256=hashlib.sha256(capture_record_bytes).hexdigest(),
+            capture_record_json=capture_record_bytes.decode("utf-8"),
+            monotonic_epoch_id=monotonic_epoch_id,
+            decision_monotonic_ns=decision_monotonic_ns,
+        )
+
+    @property
+    def capture_record(self) -> dict[str, object]:
+        raw_record: object = json.loads(self.capture_record_json)
+        if not isinstance(raw_record, dict):  # pragma: no cover - enforced at construction
+            raise AssertionError("validated audit replacement capture record changed shape")
+        return cast(dict[str, object], raw_record)
+
+    def to_payload(self) -> bytes:
+        return canonical_json_bytes(
+            {
+                "capture_state_sha256": self.capture_state_sha256,
+                "capture_record": self.capture_record,
+                "decision_monotonic_ns": self.decision_monotonic_ns,
+                "divergence_id": self.divergence_id,
+                "instrument_id": self.instrument_id,
+                "market_id": self.market_id,
+                "monotonic_epoch_id": self.monotonic_epoch_id,
+                "replacement_connection_id": self.replacement_connection_id,
+                "schema": AUDIT_REPLACEMENT_RELEASE_SCHEMA,
+            }
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class AuditHttpResponseHandoff:
     """Immutable request-scoped handoff captured at the HTTP response boundary."""
 
@@ -765,6 +913,8 @@ class AuditOutcomeEvidence:
     # Optional only for source compatibility with pre-v1 producers.  New
     # MISMATCH producers should always attach the deterministic diagnostic.
     mismatch_diagnostic: AuditMismatchDiagnostic | None = None
+    audit_start_schema: str = AUDIT_START_SCHEMA
+    trigger_reason: AuditTriggerReason = AuditTriggerReason.OTHER_TYPED_REASON
 
     def __post_init__(self) -> None:
         if not self.request_id or len(self.request_id) > 128:
@@ -828,10 +978,219 @@ class AuditOutcomeEvidence:
                 raise ValueError("audit mismatch diagnostic identifies another response ingest")
             if self.raw_response_sha256 != response_source.payload_sha256:
                 raise ValueError("audit mismatch diagnostic identifies another response payload")
+        if self.audit_start_schema == AUDIT_START_V1_SCHEMA:
+            if self.trigger_reason is not AuditTriggerReason.UNKNOWN_LEGACY:
+                raise ValueError("v1 audit outcome must expose UNKNOWN_LEGACY trigger")
+        elif self.audit_start_schema == AUDIT_START_V2_SCHEMA:
+            if self.trigger_reason is AuditTriggerReason.UNKNOWN_LEGACY:
+                raise ValueError("v2 audit outcome cannot claim a legacy-unknown trigger")
+        else:
+            raise ValueError("audit outcome start schema is unsupported")
+
+
+def _audit_divergence_id(
+    *,
+    audit_outcome: AuditOutcomeEvidence,
+    audit_start_control_source: RawSourceRef,
+    classification_source: RawSourceRef,
+    classification_control_source: RawSourceRef | None,
+) -> str:
+    return canonical_sha256(
+        {
+            "audit_outcome": audit_outcome,
+            "audit_start_control_source": audit_start_control_source,
+            "classification_source": classification_source,
+            "classification_control_source": classification_control_source,
+            "schema": AUDIT_DIVERGENCE_PENDING_SCHEMA,
+        }
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class AuditDivergencePending:
+    """Exact unresolved mismatch state retained until a separate REST baseline."""
+
+    divergence_id: str
+    market_id: MarketId
+    audit_outcome: AuditOutcomeEvidence
+    audit_start_control_source: RawSourceRef
+    classification_source: RawSourceRef
+    classification_control_source: RawSourceRef | None
+    classification_received_wall_time: UtcTimestamp
+    classification_received_monotonic_ns: int
+    schema: str = field(init=False, default=AUDIT_DIVERGENCE_PENDING_SCHEMA)
+
+    def __post_init__(self) -> None:
+        if not is_sha256_hex(self.divergence_id):
+            raise ValueError("audit divergence ID must be SHA-256 hex")
+        if self.audit_outcome.outcome is not AuditOutcome.MISMATCH:
+            raise ValueError("audit divergence must bind a MISMATCH outcome")
+        diagnostic = self.audit_outcome.mismatch_diagnostic
+        if diagnostic is None:
+            raise ValueError("audit divergence requires an exact mismatch diagnostic")
+        if diagnostic.rest_book.market_id != self.market_id:
+            raise ValueError("audit divergence market differs from its REST target")
+        response_monotonic_ns = self.audit_outcome.response_received_monotonic_ns
+        response_wall_time = self.audit_outcome.response_received_wall_time
+        if response_monotonic_ns is None or response_wall_time is None:
+            raise ValueError("audit divergence lacks response chronology")
+        if self.classification_received_monotonic_ns < response_monotonic_ns:
+            raise ValueError("audit divergence classification precedes its REST response")
+        if self.classification_control_source is None:
+            if (
+                self.classification_source != diagnostic.response_source
+                or self.classification_received_monotonic_ns != response_monotonic_ns
+                or self.classification_received_wall_time != response_wall_time
+            ):
+                raise ValueError("immediate audit classification must bind the response evidence")
+        elif self.classification_source != self.classification_control_source:
+            raise ValueError("deferred audit classification must bind its control evidence")
+        expected = _audit_divergence_id(
+            audit_outcome=self.audit_outcome,
+            audit_start_control_source=self.audit_start_control_source,
+            classification_source=self.classification_source,
+            classification_control_source=self.classification_control_source,
+        )
+        if self.divergence_id != expected:
+            raise ValueError("audit divergence ID differs from its exact evidence")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        market_id: MarketId,
+        audit_outcome: AuditOutcomeEvidence,
+        audit_start_control_source: RawSourceRef,
+        classification_source: RawSourceRef,
+        classification_control_source: RawSourceRef | None,
+        classification_received_wall_time: UtcTimestamp,
+        classification_received_monotonic_ns: int,
+    ) -> AuditDivergencePending:
+        return cls(
+            divergence_id=_audit_divergence_id(
+                audit_outcome=audit_outcome,
+                audit_start_control_source=audit_start_control_source,
+                classification_source=classification_source,
+                classification_control_source=classification_control_source,
+            ),
+            market_id=market_id,
+            audit_outcome=audit_outcome,
+            audit_start_control_source=audit_start_control_source,
+            classification_source=classification_source,
+            classification_control_source=classification_control_source,
+            classification_received_wall_time=classification_received_wall_time,
+            classification_received_monotonic_ns=classification_received_monotonic_ns,
+        )
+
+    @property
+    def instrument_id(self) -> InstrumentId:
+        return self.audit_outcome.starting_book.instrument_id
+
+    @property
+    def request_id(self) -> str:
+        return self.audit_outcome.request_id
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "audit_outcome": self.audit_outcome,
+            "audit_start_control_source": self.audit_start_control_source,
+            "classification_control_source": self.classification_control_source,
+            "classification_received_monotonic_ns": self.classification_received_monotonic_ns,
+            "classification_received_wall_time": self.classification_received_wall_time,
+            "classification_source": self.classification_source,
+            "divergence_id": self.divergence_id,
+            "instrument_id": self.instrument_id,
+            "market_id": self.market_id,
+            "request_id": self.request_id,
+            "schema": self.schema,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AuditDivergenceResolution:
+    """Raw-linked proof that an authoritative REST snapshot restored one book."""
+
+    divergence_id: str
+    request_id: str
+    instrument_id: InstrumentId
+    market_id: MarketId
+    audit_start_schema: str
+    trigger_reason: AuditTriggerReason
+    mismatch_response_source: RawSourceRef
+    authoritative_snapshot_source: RawSourceRef
+    authoritative_rest_book: AuditRestBookIdentity
+    recovered_book: AuditBookIdentity
+    observed_divergence: AuditDivergencePending
+    resolved_at: UtcTimestamp
+    resolved_monotonic_ns: int
+    status: AuditDivergenceResolutionStatus = (
+        AuditDivergenceResolutionStatus.AUTHORITATIVE_RESNAPSHOT
+    )
+    schema: str = field(init=False, default=AUDIT_DIVERGENCE_RESOLUTION_SCHEMA)
+
+    def __post_init__(self) -> None:
+        if not is_sha256_hex(self.divergence_id):
+            raise ValueError("audit divergence resolution ID must be SHA-256 hex")
+        if not self.request_id or len(self.request_id) > 128:
+            raise ValueError("audit divergence resolution request ID is invalid")
+        if self.resolved_monotonic_ns < 0:
+            raise ValueError("audit divergence resolution time cannot be negative")
+        if (
+            self.resolved_monotonic_ns
+            < self.observed_divergence.classification_received_monotonic_ns
+        ):
+            raise ValueError("audit divergence resolution precedes its classification")
+        if (
+            self.authoritative_rest_book.instrument_id != self.instrument_id
+            or self.authoritative_rest_book.market_id != self.market_id
+            or self.recovered_book.instrument_id != self.instrument_id
+        ):
+            raise ValueError("audit divergence resolution identities disagree")
+        if (
+            self.observed_divergence.divergence_id != self.divergence_id
+            or self.observed_divergence.request_id != self.request_id
+            or self.observed_divergence.instrument_id != self.instrument_id
+            or self.observed_divergence.market_id != self.market_id
+            or self.observed_divergence.audit_outcome.audit_start_schema != self.audit_start_schema
+            or self.observed_divergence.audit_outcome.trigger_reason is not self.trigger_reason
+            or self.observed_divergence.audit_outcome.mismatch_diagnostic is None
+            or self.observed_divergence.audit_outcome.mismatch_diagnostic.response_source
+            != self.mismatch_response_source
+        ):
+            raise ValueError("audit divergence resolution differs from its observed state")
+        if self.audit_start_schema == AUDIT_START_V1_SCHEMA:
+            if self.trigger_reason is not AuditTriggerReason.UNKNOWN_LEGACY:
+                raise ValueError("v1 divergence resolution must retain UNKNOWN_LEGACY")
+        elif self.audit_start_schema == AUDIT_START_V2_SCHEMA:
+            if self.trigger_reason is AuditTriggerReason.UNKNOWN_LEGACY:
+                raise ValueError("v2 divergence resolution cannot claim UNKNOWN_LEGACY")
+        else:
+            raise ValueError("audit divergence resolution start schema is unsupported")
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "audit_start_schema": self.audit_start_schema,
+            "authoritative_rest_book": self.authoritative_rest_book,
+            "authoritative_snapshot_source": self.authoritative_snapshot_source,
+            "divergence_id": self.divergence_id,
+            "instrument_id": self.instrument_id,
+            "market_id": self.market_id,
+            "mismatch_response_source": self.mismatch_response_source,
+            "observed_divergence": self.observed_divergence,
+            "recovered_book": self.recovered_book,
+            "request_id": self.request_id,
+            "resolved_at": self.resolved_at,
+            "resolved_monotonic_ns": self.resolved_monotonic_ns,
+            "schema": self.schema,
+            "status": self.status,
+            "trigger_reason": self.trigger_reason,
+        }
 
 
 __all__ = [
     "AUDIT_CLASSIFICATION_SCHEMA",
+    "AUDIT_DIVERGENCE_PENDING_SCHEMA",
+    "AUDIT_DIVERGENCE_RESOLUTION_SCHEMA",
     "AUDIT_EXACT_DEPTH_DIFFERENCE_SCHEMA",
     "AUDIT_EXPIRY_SCHEMA",
     "AUDIT_FAILURE_SCHEMA",
@@ -842,11 +1201,18 @@ __all__ = [
     "AUDIT_MISMATCH_MAX_REPRESENTATIVE_DIFFERENCES",
     "AUDIT_MISMATCH_MAX_REPRESENTATIVE_RAW_SOURCES",
     "AUDIT_RAW_SOURCE_SUMMARY_SCHEMA",
+    "AUDIT_REPLACEMENT_CAPTURE_MAX_BYTES",
+    "AUDIT_REPLACEMENT_RELEASE_SCHEMA",
     "AUDIT_REST_BOOK_IDENTITY_SCHEMA",
     "AUDIT_START_SCHEMA",
+    "AUDIT_START_V1_SCHEMA",
+    "AUDIT_START_V2_SCHEMA",
     "AuditBookIdentity",
     "AuditBookSide",
     "AuditClassificationCommand",
+    "AuditDivergencePending",
+    "AuditDivergenceResolution",
+    "AuditDivergenceResolutionStatus",
     "AuditExactDepthDifference",
     "AuditExactDepthIdentity",
     "AuditExpiryCommand",
@@ -861,8 +1227,10 @@ __all__ = [
     "AuditOutcome",
     "AuditOutcomeEvidence",
     "AuditRawSourceSummary",
+    "AuditReplacementReleaseCommand",
     "AuditRestBookIdentity",
     "AuditStartEvidence",
+    "AuditTriggerReason",
     "WebSocketAdmissionWatermark",
     "audit_exact_depth_identity",
     "build_audit_mismatch_diagnostic",

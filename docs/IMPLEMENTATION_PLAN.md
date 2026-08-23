@@ -13,8 +13,8 @@ Every stage ends with tests, reproducible evidence and an explicit gate. Code pr
 | F0 — Repository/tooling foundation | Implemented |
 | F1 — Canonical core | Implemented |
 | F2 — Immutable raw journal | Implemented |
-| F3 — Canonical analytical storage | Implemented; long-run report path requires remediation |
-| P1 — Polymarket read-only vertical slice | Implemented; reported-top transition correction required |
+| F3 — Canonical analytical storage | Implemented; incremental long-run report path present |
+| P1 — Polymarket read-only vertical slice | Implemented; ADR-0053/0054 remediation candidate present |
 | P2 — Ordinary-binary complete-set scanner | Implemented |
 | P3 — Deterministic replay/rebuild | Implemented and passed first-soak review |
 | P4 — First six-hour Polymarket soak | Executed; `GATE 1: FAIL` |
@@ -23,6 +23,11 @@ Every stage ends with tests, reproducible evidence and an explicit gate. Code pr
 | V2 — Kraken read-only | Planning only; follows Kalshi/shared-interface review |
 
 The first soak ran from `a382b93220011428703fe02483f7034f59c1f045` and is documented in `GATE_1_FAILURE_20260822.md`.
+
+Gate 1 remains `FAIL`. The current candidate adds ADR-0054 audit-divergence
+recovery and Gate semantics, but final offline gates and new exact-SHA public
+smoke/stability evidence remain pending. No six-hour rerun was performed in the
+ADR-0054 remediation task.
 
 ## 2. Completed foundation
 
@@ -96,7 +101,7 @@ The evidence remains useful and must be preserved as a permanent regression corp
 
 ## 5. Current slice P4R — Gate-1 remediation
 
-The normative contract is `GATE_1_REMEDIATION_SPEC.md` and ADR-0053.
+The normative contract is `GATE_1_REMEDIATION_SPEC.md`, ADR-0053 and ADR-0054.
 
 ### R1 — Failure-window analysis
 
@@ -137,9 +142,13 @@ The normative contract is `GATE_1_REMEDIATION_SPEC.md` and ADR-0053.
 
 ### R5 — Audit/memory diagnosis
 
-- classify mismatch causes;
+- classify online mismatch causes and full-depth causal-generation relations;
 - report transition-attributed mismatches and invalidations;
 - retain mismatch history after recovery;
+- separate observed, pending, authoritative-resnapshot resolution, terminal
+  unresolved, new-contract unknown and local-book-defect state;
+- emit v2 audit triggers while replaying v1 controls as `UNKNOWN_LEGACY`;
+- make current and Gate-sticky health reasons explicit in checkpoint v3;
 - measure RSS slope, latency tails and queue HWMs.
 
 ### R6 — Failed-run regression replay
@@ -148,18 +157,30 @@ The normative contract is `GATE_1_REMEDIATION_SPEC.md` and ADR-0053.
 - require deterministic corrected identities;
 - require no identified primary invariant failures;
 - require successful scan report, rebuild and validation;
+- require byte-identical causal reports over all 262 failed-soak and 20 prior
+  stability mismatches without relabeling recovery-generation equality as
+  natural convergence;
+- require deterministic trigger/lifecycle/interval/terminal reconciliation;
 - verify raw immutability.
 
 ### R7 — Short preflight
 
 - full lock/SCA/lint/type/test/pre-commit/build/no-live gates;
 - 60-second explicit-target smoke;
-- 30–60 minute stability/calibration run;
-- independent review of transitions, mismatches, intervals, chronology, RSS slope, queues, tails and storage.
+- 45–60 minute stability observation;
+- independent review of transitions, audit triggers, causal mismatches,
+  divergence states, intervals, chronology, RSS slope, queues, tails and
+  storage.
+
+The final-SHA smoke and stability runs are pending until the implementation and
+offline gates are frozen. Older public runs are forensic inputs, not acceptance
+of this candidate.
 
 ### R8 — Fresh six-hour soak
 
 Run only after independent pre-soak approval. Perform the complete post-soak audit again.
+
+This remediation task does not authorize or run the six-hour soak.
 
 **Gate:** G1 remains failed until accepted `PASS`.
 

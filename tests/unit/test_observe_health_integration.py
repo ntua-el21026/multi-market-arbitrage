@@ -439,7 +439,7 @@ def _initialize_clean_source(repository: Path) -> str:
     return _git(repository, "rev-parse", "HEAD")
 
 
-def test_gate1_checkpoint_decision_is_sticky_after_transient_staleness() -> None:
+def test_gate1_checkpoint_decision_recovers_after_transient_staleness() -> None:
     healthy = HealthDecision(
         capture_healthy=True,
         research_eligible=True,
@@ -459,8 +459,9 @@ def test_gate1_checkpoint_decision_is_sticky_after_transient_staleness() -> None
 
     assert restored.capture_healthy is True
     assert restored.research_eligible is True
-    assert restored.gate1_eligible_so_far is False
-    assert restored.reason_codes == (HealthDecisionReason.BOOK_NOT_HEALTHY,)
+    assert restored.gate1_eligible_so_far is True
+    assert restored.reason_codes == ()
+    assert restored.gate1_sticky_reason_codes == ()
 
 
 def test_recovered_audit_history_restores_current_research_but_not_gate1() -> None:
@@ -473,12 +474,20 @@ def test_recovered_audit_history_restores_current_research_but_not_gate1() -> No
             HealthDecisionReason.AUDIT_RACE_BUDGET_EXHAUSTED,
             HealthDecisionReason.BOOK_NOT_HEALTHY,
         ),
+        gate1_sticky_reason_codes=(
+            HealthDecisionReason.AUDIT_FAILED,
+            HealthDecisionReason.AUDIT_RACE_BUDGET_EXHAUSTED,
+        ),
     )
     recovered = HealthDecision(
         capture_healthy=True,
         research_eligible=True,
         gate1_eligible_so_far=False,
         reason_codes=(
+            HealthDecisionReason.AUDIT_FAILED,
+            HealthDecisionReason.AUDIT_RACE_BUDGET_EXHAUSTED,
+        ),
+        gate1_sticky_reason_codes=(
             HealthDecisionReason.AUDIT_FAILED,
             HealthDecisionReason.AUDIT_RACE_BUDGET_EXHAUSTED,
         ),
@@ -495,7 +504,10 @@ def test_recovered_audit_history_restores_current_research_but_not_gate1() -> No
     assert accumulated.reason_codes == (
         HealthDecisionReason.AUDIT_FAILED,
         HealthDecisionReason.AUDIT_RACE_BUDGET_EXHAUSTED,
-        HealthDecisionReason.BOOK_NOT_HEALTHY,
+    )
+    assert accumulated.gate1_sticky_reason_codes == (
+        HealthDecisionReason.AUDIT_FAILED,
+        HealthDecisionReason.AUDIT_RACE_BUDGET_EXHAUSTED,
     )
 
 
@@ -509,12 +521,14 @@ def test_recovered_protocol_history_restores_current_capture_but_not_gate1() -> 
             HealthDecisionReason.PROTOCOL_DEVIATION,
             HealthDecisionReason.SOCKET_DISCONNECTED,
         ),
+        gate1_sticky_reason_codes=(HealthDecisionReason.PROTOCOL_DEVIATION,),
     )
     recovered = HealthDecision(
         capture_healthy=True,
         research_eligible=True,
         gate1_eligible_so_far=False,
         reason_codes=(HealthDecisionReason.PROTOCOL_DEVIATION,),
+        gate1_sticky_reason_codes=(HealthDecisionReason.PROTOCOL_DEVIATION,),
     )
 
     accumulated = observe_module._accumulate_gate1_decision(  # pyright: ignore[reportPrivateUsage]
@@ -525,11 +539,8 @@ def test_recovered_protocol_history_restores_current_capture_but_not_gate1() -> 
     assert accumulated.capture_healthy is True
     assert accumulated.research_eligible is True
     assert accumulated.gate1_eligible_so_far is False
-    assert accumulated.reason_codes == (
-        HealthDecisionReason.BOOK_NOT_HEALTHY,
-        HealthDecisionReason.PROTOCOL_DEVIATION,
-        HealthDecisionReason.SOCKET_DISCONNECTED,
-    )
+    assert accumulated.reason_codes == (HealthDecisionReason.PROTOCOL_DEVIATION,)
+    assert accumulated.gate1_sticky_reason_codes == (HealthDecisionReason.PROTOCOL_DEVIATION,)
 
 
 def test_terminal_protocol_history_does_not_reblock_recovered_current_state() -> None:
@@ -576,6 +587,7 @@ def test_terminal_protocol_history_does_not_reblock_recovered_current_state() ->
         research_eligible=True,
         gate1_eligible_so_far=False,
         reason_codes=(HealthDecisionReason.PROTOCOL_DEVIATION,),
+        gate1_sticky_reason_codes=(HealthDecisionReason.PROTOCOL_DEVIATION,),
     )
 
     final = observe_module._final_health_decision(  # pyright: ignore[reportPrivateUsage]
@@ -591,6 +603,7 @@ def test_terminal_protocol_history_does_not_reblock_recovered_current_state() ->
     assert final.research_eligible is True
     assert final.gate1_eligible_so_far is False
     assert final.reason_codes == (HealthDecisionReason.PROTOCOL_DEVIATION,)
+    assert final.gate1_sticky_reason_codes == (HealthDecisionReason.PROTOCOL_DEVIATION,)
 
     lost = observe_module._final_health_decision(  # pyright: ignore[reportPrivateUsage]
         recovered,
@@ -604,6 +617,177 @@ def test_terminal_protocol_history_does_not_reblock_recovered_current_state() ->
     assert lost.research_eligible is False
     assert lost.gate1_eligible_so_far is False
     assert HealthDecisionReason.INGRESS_DATA_LOSS in lost.reason_codes
+
+    unresolved = observe_module._final_health_decision(  # pyright: ignore[reportPrivateUsage]
+        HealthDecision(
+            capture_healthy=True,
+            research_eligible=True,
+            gate1_eligible_so_far=True,
+            reason_codes=(),
+        ),
+        evidence=evidence,
+        availability_evidence=availability_evidence,
+        availability_reconciled=True,
+        analytical_outputs=analytical,
+        terminal_runtime_reasons=(HealthDecisionReason.AUDIT_DIVERGENCE_UNRESOLVED,),
+    )
+    assert unresolved.capture_healthy is True
+    assert unresolved.research_eligible is False
+    assert unresolved.gate1_eligible_so_far is False
+    assert unresolved.reason_codes == (HealthDecisionReason.AUDIT_DIVERGENCE_UNRESOLVED,)
+    assert unresolved.gate1_sticky_reason_codes == (
+        HealthDecisionReason.AUDIT_DIVERGENCE_UNRESOLVED,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "audit_divergences_unresolved",
+        "audit_replacement_captures_pending",
+        "audit_divergences_unknown",
+        "audit_local_book_defects",
+        "audit_divergence_lifecycle_reconciled",
+        "audit_trigger_reconciled",
+        "expected_reason",
+    ),
+    [
+        pytest.param(
+            0,
+            1,
+            0,
+            0,
+            True,
+            True,
+            HealthDecisionReason.AUDIT_DIVERGENCE_UNRESOLVED,
+            id="replacement-capture-pending",
+        ),
+        pytest.param(
+            0,
+            0,
+            1,
+            0,
+            True,
+            True,
+            HealthDecisionReason.AUDIT_DIVERGENCE_UNKNOWN,
+            id="unknown-divergence",
+        ),
+        pytest.param(
+            0,
+            0,
+            0,
+            1,
+            True,
+            True,
+            HealthDecisionReason.AUDIT_LOCAL_BOOK_DEFECT,
+            id="local-book-defect",
+        ),
+        pytest.param(
+            0,
+            0,
+            0,
+            0,
+            False,
+            True,
+            HealthDecisionReason.AUDIT_DIVERGENCE_RECONCILIATION_FAILED,
+            id="divergence-lifecycle-reconciliation",
+        ),
+        pytest.param(
+            0,
+            0,
+            0,
+            0,
+            True,
+            False,
+            HealthDecisionReason.AUDIT_TRIGGER_RECONCILIATION_FAILED,
+            id="trigger-reconciliation",
+        ),
+    ],
+)
+def test_post_checkpoint_audit_blockers_fail_closed_at_terminal(
+    audit_divergences_unresolved: int,
+    audit_replacement_captures_pending: int,
+    audit_divergences_unknown: int,
+    audit_local_book_defects: int,
+    audit_divergence_lifecycle_reconciled: bool,
+    audit_trigger_reconciled: bool,
+    expected_reason: HealthDecisionReason,
+) -> None:
+    run_id = CollectorRunId("terminal-audit-fallback")
+    connection_id = ConnectionId("terminal-replacement-capture")
+    ingress = BoundedRawIngress(max_items=8, max_bytes=1_024, connection_id=connection_id)
+    runtime_health = ObservationRuntimeHealth()
+    runtime_health.begin_generation(connection_id, ingress)
+    runtime_health.mark_connected(now_ns=10)
+    runtime = runtime_health.snapshot(now_ns=11)
+    reasons = observe_module._terminal_runtime_health_reasons(  # pyright: ignore[reportPrivateUsage]
+        runtime,
+        audit_divergences_unresolved=audit_divergences_unresolved,
+        audit_replacement_captures_pending=audit_replacement_captures_pending,
+        audit_divergences_unknown=audit_divergences_unknown,
+        audit_local_book_defects=audit_local_book_defects,
+        audit_divergence_lifecycle_reconciled=audit_divergence_lifecycle_reconciled,
+        audit_trigger_reconciled=audit_trigger_reconciled,
+    )
+    failed_terminal_evidence = HealthEvidenceSummary(
+        schema_version=HEALTH_EVIDENCE_SUMMARY_VERSION,
+        collector_run_id=run_id,
+        path=Path("health.jsonl.partial"),
+        completed=False,
+        gate1_evidence_eligible=False,
+        accepted=1,
+        written=1,
+        rejected=0,
+        queue_high_water=1,
+        file_bytes=1,
+        content_sha256=None,
+        failure_type="RuntimeError",
+    )
+    availability_evidence = AvailabilityEvidenceSummary(
+        schema_version=AVAILABILITY_EVIDENCE_SUMMARY_VERSION,
+        collector_run_id=run_id,
+        path=Path("availability.jsonl"),
+        completed=True,
+        gate1_evidence_eligible=True,
+        accepted=0,
+        written=0,
+        rejected=0,
+        queue_high_water=0,
+        file_bytes=0,
+        unavailable_duration_nanoseconds=0,
+        longest_interval_nanoseconds=0,
+        open_at_shutdown_intervals=0,
+        content_sha256="b" * 64,
+        failure_type=None,
+    )
+    analytical = ResearchOutputSummary(
+        root=Path("analytical"),
+        reference_manifest_hashes=(),
+        canonical_manifest_hashes=(),
+        scan_manifest_hashes=(),
+    )
+    stale_periodic_decision = HealthDecision(
+        capture_healthy=True,
+        research_eligible=True,
+        gate1_eligible_so_far=True,
+        reason_codes=(),
+    )
+
+    final = observe_module._final_health_decision(  # pyright: ignore[reportPrivateUsage]
+        stale_periodic_decision,
+        evidence=failed_terminal_evidence,
+        availability_evidence=availability_evidence,
+        availability_reconciled=True,
+        analytical_outputs=analytical,
+        terminal_runtime_reasons=reasons,
+    )
+
+    assert reasons == (expected_reason,)
+    assert final.capture_healthy
+    assert not final.research_eligible
+    assert not final.gate1_eligible_so_far
+    assert expected_reason in final.reason_codes
+    assert expected_reason in final.gate1_sticky_reason_codes
+    assert HealthDecisionReason.HEALTH_EVIDENCE_UNHEALTHY in final.reason_codes
 
 
 class _PublicClient:
@@ -1070,7 +1254,7 @@ async def test_dirty_source_tree_blocks_terminal_gate_without_blocking_capture(
 
 
 @pytest.mark.asyncio
-async def test_subcadence_disconnect_recovery_remains_gate1_ineligible(
+async def test_subcadence_disconnect_recovery_restores_gate1_current_eligibility(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1094,8 +1278,9 @@ async def test_subcadence_disconnect_recovery_remains_gate1_ineligible(
     assert final["capture"]["unavailable_intervals"] == 1
     assert final["decisions"]["capture_healthy"] is True
     assert final["decisions"]["research_eligible"] is True
-    assert final["decisions"]["gate1_eligible_so_far"] is False
-    assert final["decisions"]["reason_codes"] == ["SOCKET_DISCONNECTED"]
+    assert final["decisions"]["gate1_eligible_so_far"] is True
+    assert final["decisions"]["reason_codes"] == []
+    assert final["decisions"]["gate1_sticky_reason_codes"] == []
     assert final["recovery"]["availability"]["aggregate_reconciled"] is True
     assert summary.availability_evidence.written == 1
     assert (
@@ -1104,8 +1289,9 @@ async def test_subcadence_disconnect_recovery_remains_gate1_ineligible(
     )
     assert summary.health_decision.capture_healthy is True
     assert summary.health_decision.research_eligible is True
-    assert summary.health_decision.gate1_eligible_so_far is False
-    assert summary.health_decision.reason_codes == (HealthDecisionReason.SOCKET_DISCONNECTED,)
+    assert summary.health_decision.gate1_eligible_so_far is True
+    assert summary.health_decision.reason_codes == ()
+    assert summary.health_decision.gate1_sticky_reason_codes == ()
 
 
 @pytest.mark.asyncio
@@ -1324,10 +1510,11 @@ async def test_terminal_checkpoint_is_frozen_before_delayed_owner_close(
     assert final["capture"]["connected"] is True
     assert final["decisions"]["capture_healthy"] is True
     assert final["decisions"]["research_eligible"] is True
-    assert final["decisions"]["gate1_eligible_so_far"] is False
-    assert "SOCKET_DISCONNECTED" in final["decisions"]["reason_codes"]
-    assert summary.health_decision.gate1_eligible_so_far is False
-    assert HealthDecisionReason.SOCKET_DISCONNECTED in summary.health_decision.reason_codes
+    assert final["decisions"]["gate1_eligible_so_far"] is True
+    assert final["decisions"]["reason_codes"] == []
+    assert final["decisions"]["gate1_sticky_reason_codes"] == []
+    assert summary.health_decision.gate1_eligible_so_far is True
+    assert summary.health_decision.reason_codes == ()
     assert len(records) == recording_builder.call_count
     assert build_counts_during_close
     assert set(build_counts_during_close) == {recording_builder.call_count}

@@ -6,6 +6,14 @@ This is the normative correction specification following the failed 2026-08-22 P
 
 The current phase is Phase-1 remediation. Gate 1 remains failed until a fresh six-hour run passes the unchanged acceptance contract in `GATE_1_SOAK_SPEC.md`.
 
+ADR-0053 corrected the original reported-top defect class. Retained failed-run
+and corrected-stability evidence now supports ADR-0054's immediate fail-closed
+authoritative-resnapshot decision. The implementation candidate must still
+complete offline validation, a new 60-second smoke, and a new 45–60 minute
+stability observation before independent pre-soak review. No six-hour rerun was
+performed as part of the ADR-0054 remediation work; the first soak remains
+`FAIL`.
+
 Design Freeze v0.1 remains locked.
 
 ## 2. Objective
@@ -21,12 +29,13 @@ Correct the smallest proven defects while preserving:
 - single-owner canonical mutation;
 - no live/authenticated venue capability.
 
-The remediation has four primary tracks:
+The remediation has five primary tracks:
 
 1. bounded reported-top transition semantics;
 2. incremental bounded analytical reporting;
 3. complete monotonic and unavailable-interval evidence;
-4. long-run resource and mismatch diagnosis.
+4. causal mismatch and long-run resource diagnosis;
+5. audit-divergence lifecycle, trigger and Gate-evidence correction.
 
 ## 3. Authoritative failure corpus
 
@@ -151,9 +160,9 @@ Do not raise DuckDB/PyArrow materialization limits to make the failed run pass.
 
 ## 6. Track C — complete clock and availability evidence
 
-### 6.1 Health checkpoint v2
+### 6.1 Health checkpoint v3
 
-The rerun requires a versioned schema containing both:
+The rerun requires `gate1-health-checkpoint-v3`, containing both:
 
 - UTC emission timestamp; and
 - monotonic timestamp with explicit clock epoch/run identity.
@@ -167,6 +176,24 @@ emitted_monotonic_ns
 ```
 
 Chronology validation must use monotonic evidence. UTC remains for operator correlation.
+
+The checkpoint must also separate current `reason_codes` from the finite
+`gate1_sticky_reason_codes` set and expose cumulative, pending, resolved,
+unresolved, unknown and local-defect audit-divergence counts. Historical v1/v2
+checkpoints remain readable without inferred trigger/lifecycle evidence.
+
+The audit group must expose `current_eligibility` with `eligible`,
+`evidence_reconciled`, `pending_divergence_count`,
+`processor_ineligible_book_count`, `replacement_capture_count`,
+`required_ineligible_book_count`, and bounded
+`required_ineligible_instrument_ids`. It also exposes current
+`replacement_captures_pending` and terminal-only
+`replacement_captures_unresolved`. Periodic checkpoints serialize every bounded
+current pending object as a compact raw-linked
+`gate1-audit-divergence-pending-representative-v1` and at most one latest compact
+`gate1-audit-divergence-resolution-representative-v1`. Complete bounded pending
+and resolution objects remain in the processor summary and terminal hash;
+cumulative totals and the lifecycle chain remain authoritative.
 
 ### 6.2 Typed unavailable intervals
 
@@ -202,11 +229,13 @@ Run identity must include:
 
 Periodic resource evidence must include current RSS as well as peak RSS so long-run slope can be evaluated.
 
-## 7. Track D — audit mismatch and long-run diagnosis
+## 7. Track D/E — audit mismatch causality, lifecycle and long-run diagnosis
 
 The failed run observed 262 race-free `MISMATCH` outcomes.
 
-The correction must classify mismatches by cause, including at least:
+### 7.1 Online mismatch cause and lifecycle
+
+The online correction must classify mismatches by cause, including at least:
 
 - bounded reported-top transition;
 - true exact REST/local depth divergence;
@@ -219,13 +248,142 @@ A successful resnapshot does not erase the mismatch from evidence.
 
 Add reason metrics and bounded examples sufficient for post-run review without logging entire books or secrets.
 
+ADR-0054 additionally requires every new mismatch to create one deterministic
+pending divergence. It immediately invalidates, blocks affirmative audit and
+scanner/research eligibility, requests bounded resynchronization and opens a
+typed interval. Only a separately journaled, valid authoritative `REST_BOOK`
+baseline closes the pending instrument state. That REST closure immediately
+opens `AUDIT_REPLACEMENT_CAPTURE_PENDING`; it does not restore eligibility. One
+WebSocket connection different from the mismatched connection and every
+connection seen before authoritative resolution must then supply
+a full `OrderBookSnapshotEvent` for every required instrument in the affected
+market. All qualifying snapshots must come from that same new connection, each
+must be durably journaled and successfully processed, and a further connection
+change restarts incomplete coverage. Captured sources must share one monotonic
+epoch and every leg must be nonfuture and no older than
+`scanner.maximum_book_age` when coverage would complete. Stale,
+future-relative and cross-epoch sources are pruned, leaving capture pending.
+Current v2 sources require explicit positive admission ordinals plus ingest and
+same-epoch receive chronology strictly after the bound resolution. The capture
+commits the resolution source/boundary, mismatch cause and pre-resolution
+connection-set digest/count.
+After canonical processing, the observer independently checks every required
+book receive timestamp as present, nonfuture and within the same maximum-age
+bound and verifies every required canonical book is healthy. Complete v2
+coverage is still pending/ineligible and every replacement snapshot, including
+the completing one, emits zero scans. The coordinator must durably journal and
+successfully process the self-contained bounded
+`mma.control.rest-audit-replacement-release.v1` control at that same paired
+decision wall/monotonic boundary before state can clear or a recovery scan can
+run. The control commits the exact complete capture record and digest, including
+the original/replacement connections and every full-snapshot raw source,
+admission/ingest and receive-monotonic identity. Incrementals, reported BBO,
+socket readiness, partial coverage or the first binary leg are insufficient.
+New audit launches are suppressed before a START is journaled while either
+recovery state is pending. The availability interval ends at the control's exact
+decision time only after its successful durable canonical processing and full
+scope/current-eligibility reconciliation. Same-generation equality is not a
+live closure path.
+
+The coordinator must drain the complete admitted WebSocket prefix and require
+no deferred/queued item plus active acquisition before sampling the decision;
+the fence/sample/projection sequence has no await. Pending reported-top or
+transition-resync state, a non-capture scope blocker, a stale/future latest-L2
+receive time, `UNKNOWN`, or `LOCAL_BOOK_DEFECT` prevents release. A socket end
+after the sampled decision is a later distinct interruption. For a same-market
+multi-capture group, deterministic prefix controls scan zero times and only the
+final control may restore and scan.
+
+A missing v2 release control, or a malformed, noncanonical, capture-mismatched,
+wrong-connection, future, cross-epoch or stale control, fails before state
+mutation. Capture/ineligibility and the interval remain pending and terminal
+evaluation is Gate-sticky unresolved. Immutable v1 journals retain their exact
+deterministic snapshot-only auto-release and terminal hash without a synthesized
+control solely for replay compatibility; new producers cannot use v1 or that
+exception.
+
+Health and terminal evidence must reconcile:
+
+- cumulative observed divergences;
+- authoritative-resnapshot resolutions;
+- reserved same-generation resolutions, which must remain zero in Phase 1;
+- current pending and terminal unresolved state;
+- current replacement-capture pending and terminal replacement-unresolved
+  state;
+- new-contract unknown and local-book-defect counts;
+- bounded compact checkpoint representatives, complete processor/terminal
+  pending and resolution objects, and the lifecycle hash chain.
+
+Terminal shutdown with divergence pending or with REST resolution complete but
+replacement capture incomplete produces Gate-sticky
+`AUDIT_DIVERGENCE_UNRESOLVED`; the latter also increments
+`replacement_captures_unresolved`.
+
+Observed and fully authoritatively resolved external divergence is retained
+history, not automatically a permanent Gate blocker. Pending state is a
+current blocker. Terminal unresolved, new-contract unknown, local-book defect,
+failed recovery, or lifecycle/writer/availability/replay/hash inconsistency is
+Gate-sticky.
+
+### 7.2 Offline causal lineage result
+
+The deterministic full-depth report binds complete verified raw-envelope
+identity and classifies matching states without using venue hash/time as an
+ordering guarantee. Two independent executions were byte-identical.
+
+For the corrected 30-minute stability corpus, all 20 mismatches classify as:
+
+- 2 `SAME_GENERATION_NATURAL_CONVERGENCE`;
+- 18 `RECOVERY_GENERATION_MATCH`.
+
+For the failed six-hour corpus, all 262 classify as:
+
+- 2 `SAME_GENERATION_NATURAL_CONVERGENCE`;
+- 4 `SAME_GENERATION_CONFLICT_BEFORE_CONVERGENCE`;
+- 238 `RECOVERY_GENERATION_MATCH`;
+- 13 `PRIOR_STATE_MATCH`;
+- 1 `PERSISTENT_DIVERGENCE` before authoritative recovery;
+- 4 `NOT_FOUND` exact-state results.
+
+No case in either corpus was classified `LOCAL_BOOK_DEFECT`. Recovery-generation
+equality is recovery evidence and is never reported as natural convergence.
+The prior 25 diagnostic `UNKNOWN` cases are now 0 natural convergence,
+3 `SAME_GENERATION_CONFLICT_BEFORE_CONVERGENCE`, 4 recovery, 13 prior-state,
+1 persistent-divergence and 4 `NOT_FOUND`; the four absent exact states remain
+explicit negative evidence rather than forced convergence.
+
+### 7.3 Trigger and cadence evidence
+
+New `mma-rest-audit-start-v2` controls and outcomes carry one of `PERIODIC`,
+`FRESHNESS_GUARD`, `RACE_RETRY`, `RESYNC_VERIFICATION`, `STARTUP_BASELINE`, or
+`OTHER_TYPED_REASON`. Historical v1 controls remain raw-compatible and report
+`UNKNOWN_LEGACY`. Trigger totals and `(trigger, outcome)` totals must reconcile.
+
+Runtime evidence must report starts and outcomes by trigger, effective audit
+interval p50/p95/p99/max, the explicit freshness-scheduling reason, HTTP
+latency versus remaining freshness budget, mismatch/race/failure rates, request
+load, freshness safety margin and resulting research-eligible coverage by
+trigger. Retained v1 corpora can support aggregate timing analysis but cannot
+supply this modern per-trigger breakdown; no trigger may be inferred for them.
+
+Keep the current 30-second periodic cap and four-second freshness guard. The
+recorded runs were freshness-boundary dominated; a 15-second periodic cap did
+not create earlier frozen-trajectory opportunities, while a 4.5-second guard
+would double the steady two-leg initial-request ceiling from 20 to 40 per ten
+seconds. Neither alternative justifies reducing audit frequency or changing
+the unchanged five-second hard book-age limit.
+
+### 7.4 Long-run evidence
+
 Long-run validation must report:
 
 - current and peak RSS;
 - RSS slope by interval;
 - latency tails;
 - queue high-water marks;
-- audit mismatch/race/failure rates;
+- audit mismatch/race/failure rates plus effective interval, HTTP latency,
+  remaining freshness budget, request load, freshness safety margin and
+  research-eligible coverage by v2 trigger;
 - transition counts/durations;
 - scan-report peak memory and throughput.
 
@@ -270,7 +428,11 @@ If corrected semantics intentionally change terminal hashes, bind and explain th
 
 ### 8.4 Observability
 
-- monotonic checkpoint chronology;
+- checkpoint v3 chronology and explicit v1/v2 compatibility;
+- exact `audit.current_eligibility` field shape and reconciliation;
+- bounded compact pending representatives, one compact latest resolution
+  representative, resolution truncation, and complete processor/terminal
+  object plus total/chain authority;
 - UTC regression while monotonic advances;
 - interval open/close/recovery;
 - each cause class;
@@ -279,6 +441,73 @@ If corrected semantics intentionally change terminal hashes, bind and explain th
 - health writer failure without raw-capture contamination;
 - current/peak RSS evidence.
 
+### 8.5 Audit causality and divergence lifecycle
+
+- same-generation convergence before recovery and conflict before convergence;
+- replacement-generation matches and fail-closed raw REST-candidate ambiguity
+  when canonical baseline application is not separately proven;
+- prior exact match, no exact match and persistent divergence;
+- ambiguous generation or missing admission ordinal;
+- exact full-depth equality versus top-only/coarse similarity;
+- two byte-identical reports and rejection when raw identity changes;
+- one cumulative exact-frame budget that cannot reset on a snapshot/reconnect,
+  counts one multi-action raw frame once, starts at the response admission
+  boundary, and fails closed with an exact bound reason;
+- exact classification-control/raw-receive time binding and pre-expiry MISMATCH
+  chronology;
+- observed plus fully authoritatively resolved divergence;
+- current pending and terminal unresolved divergence;
+- new-contract unknown and local-book defect;
+- resnapshot failure, disconnect and shutdown while pending;
+- REST resolution opening `AUDIT_REPLACEMENT_CAPTURE_PENDING` without restoring
+  eligibility;
+- rejection of incrementals, reported BBO, socket readiness, partial coverage
+  and a first binary leg as replacement proof;
+- full snapshots for every required instrument from one new connection, with a
+  further connection change restarting incomplete coverage;
+- durable/canonical processing before each snapshot counts and interval closure
+  only after final-snapshot processing plus full health/eligibility restoration;
+- same-epoch replacement sources, pruning of stale/future/cross-epoch sources,
+  and an independent post-processing check that all receive times are nonfuture
+  and within `scanner.maximum_book_age`;
+- a delayed sibling arriving more than `scanner.maximum_book_age` after the
+  first replacement leg leaves capture pending and the interval open;
+- every v2 replacement snapshot emits zero scans and complete capture remains
+  pending/ineligible until the self-contained bounded release control is durably
+  journaled and successfully canonically processed;
+- exact release binding of the capture preimage/digest, decision wall/monotonic
+  time, replacement connection and every full-snapshot raw source, with the
+  availability interval ending at that same decision only after acceptance;
+- missing, malformed, noncanonical, capture-mismatched, wrong-connection,
+  future, cross-epoch and stale v2 release controls leave state pending and fail
+  closed; slow canonical return beyond the age bound emits no control or scan;
+- deterministic historical v1 snapshot-only replay and terminal-hash
+  compatibility without synthesizing a control, and proof new producers cannot
+  select that path;
+- terminal incomplete replacement capture becoming
+  `replacement_captures_unresolved` and Gate-sticky unresolved divergence;
+- no scanner/research use throughout pending state;
+- no REST audit comparison or WebSocket frame mutates/clears pending state;
+- exact lifecycle, interval and terminal-hash reconciliation.
+
+### 8.6 Audit triggers and fault injection
+
+- every v2 trigger reason and deterministic control encoding;
+- v1 replay as `UNKNOWN_LEGACY` without raw-payload mutation;
+- start and trigger/outcome totals reconcile with audit totals;
+- pre-START suppression and its metric while divergence or replacement-capture
+  recovery is pending;
+- per-trigger effective interval, HTTP latency and remaining freshness budget;
+- slow journal and slow canonical processor;
+- slow canonical return after mutually fresh snapshots such that the
+  coordinator decision occurs beyond the freshness bound: zero snapshot scans,
+  no release control, capture pending and interval open;
+- mismatch while backlog exists;
+- queue saturation and health/availability writer failure;
+- authoritative resnapshot failure and disconnect while pending;
+- clean and failed shutdown with pending divergence;
+- exact live/replay terminal equality.
+
 ## 9. Validation sequence before rerun
 
 1. Full lock/SCA/Ruff/format/Pyright/pytest/pre-commit/build/no-live gates.
@@ -286,11 +515,12 @@ If corrected semantics intentionally change terminal hashes, bind and explain th
 3. Successful incremental scan report over original and rebuilt analytical data.
 4. Successful analytical rebuild and validation.
 5. New 60-second explicit-target smoke.
-6. New 30–60 minute stability/calibration run on the intended target/host/filesystem.
+6. New 45–60 minute stability observation on the intended target/host/filesystem.
 7. Independent pre-soak review of:
    - invariant errors;
    - transition metrics;
-   - audit mismatches;
+   - audit triggers, mismatches and causal relations;
+   - pending/resolved/unresolved/unknown/local-defect divergence state;
    - unavailable-interval attribution;
    - monotonic checkpoint chronology;
    - memory slope;
@@ -306,8 +536,12 @@ The rerun is not authorized until:
 - all primary failed-run windows have regression coverage;
 - corrected replay is deterministic and free of the identified primary invariant failures;
 - scan-report succeeds within current bounds;
-- health v2 and interval evidence validate;
+- health v3, trigger/lifecycle and interval evidence validate;
 - no unresolved no-pending transition assumption remains;
+- no terminal pending/unresolved divergence, pending/unresolved replacement
+  capture, newly produced causal unknown, or local-book defect remains;
+- every observed divergence resolves through the ADR-0054 authoritative path
+  and all counts, chains, intervals and eligibility state reconcile;
 - the short stability run has acceptable memory/latency/queue behavior;
 - current official Polymarket documentation is rechecked;
 - the implementation remains structurally read-only.

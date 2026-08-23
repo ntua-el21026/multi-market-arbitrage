@@ -41,12 +41,33 @@ from multi_market_arbitrage.reference import POLYMARKET_VENUE_ID
 from multi_market_arbitrage.research import AnalyticalRuntimeSnapshot
 from multi_market_arbitrage.venues.polymarket import PublicReadMetricsSnapshot
 
-from .audit import AuditFailureReason, AuditMismatchDiagnostic, AuditOutcome
+from .audit import (
+    AuditDivergencePending,
+    AuditDivergenceResolution,
+    AuditFailureReason,
+    AuditMismatchCause,
+    AuditMismatchDiagnostic,
+    AuditOutcome,
+    AuditTriggerReason,
+)
 from .ingress import BoundedRawIngress, RawIngressMetricsSnapshot
 from .processor import CanonicalProcessor, ProcessorSummary
 from .targeting import ResolvedPolymarketTarget
 
 MAXIMUM_REPORTED_RESOURCE_DISCONTINUITIES = 16
+MAXIMUM_AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVES = 1
+AUDIT_DIVERGENCE_PENDING_REPRESENTATIVE_SCHEMA = "gate1-audit-divergence-pending-representative-v1"
+AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVE_SCHEMA = (
+    "gate1-audit-divergence-resolution-representative-v1"
+)
+
+
+def _audit_divergence_resolution_representatives(
+    records: tuple[AuditDivergenceResolution, ...],
+) -> tuple[AuditDivergenceResolution, ...]:
+    """Return a deterministic bounded tail; exact totals live outside representatives."""
+
+    return records[-MAXIMUM_AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVES:]
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,11 +245,12 @@ class ObservationRuntimeHealth:
         now_ns: int,
         now_utc: UtcTimestamp | None = None,
         research_eligibility_restored: bool = True,
+        close_unavailable: bool = True,
     ) -> None:
         if self._current_ingress is None:
             raise RuntimeError("cannot mark an absent socket generation connected")
         self._socket_connected = True
-        if self._open_unavailable is not None:
+        if close_unavailable and self._open_unavailable is not None:
             self._close_unavailable(
                 ended_at=UtcTimestamp.now() if now_utc is None else now_utc,
                 ended_monotonic_ns=now_ns,
@@ -236,6 +258,26 @@ class ObservationRuntimeHealth:
                 research_eligibility_restored=research_eligibility_restored,
                 open_at_shutdown=False,
             )
+
+    def complete_recovery(
+        self,
+        *,
+        now_ns: int,
+        now_utc: UtcTimestamp,
+    ) -> AvailabilityInterval | None:
+        """Close deferred recovery only after all replacement scopes recover."""
+
+        if not self._socket_connected or self._current_ingress is None:
+            raise RuntimeError("cannot complete recovery without connected capture")
+        if self._open_unavailable is None:
+            return None
+        return self._close_unavailable(
+            ended_at=now_utc,
+            ended_monotonic_ns=now_ns,
+            recovery_outcome=AvailabilityRecoveryOutcome.RESTORED,
+            research_eligibility_restored=True,
+            open_at_shutdown=False,
+        )
 
     def finish_generation(
         self,
@@ -795,6 +837,127 @@ def _raw_source_identity(source: RawSourceRef | None) -> dict[str, str] | None:
     }
 
 
+def _audit_divergence_pending_representative(
+    pending: AuditDivergencePending,
+) -> dict[str, object]:
+    """Project one pending divergence without repeating its full diagnostic.
+
+    The complete bounded pending object remains in the processor summary and
+    terminal lifecycle hash.  Periodic health evidence retains the exact join
+    keys, chronology, normalized identities, and raw links needed to inspect
+    the current blocker while keeping file growth independent of diagnostic
+    representative sizes.
+    """
+
+    outcome = pending.audit_outcome
+    diagnostic = outcome.mismatch_diagnostic
+    if diagnostic is None:  # pragma: no cover - enforced by AuditDivergencePending
+        raise RuntimeError("audit pending representative lacks mismatch evidence")
+    return {
+        "audit_start": {
+            "attempt": outcome.attempt,
+            "connection_id": outcome.connection_id.value,
+            "control_source": _raw_source_identity(pending.audit_start_control_source),
+            "native_asset_id": outcome.native_asset_id,
+            "schema": outcome.audit_start_schema,
+            "trigger_reason": outcome.trigger_reason.value,
+        },
+        "classification": {
+            "control_source": _raw_source_identity(pending.classification_control_source),
+            "received_monotonic_ns": pending.classification_received_monotonic_ns,
+            "received_utc_ns": pending.classification_received_wall_time.nanoseconds_since_epoch,
+            "source": _raw_source_identity(pending.classification_source),
+        },
+        "divergence_id": pending.divergence_id,
+        "instrument_id": pending.instrument_id.value,
+        "market_id": pending.market_id.value,
+        "mismatch": {
+            "cause": diagnostic.cause.value,
+            "depth_difference_sha256": diagnostic.exact_depth_difference.difference_sha256,
+            "diagnostic_schema": diagnostic.schema,
+            "local_book_economic_sha256": diagnostic.local_book.economic_content_sha256,
+            "local_book_generation": diagnostic.local_book.generation,
+            "normalized_rest_content_sha256": diagnostic.rest_book.normalized_content_sha256,
+            "response_source": _raw_source_identity(diagnostic.response_source),
+        },
+        "observed_divergence_schema": pending.schema,
+        "request_id": pending.request_id,
+        "schema": AUDIT_DIVERGENCE_PENDING_REPRESENTATIVE_SCHEMA,
+    }
+
+
+def _audit_divergence_resolution_representative(
+    resolution: AuditDivergenceResolution,
+) -> dict[str, object]:
+    """Project one exact raw-linked resolution without repeating its full mismatch.
+
+    The processor summary and divergence history chain retain the complete
+    bounded resolution object.  Periodic health evidence repeats only the
+    identities needed to join that object back to its audit start,
+    classification, mismatch response, authoritative resnapshot, and recovered
+    book.  This keeps six-hour health-file growth independent of nested mismatch
+    diagnostic size.
+    """
+
+    observed = resolution.observed_divergence
+    diagnostic = observed.audit_outcome.mismatch_diagnostic
+    if diagnostic is None:  # pragma: no cover - enforced by AuditDivergenceResolution
+        raise RuntimeError("audit resolution representative lacks mismatch evidence")
+    authoritative = resolution.authoritative_rest_book
+    return {
+        "audit_start": {
+            "control_source": _raw_source_identity(observed.audit_start_control_source),
+            "schema": resolution.audit_start_schema,
+            "trigger_reason": resolution.trigger_reason.value,
+        },
+        "authoritative_recovery": {
+            "rest_book": {
+                "ask_level_count": authoritative.depth.ask_level_count,
+                "bid_level_count": authoritative.depth.bid_level_count,
+                "depth_content_sha256": authoritative.depth.content_sha256,
+                "instrument_id": authoritative.instrument_id.value,
+                "market_id": authoritative.market_id.value,
+                "minimum_order_size": authoritative.minimum_order_size.to_canonical_string(),
+                "neg_risk": authoritative.neg_risk,
+                "normalized_content_sha256": authoritative.normalized_content_sha256,
+                "schema": authoritative.schema,
+                "tick_size": authoritative.tick_size.to_canonical_string(),
+            },
+            "snapshot_source": _raw_source_identity(resolution.authoritative_snapshot_source),
+        },
+        "classification": {
+            "control_source": _raw_source_identity(observed.classification_control_source),
+            "received_monotonic_ns": observed.classification_received_monotonic_ns,
+            "received_utc_ns": (observed.classification_received_wall_time.nanoseconds_since_epoch),
+            "source": _raw_source_identity(observed.classification_source),
+        },
+        "divergence_id": resolution.divergence_id,
+        "instrument_id": resolution.instrument_id.value,
+        "market_id": resolution.market_id.value,
+        "mismatch": {
+            "cause": diagnostic.cause.value,
+            "depth_difference_sha256": diagnostic.exact_depth_difference.difference_sha256,
+            "diagnostic_schema": diagnostic.schema,
+            "local_book_economic_sha256": diagnostic.local_book.economic_content_sha256,
+            "local_book_generation": diagnostic.local_book.generation,
+            "normalized_rest_content_sha256": diagnostic.rest_book.normalized_content_sha256,
+            "response_source": _raw_source_identity(resolution.mismatch_response_source),
+        },
+        "observed_divergence_schema": observed.schema,
+        "recovered_book": {
+            "economic_content_sha256": resolution.recovered_book.economic_content_sha256,
+            "generation": resolution.recovered_book.generation,
+            "instrument_id": resolution.recovered_book.instrument_id.value,
+        },
+        "request_id": resolution.request_id,
+        "resolution_schema": resolution.schema,
+        "resolved_at_utc_ns": resolution.resolved_at.nanoseconds_since_epoch,
+        "resolved_monotonic_ns": resolution.resolved_monotonic_ns,
+        "schema": AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVE_SCHEMA,
+        "status": resolution.status.value,
+    }
+
+
 def _audit_mismatch_representatives(
     diagnostics: tuple[AuditMismatchDiagnostic, ...],
 ) -> tuple[dict[str, object], ...]:
@@ -852,6 +1015,45 @@ def _monotonic_age_nanoseconds(now_ns: int, received_ns: int | None) -> int | No
     return now_ns - received_ns
 
 
+def audit_trigger_evidence_reconciled(processor_summary: ProcessorSummary) -> bool:
+    """Return whether trigger/start/outcome totals form the complete finite matrix."""
+
+    audit_start_trigger_counts = dict(processor_summary.audit_start_trigger_counts)
+    audit_outcome_trigger_counts = {
+        (trigger, outcome): count
+        for trigger, outcome, count in processor_summary.audit_outcome_trigger_counts
+    }
+    expected_trigger_outcome_keys = {
+        (trigger, outcome) for trigger in AuditTriggerReason for outcome in AuditOutcome
+    }
+    outcome_totals = {
+        outcome: sum(
+            audit_outcome_trigger_counts.get((trigger, outcome), 0)
+            for trigger in AuditTriggerReason
+        )
+        for outcome in AuditOutcome
+    }
+    return (
+        len(processor_summary.audit_start_trigger_counts) == len(AuditTriggerReason)
+        and set(audit_start_trigger_counts) == set(AuditTriggerReason)
+        and len(processor_summary.audit_outcome_trigger_counts)
+        == len(expected_trigger_outcome_keys)
+        and set(audit_outcome_trigger_counts) == expected_trigger_outcome_keys
+        and sum(audit_start_trigger_counts.values())
+        == processor_summary.rest_audits + processor_summary.pending_rest_audits
+        and sum(audit_outcome_trigger_counts.values()) == processor_summary.rest_audits
+        and outcome_totals[AuditOutcome.MATCH] == processor_summary.rest_audit_matches
+        and outcome_totals[AuditOutcome.MISMATCH] == processor_summary.rest_audit_mismatches
+        and outcome_totals[AuditOutcome.RACED] == processor_summary.rest_audit_raced
+        and outcome_totals[AuditOutcome.FAILED] == processor_summary.rest_audit_failed
+        and all(
+            sum(audit_outcome_trigger_counts[(trigger, outcome)] for outcome in AuditOutcome)
+            <= audit_start_trigger_counts[trigger]
+            for trigger in AuditTriggerReason
+        )
+    )
+
+
 def build_observation_health_checkpoint(
     *,
     config: Phase1Config,
@@ -873,6 +1075,7 @@ def build_observation_health_checkpoint(
     book_last_valid_receive_monotonic_ns: Mapping[InstrumentId, int],
     emitted_at: UtcTimestamp,
     monotonic_now_ns: int,
+    terminal: bool = False,
 ) -> HealthCheckpoint:
     """Build one immutable checkpoint without performing I/O or blocking owners."""
 
@@ -974,12 +1177,93 @@ def build_observation_health_checkpoint(
     audit_mismatch_cause_counts = {
         cause.value: count for cause, count in processor_summary.audit_mismatch_cause_counts
     }
+    audit_mismatch_cause_counts_reconciled = (
+        len(processor_summary.audit_mismatch_cause_counts) == len(AuditMismatchCause)
+        and set(audit_mismatch_cause_counts) == {cause.value for cause in AuditMismatchCause}
+        and sum(audit_mismatch_cause_counts.values()) == processor_summary.rest_audit_mismatches
+        and audit_mismatch_cause_counts[AuditMismatchCause.UNKNOWN.value]
+        == processor_summary.audit_divergences_unknown
+        and audit_mismatch_cause_counts[AuditMismatchCause.LOCAL_BOOK_DEFECT.value]
+        == processor_summary.audit_local_book_defects
+    )
     audit_mismatch_representatives = _audit_mismatch_representatives(
         processor_summary.audit_mismatch_diagnostics
     )
+    audit_start_trigger_counts = dict(processor_summary.audit_start_trigger_counts)
+    audit_outcome_trigger_counts = {
+        (trigger, outcome): count
+        for trigger, outcome, count in processor_summary.audit_outcome_trigger_counts
+    }
+    audit_trigger_reconciled = audit_trigger_evidence_reconciled(processor_summary)
+    pending_divergence_ids = tuple(
+        record.divergence_id for record in processor_summary.audit_divergence_pending_records
+    )
+    resolution_divergence_ids = tuple(
+        record.divergence_id for record in processor_summary.audit_divergence_resolution_records
+    )
+    resolution_representatives = _audit_divergence_resolution_representatives(
+        processor_summary.audit_divergence_resolution_records
+    )
+    resolution_records_truncated = (
+        processor_summary.audit_divergence_resolution_records_truncated
+        or processor_summary.audit_divergences_resolved_by_authoritative_resnapshot
+        > len(resolution_representatives)
+    )
+    resolution_records_reconciled = (
+        len(set(resolution_divergence_ids)) == len(resolution_divergence_ids)
+        and (
+            processor_summary.audit_divergence_resolution_records_truncated
+            or len(resolution_divergence_ids)
+            == processor_summary.audit_divergences_resolved_by_authoritative_resnapshot
+        )
+        and len(resolution_divergence_ids)
+        <= processor_summary.audit_divergences_resolved_by_authoritative_resnapshot
+    )
+    audit_divergence_evidence_reconciled = (
+        processor_summary.audit_divergence_lifecycle_reconciled
+        and processor_summary.audit_divergences_observed == processor_summary.rest_audit_mismatches
+        and processor_summary.audit_divergences_pending
+        == processor_summary.audit_divergences_unresolved
+        == len(pending_divergence_ids)
+        and processor_summary.audit_replacement_captures_pending
+        <= processor_summary.audit_divergences_resolved_by_authoritative_resnapshot
+        and len(set(pending_divergence_ids)) == len(pending_divergence_ids)
+        and set(pending_divergence_ids).isdisjoint(resolution_divergence_ids)
+        and resolution_records_reconciled
+        and audit_mismatch_cause_counts_reconciled
+        and processor_summary.audit_divergences_resolved_same_generation == 0
+        and processor_summary.audit_divergences_unknown
+        <= processor_summary.audit_divergences_observed
+        and processor_summary.audit_local_book_defects
+        <= processor_summary.audit_divergences_observed
+        and len(processor_summary.audit_divergence_history_chain_sha256) == 64
+        and all(
+            character in "0123456789abcdef"
+            for character in processor_summary.audit_divergence_history_chain_sha256
+        )
+    )
     maximum_book_age_ns = int(config.scanner.maximum_book_age_seconds * 1_000_000_000)
     audit_ineligible_instruments = set(processor.audit_ineligible_instruments)
+    audit_eligibility_evidence_reconciled = processor_summary.audit_ineligible_books == len(
+        audit_ineligible_instruments
+    )
+    audit_divergence_evidence_reconciled = (
+        audit_divergence_evidence_reconciled and audit_eligibility_evidence_reconciled
+    )
     required_books = len(required_instrument_ids)
+    required_audit_ineligible_instrument_ids = tuple(
+        sorted(
+            audit_ineligible_instruments.intersection(required_instrument_ids),
+            key=lambda item: item.value,
+        )
+    )
+    current_audit_eligible = (
+        required_books > 0
+        and audit_eligibility_evidence_reconciled
+        and not required_audit_ineligible_instrument_ids
+        and processor_summary.audit_divergences_pending == 0
+        and processor_summary.audit_replacement_captures_pending == 0
+    )
     all_required_books_healthy = (
         required_books > 0
         and len(snapshots) == required_books
@@ -988,7 +1272,7 @@ def build_observation_health_checkpoint(
             age_nanoseconds is not None and age_nanoseconds <= maximum_book_age_ns
             for age_nanoseconds in freshness_age_by_instrument.values()
         )
-        and audit_ineligible_instruments.isdisjoint(required_instrument_ids)
+        and current_audit_eligible
     )
     ingress_saturated = (
         runtime.ingress.overflows > 0
@@ -1013,6 +1297,7 @@ def build_observation_health_checkpoint(
         and runtime.availability_records_emitted == completed_availability_intervals
         and availability_writer.accepted == runtime.availability_records_emitted
         and availability_writer.rejected == 0
+        and runtime.availability_open_at_shutdown_intervals == 0
     )
     http_final_failures = sum(endpoint.final_failures for endpoint in public_reads.endpoints)
     http_retry_exhaustions = sum(
@@ -1045,6 +1330,30 @@ def build_observation_health_checkpoint(
                 or host_identity.untracked_source_clean is False
             ),
             audit_mismatches=processor_summary.rest_audit_mismatches,
+            audit_divergences_observed=(processor_summary.audit_divergences_observed),
+            audit_divergences_resolved_by_authoritative_resnapshot=(
+                processor_summary.audit_divergences_resolved_by_authoritative_resnapshot
+            ),
+            audit_divergences_resolved_same_generation=(
+                processor_summary.audit_divergences_resolved_same_generation
+            ),
+            audit_divergences_pending=processor_summary.audit_divergences_pending,
+            # Periodic checkpoints expose a transient pending state.  The one
+            # terminal checkpoint promotes any still-open divergence to the
+            # Gate-sticky unresolved state in the canonical artifact itself.
+            audit_divergences_unresolved=(
+                processor_summary.audit_divergences_unresolved if terminal else 0
+            ),
+            audit_replacement_captures_pending=(
+                processor_summary.audit_replacement_captures_pending
+            ),
+            audit_replacement_captures_unresolved=(
+                processor_summary.audit_replacement_captures_pending if terminal else 0
+            ),
+            audit_divergences_unknown=processor_summary.audit_divergences_unknown,
+            audit_local_book_defects=processor_summary.audit_local_book_defects,
+            audit_divergence_lifecycle_reconciled=(audit_divergence_evidence_reconciled),
+            audit_trigger_reconciled=audit_trigger_reconciled,
             audit_failures=processor_summary.rest_audit_failed,
             audit_race_budget_exhaustions=race_budget_exhaustions,
             http_final_failures=http_final_failures,
@@ -1160,6 +1469,18 @@ def build_observation_health_checkpoint(
         },
         audit={
             "barrier_lag_frames_max": max(barrier_lag_frames, default=None),
+            "current_eligibility": {
+                "eligible": current_audit_eligible,
+                "evidence_reconciled": audit_eligibility_evidence_reconciled,
+                "pending_divergence_count": processor_summary.audit_divergences_pending,
+                "processor_ineligible_book_count": processor_summary.audit_ineligible_books,
+                "replacement_capture_count": (processor_summary.audit_replacement_captures_pending),
+                "required_ineligible_book_count": len(required_audit_ineligible_instrument_ids),
+                "required_ineligible_instrument_ids": tuple(
+                    instrument_id.value
+                    for instrument_id in required_audit_ineligible_instrument_ids
+                ),
+            },
             "failed": processor_summary.rest_audit_failed,
             "generation_rebases": processor_summary.audit_start_generation_rebases,
             "last_successful_race_free_integrity_age_nanoseconds": (
@@ -1170,12 +1491,43 @@ def build_observation_health_checkpoint(
             ),
             "match": processor_summary.rest_audit_matches,
             "mismatch": processor_summary.rest_audit_mismatches,
+            "divergences": {
+                "evidence_reconciled": audit_divergence_evidence_reconciled,
+                "history_chain_sha256": (processor_summary.audit_divergence_history_chain_sha256),
+                "local_book_defects": processor_summary.audit_local_book_defects,
+                "observed": processor_summary.audit_divergences_observed,
+                "pending": processor_summary.audit_divergences_pending,
+                "replacement_captures_pending": (
+                    processor_summary.audit_replacement_captures_pending
+                ),
+                "replacement_captures_unresolved": (
+                    processor_summary.audit_replacement_captures_pending if terminal else 0
+                ),
+                "pending_records": tuple(
+                    _audit_divergence_pending_representative(record)
+                    for record in processor_summary.audit_divergence_pending_records
+                ),
+                "resolution_records": tuple(
+                    _audit_divergence_resolution_representative(record)
+                    for record in resolution_representatives
+                ),
+                "resolution_records_reconciled": resolution_records_reconciled,
+                "resolution_records_truncated": resolution_records_truncated,
+                "resolved_by_authoritative_resnapshot": (
+                    processor_summary.audit_divergences_resolved_by_authoritative_resnapshot
+                ),
+                "resolved_same_generation": (
+                    processor_summary.audit_divergences_resolved_same_generation
+                ),
+                "runtime_lifecycle_reconciled": (
+                    processor_summary.audit_divergence_lifecycle_reconciled
+                ),
+                "unknown": processor_summary.audit_divergences_unknown,
+                "unresolved": processor_summary.audit_divergences_unresolved,
+            },
             "mismatch_causes": {
                 "counts": audit_mismatch_cause_counts,
-                "counts_reconciled": (
-                    sum(audit_mismatch_cause_counts.values())
-                    == processor_summary.rest_audit_mismatches
-                ),
+                "counts_reconciled": audit_mismatch_cause_counts_reconciled,
                 "diagnostics_retained": len(processor_summary.audit_mismatch_diagnostics),
                 "diagnostics_truncated": (processor_summary.audit_mismatch_diagnostics_truncated),
                 "representatives": audit_mismatch_representatives,
@@ -1183,6 +1535,20 @@ def build_observation_health_checkpoint(
             "pending": processor_summary.pending_rest_audits,
             "race_budget_exhaustions": race_budget_exhaustions,
             "raced": processor_summary.rest_audit_raced,
+            "triggers": {
+                "counts_reconciled": audit_trigger_reconciled,
+                "outcomes_by_trigger": {
+                    trigger.value: {
+                        outcome.value: audit_outcome_trigger_counts[(trigger, outcome)]
+                        for outcome in AuditOutcome
+                    }
+                    for trigger in AuditTriggerReason
+                },
+                "starts_by_trigger": {
+                    trigger.value: audit_start_trigger_counts[trigger]
+                    for trigger in AuditTriggerReason
+                },
+            },
             "reported_top_transitions": {
                 "converged": processor_summary.reported_top_transitions_converged,
                 "duration_max_nanoseconds": (
@@ -1264,6 +1630,7 @@ def build_observation_health_checkpoint(
         research_eligible=decision.research_eligible,
         gate1_eligible_so_far=decision.gate1_eligible_so_far,
         reason_codes=decision.reason_codes,
+        gate1_sticky_reason_codes=decision.gate1_sticky_reason_codes,
     )
 
 
@@ -1276,6 +1643,7 @@ __all__ = [
     "ProcessResourceSnapshot",
     "ProcessResourceTrendSnapshot",
     "SupervisedProcessResourceSampler",
+    "audit_trigger_evidence_reconciled",
     "build_observation_health_checkpoint",
     "capture_process_resources",
 ]

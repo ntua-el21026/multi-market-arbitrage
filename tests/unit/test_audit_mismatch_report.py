@@ -42,6 +42,9 @@ from multi_market_arbitrage.pipeline.transitions import (
     ReportedTopTransitionStatus,
 )
 from multi_market_arbitrage.research.audit_mismatch import (
+    AuditEqualityProof,
+    AuditMatchingStateRepresentation,
+    AuditMismatchCausalRelation,
     AuditMismatchLineageReason,
     AuditMismatchObservation,
     AuditMismatchReportError,
@@ -254,7 +257,12 @@ def _rest_response(
                 "timestamp": timestamp,
             }
         ),
-        metadata={"audit_attempt": 1, "request_id": request_id},
+        metadata={
+            "audit_attempt": 1,
+            "barrier_websocket_ordinal": sequence - 1,
+            "request_id": request_id,
+            "response_boundary_websocket_ordinal": sequence - 1,
+        },
     )
 
 
@@ -381,6 +389,9 @@ def test_prior_exact_mutation_lineage_proves_freshness_boundary() -> None:
     assert result.cause is AuditMismatchCause.FRESHNESS_RESPONSE_WINDOW_BOUNDARY
     assert result.reason is AuditMismatchLineageReason.PRIOR_STATE_EXACTLY_RECONCILED
     assert result.venue_state_relation is AuditVenueStateRelation.PRIOR
+    assert result.causal_relation is AuditMismatchCausalRelation.PRIOR_STATE_MATCH
+    assert result.response_to_match_monotonic_ns == -3
+    assert result.classification_to_match_monotonic_ns == -4
     assert result.exact_reconciliation_proven
     assert result.subsequent_exact_frame_count == 1
     assert result.subsequent_raw_sources.source_count == 1
@@ -405,6 +416,7 @@ def test_contradictory_prior_snapshot_is_not_seeded_from_rest_depth() -> None:
 
     assert result.cause is AuditMismatchCause.UNKNOWN
     assert result.reason is AuditMismatchLineageReason.VENUE_STATE_NOT_FOUND
+    assert result.causal_relation is AuditMismatchCausalRelation.NOT_FOUND
     assert result.venue_state_relation is AuditVenueStateRelation.NONE
     assert result.matching_websocket_source is None
     assert result.subsequent_exact_frame_count == 0
@@ -430,6 +442,7 @@ def test_reconstructed_crossed_depth_proves_local_book_defect() -> None:
 
     assert result.cause is AuditMismatchCause.LOCAL_BOOK_DEFECT
     assert result.reason is AuditMismatchLineageReason.RECONSTRUCTED_LOCAL_BOOK_DEFECT
+    assert result.causal_relation is AuditMismatchCausalRelation.LOCAL_BOOK_DEFECT
     assert result.venue_state_relation is AuditVenueStateRelation.PRIOR
     assert not result.exact_reconciliation_proven
 
@@ -472,9 +485,15 @@ def test_future_matching_venue_state_proves_response_window_boundary() -> None:
     result = _build(envelopes, observation).results[0]
 
     assert result.cause is AuditMismatchCause.FRESHNESS_RESPONSE_WINDOW_BOUNDARY
-    assert result.reason is AuditMismatchLineageReason.FUTURE_VENUE_STATE
+    assert result.reason is AuditMismatchLineageReason.SAME_GENERATION_EXACT_CONVERGENCE
+    assert result.causal_relation is AuditMismatchCausalRelation.SAME_GENERATION_NATURAL_CONVERGENCE
     assert result.venue_state_relation is AuditVenueStateRelation.FUTURE
     assert result.matching_websocket_ingest_seq == 4
+    assert result.matching_websocket_subordinal == 0
+    assert result.matching_state_representation is AuditMatchingStateRepresentation.FULL_SNAPSHOT
+    assert result.equality_proof is AuditEqualityProof.FULL_DEPTH_EXACT
+    assert result.response_to_match_monotonic_ns == 2
+    assert result.classification_to_match_monotonic_ns == 1
 
 
 def test_raw_bound_pending_transition_proves_reported_top_cause() -> None:
@@ -498,6 +517,7 @@ def test_raw_bound_pending_transition_proves_reported_top_cause() -> None:
 
     assert result.cause is AuditMismatchCause.REPORTED_TOP_TRANSITION
     assert result.reason is AuditMismatchLineageReason.ACTIVE_REPORTED_TOP_TRANSITION
+    assert result.causal_relation is AuditMismatchCausalRelation.REFERENCE_TRANSITION
     assert result.matching_websocket_source == transition.latest_source_raw_refs[0]
     assert result.matching_websocket_ingest_seq == transition.latest_ingest_seq
     assert not result.exact_reconciliation_proven
@@ -528,6 +548,8 @@ def test_equal_depth_future_tick_transition_proves_reference_precision_cause() -
 
     assert result.cause is AuditMismatchCause.REFERENCE_PRECISION_TRANSITION
     assert result.reason is (AuditMismatchLineageReason.FUTURE_REFERENCE_PRECISION_TRANSITION)
+    assert result.causal_relation is AuditMismatchCausalRelation.REFERENCE_TRANSITION
+    assert result.equality_proof is AuditEqualityProof.FULL_DEPTH_EXACT
     assert result.venue_state_relation is AuditVenueStateRelation.FUTURE
     assert result.matching_websocket_ingest_seq == 4
     assert not result.exact_reconciliation_proven
@@ -558,6 +580,8 @@ def test_unbound_equal_depth_scalar_mismatch_remains_unknown() -> None:
 
     assert result.cause is AuditMismatchCause.UNKNOWN
     assert result.reason is AuditMismatchLineageReason.SCALAR_MISMATCH_CAUSE_UNPROVEN
+    assert result.causal_relation is AuditMismatchCausalRelation.NOT_FOUND
+    assert result.equality_proof is AuditEqualityProof.FULL_DEPTH_EXACT
     assert result.venue_state_relation is AuditVenueStateRelation.NONE
     assert result.matching_websocket_source is None
 
@@ -579,20 +603,22 @@ def test_contradictory_full_snapshot_depth_cannot_prove_future_venue_state() -> 
 
     result = _build(envelopes, observation).results[0]
 
-    assert result.cause is AuditMismatchCause.UNKNOWN
-    assert result.reason is AuditMismatchLineageReason.VENUE_STATE_NOT_FOUND
+    assert result.cause is AuditMismatchCause.TRUE_EXACT_DEPTH_DIVERGENCE
+    assert result.reason is AuditMismatchLineageReason.PERSISTENT_EXACT_DIVERGENCE
+    assert result.causal_relation is AuditMismatchCausalRelation.PERSISTENT_DIVERGENCE
     assert result.venue_state_relation is AuditVenueStateRelation.NONE
     assert result.matching_websocket_source is None
     assert not result.exact_reconciliation_proven
 
 
-def test_price_change_venue_identity_cannot_establish_full_state() -> None:
+def test_price_change_reconstructs_exact_same_generation_state() -> None:
     envelopes = (
         _ws_book(0, venue_hash="old", bid_quantity="10"),
         _start(1, response_sequence=2),
         _rest_response(2, venue_hash="h0", timestamp="1000", bid_quantity="12"),
         _classification(3, response_sequence=2),
-        # A price_change hash identifies its causing order, not full depth.
+        # The hash is diagnostic only; the retained snapshot plus ordered
+        # incremental establishes the complete project-owned depth.
         _ws_change(4, venue_hash="h0", bid_quantity="12", timestamp="1000"),
     )
     observation = _observation(
@@ -603,14 +629,20 @@ def test_price_change_venue_identity_cannot_establish_full_state() -> None:
 
     result = _build(envelopes, observation).results[0]
 
-    assert result.cause is AuditMismatchCause.UNKNOWN
-    assert result.reason is AuditMismatchLineageReason.VENUE_STATE_NOT_FOUND
-    assert result.venue_state_relation is AuditVenueStateRelation.NONE
-    assert result.matching_websocket_source is None
-    assert not result.exact_reconciliation_proven
+    assert result.cause is AuditMismatchCause.FRESHNESS_RESPONSE_WINDOW_BOUNDARY
+    assert result.reason is AuditMismatchLineageReason.SAME_GENERATION_EXACT_CONVERGENCE
+    assert result.causal_relation is AuditMismatchCausalRelation.SAME_GENERATION_NATURAL_CONVERGENCE
+    assert result.venue_state_relation is AuditVenueStateRelation.FUTURE
+    assert (
+        result.matching_state_representation
+        is AuditMatchingStateRepresentation.RECONSTRUCTED_INCREMENTALS
+    )
+    assert result.matching_exact_frame_count == 2
+    assert result.matching_source_chain.source_count == 2
+    assert result.exact_reconciliation_proven
 
 
-def test_exact_full_snapshot_depth_without_matching_identity_is_not_a_state_anchor() -> None:
+def test_exact_depth_is_authoritative_and_venue_identity_is_diagnostic_only() -> None:
     envelopes = (
         _ws_book(0, venue_hash="old", bid_quantity="10"),
         _start(1, response_sequence=2),
@@ -626,10 +658,13 @@ def test_exact_full_snapshot_depth_without_matching_identity_is_not_a_state_anch
 
     result = _build(envelopes, observation).results[0]
 
-    assert result.cause is AuditMismatchCause.UNKNOWN
-    assert result.reason is AuditMismatchLineageReason.VENUE_STATE_NOT_FOUND
-    assert result.matching_websocket_source is None
-    assert not result.exact_reconciliation_proven
+    assert result.cause is AuditMismatchCause.FRESHNESS_RESPONSE_WINDOW_BOUNDARY
+    assert result.reason is AuditMismatchLineageReason.SAME_GENERATION_EXACT_CONVERGENCE
+    assert result.causal_relation is AuditMismatchCausalRelation.SAME_GENERATION_NATURAL_CONVERGENCE
+    assert result.matching_websocket_source is not None
+    assert result.venue_hash_diagnostic_equal is False
+    assert result.venue_timestamp_diagnostic_equal is True
+    assert result.exact_reconciliation_proven
 
 
 def test_latest_prior_state_remains_true_exact_depth_divergence() -> None:
@@ -669,6 +704,7 @@ def test_missing_venue_state_is_retained_as_unknown() -> None:
 
     assert report.results[0].cause is AuditMismatchCause.UNKNOWN
     assert report.results[0].reason is AuditMismatchLineageReason.VENUE_STATE_NOT_FOUND
+    assert report.results[0].causal_relation is AuditMismatchCausalRelation.NOT_FOUND
     assert sum(item.count for item in report.cause_counts) == 1
     assert (
         next(item.count for item in report.cause_counts if item.cause is AuditMismatchCause.UNKNOWN)

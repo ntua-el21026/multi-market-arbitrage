@@ -26,7 +26,8 @@ from multi_market_arbitrage.journal.recovery import fsync_directory
 from .host import normalize_git_commit
 
 HEALTH_CHECKPOINT_V1_SCHEMA_VERSION: Final = "gate1-health-checkpoint-v1"
-HEALTH_CHECKPOINT_SCHEMA_VERSION: Final = "gate1-health-checkpoint-v2"
+HEALTH_CHECKPOINT_V2_SCHEMA_VERSION: Final = "gate1-health-checkpoint-v2"
+HEALTH_CHECKPOINT_SCHEMA_VERSION: Final = "gate1-health-checkpoint-v3"
 HEALTH_EVIDENCE_SUMMARY_VERSION: Final = "gate1-health-evidence-summary-v2"
 
 
@@ -53,7 +54,17 @@ class HealthDecisionReason(StrEnum):
     AVAILABILITY_RECONCILIATION_FAILED = "AVAILABILITY_RECONCILIATION_FAILED"
     HTTP_INTEGRITY_UNAVAILABLE = "HTTP_INTEGRITY_UNAVAILABLE"
     HTTP_FINAL_FAILURE = "HTTP_FINAL_FAILURE"
+    # Retained solely so historical v1/v2 evidence can be interpreted without
+    # relabeling.  New decisions never derive this reason from the cumulative
+    # mismatch counter.
     AUDIT_MISMATCH = "AUDIT_MISMATCH"
+    AUDIT_DIVERGENCE_PENDING = "AUDIT_DIVERGENCE_PENDING"
+    AUDIT_REPLACEMENT_CAPTURE_PENDING = "AUDIT_REPLACEMENT_CAPTURE_PENDING"
+    AUDIT_DIVERGENCE_UNRESOLVED = "AUDIT_DIVERGENCE_UNRESOLVED"
+    AUDIT_DIVERGENCE_UNKNOWN = "AUDIT_DIVERGENCE_UNKNOWN"
+    AUDIT_LOCAL_BOOK_DEFECT = "AUDIT_LOCAL_BOOK_DEFECT"
+    AUDIT_DIVERGENCE_RECONCILIATION_FAILED = "AUDIT_DIVERGENCE_RECONCILIATION_FAILED"
+    AUDIT_TRIGGER_RECONCILIATION_FAILED = "AUDIT_TRIGGER_RECONCILIATION_FAILED"
     AUDIT_FAILED = "AUDIT_FAILED"
     AUDIT_RACE_BUDGET_EXHAUSTED = "AUDIT_RACE_BUDGET_EXHAUSTED"
     PROTOCOL_DEVIATION = "PROTOCOL_DEVIATION"
@@ -91,6 +102,17 @@ class HealthDecisionInputs:
     source_identity_known: bool = True
     source_identity_mismatch: bool = False
     source_tree_dirty: bool = False
+    audit_divergences_observed: int = 0
+    audit_divergences_resolved_by_authoritative_resnapshot: int = 0
+    audit_divergences_resolved_same_generation: int = 0
+    audit_divergences_pending: int = 0
+    audit_divergences_unresolved: int = 0
+    audit_replacement_captures_pending: int = 0
+    audit_replacement_captures_unresolved: int = 0
+    audit_divergences_unknown: int = 0
+    audit_local_book_defects: int = 0
+    audit_divergence_lifecycle_reconciled: bool = True
+    audit_trigger_reconciled: bool = True
 
     def __post_init__(self) -> None:
         counts = (
@@ -104,6 +126,15 @@ class HealthDecisionInputs:
             self.protocol_deviations,
             self.raw_run_bytes,
             self.free_disk_bytes,
+            self.audit_divergences_observed,
+            self.audit_divergences_resolved_by_authoritative_resnapshot,
+            self.audit_divergences_resolved_same_generation,
+            self.audit_divergences_pending,
+            self.audit_divergences_unresolved,
+            self.audit_replacement_captures_pending,
+            self.audit_replacement_captures_unresolved,
+            self.audit_divergences_unknown,
+            self.audit_local_book_defects,
         )
         if any(value < 0 for value in counts):
             raise ValueError("health-decision counters cannot be negative")
@@ -117,6 +148,20 @@ class HealthDecision:
     research_eligible: bool
     gate1_eligible_so_far: bool
     reason_codes: tuple[HealthDecisionReason, ...]
+    gate1_sticky_reason_codes: tuple[HealthDecisionReason, ...] = ()
+
+    def __post_init__(self) -> None:
+        if len(set(self.reason_codes)) != len(self.reason_codes):
+            raise ValueError("health-decision reason codes must be unique")
+        if len(set(self.gate1_sticky_reason_codes)) != len(self.gate1_sticky_reason_codes):
+            raise ValueError("health-decision sticky reason codes must be unique")
+        if self.gate1_eligible_so_far and (
+            not self.capture_healthy
+            or not self.research_eligible
+            or self.reason_codes
+            or self.gate1_sticky_reason_codes
+        ):
+            raise ValueError("Gate-1 eligibility cannot contradict scoped health decisions")
 
 
 def evaluate_health_decision(inputs: HealthDecisionInputs) -> HealthDecision:
@@ -159,8 +204,22 @@ def evaluate_health_decision(inputs: HealthDecisionInputs) -> HealthDecision:
         reasons.add(HealthDecisionReason.AVAILABILITY_QUEUE_SATURATED)
     if not inputs.availability_reconciled:
         reasons.add(HealthDecisionReason.AVAILABILITY_RECONCILIATION_FAILED)
-    if inputs.audit_mismatches:
-        reasons.add(HealthDecisionReason.AUDIT_MISMATCH)
+    # ``audit_mismatches`` is retained as a legacy diagnostic input.  ADR-0054
+    # forbids treating cumulative observed history as unresolved current state.
+    if inputs.audit_divergences_pending:
+        reasons.add(HealthDecisionReason.AUDIT_DIVERGENCE_PENDING)
+    if inputs.audit_replacement_captures_pending:
+        reasons.add(HealthDecisionReason.AUDIT_REPLACEMENT_CAPTURE_PENDING)
+    if inputs.audit_divergences_unresolved or inputs.audit_replacement_captures_unresolved:
+        reasons.add(HealthDecisionReason.AUDIT_DIVERGENCE_UNRESOLVED)
+    if inputs.audit_divergences_unknown:
+        reasons.add(HealthDecisionReason.AUDIT_DIVERGENCE_UNKNOWN)
+    if inputs.audit_local_book_defects:
+        reasons.add(HealthDecisionReason.AUDIT_LOCAL_BOOK_DEFECT)
+    if not inputs.audit_divergence_lifecycle_reconciled:
+        reasons.add(HealthDecisionReason.AUDIT_DIVERGENCE_RECONCILIATION_FAILED)
+    if not inputs.audit_trigger_reconciled:
+        reasons.add(HealthDecisionReason.AUDIT_TRIGGER_RECONCILIATION_FAILED)
     if inputs.audit_failures:
         reasons.add(HealthDecisionReason.AUDIT_FAILED)
     if inputs.audit_race_budget_exhaustions:
@@ -189,6 +248,13 @@ def evaluate_health_decision(inputs: HealthDecisionInputs) -> HealthDecision:
         HealthDecisionReason.BOOK_NOT_HEALTHY,
         HealthDecisionReason.ANALYTICAL_UNHEALTHY,
         HealthDecisionReason.ANALYTICAL_QUEUE_SATURATED,
+        HealthDecisionReason.AUDIT_DIVERGENCE_PENDING,
+        HealthDecisionReason.AUDIT_REPLACEMENT_CAPTURE_PENDING,
+        HealthDecisionReason.AUDIT_DIVERGENCE_UNRESOLVED,
+        HealthDecisionReason.AUDIT_DIVERGENCE_UNKNOWN,
+        HealthDecisionReason.AUDIT_LOCAL_BOOK_DEFECT,
+        HealthDecisionReason.AUDIT_DIVERGENCE_RECONCILIATION_FAILED,
+        HealthDecisionReason.AUDIT_TRIGGER_RECONCILIATION_FAILED,
     }
     # Audit, HTTP, and protocol counters are cumulative evidence, not
     # current-state flags.
@@ -196,14 +262,22 @@ def evaluate_health_decision(inputs: HealthDecisionInputs) -> HealthDecision:
     # eligibility is represented by ``all_required_books_healthy`` (including
     # the processor's audit-ineligible set) and current capture state.
     ordered = tuple(sorted(reasons, key=str))
+    transient_gate_reasons = {
+        HealthDecisionReason.SOCKET_DISCONNECTED,
+        HealthDecisionReason.BOOK_NOT_HEALTHY,
+        HealthDecisionReason.AUDIT_DIVERGENCE_PENDING,
+        HealthDecisionReason.AUDIT_REPLACEMENT_CAPTURE_PENDING,
+    }
+    sticky = tuple(sorted(reasons.difference(transient_gate_reasons), key=str))
     capture_healthy = not reasons.intersection(capture_blockers)
     research_eligible = not reasons.intersection(research_blockers)
-    gate1_eligible = not reasons
+    gate1_eligible = not reasons and not sticky
     return HealthDecision(
         capture_healthy=capture_healthy,
         research_eligible=research_eligible,
         gate1_eligible_so_far=gate1_eligible,
         reason_codes=ordered,
+        gate1_sticky_reason_codes=sticky,
     )
 
 
@@ -240,6 +314,7 @@ class HealthCheckpoint:
     research_eligible: bool
     gate1_eligible_so_far: bool
     reason_codes: tuple[HealthDecisionReason, ...]
+    gate1_sticky_reason_codes: tuple[HealthDecisionReason, ...] = ()
     schema_version: str = HEALTH_CHECKPOINT_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -255,13 +330,18 @@ class HealthCheckpoint:
             raise ValueError("health-checkpoint config hash must be non-empty")
         if len(set(self.reason_codes)) != len(self.reason_codes):
             raise ValueError("health-checkpoint reason codes must be unique")
+        if len(set(self.gate1_sticky_reason_codes)) != len(self.gate1_sticky_reason_codes):
+            raise ValueError("health-checkpoint sticky reason codes must be unique")
         code_identity_unavailable = (
             HealthDecisionReason.CODE_IDENTITY_UNAVAILABLE in self.reason_codes
         )
         if (self.git_commit is None) != code_identity_unavailable:
             raise ValueError("health-checkpoint unknown code identity must have a typed reason")
         if self.gate1_eligible_so_far and (
-            not self.capture_healthy or not self.research_eligible or self.reason_codes
+            not self.capture_healthy
+            or not self.research_eligible
+            or self.reason_codes
+            or self.gate1_sticky_reason_codes
         ):
             raise ValueError("Gate-1 eligibility cannot contradict scoped health decisions")
 
@@ -276,6 +356,7 @@ class HealthCheckpoint:
             "decisions": {
                 "capture_healthy": self.capture_healthy,
                 "gate1_eligible_so_far": self.gate1_eligible_so_far,
+                "gate1_sticky_reason_codes": self.gate1_sticky_reason_codes,
                 "reason_codes": self.reason_codes,
                 "research_eligible": self.research_eligible,
             },
@@ -348,7 +429,7 @@ def _record_integer(record: Mapping[str, object], key: str) -> int:
 def validate_health_checkpoint_chronology(
     records: Iterable[Mapping[str, object]],
 ) -> HealthCheckpointChronology:
-    """Validate v2 monotonic chronology without inventing timestamps for v1.
+    """Validate v2/v3 monotonic chronology without inventing timestamps for v1.
 
     Historical v1 files remain readable evidence, but their omitted monotonic
     emission timestamps are reported as unavailable and cannot satisfy the v2
@@ -362,6 +443,8 @@ def validate_health_checkpoint_chronology(
     if len(versions) != 1:
         raise ValueError("health checkpoint evidence cannot mix schema versions")
     version = next(iter(versions))
+    if not isinstance(version, str):
+        raise ValueError("health checkpoint schema version must be text")
     if version == HEALTH_CHECKPOINT_V1_SCHEMA_VERSION:
         forbidden = {
             "emitted_monotonic_epoch_id",
@@ -377,7 +460,10 @@ def validate_health_checkpoint_chronology(
             last_emitted_monotonic=None,
             limitation="v1 evidence did not retain monotonic checkpoint emission timestamps",
         )
-    if version != HEALTH_CHECKPOINT_SCHEMA_VERSION:
+    if version not in {
+        HEALTH_CHECKPOINT_V2_SCHEMA_VERSION,
+        HEALTH_CHECKPOINT_SCHEMA_VERSION,
+    }:
         raise ValueError("unsupported health-checkpoint schema version")
     timestamps: list[MonotonicTimestamp] = []
     collector_run_id: str | None = None
@@ -400,7 +486,7 @@ def validate_health_checkpoint_chronology(
             raise ValueError("health checkpoint monotonic chronology must strictly advance")
         timestamps.append(timestamp)
     return HealthCheckpointChronology(
-        schema_version=HEALTH_CHECKPOINT_SCHEMA_VERSION,
+        schema_version=version,
         checkpoint_count=len(timestamps),
         monotonic_chronology_available=True,
         first_emitted_monotonic=timestamps[0],
@@ -780,6 +866,7 @@ class PeriodicHealthCheckpointEmitter:
 __all__ = [
     "HEALTH_CHECKPOINT_SCHEMA_VERSION",
     "HEALTH_CHECKPOINT_V1_SCHEMA_VERSION",
+    "HEALTH_CHECKPOINT_V2_SCHEMA_VERSION",
     "HEALTH_EVIDENCE_SUMMARY_VERSION",
     "HealthCheckpoint",
     "HealthCheckpointChronology",

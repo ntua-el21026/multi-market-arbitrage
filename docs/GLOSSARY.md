@@ -46,6 +46,61 @@ Bounded auxiliary state defined by ADR-0053 for a book whose exact quantity-bear
 
 It is not a `BookHealth` value and does not make the book healthy. While unresolved, exact valid L2/provenance may be retained, but audit, scanner and research eligibility remain blocked. The transition clears only by exact convergence, authoritative snapshot/resnapshot or deterministic supersession; ambiguity/bound expiry fails closed.
 
+## AuditDivergence
+
+A race-free exact disagreement between the normalized REST book and the fenced
+local exact-depth book, governed by ADR-0054. Its immutable observation is
+separate from current state:
+
+```text
+AUDIT_DIVERGENCE_OBSERVED
+AUDIT_DIVERGENCE_PENDING
+AUDIT_DIVERGENCE_RESOLVED_BY_AUTHORITATIVE_RESNAPSHOT
+AUDIT_REPLACEMENT_CAPTURE_PENDING
+AUDIT_DIVERGENCE_UNRESOLVED
+AUDIT_DIVERGENCE_UNKNOWN
+AUDIT_LOCAL_BOOK_DEFECT
+```
+
+Phase 1 resolves divergence-pending state only through a separate authoritative
+full REST resnapshot with exact provenance. REST resolution then leaves
+`AUDIT_REPLACEMENT_CAPTURE_PENDING` until one WebSocket connection different
+from the mismatched connection supplies a durably journaled and canonically
+processed full snapshot for every required market instrument. A further
+connection change restarts incomplete coverage. Retained sources must share one
+monotonic epoch and every leg must be nonfuture and no older than
+`scanner.maximum_book_age` when coverage completes; stale, future-relative and
+cross-epoch sources are pruned. Complete replacement coverage is necessary but
+not sufficient for current v2 inputs: snapshots leave the state pending, and
+only the separate durable replacement-release control may clear it after the
+observer samples the drained admitted prefix and independently rechecks
+connection, decision-time, latest-L2, freshness, health and blocker state. The
+v1 snapshot-only auto-release path exists solely to reproduce historical v1
+journals. Incrementals, reported BBO, socket readiness, partial coverage and the
+first binary leg are insufficient.
+It is a current audit/scanner/research blocker; an incomplete record at terminal
+cutoff is reported as `replacement_captures_unresolved` and produces sticky
+`AUDIT_DIVERGENCE_UNRESOLVED`. Observed, fully recovered external divergence
+remains visible but is not equivalent to current unresolved state. Terminal
+unresolved, new-contract unknown and local-book-defect state are Gate-sticky.
+
+## AuditTriggerReason
+
+Versioned reason for starting a REST integrity audit:
+
+```text
+PERIODIC
+FRESHNESS_GUARD
+RACE_RETRY
+RESYNC_VERIFICATION
+STARTUP_BASELINE
+OTHER_TYPED_REASON
+UNKNOWN_LEGACY
+```
+
+`UNKNOWN_LEGACY` means an immutable v1 control did not carry a trigger; it is
+not inferred from timing. New v2 controls cannot use it.
+
 ## AvailabilityInterval
 Versioned evidence record for one period during which required observation continuity was unavailable or indeterminate. It binds UTC and monotonic start/end, socket/connection identity, typed cause, affected scope and recovery outcome. Aggregate unavailable counters must reconcile with the interval ledger.
 

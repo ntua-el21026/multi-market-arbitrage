@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from collections import deque
 from collections.abc import Callable
@@ -42,6 +43,7 @@ from multi_market_arbitrage.normalization import (
     NewMarketEvent,
     NormalizationContext,
     NormalizationError,
+    NormalizedRestBook,
     OrderBookSnapshotEvent,
     PolymarketNormalizer,
     PriceChangeEvent,
@@ -94,17 +96,25 @@ from .audit import (
     AUDIT_CLASSIFICATION_SCHEMA,
     AUDIT_EXPIRY_SCHEMA,
     AUDIT_FAILURE_SCHEMA,
-    AUDIT_START_SCHEMA,
+    AUDIT_REPLACEMENT_RELEASE_SCHEMA,
+    AUDIT_START_V1_SCHEMA,
+    AUDIT_START_V2_SCHEMA,
     AuditBookIdentity,
     AuditClassificationCommand,
+    AuditDivergencePending,
+    AuditDivergenceResolution,
     AuditExpiryCommand,
     AuditFailureReason,
     AuditMismatchCause,
     AuditMismatchDiagnostic,
     AuditOutcome,
     AuditOutcomeEvidence,
+    AuditReplacementReleaseCommand,
+    AuditRestBookIdentity,
     AuditStartEvidence,
+    AuditTriggerReason,
     WebSocketAdmissionWatermark,
+    audit_exact_depth_identity,
     build_audit_mismatch_diagnostic,
     compare_audit_exact_depth,
 )
@@ -115,6 +125,7 @@ from .channels import (
     CONTROL_REST_AUDIT_CLASSIFY,
     CONTROL_REST_AUDIT_EXPIRED,
     CONTROL_REST_AUDIT_FAILED,
+    CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
     CONTROL_REST_AUDIT_START,
     GAMMA_EVENT_PREFIX,
     GAMMA_MARKET_PREFIX,
@@ -138,6 +149,7 @@ from .transitions import (
 )
 
 _RECENT_HISTORY_LIMIT = 4096
+_MAX_TRACKED_WEBSOCKET_CONNECTIONS = 4096
 _CHAIN_NAMESPACE = b"mma-canonical-processor-chain-v1\0"
 _V1_AUDIT_GENERATION_REBASE_SOURCE_COMMITS = frozenset(
     {
@@ -194,6 +206,10 @@ class _RestAuditProtocolMode(StrEnum):
     DEFERRED_BOUND = "DEFERRED_BOUND"
 
 
+class _AuditReplacementSnapshotEvidenceError(NormalizationError):
+    """A rejected v2 capture frame whose canonical payload was not applied."""
+
+
 @dataclass(frozen=True, slots=True)
 class MarketScanTrigger:
     market_id: MarketId
@@ -244,6 +260,157 @@ class _PostSnapshotBaseline:
 
 
 @dataclass(frozen=True, slots=True)
+class _AuditReplacementSnapshotSource:
+    instrument_id: InstrumentId
+    connection_id: ConnectionId
+    admission_ordinal: int
+    ingest_seq: int
+    received_monotonic: MonotonicTimestamp
+    raw_source: RawSourceRef
+
+
+@dataclass(frozen=True, slots=True)
+class _AuditReplacementCapture:
+    """Bounded proof still required after an authoritative REST recovery.
+
+    ADR-0054 separates instrument-baseline restoration from global research
+    eligibility.  A resolved divergence therefore remains audit-ineligible
+    until one replacement WebSocket connection has supplied full snapshots for
+    every instrument in the affected market.
+    """
+
+    divergence_id: str
+    market_id: MarketId
+    original_connection_id: ConnectionId
+    required_instrument_ids: tuple[InstrumentId, ...]
+    # This internal discriminator is intentionally omitted from ``to_record``.
+    # ``divergence_id`` already binds the audit-start schema, while preserving
+    # the exact legacy v1 capture/history serialization keeps immutable raw
+    # journals terminal-hash compatible.
+    audit_start_schema: str
+    resolution_source: RawSourceRef
+    resolution_ingest_seq: int
+    resolution_monotonic: MonotonicTimestamp
+    pre_open_connection_ids: frozenset[ConnectionId]
+    mismatch_cause: AuditMismatchCause
+    replacement_connection_id: ConnectionId | None = None
+    captured_snapshot_sources: tuple[_AuditReplacementSnapshotSource, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.audit_start_schema not in {AUDIT_START_V1_SCHEMA, AUDIT_START_V2_SCHEMA}:
+            raise ValueError("audit replacement capture start schema is unsupported")
+        if self.resolution_ingest_seq < 0:
+            raise ValueError("audit replacement capture resolution sequence cannot be negative")
+        if not self.required_instrument_ids:
+            raise ValueError("audit replacement capture requires affected instruments")
+        if tuple(sorted(set(self.required_instrument_ids), key=lambda item: item.value)) != (
+            self.required_instrument_ids
+        ):
+            raise ValueError("audit replacement instruments must be unique and sorted")
+        captured_instrument_ids = tuple(
+            source.instrument_id for source in self.captured_snapshot_sources
+        )
+        if tuple(sorted(set(captured_instrument_ids), key=lambda item: item.value)) != (
+            captured_instrument_ids
+        ):
+            raise ValueError("captured replacement instruments must be unique and sorted")
+        if not set(captured_instrument_ids).issubset(self.required_instrument_ids):
+            raise ValueError("replacement capture contains an unrelated instrument")
+        if self.captured_snapshot_sources and self.replacement_connection_id is None:
+            raise ValueError("replacement capture sources require a connection")
+        if self.replacement_connection_id == self.original_connection_id:
+            raise ValueError("replacement capture cannot use the mismatched connection")
+        if any(
+            source.connection_id != self.replacement_connection_id
+            for source in self.captured_snapshot_sources
+        ):
+            raise ValueError("replacement snapshot sources span socket connections")
+
+    def observe_snapshot(
+        self,
+        *,
+        admission_ordinal: int,
+        connection_id: ConnectionId,
+        ingest_seq: int,
+        instrument_id: InstrumentId,
+        maximum_age_ns: int,
+        received_monotonic: MonotonicTimestamp,
+        raw_source: RawSourceRef,
+    ) -> _AuditReplacementCapture:
+        if maximum_age_ns < 0:
+            raise ValueError("replacement snapshot maximum age cannot be negative")
+        if connection_id == self.original_connection_id:
+            return self
+        if instrument_id not in self.required_instrument_ids:
+            return self
+        captured = self.captured_snapshot_sources
+        if self.replacement_connection_id != connection_id:
+            captured = ()
+        captured = tuple(
+            source
+            for source in captured
+            if source.received_monotonic.epoch_id == received_monotonic.epoch_id
+            and 0
+            <= received_monotonic.nanoseconds - source.received_monotonic.nanoseconds
+            <= maximum_age_ns
+        )
+        captured_by_instrument = {source.instrument_id: source for source in captured}
+        captured_by_instrument[instrument_id] = _AuditReplacementSnapshotSource(
+            instrument_id=instrument_id,
+            connection_id=connection_id,
+            admission_ordinal=admission_ordinal,
+            ingest_seq=ingest_seq,
+            received_monotonic=received_monotonic,
+            raw_source=raw_source,
+        )
+        return replace(
+            self,
+            replacement_connection_id=connection_id,
+            captured_snapshot_sources=tuple(
+                captured_by_instrument[key]
+                for key in sorted(captured_by_instrument, key=lambda item: item.value)
+            ),
+        )
+
+    @property
+    def complete(self) -> bool:
+        return (
+            tuple(source.instrument_id for source in self.captured_snapshot_sources)
+            == self.required_instrument_ids
+        )
+
+    def to_record(self) -> dict[str, object]:
+        record: dict[str, object] = {
+            "captured_snapshot_sources": self.captured_snapshot_sources,
+            "divergence_id": self.divergence_id,
+            "market_id": self.market_id,
+            "original_connection_id": self.original_connection_id,
+            "replacement_connection_id": self.replacement_connection_id,
+            "required_instrument_ids": self.required_instrument_ids,
+        }
+        if self.audit_start_schema == AUDIT_START_V2_SCHEMA:
+            ordered_pre_open_connection_ids = tuple(
+                item.value
+                for item in sorted(
+                    self.pre_open_connection_ids,
+                    key=lambda item: item.value,
+                )
+            )
+            record["pre_open_connection_count"] = len(ordered_pre_open_connection_ids)
+            record["pre_open_connection_ids_sha256"] = canonical_sha256(
+                {
+                    "connection_ids": ordered_pre_open_connection_ids,
+                    "schema": "mma-audit-replacement-pre-open-connections-v1",
+                }
+            )
+            record["mismatch_cause"] = self.mismatch_cause
+            record["resolution_ingest_seq"] = self.resolution_ingest_seq
+            record["resolution_monotonic"] = self.resolution_monotonic
+            record["resolution_source"] = self.resolution_source
+        return record
+
+
+@dataclass(frozen=True, slots=True)
 class ProcessorSummary:
     processed_raw_messages: int
     parse_failures: int
@@ -262,6 +429,17 @@ class ProcessorSummary:
     rest_audit_failed: int
     audit_start_generation_rebases: int
     audit_mismatch_cause_counts: tuple[tuple[AuditMismatchCause, int], ...]
+    audit_start_trigger_counts: tuple[tuple[AuditTriggerReason, int], ...]
+    audit_outcome_trigger_counts: tuple[tuple[AuditTriggerReason, AuditOutcome, int], ...]
+    audit_divergences_observed: int
+    audit_divergences_resolved_by_authoritative_resnapshot: int
+    audit_divergences_resolved_same_generation: int
+    audit_divergences_pending: int
+    audit_divergences_unresolved: int
+    audit_divergences_unknown: int
+    audit_local_book_defects: int
+    audit_divergence_lifecycle_reconciled: bool
+    audit_replacement_captures_pending: int
     pending_rest_audits: int
     audit_ineligible_books: int
     reported_top_transitions_started: int
@@ -289,7 +467,9 @@ class ProcessorSummary:
     scan_chain_sha256: str
     validated_opportunity_chain_sha256: str
     reference_refresh_chain_sha256: str
+    audit_start_chain_sha256: str
     audit_outcome_chain_sha256: str
+    audit_divergence_history_chain_sha256: str
     reported_top_transition_chain_sha256: str
     lifecycle_state_sha256: str
     scan_results_truncated: bool
@@ -297,11 +477,14 @@ class ProcessorSummary:
     reference_refresh_requests_truncated: bool
     audit_outcomes_truncated: bool
     audit_mismatch_diagnostics_truncated: bool
+    audit_divergence_resolution_records_truncated: bool
     reported_top_transition_outcomes_truncated: bool
     terminal_hash: str
     opportunity_hashes: tuple[str, ...]
     audit_outcomes: tuple[AuditOutcomeEvidence, ...]
     audit_mismatch_diagnostics: tuple[AuditMismatchDiagnostic, ...]
+    audit_divergence_pending_records: tuple[AuditDivergencePending, ...]
+    audit_divergence_resolution_records: tuple[AuditDivergenceResolution, ...]
     reported_top_transitions: tuple[ReportedTopTransition, ...]
     reported_top_transition_outcomes: tuple[ReportedTopTransitionOutcome, ...]
 
@@ -384,6 +567,7 @@ class CanonicalProcessor:
             maxlen=_RECENT_HISTORY_LIMIT
         )
         self._pending_rest_audits: dict[str, AuditStartEvidence] = {}
+        self._pending_rest_audit_start_sources: dict[str, RawSourceRef] = {}
         self._pending_rest_audit_responses: dict[str, RawEventEnvelope] = {}
         self._pending_rest_audit_hard_expiries: dict[str, int] = {}
         self._pending_rest_audit_response_deadlines: dict[str, int] = {}
@@ -391,6 +575,11 @@ class CanonicalProcessor:
         self._rest_audit_run_deadline_epoch_id: str | None = None
         self._rest_audit_run_deadline_ns: int | None = None
         self._audit_ineligible_instruments: set[InstrumentId] = set()
+        self._pending_audit_divergences: dict[InstrumentId, AuditDivergencePending] = {}
+        self._audit_replacement_captures: dict[InstrumentId, _AuditReplacementCapture] = {}
+        self._audit_divergence_resolutions: deque[AuditDivergenceResolution] = deque(
+            maxlen=_RECENT_HISTORY_LIMIT
+        )
         self._reported_top_transitions: dict[InstrumentId, ReportedTopTransition] = {}
         self._reported_top_transition_outcomes: deque[ReportedTopTransitionOutcome] = deque(
             maxlen=_RECENT_HISTORY_LIMIT
@@ -399,6 +588,7 @@ class CanonicalProcessor:
         self._post_snapshot_baselines: dict[MarketId, _PostSnapshotBaseline] = {}
         self._audit_economic_generations: dict[InstrumentId, int] = {}
         self._processed_ws_watermarks: dict[ConnectionId, int] = {}
+        self._seen_websocket_connections: set[ConnectionId] = set()
         self._active_refresh_requests: list[ReferenceRefreshRequest] | None = None
         self._active_dirty_markets: dict[MarketId, set[ScanTriggerReason]] | None = None
         self._active_freshness_updates: dict[InstrumentId, BookFreshnessUpdate] | None = None
@@ -415,7 +605,9 @@ class CanonicalProcessor:
         self._scan_chain = _chain_seed("scan")
         self._validated_opportunity_chain = _chain_seed("validated-opportunity")
         self._reference_refresh_chain = _chain_seed("reference-refresh")
+        self._audit_start_chain = _chain_seed("rest-audit-start")
         self._audit_outcome_chain = _chain_seed("rest-audit-outcome")
+        self._audit_divergence_history_chain = _chain_seed("rest-audit-divergence")
         self._audit_compatibility_chain = _chain_seed("rest-audit-compatibility")
         self._reported_top_transition_chain = _chain_seed("reported-top-transition")
         self._processed = 0
@@ -436,6 +628,12 @@ class CanonicalProcessor:
         self._rest_audit_failed = 0
         self._audit_start_generation_rebases = 0
         self._audit_mismatch_cause_counts = dict.fromkeys(AuditMismatchCause, 0)
+        self._audit_start_trigger_counts = dict.fromkeys(AuditTriggerReason, 0)
+        self._audit_outcome_trigger_counts = {
+            (trigger, outcome): 0 for trigger in AuditTriggerReason for outcome in AuditOutcome
+        }
+        self._audit_divergences_observed = 0
+        self._audit_divergences_resolved_by_authoritative_resnapshot = 0
         self._reported_top_transitions_started = 0
         self._reported_top_transitions_converged = 0
         self._reported_top_transitions_superseded = 0
@@ -490,6 +688,224 @@ class CanonicalProcessor:
     @property
     def audit_outcomes(self) -> tuple[AuditOutcomeEvidence, ...]:
         return tuple(self._audit_outcomes)
+
+    @property
+    def audit_divergence_pending_records(self) -> tuple[AuditDivergencePending, ...]:
+        return tuple(
+            self._pending_audit_divergences[instrument_id]
+            for instrument_id in sorted(
+                self._pending_audit_divergences,
+                key=lambda item: item.value,
+            )
+        )
+
+    def audit_recovery_blocks_native_asset(self, native_asset_id: str) -> bool:
+        """Return whether divergence recovery owns this asset's market scope.
+
+        Audit divergence recovery is market-scoped even though the mismatch and
+        authoritative REST baseline are instrument-scoped.  The coordinator
+        must not start another audit for either leg until the pending divergence
+        has been resnapshotted and the replacement connection has supplied every
+        required full snapshot.
+        """
+
+        instrument_id = self._owner_for_native_asset(native_asset_id).instrument_id
+        for pending in sorted(
+            self._pending_audit_divergences.values(),
+            key=lambda item: item.instrument_id.value,
+        ):
+            required_instrument_ids = self._market_instruments.get(pending.market_id, ())
+            if not required_instrument_ids or pending.instrument_id not in required_instrument_ids:
+                raise ProgrammingInvariantViolation(
+                    "audit divergence lost its bounded market recovery scope",
+                    component="canonical-processor",
+                )
+            if instrument_id in required_instrument_ids:
+                return True
+        return any(
+            instrument_id in capture.required_instrument_ids
+            for capture in sorted(
+                self._audit_replacement_captures.values(),
+                key=lambda item: item.divergence_id,
+            )
+        )
+
+    @staticmethod
+    def _audit_replacement_capture_fresh_at(
+        capture: _AuditReplacementCapture,
+        decision_monotonic: MonotonicTimestamp,
+        *,
+        maximum_age_ns: int,
+    ) -> bool:
+        return (
+            capture.complete
+            and capture.resolution_monotonic.epoch_id == decision_monotonic.epoch_id
+            and decision_monotonic.nanoseconds >= capture.resolution_monotonic.nanoseconds
+            and all(
+                source.admission_ordinal > 0
+                and source.ingest_seq > capture.resolution_ingest_seq
+                and source.received_monotonic.epoch_id == decision_monotonic.epoch_id
+                and source.received_monotonic.nanoseconds
+                >= capture.resolution_monotonic.nanoseconds
+                and 0
+                <= decision_monotonic.nanoseconds - source.received_monotonic.nanoseconds
+                <= maximum_age_ns
+                for source in capture.captured_snapshot_sources
+            )
+        )
+
+    @staticmethod
+    def _audit_replacement_release_command(
+        instrument_id: InstrumentId,
+        capture: _AuditReplacementCapture,
+        decision_monotonic: MonotonicTimestamp,
+    ) -> AuditReplacementReleaseCommand:
+        replacement_connection_id = capture.replacement_connection_id
+        if replacement_connection_id is None:
+            raise ProgrammingInvariantViolation(
+                "complete audit replacement capture lacks a connection",
+                component="canonical-processor",
+            )
+        return AuditReplacementReleaseCommand.create(
+            divergence_id=capture.divergence_id,
+            instrument_id=instrument_id,
+            market_id=capture.market_id,
+            replacement_connection_id=replacement_connection_id,
+            capture_record=capture.to_record(),
+            monotonic_epoch_id=decision_monotonic.epoch_id,
+            decision_monotonic_ns=decision_monotonic.nanoseconds,
+        )
+
+    def _audit_replacement_release_group(
+        self,
+        capture: _AuditReplacementCapture,
+    ) -> tuple[tuple[InstrumentId, _AuditReplacementCapture], ...]:
+        """Return every capture sharing the exact market recovery scope.
+
+        More than one audit leg can diverge before either authoritative
+        resnapshot is processed.  Their replacement captures must be projected
+        as one deterministic group so that a partially ready sibling cannot be
+        mistaken for an unrelated blocker or released around.
+        """
+
+        return tuple(
+            (instrument_id, candidate)
+            for instrument_id, candidate in sorted(
+                self._audit_replacement_captures.items(),
+                key=lambda item: item[0].value,
+            )
+            if candidate.market_id == capture.market_id
+        )
+
+    def _audit_replacement_release_group_ready_at(
+        self,
+        group: tuple[tuple[InstrumentId, _AuditReplacementCapture], ...],
+        *,
+        connection_id: ConnectionId,
+        decision_monotonic: MonotonicTimestamp,
+    ) -> bool:
+        """Prove capture release is the only remaining scope ineligibility.
+
+        Sequential controls are safe for a multi-capture group because the
+        scanner remains blocked by the pending suffix.  This predicate is
+        evaluated both by projection and by each control's acceptance, so only
+        the final accepted control can remove the last capture and trigger a
+        scan.
+        """
+
+        if not group:
+            return False
+        release_instrument_ids = {instrument_id for instrument_id, _capture in group}
+        market_ids = {capture.market_id for _instrument_id, capture in group}
+        required_instrument_ids = {
+            required_instrument_id
+            for _instrument_id, capture in group
+            for required_instrument_id in capture.required_instrument_ids
+        }
+        if (
+            len(market_ids) != 1
+            or not release_instrument_ids.issubset(required_instrument_ids)
+            or any(
+                capture.audit_start_schema != AUDIT_START_V2_SCHEMA
+                or capture.mismatch_cause
+                in {AuditMismatchCause.LOCAL_BOOK_DEFECT, AuditMismatchCause.UNKNOWN}
+                or capture.replacement_connection_id != connection_id
+                or not self._audit_replacement_capture_fresh_at(
+                    capture,
+                    decision_monotonic,
+                    maximum_age_ns=self._scanner.config.maximum_book_age_ns,
+                )
+                for _instrument_id, capture in group
+            )
+        ):
+            return False
+        if any(
+            pending.market_id in market_ids for pending in self._pending_audit_divergences.values()
+        ):
+            return False
+        if set(self._reported_top_transitions).intersection(required_instrument_ids):
+            return False
+        if self._audit_ineligible_instruments.intersection(
+            required_instrument_ids
+        ) != release_instrument_ids or self._transition_resync_instruments.intersection(
+            required_instrument_ids
+        ):
+            return False
+        maximum_age_ns = self._scanner.config.maximum_book_age_ns
+        return all(
+            self._owners[instrument_id].health is BookHealth.HEALTHY
+            and (latest_l2 := self._last_accepted_l2_monotonic.get(instrument_id)) is not None
+            and latest_l2.epoch_id == decision_monotonic.epoch_id
+            and 0 <= decision_monotonic.nanoseconds - latest_l2.nanoseconds <= maximum_age_ns
+            for instrument_id in required_instrument_ids
+        )
+
+    def audit_replacement_release_commands(
+        self,
+        *,
+        connection_id: ConnectionId,
+        decision_monotonic: MonotonicTimestamp,
+    ) -> tuple[AuditReplacementReleaseCommand, ...]:
+        """Return exact current v2 captures eligible for durable release.
+
+        This is a deterministic, non-mutating projection.  The observation
+        coordinator owns the independent live freshness/health check; replay
+        state changes only when the returned command is durably journaled and
+        processed through the normal canonical route.
+        """
+
+        commands: list[AuditReplacementReleaseCommand] = []
+        visited_markets: set[MarketId] = set()
+        for instrument_id in sorted(
+            self._audit_replacement_captures,
+            key=lambda item: item.value,
+        ):
+            capture = self._audit_replacement_captures[instrument_id]
+            if capture.market_id in visited_markets:
+                continue
+            visited_markets.add(capture.market_id)
+            group = self._audit_replacement_release_group(capture)
+            if not self._audit_replacement_release_group_ready_at(
+                group,
+                connection_id=connection_id,
+                decision_monotonic=decision_monotonic,
+            ):
+                continue
+            commands.extend(
+                self._audit_replacement_release_command(
+                    group_instrument_id,
+                    group_capture,
+                    decision_monotonic,
+                )
+                for group_instrument_id, group_capture in group
+            )
+        return tuple(commands)
+
+    @property
+    def audit_replacement_captures_pending(self) -> int:
+        """Resolved baselines still awaiting replacement full-snapshot coverage."""
+
+        return len(self._audit_replacement_captures)
 
     @property
     def audit_ineligible_instruments(self) -> tuple[InstrumentId, ...]:
@@ -627,14 +1043,29 @@ class CanonicalProcessor:
                 PolymarketSchemaError,
                 ReferenceBuildError,
             ) as error:
-                error_type = type(error).__name__
+                error_type = (
+                    "NormalizationError"
+                    if isinstance(error, _AuditReplacementSnapshotEvidenceError)
+                    else type(error).__name__
+                )
                 self._parse_failures += 1
                 self._error_chain = _chain_extend(
                     self._error_chain,
                     "expected-data-error",
                     (envelope.ingest_seq, error_type),
                 )
-                affected = self.invalidate_all(InvalidationReason.SCHEMA_VIOLATION)
+                # Release controls are validated completely before capture or
+                # book mutation.  A malformed/stale control must remain a
+                # fail-closed protocol error, but invalidating the already
+                # recovered books would itself mutate the evidence the control
+                # is meant to authorize.  The still-pending capture continues
+                # to block every scan and research consumer.
+                affected = (
+                    ()
+                    if envelope.channel == CONTROL_REST_AUDIT_REPLACEMENT_RELEASE
+                    or isinstance(error, _AuditReplacementSnapshotEvidenceError)
+                    else self.invalidate_all(InvalidationReason.SCHEMA_VIOLATION)
+                )
                 scan_triggers = self._flush_dirty_scans(
                     envelope.received_wall_time
                     if self._active_scan_observed_at is None
@@ -1285,22 +1716,46 @@ class CanonicalProcessor:
                 raise NormalizationError("REST book arrived before matching Gamma/CLOB reference")
             context = self._normalization_context(envelope, bundle)
             rest = self._normalizer.normalize_rest_book(native, context)
+            pending_divergence = self._pending_audit_divergences.get(rest.instrument_id)
+            if (
+                pending_divergence is not None
+                and envelope.received_monotonic.nanoseconds
+                < pending_divergence.classification_received_monotonic_ns
+            ):
+                raise ProgrammingInvariantViolation(
+                    "authoritative REST recovery precedes mismatch classification",
+                    component="canonical-processor",
+                )
             owner = self._owners[rest.instrument_id]
-            self._audit_ineligible_instruments.discard(rest.instrument_id)
             was_unhealthy = owner.health is not BookHealth.HEALTHY
             self._prepare_for_rest_snapshot(owner)
             mutation = owner.apply_rest_snapshot(rest)
-            self._transition_resync_instruments.discard(rest.instrument_id)
             self._close_reported_top_transition(
                 rest.instrument_id,
                 status=ReportedTopTransitionStatus.AUTHORITATIVE_SNAPSHOT,
                 reason=ReportedTopTransitionReason.AUTHORITATIVE_FULL_SNAPSHOT,
-                research_eligibility_restored=True,
+                research_eligibility_restored=(
+                    rest.instrument_id not in self._pending_audit_divergences
+                    and rest.instrument_id not in self._audit_replacement_captures
+                ),
             )
             self._record_book_mutation(
                 mutation,
                 reason=ScanTriggerReason.REST_SNAPSHOT,
             )
+            self._resolve_audit_divergence_by_rest_snapshot(
+                envelope=envelope,
+                rest=rest,
+                owner=owner,
+            )
+            replacement_capture = self._audit_replacement_captures.get(rest.instrument_id)
+            if (
+                replacement_capture is None
+                or replacement_capture.audit_start_schema == AUDIT_START_V2_SCHEMA
+            ):
+                self._transition_resync_instruments.discard(rest.instrument_id)
+            if replacement_capture is None:
+                self._audit_ineligible_instruments.discard(rest.instrument_id)
             if was_unhealthy:
                 self._resyncs += 1
             return
@@ -1315,6 +1770,9 @@ class CanonicalProcessor:
             return
         if channel == CONTROL_REST_AUDIT_CLASSIFY:
             self._classify_staged_rest_audit_response(envelope)
+            return
+        if channel == CONTROL_REST_AUDIT_REPLACEMENT_RELEASE:
+            self._release_audit_replacement_capture_from_control(envelope)
             return
         if channel == CONTROL_REPORTED_TOP_TRANSITION_EXPIRED:
             self._expire_reported_top_transition_from_control(envelope)
@@ -1332,6 +1790,7 @@ class CanonicalProcessor:
         if channel == CONTROL_BOOK_INVALIDATION:
             for request_id in tuple(sorted(self._pending_rest_audits)):
                 start = self._pending_rest_audits.pop(request_id)
+                self._pending_rest_audit_start_sources.pop(request_id, None)
                 self._pending_rest_audit_responses.pop(request_id, None)
                 self._pending_rest_audit_hard_expiries.pop(request_id, None)
                 self._pending_rest_audit_response_deadlines.pop(request_id, None)
@@ -1422,10 +1881,15 @@ class CanonicalProcessor:
         return parsed
 
     def _parse_audit_start(self, payload: bytes) -> AuditStartEvidence:
-        control = self._control_object(
-            payload,
-            schema=AUDIT_START_SCHEMA,
-            expected_keys=frozenset(
+        decoded = decode_json_exact(payload)
+        if not isinstance(decoded, dict):
+            raise NormalizationError("audit start control payload must be an object")
+        start_record = cast(dict[str, object], decoded)
+        raw_schema = start_record.get("schema")
+        if raw_schema == AUDIT_START_V1_SCHEMA:
+            schema = AUDIT_START_V1_SCHEMA
+            trigger_reason = AuditTriggerReason.UNKNOWN_LEGACY
+            expected_keys = frozenset(
                 {
                     "attempt",
                     "connection_id",
@@ -1439,7 +1903,37 @@ class CanonicalProcessor:
                     "starting_book_generation",
                     "starting_processed_ordinal",
                 }
-            ),
+            )
+        elif raw_schema == AUDIT_START_V2_SCHEMA:
+            schema = AUDIT_START_V2_SCHEMA
+            expected_keys = frozenset(
+                {
+                    "attempt",
+                    "connection_id",
+                    "instrument_id",
+                    "native_asset_id",
+                    "request_id",
+                    "request_started_monotonic_ns",
+                    "schema",
+                    "starting_admission_ordinal",
+                    "starting_book_economic_sha256",
+                    "starting_book_generation",
+                    "starting_processed_ordinal",
+                    "trigger_reason",
+                }
+            )
+            try:
+                trigger_reason = AuditTriggerReason(
+                    self._control_text(start_record, "trigger_reason", maximum=128)
+                )
+            except (KeyError, ValueError) as error:
+                raise NormalizationError("audit start trigger reason is unknown") from error
+        else:
+            raise NormalizationError("audit start control schema is unsupported")
+        control = self._control_object(
+            payload,
+            schema=schema,
+            expected_keys=expected_keys,
         )
         try:
             connection_id = ConnectionId(self._control_text(control, "connection_id"))
@@ -1470,6 +1964,8 @@ class CanonicalProcessor:
                         maximum=64,
                     ),
                 ),
+                trigger_reason=trigger_reason,
+                schema=schema,
             )
         except ValueError as error:
             raise NormalizationError("audit start evidence is invalid") from error
@@ -1585,6 +2081,8 @@ class CanonicalProcessor:
                 )
             else:
                 raise NormalizationError("audit start book identity changed before staging")
+        if self.audit_recovery_blocks_native_asset(start.native_asset_id):
+            raise NormalizationError("audit start conflicts with unresolved divergence recovery")
         self._rest_audit_protocol_mode = requested_mode
         if raw_run_deadline is not None:
             if self._rest_audit_run_deadline_ns is not None and (
@@ -1594,7 +2092,18 @@ class CanonicalProcessor:
                 raise NormalizationError("audit start changes the bound run deadline")
             self._rest_audit_run_deadline_epoch_id = envelope.received_monotonic.epoch_id
             self._rest_audit_run_deadline_ns = cast(int, raw_run_deadline)
+        start_source = RawSourceRef(
+            ingest_id=envelope.ingest_id,
+            payload_sha256=envelope.payload_sha256,
+        )
         self._pending_rest_audits[start.request_id] = start
+        self._pending_rest_audit_start_sources[start.request_id] = start_source
+        self._audit_start_trigger_counts[start.trigger_reason] += 1
+        self._audit_start_chain = _chain_extend(
+            self._audit_start_chain,
+            "rest-audit-start",
+            (start, start_source),
+        )
         if raw_hard_expiry is not None:
             self._pending_rest_audit_hard_expiries[start.request_id] = raw_hard_expiry
             self._pending_rest_audit_response_deadlines[start.request_id] = cast(
@@ -1680,6 +2189,7 @@ class CanonicalProcessor:
             self._rest_audit_raced += 1
         else:
             self._rest_audit_failed += 1
+        self._audit_outcome_trigger_counts[(evidence.trigger_reason, evidence.outcome)] += 1
         self._audit_outcome_chain = _chain_extend(
             self._audit_outcome_chain,
             "rest-audit-outcome",
@@ -1687,6 +2197,194 @@ class CanonicalProcessor:
         )
         self._audit_outcomes.append(evidence)
         active.append(evidence)
+
+    @staticmethod
+    def _audit_rest_identity(rest: NormalizedRestBook) -> AuditRestBookIdentity:
+        return AuditRestBookIdentity.create(
+            instrument_id=rest.instrument_id,
+            market_id=rest.market_id,
+            depth=audit_exact_depth_identity(rest.bids, rest.asks),
+            tick_size=rest.tick_size,
+            minimum_order_size=rest.minimum_order_size,
+            neg_risk=rest.neg_risk,
+        )
+
+    def _open_audit_divergence(
+        self,
+        *,
+        outcome: AuditOutcomeEvidence,
+        market_id: MarketId,
+        start_source: RawSourceRef,
+        classification_control: RawEventEnvelope | None,
+    ) -> None:
+        instrument_id = outcome.starting_book.instrument_id
+        if instrument_id in self._pending_audit_divergences:
+            raise ProgrammingInvariantViolation(
+                "a second audit divergence opened before authoritative recovery",
+                component="canonical-processor",
+            )
+        diagnostic = outcome.mismatch_diagnostic
+        if diagnostic is None:
+            raise ProgrammingInvariantViolation(
+                "audit mismatch divergence lacks its exact diagnostic",
+                component="canonical-processor",
+            )
+        classification_source = (
+            diagnostic.response_source
+            if classification_control is None
+            else RawSourceRef(
+                ingest_id=classification_control.ingest_id,
+                payload_sha256=classification_control.payload_sha256,
+            )
+        )
+        classification_wall_time = (
+            outcome.response_received_wall_time
+            if classification_control is None
+            else classification_control.received_wall_time
+        )
+        classification_monotonic_ns = (
+            outcome.response_received_monotonic_ns
+            if classification_control is None
+            else classification_control.received_monotonic.nanoseconds
+        )
+        if classification_wall_time is None or classification_monotonic_ns is None:
+            raise ProgrammingInvariantViolation(
+                "audit mismatch lacks classification chronology",
+                component="canonical-processor",
+            )
+        pending = AuditDivergencePending.create(
+            market_id=market_id,
+            audit_outcome=outcome,
+            audit_start_control_source=start_source,
+            classification_source=classification_source,
+            classification_control_source=(
+                None if classification_control is None else classification_source
+            ),
+            classification_received_wall_time=classification_wall_time,
+            classification_received_monotonic_ns=classification_monotonic_ns,
+        )
+        self._pending_audit_divergences[instrument_id] = pending
+        self._audit_divergences_observed += 1
+        self._audit_divergence_history_chain = _chain_extend(
+            self._audit_divergence_history_chain,
+            "rest-audit-divergence-opened",
+            pending,
+        )
+
+    def _resolve_audit_divergence_by_rest_snapshot(
+        self,
+        *,
+        envelope: RawEventEnvelope,
+        rest: NormalizedRestBook,
+        owner: CanonicalL2BookOwner,
+    ) -> None:
+        pending = self._pending_audit_divergences.get(rest.instrument_id)
+        if pending is None:
+            return
+        snapshot = owner.snapshot()
+        exact_difference = compare_audit_exact_depth(
+            local_bids=snapshot.bids,
+            local_asks=snapshot.asks,
+            rest_bids=rest.bids,
+            rest_asks=rest.asks,
+        )
+        if snapshot.health is not BookHealth.HEALTHY or exact_difference.difference_count:
+            raise ProgrammingInvariantViolation(
+                "authoritative REST recovery did not become the exact healthy local book",
+                component="canonical-processor",
+            )
+        authoritative_source = RawSourceRef(
+            ingest_id=envelope.ingest_id,
+            payload_sha256=envelope.payload_sha256,
+        )
+        if authoritative_source not in rest.provenance.raw_source_refs:
+            raise ProgrammingInvariantViolation(
+                "authoritative REST recovery lacks its raw response identity",
+                component="canonical-processor",
+            )
+        diagnostic = pending.audit_outcome.mismatch_diagnostic
+        if diagnostic is None:
+            raise ProgrammingInvariantViolation(
+                "pending audit divergence lost its mismatch diagnostic",
+                component="canonical-processor",
+            )
+        mismatch_source = diagnostic.response_source
+        if authoritative_source.ingest_id == mismatch_source.ingest_id:
+            raise ProgrammingInvariantViolation(
+                "audit divergence requires a separately journaled REST resnapshot",
+                component="canonical-processor",
+            )
+        response_monotonic_ns = pending.audit_outcome.response_received_monotonic_ns
+        if response_monotonic_ns is None:
+            raise ProgrammingInvariantViolation(
+                "audit divergence lost its response chronology",
+                component="canonical-processor",
+            )
+        if envelope.received_monotonic.nanoseconds < max(
+            response_monotonic_ns,
+            pending.classification_received_monotonic_ns,
+        ):
+            raise ProgrammingInvariantViolation(
+                "authoritative REST recovery precedes mismatch classification",
+                component="canonical-processor",
+            )
+        resolution = AuditDivergenceResolution(
+            divergence_id=pending.divergence_id,
+            request_id=pending.request_id,
+            instrument_id=rest.instrument_id,
+            market_id=rest.market_id,
+            audit_start_schema=pending.audit_outcome.audit_start_schema,
+            trigger_reason=pending.audit_outcome.trigger_reason,
+            mismatch_response_source=mismatch_source,
+            authoritative_snapshot_source=authoritative_source,
+            authoritative_rest_book=self._audit_rest_identity(rest),
+            recovered_book=AuditBookIdentity(
+                instrument_id=owner.instrument_id,
+                generation=self._audit_economic_generations.get(owner.instrument_id, 0),
+                economic_content_sha256=owner.audit_comparison_sha256(),
+            ),
+            observed_divergence=pending,
+            resolved_at=envelope.received_wall_time,
+            resolved_monotonic_ns=envelope.received_monotonic.nanoseconds,
+        )
+        self._pending_audit_divergences.pop(rest.instrument_id)
+        self._audit_divergences_resolved_by_authoritative_resnapshot += 1
+        self._audit_divergence_resolutions.append(resolution)
+        self._audit_divergence_history_chain = _chain_extend(
+            self._audit_divergence_history_chain,
+            "rest-audit-divergence-resolved",
+            resolution,
+        )
+        required_instrument_ids = tuple(
+            sorted(
+                self._market_instruments.get(rest.market_id, ()),
+                key=lambda item: item.value,
+            )
+        )
+        if (
+            rest.instrument_id not in required_instrument_ids
+            or rest.instrument_id in self._audit_replacement_captures
+        ):
+            raise ProgrammingInvariantViolation(
+                "audit recovery cannot establish bounded replacement-capture scope",
+                component="canonical-processor",
+            )
+        self._audit_replacement_captures[rest.instrument_id] = _AuditReplacementCapture(
+            divergence_id=pending.divergence_id,
+            market_id=rest.market_id,
+            original_connection_id=pending.audit_outcome.connection_id,
+            required_instrument_ids=required_instrument_ids,
+            audit_start_schema=pending.audit_outcome.audit_start_schema,
+            resolution_source=authoritative_source,
+            resolution_ingest_seq=envelope.ingest_seq,
+            resolution_monotonic=envelope.received_monotonic,
+            pre_open_connection_ids=frozenset(self._seen_websocket_connections),
+            mismatch_cause=(
+                AuditMismatchCause.UNKNOWN
+                if pending.audit_outcome.mismatch_diagnostic is None
+                else pending.audit_outcome.mismatch_diagnostic.cause
+            ),
+        )
 
     def _failed_audit_outcome(
         self,
@@ -1724,6 +2422,8 @@ class CanonicalProcessor:
             barrier_processed_ordinal=None if response is None else processed,
             barrier_book=None if response is None else barrier,
             requires_resync=False,
+            audit_start_schema=start.schema,
+            trigger_reason=start.trigger_reason,
         )
 
     def _fail_rest_audit_from_control(self, envelope: RawEventEnvelope) -> None:
@@ -1731,6 +2431,7 @@ class CanonicalProcessor:
         start = self._pending_rest_audits.pop(request_id, None)
         if start is None:
             raise NormalizationError("audit failure references no pending request")
+        self._pending_rest_audit_start_sources.pop(request_id, None)
         if envelope.connection_id != start.connection_id:
             reason = AuditFailureReason.SOCKET_GENERATION_CHANGED
         self._pending_rest_audit_responses.pop(request_id, None)
@@ -1739,6 +2440,12 @@ class CanonicalProcessor:
         self._record_audit_outcome(self._failed_audit_outcome(start, reason=reason))
 
     def _advance_websocket_watermark(self, envelope: RawEventEnvelope) -> None:
+        if (
+            envelope.connection_id not in self._seen_websocket_connections
+            and len(self._seen_websocket_connections) >= _MAX_TRACKED_WEBSOCKET_CONNECTIONS
+        ):
+            raise NormalizationError("WebSocket connection history exceeds its deterministic bound")
+        self._seen_websocket_connections.add(envelope.connection_id)
         metadata = envelope.transport_metadata
         raw_ordinal = metadata.get("websocket_admission_ordinal")
         if raw_ordinal is None:
@@ -1879,6 +2586,7 @@ class CanonicalProcessor:
             response,
             coordinator_failure=coordinator_failure,
             coordinator_decision_supplied=True,
+            classification_control=envelope,
         )
 
     def _audit_response_coordinator_failure(
@@ -1915,6 +2623,7 @@ class CanonicalProcessor:
         *,
         coordinator_failure: AuditFailureReason | None = None,
         coordinator_decision_supplied: bool = False,
+        classification_control: RawEventEnvelope | None = None,
     ) -> None:
         request_id, boundary, barrier_ordinal, attempt = self._audit_response_metadata(envelope)
         if (
@@ -1927,6 +2636,12 @@ class CanonicalProcessor:
         start = self._pending_rest_audits.pop(request_id, None)
         if start is None:
             raise NormalizationError("REST audit response references no pending request")
+        start_source = self._pending_rest_audit_start_sources.pop(request_id, None)
+        if start_source is None:
+            raise ProgrammingInvariantViolation(
+                "pending REST audit lacks its start-control raw identity",
+                component="canonical-processor",
+            )
         self._pending_rest_audit_hard_expiries.pop(request_id, None)
         self._pending_rest_audit_response_deadlines.pop(request_id, None)
         if envelope.connection_id != start.connection_id or attempt != start.attempt:
@@ -2025,6 +2740,8 @@ class CanonicalProcessor:
                 barrier_processed_ordinal=processed,
                 barrier_book=barrier_book,
                 requires_resync=False,
+                audit_start_schema=start.schema,
+                trigger_reason=start.trigger_reason,
             )
             self._record_audit_outcome(evidence)
             return
@@ -2143,7 +2860,8 @@ class CanonicalProcessor:
         if outcome is AuditOutcome.MISMATCH and previous_health is not BookHealth.INVALID:
             self._invalidations += 1
         if outcome is AuditOutcome.MATCH:
-            self._audit_ineligible_instruments.discard(owner.instrument_id)
+            if owner.instrument_id not in self._audit_replacement_captures:
+                self._audit_ineligible_instruments.discard(owner.instrument_id)
         elif outcome is AuditOutcome.MISMATCH:
             self._audit_ineligible_instruments.add(owner.instrument_id)
             # A mismatch invalidates this exact local book.  Suppress further
@@ -2171,8 +2889,17 @@ class CanonicalProcessor:
             barrier_book=barrier_book,
             requires_resync=outcome is AuditOutcome.MISMATCH,
             mismatch_diagnostic=mismatch_diagnostic,
+            audit_start_schema=start.schema,
+            trigger_reason=start.trigger_reason,
         )
         self._record_audit_outcome(evidence)
+        if outcome is AuditOutcome.MISMATCH:
+            self._open_audit_divergence(
+                outcome=evidence,
+                market_id=rest.market_id,
+                start_source=start_source,
+                classification_control=classification_control,
+            )
 
     @staticmethod
     def _prepare_for_rest_snapshot(owner: CanonicalL2BookOwner) -> None:
@@ -2195,6 +2922,270 @@ class CanonicalProcessor:
         return _RawReferenceSource(
             ingest_id=envelope.ingest_id,
             payload_sha256=envelope.payload_sha256,
+        )
+
+    def _record_audit_replacement_snapshot(self, instrument_id: InstrumentId) -> None:
+        """Advance post-resnapshot eligibility from exact replacement WS evidence."""
+
+        if not self._audit_replacement_captures:
+            return
+        envelope, admission_ordinal = self._active_websocket_evidence()
+        v2_candidates = tuple(
+            capture
+            for capture in self._audit_replacement_captures.values()
+            if capture.audit_start_schema == AUDIT_START_V2_SCHEMA
+            and instrument_id in capture.required_instrument_ids
+            and envelope.connection_id != capture.original_connection_id
+        )
+        if v2_candidates:
+            explicit_ordinal = envelope.transport_metadata.get("websocket_admission_ordinal")
+            if (
+                isinstance(explicit_ordinal, bool)
+                or not isinstance(explicit_ordinal, int)
+                or explicit_ordinal <= 0
+            ):
+                raise NormalizationError(
+                    "v2 audit replacement snapshot requires an explicit admission ordinal"
+                )
+            admission_ordinal = explicit_ordinal
+            if any(
+                envelope.ingest_seq <= capture.resolution_ingest_seq
+                or envelope.received_monotonic.epoch_id != capture.resolution_monotonic.epoch_id
+                or envelope.received_monotonic.nanoseconds
+                < capture.resolution_monotonic.nanoseconds
+                for capture in v2_candidates
+            ):
+                raise NormalizationError(
+                    "v2 audit replacement snapshot predates authoritative resolution"
+                )
+        raw_source = RawSourceRef(
+            ingest_id=envelope.ingest_id,
+            payload_sha256=envelope.payload_sha256,
+        )
+        for divergence_instrument_id in tuple(
+            sorted(self._audit_replacement_captures, key=lambda item: item.value)
+        ):
+            pending = self._audit_replacement_captures[divergence_instrument_id]
+            advanced = pending.observe_snapshot(
+                admission_ordinal=admission_ordinal,
+                connection_id=envelope.connection_id,
+                ingest_seq=envelope.ingest_seq,
+                instrument_id=instrument_id,
+                maximum_age_ns=self._scanner.config.maximum_book_age_ns,
+                received_monotonic=envelope.received_monotonic,
+                raw_source=raw_source,
+            )
+            if advanced is pending:
+                continue
+            self._audit_replacement_captures[divergence_instrument_id] = advanced
+            if not advanced.complete:
+                continue
+            if advanced.audit_start_schema == AUDIT_START_V1_SCHEMA:
+                # Immutable v1 journals predate the durable release channel.
+                # Preserve their exact bounded snapshot-only transition and
+                # byte-structurally identical history payload.  New v2 state
+                # remains pending until the coordinator control below.
+                self._finalize_audit_replacement_capture(
+                    divergence_instrument_id,
+                    advanced,
+                    restored_at=envelope.received_wall_time,
+                    restored_monotonic=envelope.received_monotonic,
+                    release_control_source=None,
+                )
+
+    def _validate_v2_audit_replacement_snapshot_envelope(
+        self,
+        envelope: RawEventEnvelope,
+        snapshot_instruments: set[InstrumentId],
+    ) -> None:
+        candidates = tuple(
+            capture
+            for capture in self._audit_replacement_captures.values()
+            if capture.audit_start_schema == AUDIT_START_V2_SCHEMA
+            and snapshot_instruments.intersection(capture.required_instrument_ids)
+        )
+        if not candidates:
+            return
+        admission_ordinal = envelope.transport_metadata.get("websocket_admission_ordinal")
+        if (
+            isinstance(admission_ordinal, bool)
+            or not isinstance(admission_ordinal, int)
+            or admission_ordinal <= 0
+        ):
+            raise _AuditReplacementSnapshotEvidenceError(
+                "v2 audit replacement snapshot requires an explicit admission ordinal"
+            )
+        if any(
+            envelope.connection_id == capture.original_connection_id
+            or envelope.connection_id in capture.pre_open_connection_ids
+            for capture in candidates
+        ):
+            raise _AuditReplacementSnapshotEvidenceError(
+                "v2 audit replacement snapshot requires a new post-resolution connection"
+            )
+        if any(
+            envelope.ingest_seq <= capture.resolution_ingest_seq
+            or envelope.received_monotonic.epoch_id != capture.resolution_monotonic.epoch_id
+            or envelope.received_monotonic.nanoseconds < capture.resolution_monotonic.nanoseconds
+            for capture in candidates
+        ):
+            raise _AuditReplacementSnapshotEvidenceError(
+                "v2 audit replacement snapshot predates authoritative resolution"
+            )
+
+    def _finalize_audit_replacement_capture(
+        self,
+        instrument_id: InstrumentId,
+        capture: _AuditReplacementCapture,
+        *,
+        restored_at: UtcTimestamp,
+        restored_monotonic: MonotonicTimestamp,
+        release_control_source: RawSourceRef | None,
+    ) -> None:
+        if self._audit_replacement_captures.get(instrument_id) != capture:
+            raise ProgrammingInvariantViolation(
+                "audit replacement release differs from current capture state",
+                component="canonical-processor",
+            )
+        self._audit_replacement_captures.pop(instrument_id)
+        self._audit_ineligible_instruments.discard(instrument_id)
+        self._transition_resync_instruments.discard(instrument_id)
+        history_record: dict[str, object] = {
+            "replacement_capture": capture.to_record(),
+            "restored_at": restored_at,
+            "restored_monotonic": restored_monotonic,
+        }
+        if release_control_source is not None:
+            history_record["release_control_source"] = release_control_source
+        self._audit_divergence_history_chain = _chain_extend(
+            self._audit_divergence_history_chain,
+            "rest-audit-divergence-eligibility-restored",
+            history_record,
+        )
+        self._mark_market_dirty(
+            capture.market_id,
+            ScanTriggerReason.REST_AUDIT,
+        )
+
+    def _release_audit_replacement_capture_from_control(
+        self,
+        envelope: RawEventEnvelope,
+    ) -> None:
+        control = self._control_object(
+            envelope.payload_bytes,
+            schema=AUDIT_REPLACEMENT_RELEASE_SCHEMA,
+            expected_keys=frozenset(
+                {
+                    "capture_state_sha256",
+                    "capture_record",
+                    "decision_monotonic_ns",
+                    "divergence_id",
+                    "instrument_id",
+                    "market_id",
+                    "monotonic_epoch_id",
+                    "replacement_connection_id",
+                    "schema",
+                }
+            ),
+        )
+        try:
+            plain_control: object = json.loads(envelope.payload_bytes)
+            if not isinstance(plain_control, dict):
+                raise ValueError("audit replacement release must be an object")
+            typed_plain_control = cast(dict[str, object], plain_control)
+            capture_record = typed_plain_control.get("capture_record")
+            if not isinstance(capture_record, dict):
+                raise ValueError("audit replacement capture record must be an object")
+            typed_capture_record = cast(dict[str, object], capture_record)
+            command = AuditReplacementReleaseCommand(
+                divergence_id=self._control_text(control, "divergence_id", maximum=64),
+                instrument_id=InstrumentId(
+                    self._control_text(control, "instrument_id", maximum=256)
+                ),
+                market_id=MarketId(self._control_text(control, "market_id", maximum=256)),
+                replacement_connection_id=ConnectionId(
+                    self._control_text(
+                        control,
+                        "replacement_connection_id",
+                        maximum=256,
+                    )
+                ),
+                capture_state_sha256=self._control_text(
+                    control,
+                    "capture_state_sha256",
+                    maximum=64,
+                ),
+                capture_record_json=canonical_json_bytes(typed_capture_record).decode("utf-8"),
+                monotonic_epoch_id=self._control_text(
+                    control,
+                    "monotonic_epoch_id",
+                    maximum=256,
+                ),
+                decision_monotonic_ns=self._control_integer(
+                    control,
+                    "decision_monotonic_ns",
+                ),
+            )
+        except ValueError as error:
+            raise NormalizationError("audit replacement release evidence is invalid") from error
+        if envelope.payload_bytes != command.to_payload():
+            raise NormalizationError(
+                "audit replacement release evidence must use canonical encoding"
+            )
+        capture = self._audit_replacement_captures.get(command.instrument_id)
+        if capture is None:
+            raise NormalizationError("audit replacement release identifies no pending capture")
+        if capture.audit_start_schema != AUDIT_START_V2_SCHEMA:
+            raise NormalizationError(
+                "historical audit replacement capture cannot use a release control"
+            )
+        decision_monotonic = MonotonicTimestamp(
+            command.monotonic_epoch_id,
+            command.decision_monotonic_ns,
+        )
+        expected = self._audit_replacement_release_command(
+            command.instrument_id,
+            capture,
+            decision_monotonic,
+        )
+        if command != expected:
+            raise NormalizationError(
+                "audit replacement release differs from current capture evidence"
+            )
+        if (
+            envelope.connection_id != command.replacement_connection_id
+            or envelope.received_monotonic != decision_monotonic
+            or envelope.ingest_seq
+            <= max(source.ingest_seq for source in capture.captured_snapshot_sources)
+        ):
+            raise NormalizationError(
+                "audit replacement release differs from its durable receive boundary"
+            )
+        if not self._audit_replacement_capture_fresh_at(
+            capture,
+            decision_monotonic,
+            maximum_age_ns=self._scanner.config.maximum_book_age_ns,
+        ):
+            raise NormalizationError(
+                "audit replacement release capture is incomplete or freshness-invalid"
+            )
+        if not self._audit_replacement_release_group_ready_at(
+            self._audit_replacement_release_group(capture),
+            connection_id=command.replacement_connection_id,
+            decision_monotonic=decision_monotonic,
+        ):
+            raise NormalizationError(
+                "audit replacement release scope has another eligibility blocker"
+            )
+        self._finalize_audit_replacement_capture(
+            command.instrument_id,
+            capture,
+            restored_at=envelope.received_wall_time,
+            restored_monotonic=envelope.received_monotonic,
+            release_control_source=RawSourceRef(
+                ingest_id=envelope.ingest_id,
+                payload_sha256=envelope.payload_sha256,
+            ),
         )
 
     def _validate_gamma_identity(self, market: GammaMarket) -> None:
@@ -2770,6 +3761,10 @@ class CanonicalProcessor:
             for event in events
             if isinstance(event.payload, OrderBookSnapshotEvent)
         }
+        self._validate_v2_audit_replacement_snapshot_envelope(
+            envelope,
+            snapshot_instruments,
+        )
         for transition in tuple(self.reported_top_transitions):
             if (
                 transition.connection_id != envelope.connection_id
@@ -3034,7 +4029,13 @@ class CanonicalProcessor:
                     invalidation_reason=InvalidationReason.UNKNOWN_PRECISION,
                 )
             if isinstance(event.payload, OrderBookSnapshotEvent):
-                self._transition_resync_instruments.discard(owner.instrument_id)
+                self._record_audit_replacement_snapshot(owner.instrument_id)
+                replacement_capture = self._audit_replacement_captures.get(owner.instrument_id)
+                if (
+                    replacement_capture is None
+                    or replacement_capture.audit_start_schema == AUDIT_START_V2_SCHEMA
+                ):
+                    self._transition_resync_instruments.discard(owner.instrument_id)
                 self._close_reported_top_transition(
                     owner.instrument_id,
                     status=ReportedTopTransitionStatus.AUTHORITATIVE_SNAPSHOT,
@@ -3120,6 +4121,17 @@ class CanonicalProcessor:
             return
         instrument_ids = self._market_instruments.get(bundle.market.market_id, ())
         if len(instrument_ids) != 2:
+            return
+        divergence_blocked = {
+            *self._pending_audit_divergences,
+            *self._audit_replacement_captures,
+        }
+        if divergence_blocked.intersection(instrument_ids):
+            # ADR-0054 forbids invoking the scanner while an exact mismatch is
+            # unresolved or while its REST-restored baseline still lacks full
+            # replacement-generation capture coverage.  Dirty state remains
+            # coalesced; the final qualifying WS snapshot marks the market
+            # dirty again after releasing this block.
             return
         audit_ineligible = set(self.audit_ineligible_instruments)
         snapshot_views_list: list[tuple[ImmutableOrderBookSnapshot, str]] = []
@@ -3316,7 +4328,9 @@ class CanonicalProcessor:
         scan_chain_sha256 = self._scan_chain.hex()
         validated_opportunity_chain_sha256 = self._validated_opportunity_chain.hex()
         reference_refresh_chain_sha256 = self._reference_refresh_chain.hex()
+        audit_start_chain_sha256 = self._audit_start_chain.hex()
         audit_outcome_chain_sha256 = self._audit_outcome_chain.hex()
+        audit_divergence_history_chain_sha256 = self._audit_divergence_history_chain.hex()
         audit_compatibility_chain_sha256 = self._audit_compatibility_chain.hex()
         reported_top_transition_chain_sha256 = self._reported_top_transition_chain.hex()
         audit_outcomes = tuple(self._audit_outcomes)
@@ -3324,6 +4338,35 @@ class CanonicalProcessor:
         audit_mismatch_cause_counts = tuple(
             (cause, self._audit_mismatch_cause_counts[cause])
             for cause in sorted(AuditMismatchCause, key=lambda item: item.value)
+        )
+        audit_start_trigger_counts = tuple(
+            (trigger, self._audit_start_trigger_counts[trigger])
+            for trigger in sorted(AuditTriggerReason, key=lambda item: item.value)
+        )
+        audit_outcome_trigger_counts = tuple(
+            (trigger, outcome, self._audit_outcome_trigger_counts[(trigger, outcome)])
+            for trigger in sorted(AuditTriggerReason, key=lambda item: item.value)
+            for outcome in sorted(AuditOutcome, key=lambda item: item.value)
+        )
+        audit_divergence_pending_records = self.audit_divergence_pending_records
+        audit_divergence_resolution_records = tuple(self._audit_divergence_resolutions)
+        audit_replacement_capture_state = tuple(
+            self._audit_replacement_captures[instrument_id].to_record()
+            for instrument_id in sorted(
+                self._audit_replacement_captures,
+                key=lambda item: item.value,
+            )
+        )
+        audit_divergences_pending = len(audit_divergence_pending_records)
+        audit_divergences_resolved_same_generation = 0
+        audit_divergence_lifecycle_reconciled = (
+            self._audit_divergences_observed == self._rest_audit_mismatches
+            and self._audit_divergences_observed
+            == (
+                self._audit_divergences_resolved_by_authoritative_resnapshot
+                + audit_divergences_resolved_same_generation
+                + audit_divergences_pending
+            )
         )
         reported_top_transition_entry_counts = tuple(
             (source, self._reported_top_transition_entry_counts[source])
@@ -3365,6 +4408,7 @@ class CanonicalProcessor:
                     self._pending_rest_audit_response_deadlines.get(request_id)
                 ),
                 "start": self._pending_rest_audits[request_id],
+                "start_source": self._pending_rest_audit_start_sources[request_id],
             }
             for request_id in sorted(self._pending_rest_audits)
         )
@@ -3404,7 +4448,21 @@ class CanonicalProcessor:
                     "reference_updates": self._reference_updates,
                     "rest_audit_failed": self._rest_audit_failed,
                     "audit_start_generation_rebases": (self._audit_start_generation_rebases),
+                    "audit_start_triggers": audit_start_trigger_counts,
+                    "audit_outcome_triggers": audit_outcome_trigger_counts,
                     "audit_mismatch_causes": audit_mismatch_cause_counts,
+                    "audit_divergences_observed": self._audit_divergences_observed,
+                    "audit_divergences_resolved_by_authoritative_resnapshot": (
+                        self._audit_divergences_resolved_by_authoritative_resnapshot
+                    ),
+                    "audit_divergences_resolved_same_generation": (
+                        audit_divergences_resolved_same_generation
+                    ),
+                    "audit_divergences_pending": audit_divergences_pending,
+                    "audit_replacement_captures_pending": len(audit_replacement_capture_state),
+                    "audit_divergence_lifecycle_reconciled": (
+                        audit_divergence_lifecycle_reconciled
+                    ),
                     "rest_audit_matches": self._rest_audit_matches,
                     "rest_audit_mismatches": self._rest_audit_mismatches,
                     "rest_audit_raced": self._rest_audit_raced,
@@ -3459,7 +4517,9 @@ class CanonicalProcessor:
                     "expected_data_error": error_chain_sha256,
                     "raw_input": raw_input_chain_sha256,
                     "reference_refresh": reference_refresh_chain_sha256,
+                    "rest_audit_start": audit_start_chain_sha256,
                     "rest_audit_outcome": audit_outcome_chain_sha256,
+                    "rest_audit_divergence": audit_divergence_history_chain_sha256,
                     "rest_audit_compatibility": audit_compatibility_chain_sha256,
                     "reported_top_transition": reported_top_transition_chain_sha256,
                     "scan": scan_chain_sha256,
@@ -3468,6 +4528,9 @@ class CanonicalProcessor:
                 "reference_versions": reference_versions,
                 "lifecycle_state_sha256": lifecycle_state_sha256,
                 "audit_ineligible_instrument_ids": audit_ineligible_instrument_ids,
+                "audit_divergences_pending": audit_divergence_pending_records,
+                "audit_divergence_resolution_records": (audit_divergence_resolution_records),
+                "audit_replacement_captures": audit_replacement_capture_state,
                 "audit_economic_generations": audit_economic_generation_state,
                 "pending_rest_audits": pending_rest_audit_state,
                 "reported_top_transitions": reported_top_transitions,
@@ -3503,6 +4566,21 @@ class CanonicalProcessor:
             rest_audit_failed=self._rest_audit_failed,
             audit_start_generation_rebases=self._audit_start_generation_rebases,
             audit_mismatch_cause_counts=audit_mismatch_cause_counts,
+            audit_start_trigger_counts=audit_start_trigger_counts,
+            audit_outcome_trigger_counts=audit_outcome_trigger_counts,
+            audit_divergences_observed=self._audit_divergences_observed,
+            audit_divergences_resolved_by_authoritative_resnapshot=(
+                self._audit_divergences_resolved_by_authoritative_resnapshot
+            ),
+            audit_divergences_resolved_same_generation=(audit_divergences_resolved_same_generation),
+            audit_divergences_pending=audit_divergences_pending,
+            audit_divergences_unresolved=audit_divergences_pending,
+            audit_divergences_unknown=self._audit_mismatch_cause_counts[AuditMismatchCause.UNKNOWN],
+            audit_local_book_defects=self._audit_mismatch_cause_counts[
+                AuditMismatchCause.LOCAL_BOOK_DEFECT
+            ],
+            audit_divergence_lifecycle_reconciled=(audit_divergence_lifecycle_reconciled),
+            audit_replacement_captures_pending=len(audit_replacement_capture_state),
             pending_rest_audits=len(self._pending_rest_audits),
             audit_ineligible_books=audit_ineligible_books,
             reported_top_transitions_started=self._reported_top_transitions_started,
@@ -3536,7 +4614,9 @@ class CanonicalProcessor:
             scan_chain_sha256=scan_chain_sha256,
             validated_opportunity_chain_sha256=validated_opportunity_chain_sha256,
             reference_refresh_chain_sha256=reference_refresh_chain_sha256,
+            audit_start_chain_sha256=audit_start_chain_sha256,
             audit_outcome_chain_sha256=audit_outcome_chain_sha256,
+            audit_divergence_history_chain_sha256=(audit_divergence_history_chain_sha256),
             reported_top_transition_chain_sha256=reported_top_transition_chain_sha256,
             lifecycle_state_sha256=lifecycle_state_sha256,
             scan_results_truncated=self._scan_count > len(self._scan_results),
@@ -3549,6 +4629,10 @@ class CanonicalProcessor:
             audit_outcomes_truncated=self._rest_audits > len(self._audit_outcomes),
             audit_mismatch_diagnostics_truncated=(
                 self._rest_audit_mismatches > len(self._audit_mismatch_diagnostics)
+            ),
+            audit_divergence_resolution_records_truncated=(
+                self._audit_divergences_resolved_by_authoritative_resnapshot
+                > len(self._audit_divergence_resolutions)
             ),
             reported_top_transition_outcomes_truncated=(
                 (
@@ -3564,6 +4648,8 @@ class CanonicalProcessor:
             opportunity_hashes=opportunity_hashes,
             audit_outcomes=audit_outcomes,
             audit_mismatch_diagnostics=audit_mismatch_diagnostics,
+            audit_divergence_pending_records=audit_divergence_pending_records,
+            audit_divergence_resolution_records=audit_divergence_resolution_records,
             reported_top_transitions=reported_top_transitions,
             reported_top_transition_outcomes=reported_top_transition_outcomes,
         )

@@ -37,14 +37,25 @@ Current result:
 GATE 1: FAIL
 ```
 
-The failure is documented in `GATE_1_FAILURE_20260822.md` and remediated under `GATE_1_REMEDIATION_SPEC.md` plus ADR-0053.
+The failure is documented in `GATE_1_FAILURE_20260822.md` and remediated under
+`GATE_1_REMEDIATION_SPEC.md`, ADR-0053 and ADR-0054. The first result is not
+rewritten: Gate 1 remains `FAIL` until a new authorized six-hour run passes.
 
-The raw journal, deterministic replay, rebuild, data validation, immutability and no-live boundary passed. The blocking defects are concentrated in:
+The raw journal, deterministic replay, rebuild, data validation, immutability
+and no-live boundary passed. The first-soak defects were concentrated in:
 
 - bounded multi-frame reported-top/L2 transition semantics;
 - long-run scan-report materialization;
 - monotonic checkpoint chronology and typed availability intervals;
 - audit-mismatch and long-run memory/tail diagnosis.
+
+The remediation candidate now includes bounded reported-top handling,
+incremental reporting, monotonic/interval evidence, causal mismatch reporting,
+ADR-0054 immediate fail-closed authoritative-resnapshot lifecycle, v2 audit
+triggers with v1 compatibility, and health-checkpoint v3 current/sticky Gate
+semantics. Final offline gates plus a new exact-SHA 60-second smoke and
+45–60 minute stability observation remain pending. No six-hour rerun was run
+for this remediation task.
 
 ## 3. Phase A — Design foundation — COMPLETE
 
@@ -92,6 +103,11 @@ Implementation presence is not acceptance.
 - add monotonic checkpoint identity and typed unavailable-interval records;
 - add CPU/memory identity and current-RSS slope evidence;
 - classify audit mismatches by cause.
+- implement ADR-0054 observed/pending/resolved/unresolved/unknown/local-defect
+  separation with immediate authoritative resnapshot;
+- retain versioned v2 audit triggers and replay historical v1 as
+  `UNKNOWN_LEGACY`;
+- emit health checkpoint v3 with separate current and Gate-sticky reasons.
 
 ### C3. Regression replay
 
@@ -104,18 +120,28 @@ Replay the failed six-hour raw run twice with corrected code and require:
 - successful rebuild and validation;
 - raw immutability.
 
+The retained causal reporter must also classify all 20 corrected-stability and
+262 failed-soak mismatches twice with byte-identical canonical output. A
+recovery-generation match is recovery evidence, not natural convergence.
+
 ### C4. Short operational validation
 
 - full CI/static/SCA/security/no-live gates;
 - new 60-second explicit-target smoke;
-- new 30–60 minute stability/calibration run;
-- inspect mismatch rate, transition behavior, interval attribution, monotonic chronology, RSS slope, queues, tails and storage projection.
+- new 45–60 minute stability observation;
+- inspect triggers, causal mismatch relations, divergence lifecycle and
+  pending/unresolved/unknown/local-defect state as well as transition behavior,
+  interval attribution, monotonic chronology, RSS slope, queues, tails and
+  storage projection.
 
 ### C5. Fresh Gate-1 rerun
 
 - run a fresh 21,600-second soak from one exact accepted SHA;
 - perform the full independent artifact audit again;
 - accept only `PASS` under `GATE_1_SOAK_SPEC.md`.
+
+This step requires later independent authorization and is not part of the
+ADR-0054 remediation task.
 
 **Gate:** G1 — currently failed; rerun required.
 

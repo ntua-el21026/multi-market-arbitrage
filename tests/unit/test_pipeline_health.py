@@ -36,13 +36,16 @@ from multi_market_arbitrage.observability import (
     SupervisedAvailabilityIntervalWriter,
     normalize_git_commit,
 )
+from multi_market_arbitrage.pipeline import health as health_module
 from multi_market_arbitrage.pipeline.audit import (
     AuditBookIdentity,
+    AuditDivergenceResolution,
     AuditFailureReason,
     AuditMismatchCause,
     AuditMismatchDiagnostic,
     AuditOutcome,
     AuditOutcomeEvidence,
+    AuditTriggerReason,
     build_audit_mismatch_diagnostic,
 )
 from multi_market_arbitrage.pipeline.channels import (
@@ -75,6 +78,20 @@ from multi_market_arbitrage.venues.polymarket.public_reads import PublicReadMetr
 FIXTURES = Path(__file__).parents[1] / "golden" / "fixtures"
 
 
+def test_audit_divergence_resolution_representatives_are_a_bounded_tail() -> None:
+    records = cast(
+        tuple[AuditDivergenceResolution, ...],
+        tuple(object() for _ in range(5)),
+    )
+
+    selected = health_module._audit_divergence_resolution_representatives(  # pyright: ignore[reportPrivateUsage]
+        records
+    )
+
+    assert selected == records[-health_module.MAXIMUM_AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVES :]
+    assert len(selected) == health_module.MAXIMUM_AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVES
+
+
 class _ScopedProcessorView:
     def __init__(
         self,
@@ -88,6 +105,7 @@ class _ScopedProcessorView:
         audit_mismatch_cause_counts: tuple[tuple[AuditMismatchCause, int], ...] | None = None,
         audit_mismatch_diagnostics_truncated: bool = False,
         audit_start_generation_rebases: int = 0,
+        audit_divergences_resolved_same_generation: int | None = None,
     ) -> None:
         self._processor = processor
         self._snapshots = snapshots
@@ -98,6 +116,9 @@ class _ScopedProcessorView:
         self._audit_mismatch_cause_counts = audit_mismatch_cause_counts
         self._audit_mismatch_diagnostics_truncated = audit_mismatch_diagnostics_truncated
         self._audit_start_generation_rebases = audit_start_generation_rebases
+        self._audit_divergences_resolved_same_generation = (
+            audit_divergences_resolved_same_generation
+        )
 
     def summary(self) -> ProcessorSummary:
         summary = replace(
@@ -112,12 +133,49 @@ class _ScopedProcessorView:
             cause_counts = self._audit_mismatch_cause_counts
             if cause_counts is None:
                 raise RuntimeError("test mismatch diagnostics require cause counts")
+            mismatch_count = sum(count for _, count in cause_counts)
             summary = replace(
                 summary,
-                rest_audit_mismatches=sum(count for _, count in cause_counts),
+                rest_audits=mismatch_count,
+                rest_audit_mismatches=mismatch_count,
                 audit_mismatch_cause_counts=cause_counts,
                 audit_mismatch_diagnostics=self._audit_mismatch_diagnostics,
                 audit_mismatch_diagnostics_truncated=(self._audit_mismatch_diagnostics_truncated),
+                audit_start_trigger_counts=tuple(
+                    (
+                        trigger,
+                        mismatch_count if trigger is AuditTriggerReason.UNKNOWN_LEGACY else 0,
+                    )
+                    for trigger in AuditTriggerReason
+                ),
+                audit_outcome_trigger_counts=tuple(
+                    (
+                        trigger,
+                        outcome,
+                        mismatch_count
+                        if trigger is AuditTriggerReason.UNKNOWN_LEGACY
+                        and outcome is AuditOutcome.MISMATCH
+                        else 0,
+                    )
+                    for trigger in AuditTriggerReason
+                    for outcome in AuditOutcome
+                ),
+                audit_divergences_observed=mismatch_count,
+                audit_divergences_resolved_by_authoritative_resnapshot=(mismatch_count),
+                audit_divergences_unknown=dict(cause_counts)[AuditMismatchCause.UNKNOWN],
+                audit_local_book_defects=dict(cause_counts)[AuditMismatchCause.LOCAL_BOOK_DEFECT],
+                audit_divergence_lifecycle_reconciled=True,
+                audit_divergence_resolution_records_truncated=(mismatch_count > 0),
+            )
+        if self._audit_divergences_resolved_same_generation is not None:
+            same_generation = self._audit_divergences_resolved_same_generation
+            summary = replace(
+                summary,
+                audit_divergences_resolved_by_authoritative_resnapshot=max(
+                    0,
+                    summary.audit_divergences_observed - same_generation,
+                ),
+                audit_divergences_resolved_same_generation=same_generation,
             )
         if self._audit_outcomes is None:
             return summary
@@ -136,6 +194,25 @@ class _ScopedProcessorView:
             ),
             rest_audit_failed=sum(
                 outcome.outcome is AuditOutcome.FAILED for outcome in self._audit_outcomes
+            ),
+            audit_start_trigger_counts=tuple(
+                (
+                    trigger,
+                    sum(outcome.trigger_reason is trigger for outcome in self._audit_outcomes),
+                )
+                for trigger in AuditTriggerReason
+            ),
+            audit_outcome_trigger_counts=tuple(
+                (
+                    trigger,
+                    outcome_kind,
+                    sum(
+                        outcome.trigger_reason is trigger and outcome.outcome is outcome_kind
+                        for outcome in self._audit_outcomes
+                    ),
+                )
+                for trigger in AuditTriggerReason
+                for outcome_kind in AuditOutcome
             ),
         )
 
@@ -779,6 +856,19 @@ def test_checkpoint_book_freshness_accepts_exact_bound_and_scopes_selected_targe
     assert checkpoint.gate1_eligible_so_far is True
     assert checkpoint.git_commit == "a" * 40
     assert checkpoint.reason_codes == ()
+    current_audit_eligibility = cast(
+        dict[str, object],
+        checkpoint.audit["current_eligibility"],
+    )
+    assert current_audit_eligibility == {
+        "eligible": True,
+        "evidence_reconciled": True,
+        "pending_divergence_count": 0,
+        "processor_ineligible_book_count": 1,
+        "replacement_capture_count": 0,
+        "required_ineligible_book_count": 0,
+        "required_ineligible_instrument_ids": (),
+    }
 
 
 def test_checkpoint_unknown_code_identity_is_explicit_gate_only_blocker() -> None:
@@ -971,6 +1061,8 @@ def test_checkpoint_exposes_bounded_audit_mismatch_causes_and_source_identities(
     )
 
     mismatch_evidence = cast(dict[str, object], checkpoint.audit["mismatch_causes"])
+    divergence_evidence = cast(dict[str, object], checkpoint.audit["divergences"])
+    trigger_evidence = cast(dict[str, object], checkpoint.audit["triggers"])
     representatives = cast(tuple[dict[str, object], ...], mismatch_evidence["representatives"])
     assert checkpoint.audit["generation_rebases"] == 2
     assert mismatch_evidence["counts_reconciled"] is True
@@ -988,8 +1080,209 @@ def test_checkpoint_exposes_bounded_audit_mismatch_causes_and_source_identities(
     assert unknown["local_book_economic_sha256"] == (
         latest_unknown.local_book.economic_content_sha256
     )
+    assert divergence_evidence["evidence_reconciled"] is True
+    assert divergence_evidence["observed"] == 3
+    assert divergence_evidence["resolved_by_authoritative_resnapshot"] == 3
+    assert divergence_evidence["pending"] == 0
+    assert divergence_evidence["unresolved"] == 0
+    assert divergence_evidence["unknown"] == 2
+    assert trigger_evidence["counts_reconciled"] is True
+    starts = cast(dict[str, int], trigger_evidence["starts_by_trigger"])
+    outcomes = cast(
+        dict[str, dict[str, int]],
+        trigger_evidence["outcomes_by_trigger"],
+    )
+    assert starts["UNKNOWN_LEGACY"] == 3
+    assert outcomes["UNKNOWN_LEGACY"]["MISMATCH"] == 3
     assert checkpoint.gate1_eligible_so_far is False
-    assert HealthDecisionReason.AUDIT_MISMATCH in checkpoint.reason_codes
+    assert HealthDecisionReason.AUDIT_DIVERGENCE_UNKNOWN in checkpoint.reason_codes
+    assert checkpoint.gate1_sticky_reason_codes == (HealthDecisionReason.AUDIT_DIVERGENCE_UNKNOWN,)
+
+
+def test_checkpoint_keeps_fully_resolved_external_divergence_nonblocking() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    updated_at = UtcTimestamp(1_800_000_000_000_000_000)
+    processor, target = _healthy_target_processor(config, updated_at=updated_at)
+    resolved_external = _mismatch_diagnostic(
+        target,
+        cause=AuditMismatchCause.TRUE_EXACT_DEPTH_DIVERGENCE,
+        label="resolved-external",
+    )
+    counts = tuple(
+        (
+            cause,
+            int(cause is AuditMismatchCause.TRUE_EXACT_DEPTH_DIVERGENCE),
+        )
+        for cause in AuditMismatchCause
+    )
+    resolved_processor = cast(
+        CanonicalProcessor,
+        _ScopedProcessorView(
+            processor,
+            processor.snapshots(),
+            audit_mismatch_diagnostics=(resolved_external,),
+            audit_mismatch_cause_counts=counts,
+        ),
+    )
+
+    checkpoint = _checkpoint(
+        config=config,
+        target=target,
+        processor=resolved_processor,
+        book_last_valid_receive_monotonic_ns=_target_receive_times(target, 20),
+        emitted_at=updated_at,
+        monotonic_now_ns=30,
+    )
+
+    divergence_evidence = cast(dict[str, object], checkpoint.audit["divergences"])
+    assert checkpoint.audit["mismatch"] == 1
+    assert divergence_evidence["observed"] == 1
+    assert divergence_evidence["resolved_by_authoritative_resnapshot"] == 1
+    assert divergence_evidence["evidence_reconciled"] is True
+    assert checkpoint.capture_healthy is True
+    assert checkpoint.research_eligible is True
+    assert checkpoint.gate1_eligible_so_far is True
+    assert checkpoint.reason_codes == ()
+    assert checkpoint.gate1_sticky_reason_codes == ()
+
+
+def test_mismatch_cause_total_inconsistency_is_gate_sticky() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    updated_at = UtcTimestamp(1_800_000_000_000_000_000)
+    processor, target = _healthy_target_processor(config, updated_at=updated_at)
+    diagnostic = _mismatch_diagnostic(
+        target,
+        cause=AuditMismatchCause.TRUE_EXACT_DEPTH_DIVERGENCE,
+        label="inconsistent-cause-total",
+    )
+    valid_counts = tuple(
+        (
+            cause,
+            int(cause is AuditMismatchCause.TRUE_EXACT_DEPTH_DIVERGENCE),
+        )
+        for cause in AuditMismatchCause
+    )
+
+    class _InconsistentCauseProcessor(_ScopedProcessorView):
+        def summary(self) -> ProcessorSummary:
+            return replace(
+                super().summary(),
+                audit_mismatch_cause_counts=tuple((cause, 0) for cause in AuditMismatchCause),
+            )
+
+    inconsistent = cast(
+        CanonicalProcessor,
+        _InconsistentCauseProcessor(
+            processor,
+            processor.snapshots(),
+            audit_mismatch_diagnostics=(diagnostic,),
+            audit_mismatch_cause_counts=valid_counts,
+        ),
+    )
+    checkpoint = _checkpoint(
+        config=config,
+        target=target,
+        processor=inconsistent,
+        book_last_valid_receive_monotonic_ns=_target_receive_times(target, 20),
+        emitted_at=updated_at,
+        monotonic_now_ns=30,
+    )
+
+    causes = cast(dict[str, object], checkpoint.audit["mismatch_causes"])
+    divergences = cast(dict[str, object], checkpoint.audit["divergences"])
+    assert causes["counts_reconciled"] is False
+    assert divergences["evidence_reconciled"] is False
+    assert checkpoint.research_eligible is False
+    assert checkpoint.gate1_eligible_so_far is False
+    assert checkpoint.reason_codes == (HealthDecisionReason.AUDIT_DIVERGENCE_RECONCILIATION_FAILED,)
+    assert checkpoint.gate1_sticky_reason_codes == checkpoint.reason_codes
+
+
+def test_current_audit_eligibility_count_inconsistency_is_gate_sticky() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    updated_at = UtcTimestamp(1_800_000_000_000_000_000)
+    processor, target = _healthy_target_processor(config, updated_at=updated_at)
+    yes_instrument = InstrumentId.from_native(POLYMARKET_VENUE_ID, target.yes_token_id)
+
+    class _InconsistentEligibilityProcessor(_ScopedProcessorView):
+        def summary(self) -> ProcessorSummary:
+            return replace(super().summary(), audit_ineligible_books=0)
+
+    inconsistent = cast(
+        CanonicalProcessor,
+        _InconsistentEligibilityProcessor(
+            processor,
+            processor.snapshots(),
+            audit_ineligible_instruments=(yes_instrument,),
+        ),
+    )
+    checkpoint = _checkpoint(
+        config=config,
+        target=target,
+        processor=inconsistent,
+        book_last_valid_receive_monotonic_ns=_target_receive_times(target, 20),
+        emitted_at=updated_at,
+        monotonic_now_ns=30,
+    )
+
+    current = cast(dict[str, object], checkpoint.audit["current_eligibility"])
+    divergences = cast(dict[str, object], checkpoint.audit["divergences"])
+    assert current["eligible"] is False
+    assert current["evidence_reconciled"] is False
+    assert current["required_ineligible_instrument_ids"] == (yes_instrument.value,)
+    assert divergences["evidence_reconciled"] is False
+    assert checkpoint.reason_codes == (
+        HealthDecisionReason.AUDIT_DIVERGENCE_RECONCILIATION_FAILED,
+        HealthDecisionReason.BOOK_NOT_HEALTHY,
+    )
+    assert checkpoint.gate1_sticky_reason_codes == (
+        HealthDecisionReason.AUDIT_DIVERGENCE_RECONCILIATION_FAILED,
+    )
+
+
+def test_live_same_generation_resolution_is_rejected_under_alternative_a() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    updated_at = UtcTimestamp(1_800_000_000_000_000_000)
+    processor, target = _healthy_target_processor(config, updated_at=updated_at)
+    diagnostic = _mismatch_diagnostic(
+        target,
+        cause=AuditMismatchCause.TRUE_EXACT_DEPTH_DIVERGENCE,
+        label="forbidden-live-same-generation-resolution",
+    )
+    counts = tuple(
+        (
+            cause,
+            int(cause is AuditMismatchCause.TRUE_EXACT_DEPTH_DIVERGENCE),
+        )
+        for cause in AuditMismatchCause
+    )
+    invalid_processor = cast(
+        CanonicalProcessor,
+        _ScopedProcessorView(
+            processor,
+            processor.snapshots(),
+            audit_mismatch_diagnostics=(diagnostic,),
+            audit_mismatch_cause_counts=counts,
+            audit_divergences_resolved_same_generation=1,
+        ),
+    )
+
+    checkpoint = _checkpoint(
+        config=config,
+        target=target,
+        processor=invalid_processor,
+        book_last_valid_receive_monotonic_ns=_target_receive_times(target, 20),
+        emitted_at=updated_at,
+        monotonic_now_ns=30,
+    )
+
+    divergences = cast(dict[str, object], checkpoint.audit["divergences"])
+    assert divergences["resolved_same_generation"] == 1
+    assert divergences["evidence_reconciled"] is False
+    assert checkpoint.research_eligible is False
+    assert checkpoint.gate1_eligible_so_far is False
+    assert checkpoint.reason_codes == (HealthDecisionReason.AUDIT_DIVERGENCE_RECONCILIATION_FAILED,)
+    assert checkpoint.gate1_sticky_reason_codes == checkpoint.reason_codes
 
 
 def test_checkpoint_book_freshness_fails_one_nanosecond_over_bound() -> None:
@@ -1193,6 +1486,19 @@ def test_checkpoint_recovers_current_research_after_later_race_free_match() -> N
     assert unresolved_checkpoint.research_eligible is False
     assert unresolved_checkpoint.gate1_eligible_so_far is False
     assert HealthDecisionReason.BOOK_NOT_HEALTHY in unresolved_checkpoint.reason_codes
+    current_audit_eligibility = cast(
+        dict[str, object],
+        unresolved_checkpoint.audit["current_eligibility"],
+    )
+    assert current_audit_eligibility == {
+        "eligible": False,
+        "evidence_reconciled": True,
+        "pending_divergence_count": 0,
+        "processor_ineligible_book_count": 1,
+        "replacement_capture_count": 0,
+        "required_ineligible_book_count": 1,
+        "required_ineligible_instrument_ids": (ineligible_instrument.value,),
+    }
 
 
 def test_checkpoint_audit_integrity_age_fails_closed_on_future_monotonic_response() -> None:

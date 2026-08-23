@@ -55,6 +55,7 @@ from multi_market_arbitrage.pipeline import (
     WebSocketAdmissionWatermark,
 )
 from multi_market_arbitrage.pipeline import observe as observe_module
+from multi_market_arbitrage.pipeline.audit import AuditTriggerReason
 from multi_market_arbitrage.pipeline.health import ObservationRuntimeHealth
 from multi_market_arbitrage.pipeline.ingress import (
     BoundedRawIngress,
@@ -1458,6 +1459,12 @@ async def test_raced_retry_budget_exhaustion_is_bounded_and_replayable(
     counters = {key.name: value for key, value in metrics.snapshot().counters}
     assert counters["mma_rest_audit_retries_total"] == 1
     assert counters["mma_rest_audit_race_budget_exhaustions_total"] == 1
+    retry_interval = metrics.histogram_snapshot(
+        "mma_rest_audit_effective_interval_ns",
+        labels={"trigger": AuditTriggerReason.RACE_RETRY.value},
+    )
+    assert retry_interval is not None
+    assert retry_interval.total_count == 2
     records = JournalReader(tmp_path / "raw", run_id).read_all()
     start_records = [record for record in records if record.channel == CONTROL_REST_AUDIT_START]
     assert len(start_records) == 4
@@ -2159,6 +2166,7 @@ async def test_both_first_starts_are_durable_before_concurrent_http_launch(
         attempt: int,
         connection_id: ConnectionId,
         subscription_id: SubscriptionId,
+        trigger_reason: AuditTriggerReason = AuditTriggerReason.OTHER_TYPED_REASON,
         request_started_monotonic_ns: int | None = None,
         hard_expiry_monotonic_ns: int | None = None,
         response_deadline_monotonic_ns: int | None = None,
@@ -2172,6 +2180,7 @@ async def test_both_first_starts_are_durable_before_concurrent_http_launch(
             attempt=attempt,
             connection_id=connection_id,
             subscription_id=subscription_id,
+            trigger_reason=trigger_reason,
             request_started_monotonic_ns=request_started_monotonic_ns,
             hard_expiry_monotonic_ns=hard_expiry_monotonic_ns,
             response_deadline_monotonic_ns=response_deadline_monotonic_ns,
@@ -2350,6 +2359,7 @@ async def test_second_start_crossing_leg_expiry_closes_all_staged_legs_without_h
         attempt: int,
         connection_id: ConnectionId,
         subscription_id: SubscriptionId,
+        trigger_reason: AuditTriggerReason = AuditTriggerReason.OTHER_TYPED_REASON,
         request_started_monotonic_ns: int | None = None,
         hard_expiry_monotonic_ns: int | None = None,
         response_deadline_monotonic_ns: int | None = None,
@@ -2365,6 +2375,7 @@ async def test_second_start_crossing_leg_expiry_closes_all_staged_legs_without_h
             attempt=attempt,
             connection_id=connection_id,
             subscription_id=subscription_id,
+            trigger_reason=trigger_reason,
             request_started_monotonic_ns=request_started_monotonic_ns,
             hard_expiry_monotonic_ns=hard_expiry_monotonic_ns,
             response_deadline_monotonic_ns=response_deadline_monotonic_ns,
@@ -3608,7 +3619,39 @@ async def test_idle_books_launch_guarded_audit_before_future_periodic_deadline(
     live = processor.summary()
     assert len(live.audit_outcomes) == 2
     assert all(outcome.outcome is AuditOutcome.MATCH for outcome in live.audit_outcomes)
+    assert all(
+        outcome.trigger_reason is AuditTriggerReason.FRESHNESS_GUARD
+        for outcome in live.audit_outcomes
+    )
+    assert dict(live.audit_start_trigger_counts)[AuditTriggerReason.FRESHNESS_GUARD] == 2
+    outcome_trigger_counts = {
+        (trigger, outcome): count for trigger, outcome, count in live.audit_outcome_trigger_counts
+    }
+    assert outcome_trigger_counts[(AuditTriggerReason.FRESHNESS_GUARD, AuditOutcome.MATCH)] == 2
     assert live.pending_rest_audits == 0
+    trigger_labels = {"trigger": AuditTriggerReason.FRESHNESS_GUARD.value}
+    assert (
+        metrics.counter_value("mma_rest_audit_starts_by_trigger_total", labels=trigger_labels) == 2
+    )
+    assert (
+        metrics.counter_value(
+            "mma_rest_audit_outcomes_by_trigger_total",
+            labels={**trigger_labels, "outcome": AuditOutcome.MATCH.value},
+        )
+        == 2
+    )
+    http_latency = metrics.histogram_snapshot(
+        "mma_rest_audit_http_latency_ns",
+        labels=trigger_labels,
+    )
+    assert http_latency is not None
+    assert http_latency.total_count == 2
+    freshness_budget = metrics.histogram_snapshot(
+        "mma_rest_audit_remaining_freshness_budget_ns",
+        labels=trigger_labels,
+    )
+    assert freshness_budget is not None
+    assert freshness_budget.total_count == 2
     records = JournalReader(tmp_path / "raw", run_id).read_all()
     assert sum(record.channel == CONTROL_REST_AUDIT_START for record in records) == 2
     assert sum(record.channel == REST_BOOK_AUDIT for record in records) == 2
@@ -3819,6 +3862,7 @@ async def test_run_deadline_after_durable_audit_start_closes_without_http(
         attempt: int,
         connection_id: ConnectionId,
         subscription_id: SubscriptionId,
+        trigger_reason: AuditTriggerReason = AuditTriggerReason.OTHER_TYPED_REASON,
         request_started_monotonic_ns: int | None = None,
         hard_expiry_monotonic_ns: int | None = None,
         response_deadline_monotonic_ns: int | None = None,
@@ -3831,6 +3875,7 @@ async def test_run_deadline_after_durable_audit_start_closes_without_http(
             attempt=attempt,
             connection_id=connection_id,
             subscription_id=subscription_id,
+            trigger_reason=trigger_reason,
             request_started_monotonic_ns=request_started_monotonic_ns,
             hard_expiry_monotonic_ns=hard_expiry_monotonic_ns,
             response_deadline_monotonic_ns=response_deadline_monotonic_ns,

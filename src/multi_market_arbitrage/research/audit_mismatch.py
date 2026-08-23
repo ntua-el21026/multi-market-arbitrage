@@ -24,8 +24,10 @@ from typing import Protocol, cast
 from multi_market_arbitrage.core.exact import ExactDecimal, Price, Quantity
 from multi_market_arbitrage.core.ids import (
     CollectorRunId,
+    ConnectionId,
     IngestId,
     InstrumentId,
+    SubscriptionId,
     is_sha256_hex,
 )
 from multi_market_arbitrage.core.provenance import RawSourceRef
@@ -36,11 +38,14 @@ from multi_market_arbitrage.pipeline.audit import (
     AUDIT_CLASSIFICATION_SCHEMA,
     AUDIT_MISMATCH_MAX_LEVELS_PER_SIDE,
     AUDIT_MISMATCH_MAX_RAW_SOURCES,
-    AUDIT_START_SCHEMA,
+    AUDIT_START_V1_SCHEMA,
+    AUDIT_START_V2_SCHEMA,
+    AuditBookIdentity,
     AuditExactDepthDifference,
     AuditExactDepthIdentity,
     AuditMismatchCause,
     AuditRawSourceSummary,
+    AuditTriggerReason,
     audit_exact_depth_identity,
     compare_audit_exact_depth,
     summarize_audit_raw_sources,
@@ -48,6 +53,7 @@ from multi_market_arbitrage.pipeline.audit import (
 from multi_market_arbitrage.pipeline.channels import (
     CONTROL_REST_AUDIT_CLASSIFY,
     CONTROL_REST_AUDIT_START,
+    REST_BOOK,
     REST_BOOK_AUDIT,
     WS_MARKET,
 )
@@ -65,9 +71,9 @@ from multi_market_arbitrage.venues.polymarket.schemas import (
     parse_rest_book,
 )
 
-AUDIT_MISMATCH_LINEAGE_REPORT_SCHEMA = "phase1-audit-mismatch-lineage-report-v1"
-_JOURNAL_IDENTITY_DOMAIN = b"mma-audit-mismatch-journal-identity-v1\0"
-_RESULT_SEQUENCE_DOMAIN = b"mma-audit-mismatch-result-sequence-v1\0"
+AUDIT_MISMATCH_LINEAGE_REPORT_SCHEMA = "phase1-audit-mismatch-lineage-report-v2"
+_JOURNAL_IDENTITY_DOMAIN = b"mma-audit-mismatch-journal-identity-v2\0"
+_RESULT_SEQUENCE_DOMAIN = b"mma-audit-mismatch-result-sequence-v2\0"
 
 
 class _Digest(Protocol):
@@ -99,6 +105,12 @@ class AuditMismatchLineageReason(StrEnum):
     FUTURE_REFERENCE_PRECISION_TRANSITION = "FUTURE_REFERENCE_PRECISION_TRANSITION"
     RECONSTRUCTED_LOCAL_BOOK_DEFECT = "RECONSTRUCTED_LOCAL_BOOK_DEFECT"
     SCALAR_MISMATCH_CAUSE_UNPROVEN = "SCALAR_MISMATCH_CAUSE_UNPROVEN"
+    SAME_GENERATION_EXACT_CONVERGENCE = "SAME_GENERATION_EXACT_CONVERGENCE"
+    SAME_GENERATION_CONFLICT = "SAME_GENERATION_CONFLICT"
+    RECOVERY_GENERATION_EXACT_MATCH = "RECOVERY_GENERATION_EXACT_MATCH"
+    PRIOR_EXACT_STATE_MATCH = "PRIOR_EXACT_STATE_MATCH"
+    PERSISTENT_EXACT_DIVERGENCE = "PERSISTENT_EXACT_DIVERGENCE"
+    CAUSAL_GENERATION_AMBIGUOUS = "CAUSAL_GENERATION_AMBIGUOUS"
 
 
 class AuditVenueStateRelation(StrEnum):
@@ -108,6 +120,44 @@ class AuditVenueStateRelation(StrEnum):
     FUTURE = "FUTURE"
     NONE = "NONE"
     AMBIGUOUS = "AMBIGUOUS"
+
+
+class AuditMismatchCausalRelation(StrEnum):
+    """Generation-aware causal relation of exact venue evidence to a mismatch."""
+
+    SAME_GENERATION_NATURAL_CONVERGENCE = "SAME_GENERATION_NATURAL_CONVERGENCE"
+    SAME_GENERATION_CONFLICT_BEFORE_CONVERGENCE = "SAME_GENERATION_CONFLICT_BEFORE_CONVERGENCE"
+    RECOVERY_GENERATION_MATCH = "RECOVERY_GENERATION_MATCH"
+    PRIOR_STATE_MATCH = "PRIOR_STATE_MATCH"
+    PERSISTENT_DIVERGENCE = "PERSISTENT_DIVERGENCE"
+    REFERENCE_TRANSITION = "REFERENCE_TRANSITION"
+    LOCAL_BOOK_DEFECT = "LOCAL_BOOK_DEFECT"
+    AMBIGUOUS = "AMBIGUOUS"
+    NOT_FOUND = "NOT_FOUND"
+
+
+class AuditMatchingStateRepresentation(StrEnum):
+    """How an exact matching WebSocket state was established."""
+
+    FULL_SNAPSHOT = "FULL_SNAPSHOT"
+    RECONSTRUCTED_INCREMENTALS = "RECONSTRUCTED_INCREMENTALS"
+
+
+class AuditEqualityProof(StrEnum):
+    """Strength of equality evidence retained by one lineage result."""
+
+    FULL_DEPTH_EXACT = "FULL_DEPTH_EXACT"
+    COARSE_ONLY = "COARSE_ONLY"
+    NOT_PROVEN = "NOT_PROVEN"
+
+
+class AuditRecoveryEvidenceStatus(StrEnum):
+    """Provenance strength for one recovery chronology stage."""
+
+    RAW_JOURNAL = "RAW_JOURNAL"
+    RAW_JOURNAL_INFERENCE = "RAW_JOURNAL_INFERENCE"
+    DETERMINISTIC_REPLAY = "DETERMINISTIC_REPLAY"
+    NOT_RETAINED = "NOT_RETAINED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,6 +332,67 @@ class AuditMismatchCauseCount:
 
 
 @dataclass(frozen=True, slots=True)
+class AuditRecoveryStageEvidence:
+    """One explicitly sourced or explicitly absent recovery chronology stage."""
+
+    status: AuditRecoveryEvidenceStatus
+    reason: str
+    ingest_seq: int | None = None
+    source: RawSourceRef | None = None
+    connection_id: ConnectionId | None = None
+    subscription_id: SubscriptionId | None = None
+    socket_generation: int | None = None
+    admission_ordinal: int | None = None
+    received_monotonic_ns: int | None = None
+    event_type: str | None = None
+    exact_depth_identity: AuditExactDepthIdentity | None = None
+
+    def __post_init__(self) -> None:
+        if not self.reason or len(self.reason) > 512:
+            raise AuditMismatchReportError("recovery-stage reason must be non-empty bounded text")
+        if self.ingest_seq is not None and self.ingest_seq < 0:
+            raise AuditMismatchReportError("recovery-stage ingest sequence cannot be negative")
+        if self.socket_generation is not None and self.socket_generation <= 0:
+            raise AuditMismatchReportError("recovery-stage socket generation must be positive")
+        if self.admission_ordinal is not None and self.admission_ordinal < 0:
+            raise AuditMismatchReportError("recovery-stage admission ordinal cannot be negative")
+        if self.received_monotonic_ns is not None and self.received_monotonic_ns < 0:
+            raise AuditMismatchReportError("recovery-stage monotonic time cannot be negative")
+        if self.event_type is not None and (not self.event_type or len(self.event_type) > 128):
+            raise AuditMismatchReportError("recovery-stage event type must be bounded text")
+        retained = (
+            self.ingest_seq,
+            self.source,
+            self.connection_id,
+            self.subscription_id,
+            self.socket_generation,
+            self.admission_ordinal,
+            self.received_monotonic_ns,
+            self.event_type,
+            self.exact_depth_identity,
+        )
+        if self.status is AuditRecoveryEvidenceStatus.NOT_RETAINED and any(
+            item is not None for item in retained
+        ):
+            raise AuditMismatchReportError("absent recovery evidence cannot carry a source")
+
+
+@dataclass(frozen=True, slots=True)
+class AuditRecoveryChronology:
+    """Causal recovery stages retained without inventing absent historical facts."""
+
+    mismatch_classification: AuditRecoveryStageEvidence
+    local_invalidation: AuditRecoveryStageEvidence
+    research_audit_ineligibility: AuditRecoveryStageEvidence
+    generation_termination: AuditRecoveryStageEvidence
+    resync_initiation: AuditRecoveryStageEvidence
+    rest_resnapshot: AuditRecoveryStageEvidence
+    replacement_websocket_generation: AuditRecoveryStageEvidence
+    recovery_completion: AuditRecoveryStageEvidence
+    research_eligibility_restoration: AuditRecoveryStageEvidence
+
+
+@dataclass(frozen=True, slots=True)
 class AuditMismatchLineageResult:
     classification_ingest_seq: int
     instrument_id: InstrumentId
@@ -304,6 +415,43 @@ class AuditMismatchLineageResult:
     observed_difference: AuditMismatchDifferenceCounts
     reconstructed_difference: AuditMismatchDifferenceCounts | None
     exact_reconciliation_proven: bool
+    request_id: str
+    causal_relation: AuditMismatchCausalRelation
+    start_connection_id: ConnectionId
+    start_socket_generation: int | None
+    start_admission_ordinal: int
+    start_processed_ordinal: int
+    starting_book: AuditBookIdentity
+    starting_exact_depth_identity: AuditExactDepthIdentity | None
+    response_boundary_admission_ordinal: int | None
+    barrier_processed_ordinal: int | None
+    barrier_exact_depth_identity: AuditExactDepthIdentity | None
+    normalized_rest_exact_depth_identity: AuditExactDepthIdentity
+    exact_mismatch_difference_sha256: str | None
+    request_started_monotonic_ns: int
+    response_received_monotonic_ns: int
+    classification_monotonic_ns: int
+    classification_received_monotonic_ns: int
+    matching_websocket_subordinal: int | None
+    matching_connection_id: ConnectionId | None
+    matching_subscription_id: SubscriptionId | None
+    matching_socket_generation: int | None
+    matching_admission_ordinal: int | None
+    matching_event_type: str | None
+    matching_state_representation: AuditMatchingStateRepresentation | None
+    matching_exact_depth_identity: AuditExactDepthIdentity | None
+    matching_venue_hash_diagnostic: str | None
+    matching_venue_timestamp_diagnostic: str | None
+    matching_source_chain: AuditRawSourceSummary
+    matching_exact_frame_count: int
+    matching_received_monotonic_ns: int | None
+    response_to_match_monotonic_ns: int | None
+    classification_to_match_monotonic_ns: int | None
+    equality_proof: AuditEqualityProof
+    venue_hash_diagnostic_equal: bool | None
+    venue_timestamp_diagnostic_equal: bool | None
+    recovery_chronology: AuditRecoveryChronology
+    unresolved_evidence: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,6 +460,7 @@ class AuditMismatchReportResources:
     source_envelopes: int
     source_payload_bytes: int
     exact_actions_considered: int
+    exact_action_comparisons: int
     peak_retained_level_values: int
 
 
@@ -344,6 +493,7 @@ class _ResolvedObservation:
     observation: AuditMismatchObservation
     classification_source: RawSourceRef | None = None
     classification_connection: str | None = None
+    classification_subscription_id: SubscriptionId | None = None
     request_id: str | None = None
     response_ingest_seq: int | None = None
     start_ingest_seq: int | None = None
@@ -358,6 +508,31 @@ class _ResolvedObservation:
     rest_identity_mismatch: bool = False
     reported_transition_first_source: RawSourceRef | None = None
     reported_transition_latest_source: RawSourceRef | None = None
+    request_started_monotonic_ns: int | None = None
+    classification_monotonic_ns: int | None = None
+    classification_received_monotonic_ns: int | None = None
+    response_received_monotonic_ns: int | None = None
+    starting_admission_ordinal: int | None = None
+    starting_processed_ordinal: int | None = None
+    starting_book: AuditBookIdentity | None = None
+    response_boundary_ordinal: int | None = None
+    barrier_processed_ordinal: int | None = None
+    start_socket_generation: int | None = None
+    first_rest_resnapshot: _RecoveryRawStage | None = None
+    first_replacement_websocket: _RecoveryRawStage | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RecoveryRawStage:
+    ingest_seq: int
+    source: RawSourceRef
+    connection_id: ConnectionId
+    subscription_id: SubscriptionId
+    socket_generation: int | None
+    received_monotonic_ns: int
+    admission_ordinal: int | None = None
+    event_type: str | None = None
+    exact_depth_identity: AuditExactDepthIdentity | None = None
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -371,8 +546,13 @@ class _ExactAction:
     position: _JournalPosition
     source: RawSourceRef
     native_asset_id: str
+    connection_id: ConnectionId
+    subscription_id: SubscriptionId
+    admission_ordinal: int | None
+    received_monotonic_ns: int
     venue_hash: str
-    timestamp_raw: str
+    timestamp_raw: str | None
+    event_type: str
     replacement_bids: tuple[BookLevel, ...] | None = None
     replacement_asks: tuple[BookLevel, ...] | None = None
     replacement_depth_identity: AuditExactDepthIdentity | None = None
@@ -385,9 +565,40 @@ class _ExactAction:
 class _PrecisionAction:
     position: _JournalPosition
     source: RawSourceRef
+    connection_id: ConnectionId
+    subscription_id: SubscriptionId
+    admission_ordinal: int | None
+    received_monotonic_ns: int
     native_asset_id: str
     old_tick_size: ExactDecimal
     new_tick_size: ExactDecimal
+
+
+@dataclass(slots=True)
+class _CausalBook:
+    bids: dict[Price, Quantity]
+    asks: dict[Price, Quantity]
+    sources: list[RawSourceRef]
+    source_ids: set[IngestId]
+    exact_frame_count: int
+    latest_source: RawSourceRef
+    latest_position: _JournalPosition
+    latest_admission_ordinal: int | None
+    latest_received_monotonic_ns: int
+    latest_event_type: str
+    latest_venue_hash: str
+    latest_timestamp_raw: str | None
+    latest_representation: AuditMatchingStateRepresentation
+
+
+@dataclass(frozen=True, slots=True)
+class _CausalMatch:
+    action: _ExactAction
+    depth_identity: AuditExactDepthIdentity
+    representation: AuditMatchingStateRepresentation
+    sources: tuple[RawSourceRef, ...]
+    exact_frame_count: int
+    socket_generation: int | None
 
 
 @dataclass(slots=True)
@@ -403,6 +614,19 @@ class _WorkingLineage:
     subsequent_sources: list[RawSourceRef] | None = None
     subsequent_source_ids: set[IngestId] | None = None
     overflowed: bool = False
+    causal_books: dict[ConnectionId, _CausalBook] | None = None
+    causal_prior_match: _CausalMatch | None = None
+    causal_original_match: _CausalMatch | None = None
+    causal_recovery_match: _CausalMatch | None = None
+    causal_original_conflict: bool = False
+    causal_ambiguous: bool = False
+    causal_search_overflowed: bool = False
+    causal_search_exact_frames: int = 0
+    causal_search_source_ids: set[IngestId] | None = None
+    causal_missing_matching_admission: bool = False
+    causal_original_post_frames: int = 0
+    causal_replacement_seen: bool = False
+    causal_rest_resnapshot_candidate_seen: bool = False
 
 
 @dataclass(slots=True)
@@ -461,16 +685,9 @@ def _canonical_control(payload: bytes, *, context: str) -> dict[str, object]:
 
 
 def _journal_identity_update(digest: _Digest, envelope: RawEventEnvelope) -> None:
-    for value in (
-        str(envelope.ingest_seq),
-        envelope.ingest_id.value,
-        envelope.channel,
-        envelope.connection_id.value,
-        envelope.payload_sha256,
-    ):
-        encoded = value.encode("utf-8")
-        digest.update(len(encoded).to_bytes(8, "big"))
-        digest.update(encoded)
+    record = envelope.to_json_line()
+    digest.update(len(record).to_bytes(8, "big"))
+    digest.update(record)
 
 
 def _scan_pass(
@@ -574,12 +791,16 @@ def _exact_actions(
             f"cannot parse WebSocket evidence at ingest sequence {envelope.ingest_seq}"
         ) from error
     source = _source(envelope)
+    raw_admission_ordinal = envelope.transport_metadata.get("websocket_admission_ordinal")
+    admission_ordinal = (
+        raw_admission_ordinal
+        if isinstance(raw_admission_ordinal, int) and not isinstance(raw_admission_ordinal, bool)
+        else None
+    )
     actions: list[_ExactAction | _PrecisionAction] = []
     subordinal = 0
     for event in events:
         timestamp_raw = _ws_timestamp_key(event.venue_timestamp.nanoseconds_since_epoch)
-        if timestamp_raw is None:
-            continue
         if isinstance(event, WsBookEvent):
             if event.asset_id in target_assets:
                 replacement_bids, replacement_asks = _normalized_depth(
@@ -590,9 +811,14 @@ def _exact_actions(
                     _ExactAction(
                         position=_JournalPosition(envelope.ingest_seq, subordinal),
                         source=source,
+                        connection_id=envelope.connection_id,
+                        subscription_id=envelope.subscription_id,
+                        admission_ordinal=admission_ordinal,
+                        received_monotonic_ns=envelope.received_monotonic.nanoseconds,
                         native_asset_id=event.asset_id,
                         venue_hash=event.venue_hash,
                         timestamp_raw=timestamp_raw,
+                        event_type="book",
                         replacement_bids=replacement_bids,
                         replacement_asks=replacement_asks,
                         replacement_depth_identity=audit_exact_depth_identity(
@@ -609,9 +835,14 @@ def _exact_actions(
                         _ExactAction(
                             position=_JournalPosition(envelope.ingest_seq, subordinal),
                             source=source,
+                            connection_id=envelope.connection_id,
+                            subscription_id=envelope.subscription_id,
+                            admission_ordinal=admission_ordinal,
+                            received_monotonic_ns=envelope.received_monotonic.nanoseconds,
                             native_asset_id=change.asset_id,
                             venue_hash=change.venue_hash,
                             timestamp_raw=timestamp_raw,
+                            event_type="price_change",
                             side=change.side,
                             price=Price(change.price),
                             quantity=Quantity(change.new_size),
@@ -624,6 +855,10 @@ def _exact_actions(
                     _PrecisionAction(
                         position=_JournalPosition(envelope.ingest_seq, subordinal),
                         source=source,
+                        connection_id=envelope.connection_id,
+                        subscription_id=envelope.subscription_id,
+                        admission_ordinal=admission_ordinal,
+                        received_monotonic_ns=envelope.received_monotonic.nanoseconds,
                         native_asset_id=event.asset_id,
                         old_tick_size=event.old_tick_size,
                         new_tick_size=event.new_tick_size,
@@ -665,24 +900,16 @@ def _matches_rest_snapshot(
     action: _ExactAction,
     resolved: _ResolvedObservation,
 ) -> bool:
-    """Prove a venue-state anchor from one complete exact WS snapshot.
+    """Prove exact full-depth equality without trusting venue diagnostics.
 
-    Opaque venue hashes on incremental changes identify causing orders rather
-    than full book states.  They therefore cannot establish lineage.  The
-    full-snapshot hash and normalized timestamp bind the venue state, while
-    the depth identity is a fast reject and canonical complete depth equality
-    proves that the bound state is exactly the REST image.  Neither part is
-    sufficient by itself.
+    Polymarket's opaque hash and venue timestamp are retained in the result as
+    diagnostics.  They are not a cross-transport sequence or checksum and are
+    therefore never required for project-owned exact-depth equality.
     """
 
     rest = resolved.rest
-    rest_timestamp = None if rest is None else _rest_timestamp_key(rest.timestamp_raw)
     if (
         rest is None
-        or not rest.venue_hash
-        or rest_timestamp is None
-        or action.venue_hash != rest.venue_hash
-        or action.timestamp_raw != rest_timestamp
         or action.replacement_bids is None
         or action.replacement_asks is None
         or action.replacement_depth_identity is None
@@ -743,6 +970,156 @@ def _apply_action(
     if action.source.ingest_id not in working.subsequent_source_ids:
         working.subsequent_source_ids.add(action.source.ingest_id)
         working.subsequent_sources.append(action.source)
+
+
+def _causal_depth(book: _CausalBook) -> tuple[tuple[BookLevel, ...], tuple[BookLevel, ...]]:
+    return _normalized_depth(
+        tuple(BookLevel(price=price, quantity=quantity) for price, quantity in book.bids.items()),
+        tuple(BookLevel(price=price, quantity=quantity) for price, quantity in book.asks.items()),
+    )
+
+
+def _apply_causal_action(
+    working: _WorkingLineage,
+    action: _ExactAction,
+    *,
+    tracker: _LevelResourceTracker,
+    limits: AuditMismatchReportLimits,
+) -> _CausalBook | None:
+    """Apply one exact action to its connection-scoped reconstructed book."""
+
+    books = working.causal_books
+    if books is None:
+        books = {}
+        working.causal_books = books
+    book = books.get(action.connection_id)
+    if action.replacement_bids is not None and action.replacement_asks is not None:
+        before = 0 if book is None else len(book.bids) + len(book.asks)
+        book = _CausalBook(
+            bids={level.price: level.quantity for level in action.replacement_bids},
+            asks={level.price: level.quantity for level in action.replacement_asks},
+            sources=[action.source],
+            source_ids={action.source.ingest_id},
+            exact_frame_count=1,
+            latest_source=action.source,
+            latest_position=action.position,
+            latest_admission_ordinal=action.admission_ordinal,
+            latest_received_monotonic_ns=action.received_monotonic_ns,
+            latest_event_type=action.event_type,
+            latest_venue_hash=action.venue_hash,
+            latest_timestamp_raw=action.timestamp_raw,
+            latest_representation=AuditMatchingStateRepresentation.FULL_SNAPSHOT,
+        )
+        books[action.connection_id] = book
+        tracker.replace(
+            before,
+            len(book.bids) + len(book.asks),
+            limits.maximum_total_retained_level_values,
+        )
+        return book
+    if book is None:
+        return None
+    if action.side is None or action.price is None or action.quantity is None:
+        raise AuditMismatchReportError("causal exact WebSocket action is incomplete")
+    # The anchor snapshot is retained in the source chain but does not consume
+    # the configured subsequent-frame allowance.  Full snapshots may replace
+    # this connection-scoped lineage, while the separate causal search budget
+    # below remains cumulative across snapshots and connections.
+    new_source = action.source.ingest_id not in book.source_ids
+    if new_source and book.exact_frame_count - 1 >= limits.maximum_exact_frames_per_observation:
+        working.causal_search_overflowed = True
+        return None
+    before = len(book.bids) + len(book.asks)
+    side = book.bids if action.side is NativeSide.BUY else book.asks
+    if action.quantity.value:
+        side[action.price] = action.quantity
+    else:
+        side.pop(action.price, None)
+    tracker.replace(
+        before,
+        len(book.bids) + len(book.asks),
+        limits.maximum_total_retained_level_values,
+    )
+    if new_source:
+        book.source_ids.add(action.source.ingest_id)
+        book.sources.append(action.source)
+        book.exact_frame_count += 1
+    book.latest_source = action.source
+    book.latest_position = action.position
+    book.latest_admission_ordinal = action.admission_ordinal
+    book.latest_received_monotonic_ns = action.received_monotonic_ns
+    book.latest_event_type = action.event_type
+    book.latest_venue_hash = action.venue_hash
+    book.latest_timestamp_raw = action.timestamp_raw
+    book.latest_representation = AuditMatchingStateRepresentation.RECONSTRUCTED_INCREMENTALS
+    return book
+
+
+def _causal_search_decided(working: _WorkingLineage) -> bool:
+    """Return whether further exact causal comparisons cannot change the result."""
+
+    return (
+        working.causal_search_overflowed
+        or working.causal_original_match is not None
+        or working.causal_recovery_match is not None
+    )
+
+
+def _reserve_causal_search_frame(
+    working: _WorkingLineage,
+    source: RawSourceRef,
+    *,
+    limits: AuditMismatchReportLimits,
+) -> bool:
+    """Charge one candidate frame to a monotonic per-observation search budget.
+
+    The causal audit boundary is the response admission fence on the original
+    connection and classification on a later connection.  A full snapshot or
+    reconnect can replace book lineage, but neither can reset this budget.
+    """
+
+    if _causal_search_decided(working):
+        return False
+    source_ids: set[IngestId] | None = working.causal_search_source_ids
+    if source_ids is None:
+        source_ids = set[IngestId]()
+        working.causal_search_source_ids = source_ids
+    if source.ingest_id in source_ids:
+        return True
+    if working.causal_search_exact_frames >= limits.maximum_exact_frames_per_observation:
+        working.causal_search_overflowed = True
+        return False
+    source_ids.add(source.ingest_id)
+    working.causal_search_exact_frames += 1
+    return True
+
+
+def _causal_match(
+    action: _ExactAction,
+    book: _CausalBook,
+    *,
+    socket_generation: int | None,
+) -> _CausalMatch:
+    bids, asks = _causal_depth(book)
+    return _CausalMatch(
+        action=action,
+        depth_identity=audit_exact_depth_identity(bids, asks),
+        representation=book.latest_representation,
+        sources=tuple(book.sources),
+        exact_frame_count=book.exact_frame_count,
+        socket_generation=socket_generation,
+    )
+
+
+def _causal_book_matches_rest(book: _CausalBook, resolved: _ResolvedObservation) -> bool:
+    bids, asks = _causal_depth(book)
+    if resolved.rest_depth_identity is None:
+        raise AuditMismatchReportError("causal comparison lacks a normalized REST depth")
+    return (
+        audit_exact_depth_identity(bids, asks) == resolved.rest_depth_identity
+        and bids == resolved.rest_bids
+        and asks == resolved.rest_asks
+    )
 
 
 def _top_changed(
@@ -836,11 +1213,151 @@ def _result_digest(results: Sequence[AuditMismatchLineageResult]) -> str:
     return digest.hexdigest()
 
 
+def _absent_recovery_stage(reason: str) -> AuditRecoveryStageEvidence:
+    return AuditRecoveryStageEvidence(
+        status=AuditRecoveryEvidenceStatus.NOT_RETAINED,
+        reason=reason,
+    )
+
+
+def _raw_recovery_stage(
+    stage: _RecoveryRawStage,
+    *,
+    reason: str,
+    status: AuditRecoveryEvidenceStatus = AuditRecoveryEvidenceStatus.RAW_JOURNAL,
+) -> AuditRecoveryStageEvidence:
+    return AuditRecoveryStageEvidence(
+        status=status,
+        reason=reason,
+        ingest_seq=stage.ingest_seq,
+        source=stage.source,
+        connection_id=stage.connection_id,
+        subscription_id=stage.subscription_id,
+        socket_generation=stage.socket_generation,
+        admission_ordinal=stage.admission_ordinal,
+        received_monotonic_ns=stage.received_monotonic_ns,
+        event_type=stage.event_type,
+        exact_depth_identity=stage.exact_depth_identity,
+    )
+
+
+def _classification_recovery_stage(
+    resolved: _ResolvedObservation,
+    *,
+    status: AuditRecoveryEvidenceStatus,
+    reason: str,
+) -> AuditRecoveryStageEvidence:
+    if (
+        resolved.classification_source is None
+        or resolved.classification_connection is None
+        or resolved.classification_subscription_id is None
+        or resolved.classification_received_monotonic_ns is None
+    ):
+        raise AuditMismatchReportError("classification recovery evidence is incomplete")
+    return AuditRecoveryStageEvidence(
+        status=status,
+        reason=reason,
+        ingest_seq=resolved.observation.classification_ingest_seq,
+        source=resolved.classification_source,
+        connection_id=ConnectionId(resolved.classification_connection),
+        subscription_id=resolved.classification_subscription_id,
+        socket_generation=resolved.start_socket_generation,
+        received_monotonic_ns=resolved.classification_received_monotonic_ns,
+        event_type="audit_mismatch_classification",
+    )
+
+
+def _recovery_chronology(resolved: _ResolvedObservation) -> AuditRecoveryChronology:
+    classification = _classification_recovery_stage(
+        resolved,
+        status=AuditRecoveryEvidenceStatus.RAW_JOURNAL,
+        reason="raw audit classification bound to the supplied fenced MISMATCH observation",
+    )
+    replay_invalidation = _classification_recovery_stage(
+        resolved,
+        status=AuditRecoveryEvidenceStatus.DETERMINISTIC_REPLAY,
+        reason="a fenced MISMATCH deterministically invalidates the local book",
+    )
+    replay_ineligibility = _classification_recovery_stage(
+        resolved,
+        status=AuditRecoveryEvidenceStatus.DETERMINISTIC_REPLAY,
+        reason="a fenced MISMATCH deterministically blocks research and further audit eligibility",
+    )
+    replay_resync = _classification_recovery_stage(
+        resolved,
+        status=AuditRecoveryEvidenceStatus.DETERMINISTIC_REPLAY,
+        reason=(
+            "the MISMATCH observation requires resynchronization; "
+            "no separate raw start control exists"
+        ),
+    )
+    replacement = resolved.first_replacement_websocket
+    resnapshot = resolved.first_rest_resnapshot
+    if replacement is None:
+        generation_termination = _absent_recovery_stage(
+            "no raw replacement WebSocket generation establishes termination "
+            "of the original generation"
+        )
+        replacement_stage = _absent_recovery_stage(
+            "no replacement WebSocket generation for this asset is retained after classification"
+        )
+    else:
+        generation_termination = _raw_recovery_stage(
+            replacement,
+            status=AuditRecoveryEvidenceStatus.RAW_JOURNAL_INFERENCE,
+            reason="first later connection for the asset implies an original-generation boundary",
+        )
+        replacement_stage = _raw_recovery_stage(
+            replacement,
+            reason="first raw WebSocket evidence for the asset on a later socket generation",
+        )
+    if resnapshot is None:
+        resnapshot_stage = _absent_recovery_stage(
+            "no raw REST_BOOK recovery candidate for this asset is retained after classification"
+        )
+        completion = _absent_recovery_stage(
+            "no canonical replay outcome proves deterministic recovery completion"
+        )
+        restoration = _absent_recovery_stage(
+            "no retained availability evidence proves global research eligibility restoration"
+        )
+    else:
+        resnapshot_stage = _raw_recovery_stage(
+            resnapshot,
+            reason=(
+                "raw REST_BOOK is a recovery candidate; raw channel membership does not prove "
+                "canonical application"
+            ),
+        )
+        completion = _absent_recovery_stage(
+            "raw REST_BOOK does not prove successful canonical application, a healthy exact "
+            "baseline, or deterministic replay completion"
+        )
+        restoration = _absent_recovery_stage(
+            "raw REST_BOOK is only a recovery candidate; neither instrument-baseline "
+            "restoration nor global research eligibility is proven without canonical "
+            "replay and typed availability-ledger evidence"
+        )
+    return AuditRecoveryChronology(
+        mismatch_classification=classification,
+        local_invalidation=replay_invalidation,
+        research_audit_ineligibility=replay_ineligibility,
+        generation_termination=generation_termination,
+        resync_initiation=replay_resync,
+        rest_resnapshot=resnapshot_stage,
+        replacement_websocket_generation=replacement_stage,
+        recovery_completion=completion,
+        research_eligibility_restoration=restoration,
+    )
+
+
 def _build_result(working: _WorkingLineage) -> AuditMismatchLineageResult:
     resolved = working.resolved
     observation = resolved.observation
     if (
         resolved.classification_source is None
+        or resolved.classification_connection is None
+        or resolved.classification_subscription_id is None
         or resolved.start_source is None
         or resolved.response_source is None
         or resolved.start_ingest_seq is None
@@ -848,6 +1365,15 @@ def _build_result(working: _WorkingLineage) -> AuditMismatchLineageResult:
         or resolved.native_asset_id is None
         or resolved.attempt is None
         or resolved.rest is None
+        or resolved.rest_depth_identity is None
+        or resolved.request_id is None
+        or resolved.request_started_monotonic_ns is None
+        or resolved.response_received_monotonic_ns is None
+        or resolved.classification_monotonic_ns is None
+        or resolved.classification_received_monotonic_ns is None
+        or resolved.starting_admission_ordinal is None
+        or resolved.starting_processed_ordinal is None
+        or resolved.starting_book is None
     ):
         raise AuditMismatchReportError("resolved mismatch evidence is incomplete")
     relation = AuditVenueStateRelation.NONE
@@ -955,6 +1481,210 @@ def _build_result(working: _WorkingLineage) -> AuditMismatchLineageResult:
         matching_source = matching.source
         matching_ingest_seq = matching.position.ingest_seq
 
+    depth_mismatch = observation.difference_counts.difference_count > 0
+    causal_matching: _CausalMatch | None = None
+    if resolved.rest_identity_mismatch:
+        causal_relation = AuditMismatchCausalRelation.AMBIGUOUS
+        relation = AuditVenueStateRelation.AMBIGUOUS
+        matching = None
+        matching_source = None
+        matching_ingest_seq = None
+        exact_reconciliation = False
+    elif (
+        _reported_transition_proves_cause(resolved) or working.matching_reference_future is not None
+    ):
+        causal_relation = AuditMismatchCausalRelation.REFERENCE_TRANSITION
+    elif cause is AuditMismatchCause.LOCAL_BOOK_DEFECT:
+        causal_relation = AuditMismatchCausalRelation.LOCAL_BOOK_DEFECT
+        causal_matching = working.causal_prior_match
+    elif working.overflowed or working.causal_search_overflowed:
+        causal_relation = AuditMismatchCausalRelation.AMBIGUOUS
+        cause = AuditMismatchCause.UNKNOWN
+        reason = AuditMismatchLineageReason.EXACT_LINEAGE_BOUND_EXCEEDED
+        relation = AuditVenueStateRelation.AMBIGUOUS
+        matching = None
+        matching_source = None
+        matching_ingest_seq = None
+        exact_reconciliation = False
+    elif working.causal_ambiguous:
+        causal_relation = AuditMismatchCausalRelation.AMBIGUOUS
+        cause = AuditMismatchCause.UNKNOWN
+        reason = AuditMismatchLineageReason.CAUSAL_GENERATION_AMBIGUOUS
+        relation = AuditVenueStateRelation.AMBIGUOUS
+        matching = None
+        matching_source = None
+        matching_ingest_seq = None
+        exact_reconciliation = False
+    elif depth_mismatch and working.causal_original_match is not None:
+        causal_matching = working.causal_original_match
+        matching = None
+        matching_source = causal_matching.action.source
+        matching_ingest_seq = causal_matching.action.position.ingest_seq
+        relation = AuditVenueStateRelation.FUTURE
+        if working.causal_original_conflict:
+            causal_relation = (
+                AuditMismatchCausalRelation.SAME_GENERATION_CONFLICT_BEFORE_CONVERGENCE
+            )
+            cause = AuditMismatchCause.UNKNOWN
+            reason = AuditMismatchLineageReason.SAME_GENERATION_CONFLICT
+            exact_reconciliation = False
+        else:
+            causal_relation = AuditMismatchCausalRelation.SAME_GENERATION_NATURAL_CONVERGENCE
+            cause = AuditMismatchCause.FRESHNESS_RESPONSE_WINDOW_BOUNDARY
+            reason = AuditMismatchLineageReason.SAME_GENERATION_EXACT_CONVERGENCE
+            exact_reconciliation = True
+    elif depth_mismatch and working.causal_recovery_match is not None:
+        causal_matching = working.causal_recovery_match
+        matching = None
+        matching_source = causal_matching.action.source
+        matching_ingest_seq = causal_matching.action.position.ingest_seq
+        causal_relation = AuditMismatchCausalRelation.RECOVERY_GENERATION_MATCH
+        relation = AuditVenueStateRelation.FUTURE
+        cause = AuditMismatchCause.UNKNOWN
+        reason = AuditMismatchLineageReason.RECOVERY_GENERATION_EXACT_MATCH
+        exact_reconciliation = True
+    elif depth_mismatch and working.causal_prior_match is not None:
+        causal_matching = working.causal_prior_match
+        matching = None
+        matching_source = causal_matching.action.source
+        matching_ingest_seq = causal_matching.action.position.ingest_seq
+        causal_relation = AuditMismatchCausalRelation.PRIOR_STATE_MATCH
+        relation = AuditVenueStateRelation.PRIOR
+        if reason not in {
+            AuditMismatchLineageReason.PRIOR_STATE_EXACTLY_RECONCILED,
+            AuditMismatchLineageReason.LATEST_PRIOR_STATE_DIVERGENCE,
+            AuditMismatchLineageReason.PRIOR_STATE_RESIDUAL_DIVERGENCE,
+            AuditMismatchLineageReason.PRIOR_STATE_COARSE_RECONCILIATION_UNPROVEN,
+        }:
+            reason = AuditMismatchLineageReason.PRIOR_EXACT_STATE_MATCH
+    elif depth_mismatch and working.causal_original_post_frames:
+        causal_relation = AuditMismatchCausalRelation.PERSISTENT_DIVERGENCE
+        relation = AuditVenueStateRelation.NONE
+        cause = AuditMismatchCause.TRUE_EXACT_DEPTH_DIVERGENCE
+        reason = AuditMismatchLineageReason.PERSISTENT_EXACT_DIVERGENCE
+        matching = None
+        matching_source = None
+        matching_ingest_seq = None
+        exact_reconciliation = False
+    else:
+        causal_relation = AuditMismatchCausalRelation.NOT_FOUND
+        relation = AuditVenueStateRelation.NONE
+        cause = AuditMismatchCause.UNKNOWN
+        reason = (
+            AuditMismatchLineageReason.SCALAR_MISMATCH_CAUSE_UNPROVEN
+            if not depth_mismatch
+            else AuditMismatchLineageReason.VENUE_STATE_NOT_FOUND
+        )
+        matching = None
+        matching_source = None
+        matching_ingest_seq = None
+        exact_reconciliation = False
+
+    start_connection_id = ConnectionId(resolved.classification_connection)
+    matching_subordinal: int | None = None
+    matching_connection_id: ConnectionId | None = None
+    matching_subscription_id: SubscriptionId | None = None
+    matching_socket_generation: int | None = None
+    matching_admission_ordinal: int | None = None
+    matching_event_type: str | None = None
+    matching_representation: AuditMatchingStateRepresentation | None = None
+    matching_depth_identity: AuditExactDepthIdentity | None = None
+    matching_venue_hash: str | None = None
+    matching_venue_timestamp: str | None = None
+    matching_sources: tuple[RawSourceRef, ...] = ()
+    matching_frame_count = 0
+    matching_received_monotonic_ns: int | None = None
+    if causal_matching is not None:
+        action = causal_matching.action
+        matching_subordinal = action.position.subordinal
+        matching_connection_id = action.connection_id
+        matching_subscription_id = action.subscription_id
+        matching_source = action.source
+        matching_ingest_seq = action.position.ingest_seq
+        matching_socket_generation = causal_matching.socket_generation
+        matching_admission_ordinal = action.admission_ordinal
+        matching_event_type = action.event_type
+        matching_representation = causal_matching.representation
+        matching_depth_identity = causal_matching.depth_identity
+        matching_venue_hash = action.venue_hash
+        matching_venue_timestamp = action.timestamp_raw
+        matching_sources = causal_matching.sources
+        matching_frame_count = causal_matching.exact_frame_count
+        matching_received_monotonic_ns = action.received_monotonic_ns
+    elif isinstance(matching, _PrecisionAction):
+        matching_subordinal = matching.position.subordinal
+        matching_connection_id = matching.connection_id
+        matching_subscription_id = matching.subscription_id
+        matching_socket_generation = (
+            resolved.start_socket_generation
+            if matching.connection_id == start_connection_id
+            else None
+        )
+        matching_admission_ordinal = matching.admission_ordinal
+        matching_event_type = "tick_size_change"
+        matching_sources = (matching.source,)
+        matching_frame_count = 1
+        matching_received_monotonic_ns = matching.received_monotonic_ns
+    elif _reported_transition_proves_cause(resolved):
+        transition = cast(ReportedTopTransition, observation.reported_top_transition)
+        matching_connection_id = transition.connection_id
+        matching_subscription_id = resolved.classification_subscription_id
+        matching_socket_generation = resolved.start_socket_generation
+        matching_admission_ordinal = transition.latest_admission_ordinal
+        matching_event_type = "reported_top_transition"
+        matching_sources = transition.latest_source_raw_refs
+        matching_frame_count = transition.accepted_frame_count
+        matching_received_monotonic_ns = transition.latest_received_monotonic_ns
+
+    rest_timestamp_key = _rest_timestamp_key(resolved.rest.timestamp_raw)
+    venue_hash_equal = (
+        None
+        if not resolved.rest.venue_hash or not matching_venue_hash
+        else resolved.rest.venue_hash == matching_venue_hash
+    )
+    venue_timestamp_equal = (
+        None
+        if rest_timestamp_key is None or matching_venue_timestamp is None
+        else rest_timestamp_key == matching_venue_timestamp
+    )
+    exact = observation.exact_depth_difference
+    evidence_gaps: list[str] = []
+    if resolved.start_socket_generation is None:
+        evidence_gaps.append("START_SOCKET_GENERATION_NOT_BOUND")
+    if resolved.response_boundary_ordinal is None:
+        evidence_gaps.append("RESPONSE_BOUNDARY_ADMISSION_ORDINAL_NOT_RETAINED")
+    if resolved.barrier_processed_ordinal is None:
+        evidence_gaps.append("BARRIER_PROCESSED_ORDINAL_NOT_RETAINED")
+    if exact is None:
+        evidence_gaps.extend(
+            (
+                "STARTING_EXACT_DEPTH_IDENTITY_NOT_RETAINED",
+                "BARRIER_EXACT_DEPTH_IDENTITY_NOT_RETAINED",
+                "EXACT_MISMATCH_DIFFERENCE_IDENTITY_NOT_RETAINED",
+            )
+        )
+    if working.causal_search_overflowed:
+        evidence_gaps.append("EXACT_FRAME_BOUND_EXCEEDED")
+    elif causal_relation is AuditMismatchCausalRelation.AMBIGUOUS:
+        evidence_gaps.append("CAUSAL_ORDER_OR_GENERATION_AMBIGUOUS")
+    if causal_relation is AuditMismatchCausalRelation.NOT_FOUND:
+        evidence_gaps.append("MATCHING_EXACT_STATE_NOT_FOUND")
+    if (
+        matching_source is not None and matching_admission_ordinal is None
+    ) or working.causal_missing_matching_admission:
+        evidence_gaps.append("MATCHING_ADMISSION_ORDINAL_NOT_RETAINED")
+
+    response_to_match = (
+        None
+        if matching_received_monotonic_ns is None
+        else matching_received_monotonic_ns - resolved.response_received_monotonic_ns
+    )
+    classification_to_match = (
+        None
+        if matching_received_monotonic_ns is None
+        else matching_received_monotonic_ns - resolved.classification_received_monotonic_ns
+    )
+
     return AuditMismatchLineageResult(
         classification_ingest_seq=observation.classification_ingest_seq,
         instrument_id=observation.instrument_id,
@@ -977,6 +1707,56 @@ def _build_result(working: _WorkingLineage) -> AuditMismatchLineageResult:
         observed_difference=observation.difference_counts,
         reconstructed_difference=reconstructed_counts,
         exact_reconciliation_proven=exact_reconciliation,
+        request_id=resolved.request_id,
+        causal_relation=causal_relation,
+        start_connection_id=start_connection_id,
+        start_socket_generation=resolved.start_socket_generation,
+        start_admission_ordinal=resolved.starting_admission_ordinal,
+        start_processed_ordinal=resolved.starting_processed_ordinal,
+        starting_book=resolved.starting_book,
+        starting_exact_depth_identity=None if exact is None else exact.local_depth,
+        response_boundary_admission_ordinal=resolved.response_boundary_ordinal,
+        barrier_processed_ordinal=resolved.barrier_processed_ordinal,
+        barrier_exact_depth_identity=None if exact is None else exact.local_depth,
+        normalized_rest_exact_depth_identity=resolved.rest_depth_identity,
+        exact_mismatch_difference_sha256=None if exact is None else exact.difference_sha256,
+        request_started_monotonic_ns=resolved.request_started_monotonic_ns,
+        response_received_monotonic_ns=resolved.response_received_monotonic_ns,
+        classification_monotonic_ns=resolved.classification_monotonic_ns,
+        classification_received_monotonic_ns=resolved.classification_received_monotonic_ns,
+        matching_websocket_subordinal=matching_subordinal,
+        matching_connection_id=matching_connection_id,
+        matching_subscription_id=matching_subscription_id,
+        matching_socket_generation=matching_socket_generation,
+        matching_admission_ordinal=matching_admission_ordinal,
+        matching_event_type=matching_event_type,
+        matching_state_representation=matching_representation,
+        matching_exact_depth_identity=matching_depth_identity,
+        matching_venue_hash_diagnostic=matching_venue_hash,
+        matching_venue_timestamp_diagnostic=matching_venue_timestamp,
+        matching_source_chain=summarize_audit_raw_sources(matching_sources),
+        matching_exact_frame_count=matching_frame_count,
+        matching_received_monotonic_ns=matching_received_monotonic_ns,
+        response_to_match_monotonic_ns=response_to_match,
+        classification_to_match_monotonic_ns=classification_to_match,
+        equality_proof=(
+            AuditEqualityProof.FULL_DEPTH_EXACT
+            if causal_matching is not None
+            or (
+                exact is not None
+                and exact.difference_count == 0
+                and not resolved.rest_identity_mismatch
+            )
+            else (
+                AuditEqualityProof.COARSE_ONLY
+                if observation.exact_depth_difference is None
+                else AuditEqualityProof.NOT_PROVEN
+            )
+        ),
+        venue_hash_diagnostic_equal=venue_hash_equal,
+        venue_timestamp_diagnostic_equal=venue_timestamp_equal,
+        recovery_chronology=_recovery_chronology(resolved),
+        unresolved_evidence=tuple(sorted(evidence_gaps)),
     )
 
 
@@ -1008,6 +1788,7 @@ def build_audit_mismatch_lineage_report(
     by_classification = {item.observation.classification_ingest_seq: item for item in resolved}
     reported_first_by_sequence: dict[int, list[_ResolvedObservation]] = {}
     reported_latest_by_sequence: dict[int, list[_ResolvedObservation]] = {}
+    connection_generations: dict[ConnectionId, int] = {}
     for item in resolved:
         transition = item.observation.reported_top_transition
         if transition is None:
@@ -1016,6 +1797,8 @@ def build_audit_mismatch_lineage_report(
         reported_latest_by_sequence.setdefault(transition.latest_ingest_seq, []).append(item)
 
     def bind_classification(envelope: RawEventEnvelope) -> None:
+        if envelope.channel == WS_MARKET and envelope.connection_id not in connection_generations:
+            connection_generations[envelope.connection_id] = len(connection_generations) + 1
         reported_source = None
         for reported_item in reported_first_by_sequence.get(envelope.ingest_seq, ()):
             reported_source = reported_source or _source(envelope)
@@ -1096,16 +1879,31 @@ def build_audit_mismatch_lineage_report(
             raise AuditMismatchReportError("audit classification control schema is invalid")
         item.classification_source = source
         item.classification_connection = envelope.connection_id.value
+        item.classification_subscription_id = envelope.subscription_id
         item.request_id = _text(control.get("request_id"), field="classification request ID")
         item.response_ingest_seq = _integer(
             control.get("response_ingest_seq"),
             field="classification response ingest sequence",
         )
-        _integer(
+        classification_monotonic_ns = _integer(
             control.get("classification_monotonic_ns"),
             field="classification monotonic time",
         )
-        _integer(control.get("hard_expiry_monotonic_ns"), field="audit hard expiry")
+        classification_received_monotonic_ns = envelope.received_monotonic.nanoseconds
+        if classification_monotonic_ns != classification_received_monotonic_ns:
+            raise AuditMismatchReportError(
+                "audit classification timestamp differs from raw receive evidence"
+            )
+        hard_expiry_monotonic_ns = _integer(
+            control.get("hard_expiry_monotonic_ns"),
+            field="audit hard expiry",
+        )
+        if classification_monotonic_ns >= hard_expiry_monotonic_ns:
+            raise AuditMismatchReportError(
+                "a MISMATCH classification reached or exceeded its hard expiry"
+            )
+        item.classification_monotonic_ns = classification_monotonic_ns
+        item.classification_received_monotonic_ns = classification_received_monotonic_ns
 
     first_pass = _scan_pass(
         envelope_factory,
@@ -1153,6 +1951,22 @@ def build_audit_mismatch_lineage_report(
             response_item.attempt = _integer(
                 metadata.get("audit_attempt"), field="REST response attempt", minimum=1
             )
+            raw_response_boundary = metadata.get("response_boundary_websocket_ordinal")
+            raw_barrier = metadata.get("barrier_websocket_ordinal")
+            if (raw_response_boundary is None) != (raw_barrier is None):
+                raise AuditMismatchReportError(
+                    "REST response boundary and barrier must be retained together"
+                )
+            if raw_response_boundary is not None:
+                response_item.response_boundary_ordinal = _integer(
+                    raw_response_boundary,
+                    field="REST response boundary admission ordinal",
+                )
+                response_item.barrier_processed_ordinal = _integer(
+                    raw_barrier,
+                    field="REST response barrier processed ordinal",
+                )
+            response_item.response_received_monotonic_ns = envelope.received_monotonic.nanoseconds
             try:
                 rest = parse_rest_book(envelope.payload_bytes)
                 rest_bids, rest_asks = _normalized_depth(
@@ -1201,7 +2015,7 @@ def build_audit_mismatch_lineage_report(
         if start_item.start_source is not None:
             raise AuditMismatchReportError("audit request has multiple start controls")
         control = _canonical_control(envelope.payload_bytes, context="audit start control")
-        expected_keys = {
+        v1_keys = {
             "attempt",
             "connection_id",
             "instrument_id",
@@ -1214,7 +2028,28 @@ def build_audit_mismatch_lineage_report(
             "starting_book_generation",
             "starting_processed_ordinal",
         }
-        if set(control) != expected_keys or control.get("schema") != AUDIT_START_SCHEMA:
+        schema = control.get("schema")
+        if schema == AUDIT_START_V1_SCHEMA:
+            expected_keys = v1_keys
+        elif schema == AUDIT_START_V2_SCHEMA:
+            expected_keys = v1_keys | {"trigger_reason"}
+            try:
+                trigger_reason = AuditTriggerReason(
+                    _text(
+                        control.get("trigger_reason"),
+                        field="audit start trigger reason",
+                        maximum=128,
+                    )
+                )
+            except ValueError as error:
+                raise AuditMismatchReportError("audit start trigger reason is unknown") from error
+            if trigger_reason is AuditTriggerReason.UNKNOWN_LEGACY:
+                raise AuditMismatchReportError(
+                    "v2 audit start cannot claim a legacy-unknown trigger"
+                )
+        else:
+            raise AuditMismatchReportError("audit start control schema is invalid")
+        if set(control) != expected_keys:
             raise AuditMismatchReportError("audit start control schema is invalid")
         if _text(control.get("request_id"), field="audit start request ID") != metadata_request:
             raise AuditMismatchReportError("audit start payload and metadata request IDs disagree")
@@ -1241,10 +2076,18 @@ def build_audit_mismatch_lineage_report(
         if start_item.attempt is not None and start_item.attempt != attempt:
             raise AuditMismatchReportError("audit start and REST response attempts disagree")
         start_item.attempt = attempt
-        _integer(control.get("request_started_monotonic_ns"), field="request start time")
-        _integer(control.get("starting_admission_ordinal"), field="starting admission ordinal")
-        _integer(control.get("starting_processed_ordinal"), field="starting processed ordinal")
-        _integer(control.get("starting_book_generation"), field="starting book generation")
+        start_item.request_started_monotonic_ns = _integer(
+            control.get("request_started_monotonic_ns"), field="request start time"
+        )
+        start_item.starting_admission_ordinal = _integer(
+            control.get("starting_admission_ordinal"), field="starting admission ordinal"
+        )
+        start_item.starting_processed_ordinal = _integer(
+            control.get("starting_processed_ordinal"), field="starting processed ordinal"
+        )
+        starting_book_generation = _integer(
+            control.get("starting_book_generation"), field="starting book generation"
+        )
         economic_hash = _text(
             control.get("starting_book_economic_sha256"),
             field="starting book economic hash",
@@ -1252,6 +2095,11 @@ def build_audit_mismatch_lineage_report(
         )
         if not is_sha256_hex(economic_hash):
             raise AuditMismatchReportError("starting book economic hash is invalid")
+        start_item.starting_book = AuditBookIdentity(
+            instrument_id=instrument_id,
+            generation=starting_book_generation,
+            economic_content_sha256=economic_hash,
+        )
 
     second_pass = _scan_pass(
         envelope_factory,
@@ -1270,6 +2118,14 @@ def build_audit_mismatch_lineage_report(
             or item.native_asset_id is None
             or item.attempt is None
             or item.response_ingest_seq is None
+            or item.request_id is None
+            or item.request_started_monotonic_ns is None
+            or item.classification_monotonic_ns is None
+            or item.classification_received_monotonic_ns is None
+            or item.response_received_monotonic_ns is None
+            or item.starting_admission_ordinal is None
+            or item.starting_processed_ordinal is None
+            or item.starting_book is None
         ):
             raise AuditMismatchReportError("one or more mismatch raw joins are incomplete")
         if (
@@ -1280,6 +2136,31 @@ def build_audit_mismatch_lineage_report(
             raise AuditMismatchReportError("audit start/response/classification order is invalid")
         if item.native_asset_id != item.rest.asset_id:
             raise AuditMismatchReportError("audit start and REST response asset IDs disagree")
+        if (
+            item.response_boundary_ordinal is not None
+            and item.barrier_processed_ordinal is not None
+        ):
+            if item.response_boundary_ordinal != item.barrier_processed_ordinal:
+                raise AuditMismatchReportError(
+                    "a MISMATCH observation must have an equal response boundary and barrier"
+                )
+            if item.starting_admission_ordinal > item.response_boundary_ordinal:
+                raise AuditMismatchReportError(
+                    "audit starting admission ordinal exceeds its response boundary"
+                )
+            if item.starting_processed_ordinal > item.barrier_processed_ordinal:
+                raise AuditMismatchReportError(
+                    "audit starting processed ordinal exceeds its barrier"
+                )
+        if not (
+            item.request_started_monotonic_ns
+            <= item.response_received_monotonic_ns
+            <= item.classification_received_monotonic_ns
+        ):
+            raise AuditMismatchReportError("audit raw monotonic chronology is invalid")
+        item.start_socket_generation = connection_generations.get(
+            ConnectionId(cast(str, item.classification_connection))
+        )
 
     working = [_WorkingLineage(resolved=item) for item in resolved]
     by_asset: dict[str, list[_WorkingLineage]] = {}
@@ -1298,8 +2179,54 @@ def build_audit_mismatch_lineage_report(
     exact_actions_considered = 0
     exact_action_comparisons = 0
 
-    def join_websocket_lineage(envelope: RawEventEnvelope) -> None:
-        nonlocal exact_action_comparisons, exact_actions_considered
+    def reserve_comparisons(count: int) -> None:
+        nonlocal exact_action_comparisons
+        remaining = selected_limits.maximum_exact_action_comparisons - exact_action_comparisons
+        if count > remaining:
+            raise AuditMismatchReportResourceError(
+                "audit-mismatch exact action-to-observation comparisons exceed the configured limit"
+            )
+        exact_action_comparisons += count
+
+    def join_exact_lineage(envelope: RawEventEnvelope) -> None:
+        nonlocal exact_actions_considered
+        if envelope.channel == REST_BOOK:
+            try:
+                recovery_rest = parse_rest_book(envelope.payload_bytes)
+                recovery_bids, recovery_asks = _normalized_depth(
+                    _native_levels(recovery_rest.bids),
+                    _native_levels(recovery_rest.asks),
+                )
+            except (PolymarketAdapterError, TypeError, ValueError) as error:
+                raise AuditMismatchReportError(
+                    f"cannot parse recovery REST book at ingest sequence {envelope.ingest_seq}"
+                ) from error
+            recovery_candidates = by_asset.get(recovery_rest.asset_id, ())
+            reserve_comparisons(len(recovery_candidates))
+            for item in recovery_candidates:
+                resolved_item = item.resolved
+                if envelope.ingest_seq <= resolved_item.observation.classification_ingest_seq:
+                    continue
+                # This raw channel is a recovery candidate only.  The lineage
+                # report has no canonically replayed apply result, resulting
+                # health, or exact owner identity, so it cannot claim that the
+                # local baseline was authoritatively replaced.
+                item.causal_rest_resnapshot_candidate_seen = True
+                if resolved_item.first_rest_resnapshot is None:
+                    resolved_item.first_rest_resnapshot = _RecoveryRawStage(
+                        ingest_seq=envelope.ingest_seq,
+                        source=_source(envelope),
+                        connection_id=envelope.connection_id,
+                        subscription_id=envelope.subscription_id,
+                        socket_generation=None,
+                        received_monotonic_ns=envelope.received_monotonic.nanoseconds,
+                        event_type="rest_book",
+                        exact_depth_identity=audit_exact_depth_identity(
+                            recovery_bids,
+                            recovery_asks,
+                        ),
+                    )
+            return
         if envelope.channel != WS_MARKET:
             return
         for action in _exact_actions(
@@ -1313,19 +2240,11 @@ def build_audit_mismatch_lineage_report(
                 if isinstance(action, _PrecisionAction)
                 else by_asset[action.native_asset_id]
             )
-            remaining_comparisons = (
-                selected_limits.maximum_exact_action_comparisons - exact_action_comparisons
-            )
-            if len(candidates) > remaining_comparisons:
-                raise AuditMismatchReportResourceError(
-                    "audit-mismatch exact action-to-observation comparisons "
-                    "exceed the configured limit"
-                )
             # Reserve the complete fan-out before examining any candidate for
             # this action.  The report therefore never performs work outside
             # the declared global ceiling or emits a partially classified
             # result when the remaining comparison budget is insufficient.
-            exact_action_comparisons += len(candidates)
+            reserve_comparisons(len(candidates))
             for item in candidates:
                 resolved_item = item.resolved
                 classification_seq = resolved_item.observation.classification_ingest_seq
@@ -1341,6 +2260,147 @@ def build_audit_mismatch_lineage_report(
                     ):
                         item.matching_reference_future = action
                     continue
+
+                start_connection = ConnectionId(cast(str, resolved_item.classification_connection))
+                start_generation = resolved_item.start_socket_generation
+                action_generation = connection_generations.get(action.connection_id)
+                start_admission = cast(int, resolved_item.starting_admission_ordinal)
+                response_boundary = resolved_item.response_boundary_ordinal
+                is_original = action.connection_id == start_connection
+                is_later_generation = (
+                    not is_original
+                    and start_generation is not None
+                    and action_generation is not None
+                    and action_generation > start_generation
+                    and action.position.ingest_seq > classification_seq
+                )
+
+                if is_original:
+                    admission = action.admission_ordinal
+                    ordered_after_boundary = (
+                        admission is not None
+                        and response_boundary is not None
+                        and admission > response_boundary
+                    )
+                    already_decided = _causal_search_decided(item)
+                    if (
+                        not already_decided
+                        and ordered_after_boundary
+                        and not _reserve_causal_search_frame(
+                            item,
+                            action.source,
+                            limits=selected_limits,
+                        )
+                    ) or already_decided:
+                        book = None
+                    else:
+                        book = _apply_causal_action(
+                            item,
+                            action,
+                            tracker=tracker,
+                            limits=selected_limits,
+                        )
+                    if already_decided or item.causal_search_overflowed:
+                        pass
+                    elif (
+                        admission is None
+                        and book is not None
+                        and _causal_book_matches_rest(book, resolved_item)
+                    ):
+                        item.causal_missing_matching_admission = True
+                        item.causal_ambiguous = True
+                    elif admission is not None and admission <= start_admission:
+                        if action.position.ingest_seq >= cast(
+                            int,
+                            resolved_item.start_ingest_seq,
+                        ):
+                            item.causal_ambiguous = True
+                        elif book is not None and _causal_book_matches_rest(book, resolved_item):
+                            item.causal_prior_match = _causal_match(
+                                action,
+                                book,
+                                socket_generation=action_generation,
+                            )
+                    elif (
+                        admission is not None
+                        and response_boundary is not None
+                        and admission <= response_boundary
+                    ):
+                        if action.position.ingest_seq > classification_seq:
+                            item.causal_ambiguous = True
+                        elif book is not None and _causal_book_matches_rest(book, resolved_item):
+                            item.causal_prior_match = _causal_match(
+                                action,
+                                book,
+                                socket_generation=action_generation,
+                            )
+                    elif not ordered_after_boundary or book is None:
+                        item.causal_ambiguous = True
+                    else:
+                        matches_rest = _causal_book_matches_rest(book, resolved_item)
+                        recovery_has_started = item.causal_replacement_seen
+                        if not recovery_has_started:
+                            item.causal_original_post_frames += 1
+                        if item.causal_rest_resnapshot_candidate_seen and not recovery_has_started:
+                            # Raw REST evidence alone cannot establish whether
+                            # the canonical baseline changed before this frame.
+                            item.causal_ambiguous = True
+                        elif matches_rest:
+                            candidate = _causal_match(
+                                action,
+                                book,
+                                socket_generation=action_generation,
+                            )
+                            if recovery_has_started:
+                                item.causal_recovery_match = candidate
+                            else:
+                                item.causal_original_match = candidate
+                        elif not recovery_has_started:
+                            item.causal_original_conflict = True
+                elif is_later_generation:
+                    item.causal_replacement_seen = True
+                    if resolved_item.first_replacement_websocket is None:
+                        resolved_item.first_replacement_websocket = _RecoveryRawStage(
+                            ingest_seq=action.position.ingest_seq,
+                            source=action.source,
+                            connection_id=action.connection_id,
+                            subscription_id=action.subscription_id,
+                            socket_generation=action_generation,
+                            received_monotonic_ns=action.received_monotonic_ns,
+                            admission_ordinal=action.admission_ordinal,
+                            event_type=action.event_type,
+                            exact_depth_identity=action.replacement_depth_identity,
+                        )
+                    if _reserve_causal_search_frame(
+                        item,
+                        action.source,
+                        limits=selected_limits,
+                    ):
+                        book = _apply_causal_action(
+                            item,
+                            action,
+                            tracker=tracker,
+                            limits=selected_limits,
+                        )
+                        recovery_matches = book is not None and _causal_book_matches_rest(
+                            book,
+                            resolved_item,
+                        )
+                        if recovery_matches and action.admission_ordinal is None:
+                            item.causal_missing_matching_admission = True
+                        if recovery_matches and book is not None:
+                            item.causal_recovery_match = _causal_match(
+                                action,
+                                book,
+                                socket_generation=action_generation,
+                            )
+                elif (
+                    action.position.ingest_seq > classification_seq
+                    and start_generation is None
+                    and not _causal_search_decided(item)
+                ):
+                    item.causal_ambiguous = True
+
                 matches = _matches_rest_snapshot(action, resolved_item)
                 start_seq = cast(int, resolved_item.start_ingest_seq)
                 if action.position.ingest_seq < start_seq:
@@ -1371,7 +2431,7 @@ def build_audit_mismatch_lineage_report(
         envelope_factory,
         collector_run_id=collector_run_id,
         limits=selected_limits,
-        visit=join_websocket_lineage,
+        visit=join_exact_lineage,
     )
     _require_equal_passes(first_pass, third_pass)
     results = tuple(_build_result(item) for item in working)
@@ -1393,6 +2453,7 @@ def build_audit_mismatch_lineage_report(
             source_envelopes=first_pass.event_count,
             source_payload_bytes=first_pass.payload_bytes,
             exact_actions_considered=exact_actions_considered,
+            exact_action_comparisons=exact_action_comparisons,
             peak_retained_level_values=tracker.peak,
         ),
     )
@@ -1550,6 +2611,9 @@ def load_instrumented_replay_mismatch_observations(
 
 __all__ = [
     "AUDIT_MISMATCH_LINEAGE_REPORT_SCHEMA",
+    "AuditEqualityProof",
+    "AuditMatchingStateRepresentation",
+    "AuditMismatchCausalRelation",
     "AuditMismatchCauseCount",
     "AuditMismatchDifferenceCounts",
     "AuditMismatchLineageReason",
@@ -1560,6 +2624,9 @@ __all__ = [
     "AuditMismatchReportLimits",
     "AuditMismatchReportResourceError",
     "AuditMismatchReportResources",
+    "AuditRecoveryChronology",
+    "AuditRecoveryEvidenceStatus",
+    "AuditRecoveryStageEvidence",
     "AuditVenueStateRelation",
     "build_audit_mismatch_lineage_report",
     "build_journal_audit_mismatch_lineage_report",

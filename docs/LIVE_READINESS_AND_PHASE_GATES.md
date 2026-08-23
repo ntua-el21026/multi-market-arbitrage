@@ -17,6 +17,7 @@ The first six-hour run completed but failed independent acceptance. Evidence is 
 - `GATE_1_FAILURE_20260822.md`;
 - `GATE_1_REMEDIATION_SPEC.md`;
 - ADR-0053;
+- ADR-0054;
 - retained local raw/analysis manifests.
 
 The following foundation evidence passed:
@@ -38,10 +39,14 @@ Before a rerun:
 - implement bounded reported-top transition semantics;
 - replay the failed raw run deterministically without identified primary failures;
 - make reporting incremental within existing limits;
-- emit monotonic checkpoint v2 and typed availability intervals;
-- pass a new smoke and 30–60 minute stability/calibration run.
+- emit monotonic checkpoint v3, versioned trigger/divergence evidence and typed
+  availability intervals;
+- prove ADR-0054 immediate authoritative-resnapshot lifecycle and current versus
+  Gate-sticky health semantics;
+- pass a new exact-SHA 60-second smoke and 45–60 minute stability observation.
 
 A fresh six-hour run and full independent post-run audit are mandatory.
+Neither has been run for the ADR-0054 remediation candidate.
 
 No later production phase may be promoted while G1 is failed.
 

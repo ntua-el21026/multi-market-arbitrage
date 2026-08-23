@@ -62,7 +62,9 @@ Phase-1 Polymarket additionally records:
 - journal group/fsync behavior;
 - parse/protocol/invariant failures;
 - book and reported-top transition state;
-- audit barrier lag, outcome, retry and mismatch cause;
+- audit barrier lag, explicit current audit eligibility, versioned trigger,
+  outcome, retry, mismatch cause, divergence lifecycle and replacement-capture
+  state;
 - scanner latency and receive→scan `T_obs`;
 - current/peak RSS and host identity.
 
@@ -139,16 +141,18 @@ UNSAFE
 
 A healthy process does not imply healthy capture, books, persistence, research, risk authority or future live readiness.
 
-## 8. Gate-1 health checkpoint v2
+## 8. Gate-1 health checkpoint v3
 
-The observer emits `gate1-health-checkpoint-v2`. The first soak's v1 records
-remain readable as historical evidence, but the compatibility validator reports
-their monotonic chronology unavailable and never synthesizes missing timestamps.
+The observer emits `gate1-health-checkpoint-v3`. Historical v1 and v2 records
+remain readable as the schemas that produced them. The compatibility validator
+never upgrades their content or synthesizes missing chronology, trigger, or
+divergence-lifecycle evidence. In particular, the first soak's v1 chronology
+remains explicitly unavailable.
 
-Every v2 record contains:
+Every v3 record contains:
 
 ```text
-schema_version = gate1-health-checkpoint-v2
+schema_version = gate1-health-checkpoint-v3
 collector_run_id
 emitted_at_utc_ns
 emitted_monotonic_epoch_id
@@ -179,9 +183,53 @@ Each checkpoint distinguishes:
 capture_healthy
 research_eligible
 gate1_eligible_so_far
+reason_codes
+gate1_sticky_reason_codes
 ```
 
-Gate-1 reason history is sticky. Recovery may restore current capture/research eligibility but does not erase a prior Gate blocker.
+`reason_codes` is the complete decision state at that checkpoint. The separate
+`gate1_sticky_reason_codes` field carries only reasons whose occurrence is a
+permanent blocker for the candidate run. A socket/book outage, pending
+divergence, or `AUDIT_REPLACEMENT_CAPTURE_PENDING` blocks current eligibility
+while present, but does not remain sticky merely because a later checkpoint
+proves complete recovery. Data loss, terminal unresolved divergence including
+an incomplete terminal replacement capture, new-contract unknown divergence,
+local-book defect, failed recovery, and evidence/replay/reconciliation
+inconsistency remain sticky. Historical mismatch count is evidence, not a
+current-state proxy.
+
+The audit group separately exposes:
+
+- `current_eligibility`, containing `eligible`, `evidence_reconciled`,
+  `pending_divergence_count`, `processor_ineligible_book_count`,
+  `replacement_capture_count`, `required_ineligible_book_count`, and bounded
+  `required_ineligible_instrument_ids`;
+- cumulative divergences observed;
+- current divergence-pending count and its unresolved-at-terminal projection;
+- current `replacement_captures_pending` and terminal-only
+  `replacement_captures_unresolved` counts;
+- authoritative-resnapshot and reserved same-generation resolution counts;
+- new-contract unknown and local-book-defect counts;
+- bounded compact pending representatives, one latest compact resolution
+  representative, and a deterministic lifecycle chain;
+- audit starts by trigger and outcomes by `(trigger, outcome)`;
+- lifecycle and trigger reconciliation booleans.
+
+The checkpoint is Gate-eligible only when these finite totals and identities
+reconcile. A fully evidenced authoritative resolution remains visible but is
+not automatically a sticky blocker under ADR-0054.
+
+Periodic checkpoints project every bounded current pending divergence as a
+compact raw-linked `gate1-audit-divergence-pending-representative-v1` and retain
+at most one deterministic latest
+`gate1-audit-divergence-resolution-representative-v1`, reporting resolution
+truncation explicitly. These representatives preserve exact join identities,
+raw-source links, chronology, local/REST/recovered-book identities and depth-
+difference identity without repeating full nested diagnostics in every
+checkpoint. This is a checkpoint-size bound only: complete bounded pending and
+resolution objects remain in the processor summary and terminal hash, while
+cumulative totals, the complete lifecycle history chain and reconciliation are
+authoritative and cannot be truncated.
 
 `git_commit` is either an exact 40-character lowercase hexadecimal commit that
 equals `git rev-parse HEAD` in the resolved repository, or `null`. Sentinel,
@@ -202,7 +250,11 @@ correlation evidence, not causal ordering. Serialization/write/fsync occurs off
 the capture path. Failure does not corrupt raw capture but blocks automatic Gate
 acceptance.
 
-The final checkpoint and final summary reuse one paired UTC/monotonic capture cutoff. Delayed durability or shutdown work must not extend the claimed observation duration.
+The final checkpoint and final summary reuse one paired UTC/monotonic capture
+cutoff. Terminal evaluation promotes any still-pending divergence or incomplete
+replacement capture to `AUDIT_DIVERGENCE_UNRESOLVED`; the checkpoint separately
+reports `replacement_captures_unresolved`. Delayed durability or shutdown work
+must not extend the claimed observation duration.
 
 ## 9. Availability interval ledger
 
@@ -246,6 +298,55 @@ Cause types are:
 - unknown.
 
 Routine REST auditing is never classified as WebSocket downtime.
+
+For an audit mismatch, the interval begins at the retained causal response
+boundary and marks the affected canonical book, affirmative audit claims, and
+scanner/research use unavailable. An authoritative REST baseline can resolve
+the instrument's divergence-pending record, but socket readiness and REST
+resolution do not close the interval. One WebSocket connection different from
+the mismatched connection and every connection seen before authoritative
+resolution must supply durably journaled and successfully
+canonically processed full snapshots for every required market instrument. A
+connection change restarts incomplete proof. The canonical owner retains only
+same-epoch sources that are nonfuture and no older than
+`scanner.maximum_book_age` when the completing snapshot arrives; stale,
+future-relative and cross-epoch sources are pruned, so incomplete coverage stays
+pending. Incrementals, reported BBO, partial coverage, and the first leg of a
+multi-leg replacement do not qualify.
+
+Each current v2 snapshot retains a true explicit positive admission ordinal,
+ingest sequence and same-epoch receive time strictly after the bound REST
+resolution. The capture also retains the resolution source/ingest/monotonic
+boundary, mismatch cause, and a digest/count of the pre-resolution connection
+set. These fields distinguish a genuinely new post-resolution connection from
+an old or replay-substituted socket.
+
+After processing the final qualifying snapshot, the observer samples one paired
+UTC/monotonic decision boundary only after every already admitted WebSocket item
+has been processed, no deferred/queued item remains, and the acquisition
+generation is active. It independently rechecks that every required
+book receive timestamp is present, nonfuture and no older than
+`scanner.maximum_book_age`, and that every required canonical book is healthy.
+Complete v2 capture remains pending/ineligible and all of its replacement
+snapshots have emitted zero scans at this point. The coordinator next preserves
+`mma.control.rest-audit-replacement-release.v1` at that same boundary and waits
+for successful canonical processing. Only that accepted durable control may
+clear replacement-capture pending, clear audit ineligibility and produce the
+recovery scan. The interval then closes with exactly the control envelope's
+decision UTC/monotonic time, not a later post-durability clock sample, and carries
+`research_eligibility_restored=true` only after pending is zero, every required
+book is healthy, explicit current audit eligibility is true, and
+scanner/research eligibility is restored. At shutdown an unrecovered interval
+closes only at the terminal capture cutoff with `open_at_shutdown=true`; it
+cannot reconcile as Gate-eligible. A routine successful audit with no
+interruption creates no interval.
+
+The prefix fence, decision sample and command projection have no await point.
+Pre-decision input therefore cannot be overtaken. A generation end strictly
+after the decision is recorded as a separate later interruption and does not
+rewrite the accepted boundary. Same-market multi-capture controls are ordered by
+instrument; intermediate controls retain the group blocker and emit zero scans,
+and only the final accepted control can close the interval and scan.
 
 The ledger has its own non-blocking 64-command queue, 8,192-record limit, and
 64 MiB file bound. A supervised owner serializes, appends, and `fsync`s outside
@@ -301,7 +402,7 @@ capture cutoff. Each closed outcome retains its exact closing raw/control
 source, ending UTC/monotonic identity, and whether duration is only a lower
 bound. Full unbounded books are never copied into transition evidence.
 
-## 11. Audit mismatch diagnostics
+## 11. Audit mismatch and divergence diagnostics
 
 Every newly produced `MISMATCH` carries one bounded
 `mma-rest-audit-mismatch-diagnostic-v1` record and remains in cumulative history
@@ -323,6 +424,129 @@ those counts plus the audit-outcome chain to terminal identity. A checkpoint
 copies only the counts, their reconciliation with total mismatches, truncation
 state, and one deterministic representative per cause. Successful recovery
 does not convert a mismatch into a match or erase its cause.
+
+### 11.1 Live divergence lifecycle
+
+Every new mismatch also opens one bounded
+`mma-rest-audit-divergence-pending-v1` record. Its deterministic identity binds
+the audit start schema and trigger, request/attempt, connection and instrument,
+starting and barrier identities, response raw source, normalized REST target,
+exact difference, and classification source/time. A second pending divergence
+for the same instrument is an invariant failure.
+
+The only Phase-1 live closure is
+`mma-rest-audit-divergence-resolution-v1` with status
+`AUTHORITATIVE_RESNAPSHOT`. It binds the original divergence and mismatch
+response to a different, separately journaled authoritative REST source, its
+normalized full-depth identity, the exact healthy post-apply canonical book,
+and close chronology. Same-generation equality remains forensic evidence and
+cannot close this live state.
+
+REST closure opens a bounded `AUDIT_REPLACEMENT_CAPTURE_PENDING` eligibility
+record containing the divergence, mismatch cause, authoritative-resolution
+source/ingest/monotonic boundary, pre-resolution connection-set digest/count,
+affected market, original connection,
+complete required-instrument set, one replacement connection, and accepted
+full-snapshot raw identities/admission ordinals. It blocks new audit STARTs for
+the affected asset before journaling, scanner use, and research. Complete
+full-snapshot coverage from one different connection is necessary but does not
+clear current v2 state: every snapshot, including the completing one, emits zero
+scans and leaves capture/ineligibility pending. All sources must share one
+monotonic epoch and be nonfuture and within `scanner.maximum_book_age` at the
+decision; the observer's independent post-processing freshness check and all
+required canonical-book health checks must pass first.
+
+The coordinator then durably journals
+`mma.control.rest-audit-replacement-release.v1` at that exact sampled paired
+UTC/monotonic decision boundary. Its bounded self-contained payload carries the
+full canonical capture preimage and SHA-256: divergence/market identity,
+original/replacement connection, complete required-instrument set, and every
+accepted snapshot's instrument, connection, admission ordinal, ingest sequence,
+receive-monotonic timestamp, ingest ID and payload SHA-256. The raw control
+envelope binds its own ingest/payload identity, replacement connection,
+subscription, decision wall time, and the same monotonic epoch/value. Canonical
+application compares the preimage/digest with current capture, rechecks the
+durable receive boundary, explicit admission chronology, freshness,
+pending-divergence/reported-top/transition-resync absence, exact capture-owned
+ineligible state, nonfuture latest-L2 chronology, mismatch cause and required-
+book health, and only then clears state and permits the
+recovery scan. The availability ledger uses that identical decision wall/
+monotonic time after successful control processing.
+
+Stale, future-relative and cross-epoch snapshot sources are pruned rather than
+completing the record. A missing v2 control or a malformed, noncanonical,
+capture-mismatched, wrong-connection, future, cross-epoch or stale control is
+rejected before mutation: capture/ineligibility and the interval remain pending,
+scanner/research remains blocked, and terminal evaluation makes the remainder
+Gate-sticky unresolved. Historical immutable v1 raw journals predate this
+channel and retain their exact deterministic snapshot-only auto-release and
+terminal-hash serialization without a synthesized control. That is replay-only
+compatibility; new producers cannot emit v1 state or select auto-release, and
+v2 replay cannot synthesize an omitted control.
+
+Cumulative observed, resolution, unknown and local-defect counts are separate
+from current divergence-pending and replacement-capture-pending state. Periodic
+health evaluates both pending states as nonsticky current blockers; terminal
+evaluation makes any remainder unresolved and Gate-sticky. The lifecycle chain,
+full totals, exact replacement-capture state, and complete bounded pending and
+resolution objects are deterministic processor-summary and terminal-hash
+inputs; representative projection may not truncate totals, chain identity, or
+terminal authority.
+
+The periodic checkpoint projection emits up to the bounded set of current
+compact pending representatives and one compact latest resolution
+representative. Older individual resolutions remain committed by the complete
+lifecycle chain and totals; consumers must not interpret either checkpoint
+projection as complete lifecycle history.
+
+### 11.2 Offline causal lineage
+
+The retained mismatch-lineage reporter classifies exact matching-state
+relationships with this finite vocabulary:
+
+```text
+SAME_GENERATION_NATURAL_CONVERGENCE
+SAME_GENERATION_CONFLICT_BEFORE_CONVERGENCE
+RECOVERY_GENERATION_MATCH
+PRIOR_STATE_MATCH
+PERSISTENT_DIVERGENCE
+REFERENCE_TRANSITION
+LOCAL_BOOK_DEFECT
+AMBIGUOUS
+NOT_FOUND
+```
+
+It binds complete raw-envelope identity, socket generation, admission ordinal,
+exact full-depth state, matching raw source, signed monotonic chronology and
+recovery stages. `RECOVERY_GENERATION_MATCH` is recovery evidence, never proof
+of natural same-generation convergence. Venue timestamps and hashes are
+diagnostic only.
+
+### 11.3 Audit trigger evidence
+
+New `mma-rest-audit-start-v2` controls carry one finite trigger reason and the
+same reason is retained on their outcomes. Historical v1 controls are exposed
+as `UNKNOWN_LEGACY` without payload rewriting or inferred scheduling intent.
+Health reports starts by trigger and outcomes by trigger; both matrices must
+reconcile with cumulative audit totals.
+
+Runtime evidence includes:
+
+- `mma_rest_audit_starts_by_trigger_total{trigger}`;
+- `mma_rest_audit_outcomes_by_trigger_total{trigger,outcome}`;
+- `mma_rest_audit_effective_interval_ns{trigger}`;
+- `mma_rest_audit_http_latency_ns{trigger}`;
+- `mma_rest_audit_remaining_freshness_budget_ns{trigger}`; and
+- `mma_rest_audit_launches_suppressed_total{reason="divergence_recovery_pending"}`.
+
+The effective-interval, HTTP-latency and remaining-freshness-budget histograms
+report p50/p95/p99/max where available. `FRESHNESS_GUARD` records that launch
+was selected from the retained
+hard-expiry boundary minus the configured guard; it is not inferred later from
+cadence. Retained v1 corpora may support timing/cadence analysis, but they cannot
+supply a modern per-trigger breakdown. Only v2 runs may satisfy that requirement,
+and their mismatch/race/failure rates, request load, freshness-budget margin,
+and resulting research-eligible coverage must be reported by trigger.
 
 ## 12. Long-run resource evidence
 

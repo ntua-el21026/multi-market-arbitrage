@@ -175,11 +175,18 @@ def _production_checkpoint_builder(
     *,
     run_id: CollectorRunId,
     git_commit: str,
+    processor_override: CanonicalProcessor | None = None,
 ) -> Callable[[], HealthCheckpoint]:
-    """Construct the same immutable owner snapshots used by production observe."""
+    """Construct the same immutable owner snapshots used by production observe.
+
+    ``processor_override`` lets focused benchmarks size a real, prebuilt
+    production state without copying the health-composition fixture.  The
+    ordinary health benchmark continues to use the deterministic healthy
+    bootstrap below.
+    """
 
     config = load_phase1_config(REPOSITORY / "config" / "phase1.toml")
-    processor = CanonicalProcessor(config)
+    processor = CanonicalProcessor(config) if processor_override is None else processor_override
     bootstrap = (
         (GAMMA_MARKETS_KEYSET, _fixture("polymarket_gamma_market_keyset.json")),
         (f"{CLOB_MARKET_PREFIX}0xcondition", _fixture("polymarket_clob_market_info.json")),
@@ -187,21 +194,26 @@ def _production_checkpoint_builder(
         (REST_BOOK, _no_book_payload()),
     )
     book_last_valid_receive_monotonic_ns: dict[InstrumentId, int] = {}
-    for sequence, (channel, payload) in enumerate(bootstrap):
-        processed = processor.process_replayed(_envelope(run_id, sequence, channel, payload))
-        if not processed.success:
-            raise RuntimeError("health benchmark processor bootstrap failed")
-        for update in processed.book_freshness_updates:
-            book_last_valid_receive_monotonic_ns[update.instrument_id] = (
-                update.received_monotonic.nanoseconds
-            )
+    if processor_override is None:
+        for sequence, (channel, payload) in enumerate(bootstrap):
+            processed = processor.process_replayed(_envelope(run_id, sequence, channel, payload))
+            if not processed.success:
+                raise RuntimeError("health benchmark processor bootstrap failed")
+            for update in processed.book_freshness_updates:
+                book_last_valid_receive_monotonic_ns[update.instrument_id] = (
+                    update.received_monotonic.nanoseconds
+                )
+    else:
+        book_last_valid_receive_monotonic_ns.update(
+            (snapshot.instrument_id, 1_000) for snapshot in processor.snapshots()
+        )
     market = processor.discovered_markets[0]
     target = resolve_polymarket_target(
         market,
         processor.current_bundles[0],
         requested_gamma_market_id=market.gamma_market_id,
     )
-    if processor.summary().healthy_books != 2:
+    if processor_override is None and processor.summary().healthy_books != 2:
         raise RuntimeError("health benchmark requires two healthy production books")
 
     connection_id = ConnectionId("health-benchmark-connection")

@@ -4,6 +4,7 @@ import asyncio
 import itertools
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -12,6 +13,7 @@ from multi_market_arbitrage.core.time import MonotonicTimestamp, UtcTimestamp
 from multi_market_arbitrage.observability import (
     HEALTH_CHECKPOINT_SCHEMA_VERSION,
     HEALTH_CHECKPOINT_V1_SCHEMA_VERSION,
+    HEALTH_CHECKPOINT_V2_SCHEMA_VERSION,
     HealthCheckpoint,
     HealthDecisionInputs,
     HealthDecisionReason,
@@ -163,7 +165,6 @@ def test_source_identity_failure_is_gate_only_and_explicit(
 @pytest.mark.parametrize(
     ("counter", "reason"),
     [
-        ("audit_mismatches", HealthDecisionReason.AUDIT_MISMATCH),
         ("audit_failures", HealthDecisionReason.AUDIT_FAILED),
         (
             "audit_race_budget_exhaustions",
@@ -191,7 +192,6 @@ def test_recovered_integrity_history_is_gate_sticky_but_not_current_research_blo
 @pytest.mark.parametrize(
     ("counter", "reason"),
     [
-        ("audit_mismatches", HealthDecisionReason.AUDIT_MISMATCH),
         ("audit_failures", HealthDecisionReason.AUDIT_FAILED),
         (
             "audit_race_budget_exhaustions",
@@ -232,6 +232,112 @@ def test_recovered_protocol_deviation_is_gate_sticky_not_current_capture_blocker
     assert decision.research_eligible is True
     assert decision.gate1_eligible_so_far is False
     assert decision.reason_codes == (HealthDecisionReason.PROTOCOL_DEVIATION,)
+
+
+def test_fully_resolved_audit_divergence_history_is_nonblocking() -> None:
+    decision = evaluate_health_decision(
+        _decision_inputs(
+            audit_mismatches=1,
+            audit_divergences_observed=1,
+            audit_divergences_resolved_by_authoritative_resnapshot=1,
+        )
+    )
+
+    assert decision.capture_healthy is True
+    assert decision.research_eligible is True
+    assert decision.gate1_eligible_so_far is True
+    assert decision.reason_codes == ()
+    assert decision.gate1_sticky_reason_codes == ()
+
+
+def test_pending_audit_divergence_is_current_nonsticky_blocker() -> None:
+    decision = evaluate_health_decision(
+        _decision_inputs(
+            audit_mismatches=1,
+            audit_divergences_observed=1,
+            audit_divergences_pending=1,
+        )
+    )
+
+    assert decision.capture_healthy is True
+    assert decision.research_eligible is False
+    assert decision.gate1_eligible_so_far is False
+    assert decision.reason_codes == (HealthDecisionReason.AUDIT_DIVERGENCE_PENDING,)
+    assert decision.gate1_sticky_reason_codes == ()
+
+
+@pytest.mark.parametrize(
+    ("counter", "reason"),
+    [
+        (
+            "audit_divergences_unresolved",
+            HealthDecisionReason.AUDIT_DIVERGENCE_UNRESOLVED,
+        ),
+        (
+            "audit_divergences_unknown",
+            HealthDecisionReason.AUDIT_DIVERGENCE_UNKNOWN,
+        ),
+        ("audit_local_book_defects", HealthDecisionReason.AUDIT_LOCAL_BOOK_DEFECT),
+    ],
+)
+def test_unsafe_audit_divergence_history_is_gate_sticky(
+    counter: str,
+    reason: HealthDecisionReason,
+) -> None:
+    decision = evaluate_health_decision(_decision_inputs(**{counter: 1}))
+
+    assert decision.capture_healthy is True
+    assert decision.research_eligible is False
+    assert decision.gate1_eligible_so_far is False
+    assert decision.reason_codes == (reason,)
+    assert decision.gate1_sticky_reason_codes == (reason,)
+
+
+@pytest.mark.parametrize(
+    ("flag", "reason"),
+    [
+        (
+            "audit_divergence_lifecycle_reconciled",
+            HealthDecisionReason.AUDIT_DIVERGENCE_RECONCILIATION_FAILED,
+        ),
+        (
+            "audit_trigger_reconciled",
+            HealthDecisionReason.AUDIT_TRIGGER_RECONCILIATION_FAILED,
+        ),
+    ],
+)
+def test_audit_evidence_reconciliation_failure_is_gate_sticky(
+    flag: str,
+    reason: HealthDecisionReason,
+) -> None:
+    decision = evaluate_health_decision(_decision_inputs(**{flag: False}))
+
+    assert decision.research_eligible is False
+    assert decision.gate1_eligible_so_far is False
+    assert decision.reason_codes == (reason,)
+    assert decision.gate1_sticky_reason_codes == (reason,)
+
+
+def test_resolved_state_does_not_inherit_pending_as_sticky_history() -> None:
+    pending = evaluate_health_decision(
+        _decision_inputs(
+            audit_mismatches=1,
+            audit_divergences_observed=1,
+            audit_divergences_pending=1,
+        )
+    )
+    resolved = evaluate_health_decision(
+        _decision_inputs(
+            audit_mismatches=1,
+            audit_divergences_observed=1,
+            audit_divergences_resolved_by_authoritative_resnapshot=1,
+        )
+    )
+
+    assert pending.gate1_sticky_reason_codes == ()
+    assert resolved.gate1_eligible_so_far is True
+    assert resolved.reason_codes == ()
+    assert resolved.gate1_sticky_reason_codes == ()
 
 
 def test_protocol_deviation_fails_closed_while_current_socket_is_unavailable() -> None:
@@ -313,9 +419,10 @@ async def test_health_writer_publishes_bounded_canonical_jsonl(tmp_path: Path) -
     assert record["emitted_monotonic_epoch_id"] == run_id.value
     assert isinstance(record["emitted_monotonic_ns"], int)
     assert record["decisions"]["gate1_eligible_so_far"] is True
+    assert record["decisions"]["gate1_sticky_reason_codes"] == []
 
 
-def test_checkpoint_v2_chronology_uses_monotonic_when_utc_regresses() -> None:
+def test_checkpoint_v3_chronology_uses_monotonic_when_utc_regresses() -> None:
     run_id = CollectorRunId.new()
     first = _checkpoint(run_id, emitted_monotonic_ns=10).to_record()
     second = _checkpoint(run_id, emitted_monotonic_ns=20).to_record()
@@ -324,6 +431,25 @@ def test_checkpoint_v2_chronology_uses_monotonic_when_utc_regresses() -> None:
 
     chronology = validate_health_checkpoint_chronology((first, second))
 
+    assert chronology.monotonic_chronology_available is True
+    assert chronology.first_emitted_monotonic == MonotonicTimestamp(run_id.value, 10)
+    assert chronology.last_emitted_monotonic == MonotonicTimestamp(run_id.value, 20)
+
+
+def test_checkpoint_v2_chronology_remains_readable() -> None:
+    run_id = CollectorRunId.new()
+    first = _checkpoint(run_id, emitted_monotonic_ns=10).to_record()
+    second = _checkpoint(run_id, emitted_monotonic_ns=20).to_record()
+    first["schema_version"] = HEALTH_CHECKPOINT_V2_SCHEMA_VERSION
+    second["schema_version"] = HEALTH_CHECKPOINT_V2_SCHEMA_VERSION
+    first_decisions = cast(dict[str, object], first["decisions"])
+    second_decisions = cast(dict[str, object], second["decisions"])
+    first_decisions.pop("gate1_sticky_reason_codes")
+    second_decisions.pop("gate1_sticky_reason_codes")
+
+    chronology = validate_health_checkpoint_chronology((first, second))
+
+    assert chronology.schema_version == HEALTH_CHECKPOINT_V2_SCHEMA_VERSION
     assert chronology.monotonic_chronology_available is True
     assert chronology.first_emitted_monotonic == MonotonicTimestamp(run_id.value, 10)
     assert chronology.last_emitted_monotonic == MonotonicTimestamp(run_id.value, 20)
@@ -355,7 +481,7 @@ def test_checkpoint_v1_compatibility_does_not_synthesize_monotonic_evidence() ->
     "mutation",
     ["epoch", "regression"],
 )
-def test_checkpoint_v2_chronology_rejects_epoch_mismatch_or_regression(
+def test_checkpoint_v3_chronology_rejects_epoch_mismatch_or_regression(
     mutation: str,
 ) -> None:
     run_id = CollectorRunId.new()

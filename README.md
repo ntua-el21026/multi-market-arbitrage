@@ -4,7 +4,8 @@ Multi-venue quantitative arbitrage, market-making, and delta-neutral trading res
 
 **Initial venues:** Polymarket, Kalshi, Kraken  
 **Architecture:** Python modular monolith  
-**Current project state:** Phase-1 Gate-1 remediation after a failed first six-hour soak  
+**Current project state:** Phase-1 Gate-1 audit-divergence remediation; first six-hour soak remains failed
+
 **Live trading:** Structurally unavailable in Phase 1
 
 ## Engineering priorities
@@ -32,6 +33,7 @@ An apparent arbitrage is not treated as executable until data health, settlement
 - [`docs/GATE_1_FAILURE_20260822.md`](docs/GATE_1_FAILURE_20260822.md) — evidence summary for the failed first six-hour soak
 - [`docs/GATE_1_REMEDIATION_SPEC.md`](docs/GATE_1_REMEDIATION_SPEC.md) — normative correction and rerun requirements
 - [`docs/GATE_1_SOAK_SPEC.md`](docs/GATE_1_SOAK_SPEC.md) — unchanged Gate-1 acceptance contract
+- [`docs/adr/0054-audit-divergence-state-and-gate-eligibility.md`](docs/adr/0054-audit-divergence-state-and-gate-eligibility.md) — immediate fail-closed audit-divergence recovery and Gate semantics
 - [`docs/PHASE_2_RESEARCH_AND_SPEC.md`](docs/PHASE_2_RESEARCH_AND_SPEC.md) — planning-only multi-venue/semantic specification; production work remains blocked
 - [`docs/EXTERNAL_REFERENCE_BACKLOG.md`](docs/EXTERNAL_REFERENCE_BACKLOG.md) — non-normative external systems, strategy priorities, and future ADR candidates
 - [`docs/ADR_INDEX.md`](docs/ADR_INDEX.md) — architecture decision index
@@ -58,7 +60,24 @@ The raw journal, dual replay, analytical rebuild, raw immutability and no-live b
 - `scan-report` attempted to materialize approximately 819.6 MiB against the valid 512 MiB bound;
 - monotonic checkpoint chronology and typed per-interval availability causality were not retained completely.
 
-The failure dataset is preserved as a permanent regression corpus. A fresh six-hour soak is mandatory after ADR-0053 and `GATE_1_REMEDIATION_SPEC.md` are implemented, the failed raw run replays cleanly, bounded reporting succeeds, and a new smoke plus 30–60 minute stability run pass.
+Those findings remain historical and the failure dataset is preserved as a
+permanent regression corpus. The original reported-top, bounded reporting,
+monotonic checkpoint and interval defects have remediation implementations.
+Follow-up causal analysis found that a matching state often appears only after
+mismatch-triggered recovery, so ADR-0054 retains every mismatch, immediately
+fails closed, and permits current eligibility restoration only after a separate
+authoritative resnapshot, replacement capture and exact lifecycle/interval
+reconciliation. Replacement capture requires full snapshots for every required
+instrument from one new WebSocket connection after durable canonical
+processing, with same-epoch nonfuture sources no older than
+`scanner.maximum_book_age` at completion. REST resolution, stale/future/cross-
+epoch coverage, socket readiness, incrementals or partial coverage cannot restore
+eligibility. It does not accept same-generation waiting as a live closure.
+
+Gate 1 remains `FAIL`. A new final-SHA 60-second smoke and 45–60 minute
+stability observation are still required before independent pre-soak review.
+A fresh six-hour soak is mandatory only after later independent authorization;
+no six-hour rerun was performed for the ADR-0054 remediation.
 
 Phase-2 research may continue in parallel. Production Kalshi, Kraken, semantic-engine, paper/shadow or live implementation must not be merged or promoted until Gate 1 receives an accepted `PASS`.
 
@@ -84,7 +103,7 @@ uv run --frozen --all-groups mma validate-data data
 uv run --frozen --all-groups mma scan-report data/analytical
 ```
 
-See [`docs/PHASE_1_IMPLEMENTATION.md`](docs/PHASE_1_IMPLEMENTATION.md) for current implementation behavior. It must be refreshed after remediation so it describes the corrected code rather than intended behavior.
+See [`docs/PHASE_1_IMPLEMENTATION.md`](docs/PHASE_1_IMPLEMENTATION.md) for the current pre-soak implementation behavior and [`docs/GATE_1_REMEDIATION_SPEC.md`](docs/GATE_1_REMEDIATION_SPEC.md) for the validation still required.
 
 ## Repository policy
 

@@ -6,11 +6,36 @@ from typing import cast
 
 import pytest
 
+from multi_market_arbitrage.core.config import load_phase1_config
 from multi_market_arbitrage.core.ids import CollectorRunId
+from multi_market_arbitrage.pipeline import (
+    CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
+    WS_MARKET,
+)
+from multi_market_arbitrage.pipeline.health import (
+    AUDIT_DIVERGENCE_PENDING_REPRESENTATIVE_SCHEMA,
+    AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVE_SCHEMA,
+    MAXIMUM_AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVES,
+)
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY))
 
+from benchmarks.gate1_audit_divergence import (  # noqa: E402
+    CAPACITY_PENDING_SATURATION_KIND,
+    HEALTH_EVIDENCE_MAXIMUM_BYTES,
+    HEALTH_EVIDENCE_MAXIMUM_RECORDS,
+    SIX_HOUR_CHECKPOINT_COUNT,
+    WORKLOAD_VERSION,
+    _capacity_projection,  # pyright: ignore[reportPrivateUsage]
+    _replay_workload,  # pyright: ignore[reportPrivateUsage]
+)
+from benchmarks.gate1_audit_divergence import (  # noqa: E402
+    RESULT_SCHEMA as AUDIT_DIVERGENCE_RESULT_SCHEMA,
+)
+from benchmarks.gate1_audit_divergence import (  # noqa: E402
+    run_benchmark as run_audit_divergence_benchmark,
+)
 from benchmarks.gate1_health import SCHEMA_VERSION as HEALTH_RESULT_SCHEMA  # noqa: E402
 from benchmarks.gate1_health import (  # noqa: E402
     _availability_interval,  # pyright: ignore[reportPrivateUsage]
@@ -49,7 +74,7 @@ def test_health_benchmark_uses_production_checkpoint_builder() -> None:
     checkpoint = build()
 
     assert HEALTH_RESULT_SCHEMA == "gate1-health-benchmark-v2"
-    assert checkpoint.schema_version == "gate1-health-checkpoint-v2"
+    assert checkpoint.schema_version == "gate1-health-checkpoint-v3"
     assert checkpoint.gate1_eligible_so_far
     assert checkpoint.target["mode"] == "EXPLICIT_GATE1"
     assert len(checkpoint.books) == 2
@@ -93,6 +118,144 @@ def test_health_benchmark_constructs_production_availability_interval() -> None:
     assert record["interval_id"] == "health-benchmark-availability-00000007"
     assert record["cause_type"] == "EXTERNAL_CONNECTION_TRANSPORT"
     assert record["duration_ns"] == 500
+
+
+def test_audit_divergence_benchmark_covers_changed_paths_and_capacity() -> None:
+    result = run_audit_divergence_benchmark(
+        warmups=0,
+        repetitions=1,
+        causal_repetitions=1,
+        replay_repetitions=1,
+    )
+
+    assert AUDIT_DIVERGENCE_RESULT_SCHEMA == "mma-gate1-audit-divergence-benchmark-v1"
+    assert result["schema_version"] == AUDIT_DIVERGENCE_RESULT_SCHEMA
+    series_items = cast(tuple[dict[str, object], ...], result["series"])
+    series = {cast(str, item["name"]): item for item in series_items}
+    assert set(series) == {
+        "audit_start_v2_trigger_encoding",
+        "causal_lineage_report_same_generation",
+        "exact_depth_compare_64x64",
+        "mismatch_diagnostic_construction_64x64",
+        "pending_divergence_authoritative_close",
+        "pending_divergence_open",
+        "processor_summary_terminal_hash_maximum_divergence_shape",
+        "replacement_snapshot_eligibility_restore",
+        "resolved_divergence_health_decision",
+        "verified_replay_with_resolved_divergence",
+    }
+    for measurement in series.values():
+        timing = cast(dict[str, int], measurement["timing"])
+        allocation = cast(dict[str, int], measurement["allocation_probe"])
+        assert timing["median_ns"] > 0
+        assert allocation["peak_delta_bytes"] >= 0
+
+    causal_validation = cast(
+        dict[str, object],
+        series["causal_lineage_report_same_generation"]["validation"],
+    )
+    replay_validation = cast(
+        dict[str, object],
+        series["verified_replay_with_resolved_divergence"]["validation"],
+    )
+    restore_validation = cast(
+        dict[str, object],
+        series["replacement_snapshot_eligibility_restore"]["validation"],
+    )
+    replacement_submeasurements = cast(
+        dict[str, dict[str, object]],
+        series["replacement_snapshot_eligibility_restore"]["submeasurements"],
+    )
+    assert causal_validation["causal_relation"] == "SAME_GENERATION_NATURAL_CONVERGENCE"
+    assert len(cast(str, causal_validation["report_sha256"])) == 64
+    assert replay_validation["audit_replacement_captures_pending"] == 0
+    assert replay_validation["replacement_release_controls"] == 1
+    assert restore_validation["audit_ineligible_books"] == 0
+    assert restore_validation["release_control_channel"] == CONTROL_REST_AUDIT_REPLACEMENT_RELEASE
+    assert cast(int, restore_validation["capture_record_bytes"]) > 0
+    assert restore_validation["capture_source_count"] == 2
+    assert len(cast(str, restore_validation["capture_state_sha256"])) == 64
+    assert restore_validation["connection_bound"] is True
+    assert restore_validation["decision_time_bound"] is True
+    assert restore_validation["digest_bound"] is True
+    assert restore_validation["raw_sources_bound"] is True
+    assert set(replacement_submeasurements) == {"release_control", "snapshot_only"}
+    snapshot_validation = cast(
+        dict[str, object], replacement_submeasurements["snapshot_only"]["validation"]
+    )
+    release_validation = cast(
+        dict[str, object], replacement_submeasurements["release_control"]["validation"]
+    )
+    assert snapshot_validation["snapshot_scan_count"] == 0
+    assert snapshot_validation["replacement_captures_pending"] == 1
+    assert release_validation["release_scan_count"] == 1
+    assert release_validation["replacement_captures_pending"] == 0
+    for submeasurement in replacement_submeasurements.values():
+        timing = cast(dict[str, int], submeasurement["timing"])
+        assert timing["median_ns"] > 0
+    identity = cast(dict[str, object], result["identity"])
+    assert identity["workload_version"] == WORKLOAD_VERSION == "adr-0054-production-paths-v2"
+
+    capacity = cast(dict[str, int | bool], result["capacity_projection"])
+    assert capacity["checkpoint_count"] == SIX_HOUR_CHECKPOINT_COUNT == 2_161
+    assert capacity["maximum_records"] == HEALTH_EVIDENCE_MAXIMUM_RECORDS == 8_192
+    assert capacity["maximum_file_bytes"] == HEALTH_EVIDENCE_MAXIMUM_BYTES == 67_108_864
+    assert capacity["projected_file_bytes"] <= HEALTH_EVIDENCE_MAXIMUM_BYTES
+    assert capacity["remaining_file_bytes"] > 0
+    assert capacity["within_file_bound"] is True
+    assert capacity["within_record_bound"] is True
+    capacity_shape = cast(dict[str, int | str | bool], result["capacity_evidence_shape"])
+    assert capacity_shape["mismatch_cause_representative_count"] == 6
+    assert capacity_shape["pending_record_count"] == 2
+    assert capacity_shape["pending_saturation_kind"] == CAPACITY_PENDING_SATURATION_KIND
+    assert (
+        capacity_shape["pending_representative_schema"]
+        == AUDIT_DIVERGENCE_PENDING_REPRESENTATIVE_SCHEMA
+    )
+    assert (
+        capacity_shape["resolution_representative_count"]
+        == MAXIMUM_AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVES
+        == 1
+    )
+    assert (
+        capacity_shape["resolution_representative_schema"]
+        == AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVE_SCHEMA
+    )
+    assert capacity_shape["raw_links_complete"] is True
+    assert capacity_shape["exact_identities_complete"] is True
+    assert capacity_shape["pending_raw_links_and_identities_complete"] is True
+    assert capacity_shape["current_eligibility_saturated"] is True
+    assert capacity_shape["compact_pending_omits_nested_audit_outcome"] is True
+    assert capacity_shape["compact_resolution_omits_nested_observed_divergence"] is True
+
+
+def test_audit_divergence_replay_workload_journals_durable_v2_release() -> None:
+    envelopes = _replay_workload(load_phase1_config(REPOSITORY / "config" / "phase1.toml"))
+    release_controls = tuple(
+        envelope
+        for envelope in envelopes
+        if envelope.channel == CONTROL_REST_AUDIT_REPLACEMENT_RELEASE
+    )
+
+    assert len(release_controls) == 1
+    release = release_controls[0]
+    assert release == envelopes[-1]
+    assert release.transport_type == "CONTROL"
+    replacement = envelopes[-2]
+    assert replacement.channel == WS_MARKET
+    assert release.ingest_seq == replacement.ingest_seq + 1
+    assert release.connection_id == replacement.connection_id
+    assert release.received_monotonic == replacement.received_monotonic
+
+
+def test_audit_divergence_capacity_projection_binds_final_checkpoint() -> None:
+    projection = _capacity_projection(maximum_checkpoint_bytes=10)
+
+    assert projection["checkpoint_count"] == 2_161
+    assert projection["projected_file_bytes"] == 21_610
+    assert projection["remaining_file_bytes"] == HEALTH_EVIDENCE_MAXIMUM_BYTES - 21_610
+    assert projection["within_file_bound"] is True
+    assert projection["within_record_bound"] is True
 
 
 @pytest.mark.asyncio
