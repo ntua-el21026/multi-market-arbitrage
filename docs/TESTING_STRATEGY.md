@@ -16,208 +16,178 @@ venue conformance
 fault injection
 fuzz/adversarial
 metamorphic economics
-performance regression
+performance/resource regression
+long-run evidence
 ```
 
 ## 3. Unit tests
 
-Cover:
-- exact arithmetic;
-- quantization;
-- cost formulas;
-- book application;
-- semantic relation evaluation;
-- capacity calculations;
-- lifecycle transitions.
-
-Phase-1 pre-soak unit coverage also fixes the contracts for typed HTTP versus
-WebSocket faults, retry/`Retry-After`/deadline/rate-window policy, contiguous
-per-generation admission watermarks, all four audit outcomes and failure
-reasons, explicit target validation/no-fallback, scoped health decisions and
-bounded writer publication/failure, and exact calibration projections/artifact
-bindings.
+Cover exact arithmetic, quantization, costs, book application, reported-top transitions, semantic relations, capacity, lifecycle, typed transport faults, retry/rate policy, audit outcomes, target validation, health decisions, availability intervals, calibration and bounded reporting.
 
 ## 4. Property-based testing
 
 Examples:
+
 - exact decimal round-trip;
-- valid quantization always lands on increment;
-- negative quantity never survives canonical book;
+- valid quantization lands on increment;
+- invalid quantity/crossed book never survives;
 - fee increase cannot improve identical net economics;
-- reduced depth cannot increase aggressive capacity;
-- higher explicit cost cannot increase net edge;
-- deterministic serialization round-trip preserves hash identity.
+- reduced depth cannot increase capacity;
+- deterministic serialization preserves identity;
+- transition bounds cannot increase silently;
+- unresolved transition never becomes scanner/audit eligible;
+- interval ledger aggregates reconcile exactly.
 
-The optimized complete-set capacity solver is tested differentially against
-the exhaustive `PolymarketCompleteSetReferenceScanner`. The property campaign
-uses 2,000 randomized cases and dedicated deep multi-level, exact depth/minimum
-quantity, fee-zero, half-quantum/`HALF_UP`, changing fee-factor, multiple
-threshold, edge/no-edge, and full 4,096-lattice cases. Comparisons cover the
-full disposition, validation results, maximum quantities, economics, and
-terminal identity; diagnostic work counters are explicitly non-canonical.
+The optimized complete-set solver remains differentially tested against the exhaustive oracle across randomized and targeted fee/depth/minimum/threshold cases.
 
-## 5. Metamorphic economic tests
+## 5. Metamorphic economics
 
-Given identical opportunity:
 - add fee → net P&L non-increasing;
 - remove depth → capacity non-increasing;
-- worsen price level → buyer cost non-decreasing;
+- worsen buyer price → cost non-decreasing;
 - remove rebate → rebate-inclusive P&L non-increasing;
-- increase capital lock with positive opportunity cost → capital efficiency non-increasing.
+- increase capital lock/opportunity cost → capital efficiency non-increasing.
 
 ## 6. Golden fixtures
 
-Small immutable venue-message datasets exercise:
-- normal snapshot/deltas;
-- sequence gap;
-- duplicate;
-- reconnect;
-- tick/precision update;
-- fee update;
-- market halt/close;
-- malformed payload.
+Small immutable fixtures cover snapshots/deltas, duplicates, reconnect, precision/cost/lifecycle changes, malformed payloads, audit controls and reported-top transitions.
 
-Expected canonical hashes are stored.
+Expected canonical hashes are retained for fixed semantics.
 
-## 7. Venue conformance suites
+## 7. Failed Gate-1 regression corpus
 
-Each adapter must prove:
-- native parsing;
-- subscription semantics;
-- sequence/checksum behavior where supported;
-- price-side normalization;
-- reference-data mapping;
-- invalid-state recovery.
+The authoritative failed run remains outside Git:
 
-## 8. Deterministic replay tests
+```text
+commit: a382b93220011428703fe02483f7034f59c1f045
+run:    01a02ba9-7bc0-7a86-b920-893b695d9ba4
+```
 
-Same:
-- dataset;
-- commit;
-- config;
-- reference interpretation;
-- simulator version;
+It is a mandatory regression dataset.
 
-must produce identical state and output hashes.
+Testing must:
 
-Audit start/failure/response control records, response-boundary and processed
-watermarks, raw response identity, barrier book identity, typed outcome, and
-audit outcome hash chain are included in replay comparisons. Tests require the
-same `MATCH`/`MISMATCH`/`RACED`/`FAILED` classification and terminal hash
-without repeating the HTTP request or depending on current scheduler timing.
-The matrix also covers pending deferred raw responses and their complete bound
-start state in the terminal hash, then proves that only the durable
-classification control releases them. Historical inline records replay in
-their all-legacy mode, while legacy-to-bound and bound-to-legacy run changes,
-mismatched ingest-sequence, repeated-classification, and malformed bound-control
-records fail closed. The terminal hash binds the locked mode and the bound
-run-deadline monotonic epoch/value after requests complete, plus the sorted
-audit-economic generation map that determines the next fenced audit identity.
-Adversarial starts include no accepted freshness and a forged future hard
-expiry followed by classification after the true freshness boundary; neither
-may produce an audit outcome or refresh eligibility. A START earlier than its
-claimed accepted freshness and same-connection response/classification records
-from another monotonic epoch are likewise rejected before any `MATCH`.
+1. preserve a manifest/reference to the external corpus;
+2. extract sanitized byte-exact minimal fixtures for all four primary book-invariant failures;
+3. cover the three no-pending cases separately;
+4. include successful nearby multi-frame controls;
+5. replay the full raw run twice under corrected code;
+6. require deterministic corrected outputs;
+7. require no identified primary/cascading invariant failures;
+8. ensure unresolved/ambiguous cases still fail closed;
+9. rebuild and validate analytical output;
+10. prove raw immutability.
 
-## 9. Fault injection
+A changed terminal hash is expected when canonical bug semantics change, but the new identity must be deterministic, documented and bound to the corrected code/config.
+
+## 8. Reported-top transition matrix
+
+At minimum:
+
+- BBO announcement then add-new/remove-old;
+- BBO announcement then remove-old/add-new;
+- multiple exact frames;
+- repeated same target;
+- superseding target;
+- recognized no-pending complete reported top;
+- unsupported no-pending mismatch;
+- irrelevant last trade;
+- tick/quantity/crossing/provenance failure;
+- frame/time bound expiry;
+- disconnect and authoritative resnapshot;
+- audit while pending;
+- exact convergence;
+- live/replay terminal equality.
+
+Tests prove that exact levels/provenance are retained without making the book research eligible.
+
+## 9. Venue conformance
+
+Each adapter proves native parsing, subscription/snapshot semantics, sequence/checksum behavior where supported, side/price normalization, reference mapping and invalid-state recovery.
+
+## 10. Deterministic replay
+
+Same raw data, commit, config, reference interpretation and model versions must produce identical state/output hashes.
+
+Replay covers audit starts/responses/failures/classification, watermarks, barriers, transition state/bounds, availability evidence and terminal hash inputs without repeating external I/O or depending on current scheduler time.
+
+## 11. Fault injection
 
 Inject:
-- packet/message loss at adapter boundary;
-- duplicate events;
-- delayed events;
-- storage failures;
+
+- message loss/duplicate/delay;
+- HTTP/WS faults and rate limits;
 - queue saturation;
-- malformed reference updates;
-- clock-quality degradation;
-- simulator latency spikes.
+- journal/analytical/health storage failures;
+- malformed reference/schema;
+- clock-quality/UTC regression;
+- reported-top transition conflict/expiry;
+- audit backlog/races/deadlines;
+- resource pressure.
 
-The Phase-1 audit matrix additionally delays ingress consumption, journal
-durability, canonical processing, and audit HTTP handoff. It covers an economic
-update processed before response, still queued at response, post-response
-updates, last-trade-only changes, multiple updates around the boundary, large
-backlog, ambiguous watermark, socket close during audit, bounded race retry,
-race-budget exhaustion, and persistent HTTP failure. Slow journal durability is
-forced across the bound hard expiry: a timely raw response whose classification
-is equal to or later than expiry must deterministically become
-`BOOK_FRESHNESS_EXPIRED`. Tests separately place response receipt immediately
-before and at/after the recorded socket-generation end. Reverse leg-completion
-order and an already-completed task in the wait set prove that the coordinator
-does not spin and that a raced retry cannot starve the other leg's first
-attempt. Both START/fence-order permutations terminate the socket after one
-exact body is coordinator-owned and the globally earlier body is waiting on
-cancelable connection cleanup; the tests require both raw bodies and hashes,
-two classifications, no synthetic failure, and replay equality. A gated second
-START proves neither HTTP read begins before both starts are durable and that
-the two eligible first attempts then coexist in flight; another case crosses a
-staged leg's deadline and proves no late HTTP launch. A pre-response economic
-update must never yield a false `MATCH`, and routine audit must not cancel or
-replace a healthy socket generation.
+Expected response is explicit fail-closed/quarantine/resync, not silent continuation.
 
-Byte-exact captured regressions cover the observed multi-frame BBO transition:
-announce the new top, add its exact level while the old top remains, then delete
-the old level. They require audit/research ineligibility until derived L2
-converges, exact provenance retention, strict rejection without the matching
-pending BBO, and identical live/replay terminal state.
+## 12. Incremental scan-report tests
 
-Public-read faults cover timeout, connection failure, `429`, temporary `5xx`,
-delta-seconds and HTTP-date `Retry-After`, over-policy `Retry-After`, permanent
-`4xx`, malformed framing/schema, deadline and retry exhaustion, WebSocket
-close/protocol errors, and isolation of HTTP failures from WebSocket
-disconnect/reconnect/invalidation metrics. Health faults cover periodic output,
-the final terminal-disconnect record, paired acquisition-cutoff wall/monotonic
-timestamps despite delayed queue drain, immediate cutoff-time cancellation of
-periodic emission with nondecreasing evidence timestamps, missing or failed
-initial resource sampling, queue saturation, count/file/storage failure,
-non-blocking raw-capture independence, and fail-closed Gate-1 reason codes.
-Calibration tests cover
-under/over raw cap, insufficient disk, path/queue threat, health failure,
-fresh-directory/symlink protection, and deterministic report/binding identity.
+Required:
 
-Expected response is fail-closed/quarantine/resync as designed.
+- exact summary equality with the old implementation on small valid datasets;
+- column projection and row-group/batch aggregation;
+- a dataset whose full materialized size exceeds 512 MiB;
+- success within the existing materialization/memory limit;
+- bounded result cardinality/hash-chain output;
+- corrupt/missing/extra/symlink/schema failures;
+- original-versus-rebuild report equality.
 
-## 10. Simulation tests
+Do not test success by raising the resource limit.
 
-Verify:
-- taker sees post-latency book;
-- own depth is consumed;
-- partial fills persist;
-- passive touch does not guarantee fill;
-- cancel race can fill before cancel;
-- cross-venue legs remain independent;
-- residual exposure remains open.
+## 13. Health and availability tests
 
-## 11. Research-integrity tests
+Required:
 
-Check:
-- OOS segment not used in configuration;
-- experiment manifest complete;
-- search history retained;
-- data coverage reported;
-- invalidated run cannot be promoted.
+- checkpoint v2 UTC plus monotonic epoch/ns;
+- monotonic chronology under UTC regression;
+- final cutoff consistency;
+- interval start/end/cause/recovery;
+- open interval at shutdown;
+- aggregate/ledger reconciliation;
+- routine audit not counted as WS downtime;
+- external/protocol/mismatch/transition/resource cause classes;
+- current/peak RSS and host identity;
+- writer failure without raw-capture contamination;
+- sticky Gate reason history.
 
-## 12. Regression policy
+## 14. Long-run stability tests
 
-Any fixed defect should receive a regression test where practical.
+Before another six-hour soak, run 30–60 minutes against the intended target and report:
 
-A research result affected by the defect is invalidated and rerun under a new experiment ID.
+- current/peak RSS and slope;
+- latency tails;
+- queue HWMs;
+- transition counts/durations;
+- audit mismatch/race/failure rates;
+- availability intervals;
+- raw/analytical growth;
+- incremental report resource usage.
 
-## 13. CI
+This is a preflight, not Gate-1 acceptance.
 
-CI runs the reproducible ordinary-GIL CPython 3.14.7 environment and includes:
-- lint;
-- strict typing;
-- full unit/property/golden/integration/replay tests;
-- small deterministic replay suite;
-- schema checks;
-- frozen dependency/SCA checks;
-- pre-commit;
-- package build.
+## 15. Simulation and research-integrity tests
 
-Documentation/code-fence and local-link checks remain required during the
-documentation refresh even though they are not a separate workflow step.
+Future simulator tests preserve post-latency books, own depth consumption, partial fills, conservative passive fills, cancel races, independent legs and residual exposure.
 
-Large soak/performance suites may run separately but remain automated.
+Research integrity tests preserve OOS isolation, experiment manifests/search history, coverage and invalidated-run demotion.
 
-The bounded public smoke, target-specific 180–300 second calibration, and
-six-hour Gate-1 soak are evidence gates outside ordinary CI. A green CI run does
-not claim that any of them was executed or accepted.
+## 16. Regression policy
+
+Every fixed defect receives a regression test where practical.
+
+Research results affected by a defect are invalidated and rerun under new experiment identity.
+
+## 17. CI and external evidence gates
+
+CI uses the frozen ordinary-GIL CPython environment and runs lint, strict typing, unit/property/golden/integration/replay tests, schemas, SCA, pre-commit and package build.
+
+Large failed-corpus replay, long-run stability, public smoke/calibration and six-hour soak may run outside ordinary CI but remain scripted, reproducible and independently reviewed.
+
+A green CI run does not imply Gate-1 acceptance.

@@ -2,277 +2,286 @@
 
 ## 1. Status
 
-This is the normative acceptance specification for the Phase P4 Polymarket soak.
+This is the normative acceptance specification for the Phase-P4 Polymarket soak.
 
-As of commit `d31204e6c8b09aa722f0828f8ded96a2739148a5`, the final six-hour Gate-1 soak MUST NOT start. ADR-0052 identifies required pre-soak corrections: continuous acquisition during REST integrity audits, race-fenced audit semantics, typed HTTP/WS transport recovery, bounded public-read retry/rate handling, periodic health evidence, explicit target selection, storage calibration, and another exact scanner hot-path optimization pass.
+The first six-hour run, executed from `a382b93220011428703fe02483f7034f59c1f045`, received:
 
-A short public smoke is development evidence. It is not Gate-1 acceptance.
+```text
+GATE 1: FAIL
+```
+
+The result is recorded in `GATE_1_FAILURE_20260822.md`. Acceptance criteria are not weakened after observing the failure.
+
+A fresh six-hour run is mandatory after ADR-0053 and `GATE_1_REMEDIATION_SPEC.md` are implemented and independently approved through failed-run replay, a new smoke and a 30–60 minute stability/calibration run.
 
 ## 2. Objective
 
-Gate 1 tests whether the Phase-1 Polymarket observation foundation can run for six hours on a deliberately selected real public market while preserving trustworthy raw evidence, bounded/fail-closed state, deterministic replay, useful research output, explicit availability gaps, and measured latency/resource behavior.
+Gate 1 tests whether the Polymarket observation foundation can run for six hours while preserving trustworthy raw evidence, bounded/fail-closed state, deterministic replay, bounded research reporting, explicit availability intervals and measured latency/resources.
 
-Gate 1 does **not** certify trading profitability, fill realism, live execution readiness, or competitive order-send latency.
+Gate 1 does not certify profitability, fill realism, live execution readiness or competitive order-send latency.
 
-## 3. Required implementation baseline before the soak
+## 3. Required implementation baseline
 
-Before the six-hour run, all of the following must be true on one exact `main` commit:
+Before another soak:
 
-1. ADR-0052 is implemented and current documentation describes the implementation accurately.
-2. Periodic integrity audits do not intentionally stop a healthy primary WebSocket acquisition stream.
-3. Audit outcomes are typed at least as `MATCH`, `MISMATCH`, `RACED`, and `FAILED`, with exact race-fence evidence including a response-boundary receive watermark/barrier.
-4. Public HTTP and WebSocket transport failures are distinct typed errors and metrics/recovery paths.
-5. Safe public read retry is bounded, observable, rate-aware, and deadline constrained.
-6. Periodic versioned machine-readable health checkpoints exist and are produced by a supervised bounded path that cannot block raw capture.
-7. The observer accepts an explicit Gate-1 target identifier and records the resolved condition/assets.
-8. The 4,096-evaluation scanner path has received the ADR-0052 algorithm-first optimization/equivalence pass and a refreshed same-machine performance baseline.
-9. All existing no-live negative-capability guarantees still hold.
-10. Full CI, static analysis, SCA, tests, package build, deterministic replay tests, and security checks pass on the exact final SHA.
-11. A new bounded public smoke on that SHA passes before the six-hour run.
+1. ADR-0052 continuous-capture/race-fenced auditing remains implemented.
+2. ADR-0053 bounded reported-top transition state is implemented.
+3. Exact quantity-bearing L2 remains authoritative; reported BBO never fabricates depth.
+4. Unresolved reported-top transitions block audit and scanner/research eligibility.
+5. Transition bounds/convergence/supersession/failure are deterministic and replayable.
+6. Public HTTP and WebSocket failures remain separate typed domains.
+7. Safe public-read retry remains bounded, observable, rate-aware and deadline-constrained.
+8. Health checkpoint v2 includes UTC plus monotonic epoch/time.
+9. Every unavailable interval has typed start/end/cause/recovery evidence.
+10. Explicit target selection and identity remain required.
+11. Long-run `scan-report` is incremental/column-selective and succeeds within existing resource bounds.
+12. Full CI, static analysis, SCA, tests, package build, replay, rebuild, validation and no-live checks pass on the exact candidate SHA.
+13. The failed six-hour raw run replays twice deterministically under corrected code without the identified primary invariant failures.
+14. A new 60-second smoke and 30–60 minute stability/calibration run pass before the rerun.
 
 ## 4. Target selection
 
-The Gate-1 run uses one explicit ordinary-binary Polymarket target per observer process. Automatic `eligible[:1]` selection is not acceptable for the acceptance run.
+Use one explicit ordinary-binary Polymarket target per observer process. Listing-order selection is not acceptable.
 
-The recorded target evidence includes:
+Record:
 
-- requested Gamma market ID or equivalent explicit identifier;
-- resolved condition ID;
+- requested/resolved Gamma market ID;
+- condition ID;
 - YES/NO token IDs;
-- relevant event ID where present;
-- lifecycle/status/reference versions at start;
+- event ID where present;
+- lifecycle/reference/semantic versions;
 - selection rationale.
 
-The target must:
+The target must be active/open, order-book enabled, accepting orders, ordinary binary YES/NO, non-negative-risk, expected to remain open and active enough to exercise the path.
 
-- be active and open;
-- accept orders and expose the order book;
-- have exactly the supported ordinary binary YES/NO semantics;
-- not be negative-risk;
-- be expected to remain unresolved/open for the requested six hours;
-- have enough real activity to exercise the WebSocket/book/scanner path without being chosen solely to minimize system load.
-
-If the market resolves/closes unexpectedly, the run remains valid evidence but is not automatically a complete six-hour acceptance run; select a replacement and rerun unless the acceptance review explicitly determines otherwise.
+Unexpected resolution/closure remains valid evidence but normally requires a replacement run.
 
 ## 5. Pre-soak workload and storage calibration
 
-Run a bounded calibration on the exact target, final code SHA, final configuration, runtime, filesystem, and machine used for the soak.
+Run bounded calibration on the exact target, code, config, runtime, filesystem and host.
 
-Measure at least:
+Measure:
 
-- WebSocket messages/s and bytes/s;
-- total durable raw records/s and uncompressed raw bytes/s;
-- canonical events/s;
-- scans/s by disposition;
-- raw-run growth rate;
-- journal fsync/group behavior;
-- ingress/journal/analytical queue high-water marks;
-- peak RSS;
-- p50/p95/p99/max receive-to-scan latency;
-- audit request rate and audit outcome distribution.
+- WS messages/bytes per second;
+- durable records and uncompressed bytes per second;
+- canonical events/scans;
+- journal groups/fsyncs;
+- queue HWMs;
+- T_obs p50/p95/p99/max;
+- audit outcomes/retries;
+- reported-top transition counts/durations;
+- current/peak RSS and RSS slope;
+- raw growth;
+- scan-report peak memory/throughput.
 
-Project six-hour uncompressed raw size from measured bytes/time with conservative headroom. Record the projection and calculation.
+Project 21,600-second storage with conservative headroom. Do not start if raw/file/path/disk/queue/memory bounds are threatened.
 
-Do not start if:
-
-- the projection threatens the configured 4 GiB raw-run limit;
-- expected fragment/file counts threaten validation/replay bounds;
-- free disk space does not safely cover raw, analytical, temporary sealing/rebuild, logs/health evidence, and headroom;
-- queue/resource behavior already approaches configured bounds.
-
-Do not enlarge a safety bound simply to make the soak fit. Re-evaluate the architecture/configuration and evidence first.
+Do not raise a safety bound merely to make the run fit.
 
 ## 6. Run identity and command evidence
 
-The acceptance record must bind:
+Bind:
 
-- final Git commit SHA;
-- `design-freeze-v0.1` identity;
-- exact CPython build;
-- exact `uv` version;
-- lock SHA-256;
-- config SHA-256;
-- target identifiers;
+- Git SHA and Design Freeze SHA;
+- CPython build/GIL and uv version;
+- lock/config hashes;
+- target IDs;
 - command/arguments;
-- host/CPU/memory/kernel/filesystem details;
-- UTC start/end times;
-- collector run ID;
-- health-evidence schema version;
-- relevant official Polymarket documentation check time/source.
+- host CPU model, logical cores, total memory, kernel and filesystem;
+- UTC start/end;
+- monotonic epoch/start/end;
+- CollectorRunId;
+- health and availability schema versions;
+- relevant official-doc check time/source.
 
-The requested soak duration is exactly **21,600 seconds** unless a later accepted ADR changes it.
+Requested duration is exactly 21,600 seconds unless a later ADR changes it.
 
-## 7. Continuous-capture integrity requirements
+## 7. Continuous capture and audit integrity
 
-Routine periodic REST audits must run without deliberately closing healthy WebSocket acquisition.
+Routine REST audits must not stop a healthy WebSocket.
 
-Every audit records:
+Each audit binds request/response times, starting and barrier book identity, response-boundary WS watermark, canonical barrier watermark, raw response identity, typed outcome and recovery.
 
-- endpoint/instrument;
-- request-start and response-receive times;
-- starting book generation/economic hash;
-- response-boundary WebSocket receive/admission watermark for the socket generation;
-- canonical barrier watermark reached before classification;
-- barrier-time book generation/economic hash;
-- raw response identity;
-- outcome (`MATCH`, `MISMATCH`, `RACED`, `FAILED`);
-- retry count/delay where applicable;
-- resulting health/resync action.
-
-Before `MATCH`, `MISMATCH`, or `RACED` is classified, the canonical owner must have durably processed every WebSocket frame admitted through the exact response-boundary watermark, or an equivalent formally proven barrier. The barrier must not stop healthy acquisition; later frames may continue to be admitted while the owner catches up. A frame received before the REST response but still queued in ingress, journal durability, or canonical processing cannot be excluded from the race decision.
-
-After the barrier is reached, compare the request-start economic book identity with the barrier-time identity. Irrelevant frames that do not mutate the audited economic book need not force `RACED`; a relevant mutation across the fenced window does. Exact REST bytes may be journaled at receipt, but a replay-relevant audit classification/state transition cannot precede the barrier evidence.
+Before `MATCH`, `MISMATCH` or `RACED`, every WS frame admitted through the response watermark must be durable and canonically processed. Later frames may continue to enter.
 
 Rules:
 
-- `MATCH`: only a race-free comparison after the response-boundary barrier can match.
-- `MISMATCH`: only a race-free comparison after the response-boundary barrier can mismatch; affected state invalidates/resynchronizes.
-- `RACED`: no match/mismatch claim and no authoritative freshness promotion; retry is bounded.
-- `FAILED`: no false match; required integrity/reference state eventually becomes stale/indeterminate if recovery cannot complete.
+- `MATCH`: only race-free exact comparison;
+- `MISMATCH`: race-free exact disagreement; invalidate/resynchronize;
+- `RACED`: relevant mutation crossed the window; no freshness promotion; bounded retry;
+- `FAILED`: no safe classification; fail dependent eligibility closed.
 
-Any real socket disconnect or other unavoidable unavailable interval is explicitly timestamped and measured. Reconnect/resubscribe/resnapshot may restore state but never erases the missing interval from coverage evidence.
+Reported-top transition state is an audit-comparability blocker. A REST response equal to unresolved local L2 cannot produce `MATCH` or clear the transition.
 
-## 8. Public HTTP resilience requirements
+Any real socket gap remains explicit and cannot be backfilled by a later snapshot.
 
-Public read retries comply with `ERROR_MODEL.md` and ADR-0052.
+## 8. Reported-top transition integrity
+
+Every transition records target BBO, source identities, generation/hash, socket generation, ordinals, wall/monotonic times, frames, bounds and status.
+
+While pending:
+
+- exact valid L2/provenance may be retained;
+- scanner/research/audit eligibility is blocked;
+- precision/quantity/crossing/provenance checks remain strict.
+
+A transition clears only through exact convergence, authoritative full snapshot or deterministic supersession. Bound expiry/ambiguity/conflict requires invalidation/resnapshot.
+
+No-pending recognition must be evidence-backed and deterministic; generic mismatch remains invalid.
+
+## 9. Public HTTP resilience
 
 Record by endpoint class:
 
-- requests;
-- successful first attempts;
-- retries;
-- retryable status/transport faults;
-- rate-limit/throttle observations;
-- backoff time;
-- retry-budget exhaustion;
-- final failures.
+- requests/attempts/first successes;
+- retries/statuses/timeouts/network faults;
+- throttles and Retry-After;
+- local rate waits/backoff;
+- exhausted budgets/final failures;
+- latency.
 
-A REST failure is never counted as a WebSocket disconnect. Automatic retry remains unavailable for future ambiguous live mutations.
+A REST failure is not a WS disconnect. Automatic retry remains unavailable for future ambiguous mutations.
 
-Current official Polymarket rate-limit values are re-checked before the run and treated as dated external reference evidence, not permanent code constants.
+Current official rate limits must be rechecked and retained as dated evidence.
 
-## 9. Periodic health evidence
+## 10. Periodic health evidence
 
-During the six-hour run, emit versioned machine-readable checkpoints on a documented bounded cadence. The cadence must be frequent enough to reconstruct operational health without materially affecting acquisition; the implementation benchmark determines the final interval.
+Use versioned health checkpoints on a documented bounded cadence plus final checkpoint.
 
-At minimum each checkpoint includes:
+Each checkpoint includes:
 
 - run/code/config/target identity;
-- `capture_healthy`, `research_eligible`, `gate1_eligible_so_far` plus reason codes;
-- socket generation/connectivity and last-frame age;
-- per-book health/generation/freshness/reference versions;
-- ingress depth/bytes/HWM/overflow;
-- journal depth/HWM/durable watermark/fsync groups/failure;
-- analytical health/depth/HWM/rejections/failure;
-- HTTP retry/rate-limit metrics;
-- audit counts/outcomes/last successful integrity age;
-- reconnect/resync/protocol/data-loss counters;
-- scanner counts and latency distribution/rolling measurements;
-- raw bytes versus cap and disk-space evidence.
+- UTC emission time;
+- monotonic epoch and nanoseconds;
+- `capture_healthy`, `research_eligible`, `gate1_eligible_so_far` and sticky reason history;
+- socket state/frame age;
+- per-book health/generation/freshness/references;
+- reported-top transition state;
+- ingress/journal/analytical/health-writer queues and failures;
+- HTTP and audit evidence;
+- scanner counts/latency/T_obs;
+- reconnect/resync/protocol/loss counts;
+- raw cap/free disk;
+- CPU, current RSS and peak RSS.
 
-The health writer is derived diagnostic evidence. Its failure cannot block raw acquisition, but it prevents an automatic Gate-1 pass until the evidence deficiency is reviewed.
+Chronology validation uses monotonic evidence. UTC is retained for external correlation.
 
-## 10. Hard fail conditions
+Health-writer failure may not block raw capture but prevents automatic Gate-1 pass.
 
-The six-hour run cannot automatically pass Gate 1 if any of the following occurs:
+## 11. Typed availability interval ledger
 
-- bounded ingress overflow or `BACKPRESSURE_DATA_LOSS`;
-- raw journal write/durability/seal/verification failure;
+Every unavailable interval must have a versioned record with:
+
+- interval/run/socket/connection identity;
+- start/end UTC;
+- start/end monotonic epoch/ns;
+- duration;
+- typed initiating cause and source evidence;
+- affected scope;
+- external/protocol/audit/resync/resource/planned classification;
+- recovery/resnapshot result;
+- restored eligibility state;
+- open-at-shutdown status.
+
+Interval records must reconcile exactly with aggregate unavailable counters. Missing causality or chronology makes the corresponding Gate requirement `UNKNOWN`, not `PASS`.
+
+Routine audits cannot be labeled as socket downtime.
+
+## 12. Hard fail conditions
+
+The run cannot pass if any occurs:
+
+- ingress overflow or `BACKPRESSURE_DATA_LOSS`;
+- journal write/durability/seal/verification failure;
 - non-contiguous authoritative ingest sequence;
-- unsupported/malformed public schema that affects required state;
-- silently dropped required event;
-- unresolved race-free REST audit mismatch;
-- an audit classified before all WebSocket frames through its response-boundary watermark have crossed the canonical durability/processing barrier;
-- an audit falsely classified despite a crossed race fence;
-- analytical writer failure/rejection/saturation that prevents a healthy original derived completion;
-- raw or analytical completion-head inconsistency;
-- deterministic replay mismatch;
-- raw/derived data validation error;
-- violation of exact arithmetic, provenance, reference, or book-health invariants;
+- required schema failure;
+- silent required-event loss;
+- unresolved race-free REST mismatch;
+- false/early audit classification;
+- unresolved/expired reported-top transition accepted for audit/research;
+- book/arithmetic/provenance/reference invariant violation;
+- analytical writer failure/rejection/saturation preventing healthy completion;
+- raw/analytical completion inconsistency;
+- replay or rebuild mismatch;
+- data-validation error;
+- required scan report failing existing resource bounds;
 - safety/resource bound breach;
-- accidental live/authentication/mutation capability;
-- planned WebSocket downtime created solely by routine integrity audits;
-- process termination before the requested duration, except a correctly handled target lifecycle termination that is explicitly reviewed and normally requires a replacement run.
+- accidental live/auth/mutation capability;
+- planned WS downtime from routine audits;
+- premature termination except reviewed lifecycle termination;
+- missing/invalid periodic health evidence;
+- missing/irreconcilable required availability interval evidence.
 
-A real external disconnect is not itself equivalent to an internal correctness failure if it is explicit, correctly invalidates state, resynchronizes, and its missing interval remains in coverage evidence. It must still be reported and assessed before Gate-1 acceptance.
+A real external disconnect is not automatically an internal correctness failure if explicit, fail-closed, correctly recovered and transparently represented. It still requires review.
 
-## 11. Required quantitative report
+## 13. Required quantitative report
 
-Report at least:
-
-### Coverage and data quality
+### Coverage/data quality
 
 - requested/actual duration;
-- WebSocket connected/unavailable time and longest unavailable interval;
-- received/admitted/durable raw records;
-- raw bytes and segment count;
-- canonical events by type;
-- parse/schema failures;
-- book invalidation/resync counts and durations;
+- connected/unavailable time and interval ledger;
+- records/bytes/segments;
+- canonical events;
+- schema failures;
+- invalidation/resync;
 - reference changes;
-- audit outcomes and retry counts;
-- protocol deviations;
-- explicit missing/unavailable intervals.
+- audit outcomes/retries;
+- transition outcomes;
+- protocol deviations/missing intervals.
 
-### Performance
+### Performance/resources
 
-- receive → application ingress p50/p95/p99/max;
-- ingress dwell p50/p95/p99/max;
-- receive → durable p50/p95/p99/max;
-- decode/normalize/book update where measured;
-- scanner latency by quiet/apparent-edge/worst relevant class;
-- `T_obs` receive → scan complete p50/p95/p99/max;
-- events/s and scans/s;
-- journal durability-group distribution;
-- CPU and peak RSS;
-- queue high-water records/bytes;
-- analytical throughput/flush metrics;
-- disk growth and I/O evidence.
-
-Performance evidence must be interpreted as observation-path performance, not future order-send/fill latency.
+- receive→ingress, ingress dwell, receive→durable;
+- decode/normalize/book update;
+- scanner/T_obs;
+- audit latency/barrier lag;
+- events/scans per second;
+- journal groups/fsyncs;
+- CPU;
+- current/peak RSS and slope;
+- queue HWMs;
+- disk growth;
+- incremental scan-report latency/peak memory.
 
 ### Opportunity research
 
-- scans by disposition;
-- candidate and validated `BOOK_UPPER_BOUND` counts;
-- unique lifecycle counts;
-- capacity distributions;
-- edge distributions;
-- opportunity lifetime/duration where observable;
-- concentration by time/market state;
-- count and share blocked by stale/invalid/reference/cost conditions.
+- scans/dispositions;
+- candidates/validated BOOK_UPPER_BOUND;
+- lifecycles;
+- edge/capacity/duration;
+- blocked reasons.
 
-Do not convert `BOOK_UPPER_BOUND` into an executable-profit claim.
+Do not claim executable or realized profit.
 
-## 12. Replay and rebuild acceptance
+## 14. Replay, rebuild and report acceptance
 
-After the observer exits cleanly:
+After clean exit:
 
-1. verify the raw completion head and exact segment inventory;
-2. run full `mma validate-data` over the authoritative output;
-3. replay the run twice independently through the production canonical/scanner path;
-4. require byte/semantic deterministic replay evidence and identical terminal hashes;
-5. rebuild analytical datasets from the completed raw run into a fresh destination;
-6. validate the rebuild;
-7. bind the rebuild to the exact source journal completion;
-8. compare the expected deterministic identities allowed by the rebuild contract;
-9. confirm the raw inventory did not change during replay/rebuild/validation.
+1. validate raw and original analytical data;
+2. replay twice independently;
+3. require deterministic terminal/state/scan/audit/transition identities;
+4. rebuild analytical datasets into fresh destination;
+5. validate rebuild;
+6. run bounded incremental scan report on original and rebuild;
+7. compare deterministic semantic content;
+8. prove raw inventory unchanged.
 
-Any mismatch blocks Gate 1.
+Any mismatch or required reporting failure blocks Gate 1.
 
-## 13. Security and no-live seal
+## 15. Security/no-live seal
 
-Repeat the negative-capability audit on the exact soak commit. Phase 1 remains structurally incapable of authenticated venue mutation, order placement/cancel, balance/position mutation, withdrawals, or loading trading credentials.
+Repeat the exact-SHA negative-capability audit. Phase 1 must remain structurally incapable of authenticated venue mutation, order placement/cancel, balances/positions mutation, withdrawals or trading credentials.
 
-## 14. Gate-1 decision
+## 16. Gate decision
 
-Gate 1 passes only after an independent review of the actual repository and six-hour artifacts confirms:
+Use exactly one:
 
-- all hard fail conditions are absent;
-- explicit external gaps are understood and correctly represented;
-- raw and derived evidence is valid;
-- replay/rebuild is deterministic;
-- measured performance/resource behavior is acceptable for proceeding to execution-simulation research;
-- no important methodological claim exceeds the evidence.
+```text
+GATE 1: PASS
+GATE 1: FAIL
+GATE 1: INCONCLUSIVE
+```
 
-A green process exit alone is not Gate-1 acceptance.
+`PASS` requires all hard-fail conditions absent and all required evidence complete. Missing critical evidence is `INCONCLUSIVE`; a hard failure is `FAIL`.
+
+A green process exit alone is insufficient.

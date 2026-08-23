@@ -4,37 +4,40 @@
 
 Observability must answer:
 
-1. Is the system healthy?
-2. What risk exists right now?
-3. What orders does the venue believe exist?
-4. Are internal and venue states reconciled?
-5. Why did the system trade or refuse to trade?
-6. Can an incident timeline be reconstructed?
+1. Is each scoped component healthy?
+2. Is authoritative capture trustworthy?
+3. Is research currently eligible?
+4. What unavailable intervals occurred and why?
+5. Why was an opportunity accepted or blocked?
+6. Can an incident timeline be reconstructed deterministically?
+7. For future live operation, what risk/orders/reconciliation state exists?
 
-## 2. Structured logs
+## 2. Structured records
 
-Logs are machine-readable structured records.
+Logs and evidence records are machine-readable.
 
-Required fields where relevant:
+Required identity where relevant:
 
 ```text
-timestamp
+UTC timestamp
+monotonic clock epoch
+monotonic timestamp
 severity
-service/runtime_role
-process_instance
-release_id
-config_hash
+runtime role/process instance
+release/Git commit
+config hash
+collector run
 venue
-strategy_id
 market/instrument
-plan_id
-order_intent_id
-venue_order_id
-event_type
-reason_code
+socket generation/connection
+strategy/opportunity/plan/order IDs
+record/event type
+reason code
 ```
 
-No secrets.
+No secrets or arbitrary headers.
+
+UTC supports external/operator correlation. Causal duration and ordering use monotonic evidence within one explicit epoch/run.
 
 ## 3. Metrics
 
@@ -45,117 +48,83 @@ feed_connected
 feed_message_rate
 book_health
 book_age
-sequence_gaps
+sequence_gaps where supported
 resyncs
 raw_journal_latency
-queue_depth
+queue_depth/high_water
 ```
 
-For the current Phase-1 Polymarket observer, the concrete data path also
-records socket generations/disconnects/reconnects/unavailable duration,
-resynchronizations, receive→ingress and ingress-dwell latency, raw
-receive→durable latency, journal group size/flush reason, queue depth/high-water
-and byte high-water, parse failures, healthy books, audit barrier lag and
-classification latency, typed audit outcomes/retries/exhaustion, scanner
-latency, and receive→scan-complete `T_obs`. Polymarket does not expose a proven
-sequence number; a zero sequence-gap counter must never be substituted for
-continuity evidence.
+Phase-1 Polymarket additionally records:
 
-Public HTTP metrics are bounded by fixed endpoint-class labels and include
-requests, attempts, first-attempt successes, retries, HTTP status class,
-timeouts, temporary network failures, throttle observations, `Retry-After`
-observations split into parsed/malformed dispositions, cumulative backoff,
-local rate-window waits, exhausted retry budget, final failure category,
-active-attempt high-water, and latency.
+- socket generations, disconnects, reconnects and unavailable time;
+- exact typed unavailable intervals;
+- receive→ingress, ingress dwell and receive→durable latency;
+- journal group/fsync behavior;
+- parse/protocol/invariant failures;
+- book and reported-top transition state;
+- audit barrier lag, outcome, retry and mismatch cause;
+- scanner latency and receive→scan `T_obs`;
+- current/peak RSS and host identity.
 
-### Execution
-```text
-plans_proposed
-plans_rejected
-orders_submitted
-orders_unknown
-order_ack_latency
-cancel_latency
-fills
-partial_fills
-rejects
-hedge_delay
-residual_exposure_age
-```
+Polymarket exposes no proven gap-free sequence; a zero sequence-gap counter is never continuity proof.
 
-### Risk
-```text
-risk_limit_utilization
-capital_reserved
-gross_exposure
-net_delta
-worst_case_settlement_loss
-margin_headroom
-liquidation_distance
-kill_switch_level
-```
+### Public HTTP
 
-### Reconciliation/accounting
-```text
-last_reconciliation_age
-reconciliation_discrepancies
-unresolved_unknown_commands
-ledger_balance_errors
-venue_ledger_delta
-```
+Bounded endpoint-class labels:
+
+- requests/attempts;
+- first-attempt successes;
+- retries/status classes;
+- timeouts/network failures;
+- throttle/Retry-After;
+- backoff/rate-window waits;
+- exhausted budget/final failure;
+- active-attempt HWM;
+- latency.
+
+### Future execution/risk/reconciliation
+
+Retain the existing planned metrics for plans, orders, unknown mutations, acknowledgements, fills, partial fills, hedge delay, residual exposure, reservations, limits, reconciliation discrepancies, ledger errors and kill state.
 
 ### Host
+
 ```text
-cpu
-memory
-disk_space
-disk_io_latency
-network_errors
-clock_offset
-process_restarts
+CPU model/logical cores
+CPU utilization/time
+current RSS
+peak RSS
+total memory
+disk space/I/O latency
+network errors
+clock quality
+process restarts
 ```
 
 ## 4. Histograms
 
-Latency metrics use histograms with p50/p95/p99.
+Latency uses p50/p95/p99/max. Average alone is insufficient.
 
-Average latency alone is insufficient.
+## 5. Causal tracing
 
-## 5. Tracing
-
-A correlation chain should connect:
+Stable IDs should connect:
 
 ```text
 market event
+→ raw durability
+→ canonical mutation
 → opportunity
-→ execution plan
-→ risk approval
-→ order intent
-→ venue command
-→ acknowledgement
-→ fill
-→ ledger entry
-→ reconciliation
+→ future plan/risk/intent
+→ venue command/ack/fill
+→ ledger/reconciliation
 ```
 
-A full distributed tracing stack is optional initially; stable IDs are mandatory.
+A distributed tracing stack is optional; stable causal identities are mandatory.
 
-## 6. Audit vs diagnostic logs
+## 6. Audit versus diagnostic evidence
 
-Audit log:
-- immutable control/economic actions;
-- longer retention;
-- stricter access.
+Audit evidence is immutable, retained longer and access-controlled. Diagnostic logs may be rotated more aggressively. Do not conflate them.
 
-Diagnostic log:
-- operational troubleshooting;
-- may be rotated more aggressively.
-
-Do not conflate them.
-
-## 7. Health states
-
-System/venue component health:
+## 7. Scoped health states
 
 ```text
 HEALTHY
@@ -168,22 +137,24 @@ PAUSED
 UNSAFE
 ```
 
-Health is scoped. A healthy process does not imply healthy market data, persistence, research eligibility, risk authority, or future live readiness.
+A healthy process does not imply healthy capture, books, persistence, research, risk authority or future live readiness.
 
-### Phase-1 Gate-1 health evidence
+## 8. Gate-1 health checkpoint v2
 
-For the Phase-1 six-hour Polymarket soak, a final summary alone is insufficient.
-The observer emits `gate1-health-checkpoint-v1` JSONL records at the configured
-ten-second cadence and at finalization. This benchmark-selected bounded cadence
-satisfies the periodic-evidence requirements in
-[`GATE_1_SOAK_SPEC.md`](GATE_1_SOAK_SPEC.md) and
-[`ADR-0052`](adr/0052-continuous-capture-audit-and-gate1-evidence.md). Each
-record binds collector run, UTC timestamp, runtime role, full Git commit, code
-version, config hash, and the explicit requested/resolved target identity.
+The first soak's v1 checkpoints retained UTC but not the monotonic emission timestamp, making monotonic chronology unprovable. A rerun requires a new versioned schema.
 
-The schema contains these explicit groups:
+At minimum:
 
 ```text
+schema_version = gate1-health-checkpoint-v2
+collector_run_id
+emitted_at_utc_ns
+emitted_monotonic_epoch_id
+emitted_monotonic_ns
+runtime_role
+git_commit
+code_version
+config_hash
 target
 capture
 books[]
@@ -198,13 +169,7 @@ resources
 decisions
 ```
 
-Together they record the socket generation/connected state and last-frame age;
-per-book health, generation, age, and reference identity; record/byte queue
-depth and high-water/loss; journal durability watermark, group/fsync and writer
-health; analytical queue/rejection/failure state; endpoint-class HTTP retry and
-rate evidence; `MATCH`/`MISMATCH`/`RACED`/`FAILED` counts and integrity age;
-scan dispositions and latency/`T_obs`; reconnect/resync/protocol/data-loss
-state; and raw-cap, disk, CPU, and RSS evidence where safely available.
+Each book record includes health, generation, freshness, reference versions and any unresolved `ReportedTopTransition` identity/status/bounds.
 
 Each checkpoint distinguishes:
 
@@ -214,114 +179,95 @@ research_eligible
 gate1_eligible_so_far
 ```
 
-`capture_healthy` and `research_eligible` describe the current checkpoint;
-`gate1_eligible_so_far` is sticky for the run. `decisions.reason_codes` is the
-cumulative Gate-1 blocker history through that checkpoint, so a recovered
-current condition does not erase earlier disqualifying evidence. Stable reason
-codes distinguish target, socket/book, ingress, journal,
-analytical, health-evidence, HTTP-integrity, audit, protocol, raw-cap, and disk
-failures. These decisions are scoped: a derived analytical failure can leave
-capture evidence valid while blocking research, and a health-evidence failure
-can leave raw capture operating while making `gate1_eligible_so_far=false`.
-Cumulative audit and public-HTTP final-failure/retry-exhaustion counters remain
-typed reason history and permanently block automatic Gate-1 eligibility. While
-the dependent book/reference scope is unresolved, its current book or socket
-state also blocks current research; a later proven audit/resnapshot recovery may
-restore `research_eligible` without erasing those reasons or restoring
-`gate1_eligible_so_far`. The HTTP history is never mislabeled as raw-capture or
-WebSocket failure. A protocol deviation follows the same split: its immediate
-invalidation/disconnect fails current state closed, while a successful
-resnapshot and healthy new socket generation may restore current capture and
-research. The cumulative `PROTOCOL_DEVIATION` reason remains Gate-1-sticky.
-Ingress data loss and journal durability/write failures are not recoverable
-within the run and remain capture and research blockers.
+Gate-1 reason history is sticky. Recovery may restore current capture/research eligibility but does not erase a prior Gate blocker.
 
-The health writer has its own single owner and bounded queue. Producers use a
-non-blocking admission only; JSON serialization, append, and file `fsync` occur
-off the acquisition path. Count and file bytes are bounded. A run writes a
-`.jsonl.partial` file and publishes the completed `.jsonl` only after clean
-close and directory sync. Saturation, write failure, or bound exhaustion is
-retained in the final health summary and makes automatic Gate-1 evidence
-ineligible; it must not corrupt canonical state or be relabeled as raw-journal
-failure.
+The writer remains single-owner, bounded, supervised and non-blocking to acquisition. Serialization/write/fsync occurs off the capture path. Failure does not corrupt raw capture but blocks automatic Gate acceptance.
 
-Terminal evidence freezes one paired wall/monotonic capture cutoff before raw,
-analytical, resource, and health owners close. A stream-provided acquisition
-cutoff is reused; otherwise the terminal emitter materializes the pair exactly
-once. The final health checkpoint and `ObservationSummary` both reuse that
-same pair, so delayed durability/sealing cannot extend the reported capture
-duration or re-age socket/book state. If the initial resource attempt is still
-pending, the terminal path may await it only after freezing capture-owned state;
-the eventual resource sample or failure does not move the cutoff. A monotonic
-source timestamp later than the cutoff yields unknown age rather than a
-clamped zero-age value.
+The final checkpoint and final summary reuse one paired UTC/monotonic capture cutoff. Delayed durability or shutdown work must not extend the claimed observation duration.
 
-The periodic health producer is stopped at the acquisition cutoff, before any
-bounded post-cutoff audit drain. Responses whose exact bodies completed before
-the cutoff may still be durably classified and reflected in the one terminal
-checkpoint, but no periodic checkpoint may acquire a later timestamp and then
-precede the cutoff-stamped terminal record in the evidence stream.
+## 9. Availability interval ledger
 
-Routine REST integrity auditing must not be represented as a WebSocket
-disconnect. HTTP and WebSocket failures are separate operational dimensions,
-and audit HTTP failure does not create artificial socket downtime or reconnect
-counts. A successfully parsed WebSocket L2 freshness-gap invalidation is
-recorded as a resynchronization, not as a venue protocol deviation; malformed
-or unsupported WebSocket protocol input is a protocol deviation, immediately
-invalidates the affected state, and fails closed until successful recovery.
-Recovery does not erase its Gate-1-sticky reason. This is distinct from a
-replayable REST-audit eligibility expiry, which blocks the affected leg from
-research without inventing a socket disconnect.
-
-## 8. Alert routing
-
-Severity:
+A rerun requires a versioned typed interval record, conceptually:
 
 ```text
-CRITICAL
-HIGH
-MEDIUM
-LOW
-INFO
+AvailabilityInterval
+├── schema_version
+├── interval_id
+├── collector_run_id
+├── socket_generation
+├── connection_id
+├── started_at_utc_ns
+├── started_monotonic_epoch_id
+├── started_monotonic_ns
+├── ended_at_utc_ns
+├── ended_monotonic_epoch_id
+├── ended_monotonic_ns
+├── duration_ns
+├── cause_type
+├── reason_code
+├── source_evidence_ids
+├── affected_instruments
+├── recovery_action
+├── recovery_result
+├── research_eligibility_restored
+└── open_at_shutdown
 ```
 
-Critical alerts require immediate operator awareness.
+Cause types distinguish at least:
 
-At meaningful capital, use more than one independent alert path.
+- external connection/transport;
+- protocol/schema/invariant;
+- reported-top transition expiry;
+- audit mismatch/resynchronization;
+- backpressure/resource;
+- target lifecycle;
+- planned operator shutdown;
+- unknown.
 
-Provider selection remains operational/deployment-specific.
+Routine REST auditing is never classified as WebSocket downtime.
 
-## 9. Alert quality
+The interval ledger must reconcile exactly with aggregate interval count, unavailable duration and longest interval. Missing or contradictory interval evidence yields `UNKNOWN` for the affected Gate requirement.
 
-Avoid alert floods.
+## 10. Reported-top transition observability
 
-Alerts should:
-- deduplicate;
-- aggregate repeated conditions;
-- include actionable context;
-- clearly identify whether new risk is already blocked.
+Record:
 
-## 10. Dashboard priorities
+- started/converged/superseded/expired/invalidated counts;
+- target bid/ask identity;
+- frames and duration;
+- entry source type (`best_bid_ask`, recognized complete reported top, other rejected);
+- no-pending recognizer outcome;
+- affected audit/scanner eligibility;
+- recovery/resnapshot;
+- exact reason.
 
-If/when a dashboard is implemented, first panels are:
-- kill-switch state;
-- exposure;
-- venue/account health;
-- open/unknown orders;
-- reconciliation status;
-- residual leg exposure;
-- margin/liquidation;
-- data freshness;
-- current P&L and cost decomposition.
+Do not log full unbounded books for each transition. Preserve raw identity and bounded diagnostic context.
 
-Aesthetic dashboards are secondary.
+## 11. Audit mismatch diagnostics
 
-## 11. Retention
+Every `MISMATCH` remains in history after resync and is classified when possible as:
 
-Retention policy differs for:
-- audit logs;
-- raw research data;
-- metrics;
-- diagnostic logs.
+- reported-top transition;
+- true REST/local depth divergence;
+- freshness/deadline boundary;
+- reference/precision change;
+- local book defect;
+- unknown.
 
-Exact periods are set after storage/operational requirements are measured.
+Successful recovery does not convert a mismatch into a match.
+
+## 12. Long-run resource evidence
+
+Periodic evidence includes current and peak RSS. Analysis reports RSS slope, tails and queue HWMs over time rather than only terminal maxima.
+
+Run identity includes CPU model, logical CPU count and total memory. If unavailable, the run records explicit unknown rather than omitting the field silently.
+
+## 13. Alerting and dashboards
+
+Severity remains `CRITICAL/HIGH/MEDIUM/LOW/INFO`. Alerts should deduplicate, aggregate and show whether risk is already blocked.
+
+Future dashboard priority remains safety/exposure/venue health/orders/reconciliation/residual risk/margin/data freshness before aesthetics.
+
+## 14. Retention
+
+Retention differs for raw research data, audit/control evidence, health intervals/checkpoints, metrics and diagnostic logs. Exact periods follow measured storage/operational requirements.

@@ -4,7 +4,7 @@ Multi-venue quantitative arbitrage, market-making, and delta-neutral trading res
 
 **Initial venues:** Polymarket, Kalshi, Kraken  
 **Architecture:** Python modular monolith  
-**Current project state:** Phase 1 implementation complete; six-hour Gate-1 soak completed; independent artifact acceptance pending  
+**Current project state:** Phase-1 Gate-1 remediation after a failed first six-hour soak  
 **Live trading:** Structurally unavailable in Phase 1
 
 ## Engineering priorities
@@ -28,31 +28,43 @@ An apparent arbitrage is not treated as executable until data health, settlement
 - [`docs/INVARIANTS.md`](docs/INVARIANTS.md) — hard system invariants
 - [`docs/GLOSSARY.md`](docs/GLOSSARY.md) — canonical terminology
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — gate-driven path to controlled live deployment
-- [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) — staged engineering sequence and current gate
-- [`docs/PHASE_2_RESEARCH_AND_SPEC.md`](docs/PHASE_2_RESEARCH_AND_SPEC.md) — planning-only Kalshi/Kraken/semantic specification; implementation is blocked until Gate 1 passes
+- [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) — staged engineering sequence and current remediation
+- [`docs/GATE_1_FAILURE_20260822.md`](docs/GATE_1_FAILURE_20260822.md) — evidence summary for the failed first six-hour soak
+- [`docs/GATE_1_REMEDIATION_SPEC.md`](docs/GATE_1_REMEDIATION_SPEC.md) — normative correction and rerun requirements
+- [`docs/GATE_1_SOAK_SPEC.md`](docs/GATE_1_SOAK_SPEC.md) — unchanged Gate-1 acceptance contract
+- [`docs/PHASE_2_RESEARCH_AND_SPEC.md`](docs/PHASE_2_RESEARCH_AND_SPEC.md) — planning-only multi-venue/semantic specification; production work remains blocked
 - [`docs/EXTERNAL_REFERENCE_BACKLOG.md`](docs/EXTERNAL_REFERENCE_BACKLOG.md) — non-normative external systems, strategy priorities, and future ADR candidates
-- [`docs/CODEX_PHASE_1_SPEC.md`](docs/CODEX_PHASE_1_SPEC.md) — Phase 1 implementation scope
-- [`docs/GATE_1_SOAK_SPEC.md`](docs/GATE_1_SOAK_SPEC.md) — normative six-hour soak acceptance contract
-- [`docs/PHASE_1_PERFORMANCE_BASELINE.md`](docs/PHASE_1_PERFORMANCE_BASELINE.md) — measured Phase 1 performance evidence
 - [`docs/ADR_INDEX.md`](docs/ADR_INDEX.md) — architecture decision index
 
 Historical pass reports and adversarial reviews live under `docs/design_freeze/`. They are audit evidence, not current implementation authority.
 
 ## Current gate
 
-The six-hour Polymarket soak was executed from accepted implementation commit:
+The first six-hour Polymarket soak ran from:
 
 ```text
 a382b93220011428703fe02483f7034f59c1f045
 ```
 
-Gate 1 remains **pending** until the completed artifacts pass the independent validation, dual-replay, analytical-rebuild, raw-immutability, health-evidence, hard-fail, and no-live-capability review defined in `GATE_1_SOAK_SPEC.md`.
+The independent artifact review returned:
 
-Phase 2 research and specification may proceed in parallel. Production Kalshi/Kraken code must not be promoted or merged until Gate 1 is accepted.
+```text
+GATE 1: FAIL
+```
+
+The raw journal, dual replay, analytical rebuild, raw immutability and no-live boundary passed. Gate 1 failed because:
+
+- four primary deterministic book-invariant violations exposed incomplete multi-frame reported-top transition handling;
+- `scan-report` attempted to materialize approximately 819.6 MiB against the valid 512 MiB bound;
+- monotonic checkpoint chronology and typed per-interval availability causality were not retained completely.
+
+The failure dataset is preserved as a permanent regression corpus. A fresh six-hour soak is mandatory after ADR-0053 and `GATE_1_REMEDIATION_SPEC.md` are implemented, the failed raw run replays cleanly, bounded reporting succeeds, and a new smoke plus 30–60 minute stability run pass.
+
+Phase-2 research may continue in parallel. Production Kalshi, Kraken, semantic-engine, paper/shadow or live implementation must not be merged or promoted until Gate 1 receives an accepted `PASS`.
 
 ## Phase 1 development
 
-The reproducible implementation baseline is ordinary-GIL CPython 3.14.7 with `uv==0.12.5`, exact direct dependency pins, and a committed transitive lock:
+The reproducible baseline is ordinary-GIL CPython 3.14.7 with `uv==0.12.5`, exact direct dependency pins, and a committed transitive lock:
 
 ```bash
 uv python install
@@ -61,7 +73,7 @@ uv sync --frozen --all-groups
 uv run --frozen --all-groups mma --help
 ```
 
-The focused public/read-only commands are:
+The public/read-only commands include:
 
 ```bash
 uv run --frozen --all-groups mma observe polymarket --gamma-market-id <id> --duration 30 --config config/phase1.toml
@@ -72,9 +84,7 @@ uv run --frozen --all-groups mma validate-data data
 uv run --frozen --all-groups mma scan-report data/analytical
 ```
 
-Gate-1 evidence requires `--gamma-market-id`; the resolved Gamma, condition, event-where-applicable, YES/NO token, reference-version, and semantic identities are frozen into the run evidence. Omitting the flag retains bounded discovery only for developer smoke work and is explicitly ineligible for Gate 1.
-
-See [`docs/PHASE_1_IMPLEMENTATION.md`](docs/PHASE_1_IMPLEMENTATION.md) for configuration, validation, storage, replay, official protocol evidence, and the explicit Phase 1 safety boundary.
+See [`docs/PHASE_1_IMPLEMENTATION.md`](docs/PHASE_1_IMPLEMENTATION.md) for current implementation behavior. It must be refreshed after remediation so it describes the corrected code rather than intended behavior.
 
 ## Repository policy
 

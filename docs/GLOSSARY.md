@@ -41,6 +41,14 @@ CLOSED
 UNAVAILABLE
 ```
 
+## ReportedTopTransition
+Bounded auxiliary state defined by ADR-0053 for a book whose exact quantity-bearing L2 has not yet converged to a complete venue-reported best bid/ask during an evidence-backed multi-frame transition.
+
+It is not a `BookHealth` value and does not make the book healthy. While unresolved, exact valid L2/provenance may be retained, but audit, scanner and research eligibility remain blocked. The transition clears only by exact convergence, authoritative snapshot/resnapshot or deterministic supersession; ambiguity/bound expiry fails closed.
+
+## AvailabilityInterval
+Versioned evidence record for one period during which required observation continuity was unavailable or indeterminate. It binds UTC and monotonic start/end, socket/connection identity, typed cause, affected scope and recovery outcome. Aggregate unavailable counters must reconcile with the interval ledger.
+
 ## ComponentHealth
 Operational health of a component:
 
@@ -103,6 +111,9 @@ UNPARSEABLE
 
 `PROVEN_EQUIVALENT` is historical terminology and is not a current enum.
 
+## OutcomePartition
+Versioned proof object for a set of outcomes/contracts whose exact membership, mutual exclusivity, exhaustiveness, payout, cancellation and exceptional terminal states are established. Venue grouping or title similarity does not establish a partition.
+
 ## CostRuleSet
 Versioned rule set that determines applicable fees, rebates, funding, or related costs under a `CostContext`.
 
@@ -120,8 +131,6 @@ Immutable exact set of state/reference/semantic versions used to evaluate an opp
 
 ## Economic layers
 
-Current canonical names:
-
 ```text
 THEORETICAL
 BOOK_UPPER_BOUND
@@ -130,7 +139,7 @@ SHADOW_SIMULATED
 LIVE_REALIZED
 ```
 
-`BOOK_EXECUTABLE` and `paper_realized` are historical terminology and are not used in new code.
+`BOOK_EXECUTABLE` and `paper_realized` are historical terminology.
 
 ## BOOK_UPPER_BOUND
 Full-depth, precision/cost-aware aggressive execution upper bound evaluated at the observation snapshot under zero decision/network latency. It is not proof of future fill.
@@ -172,4 +181,4 @@ LIVE
 `OBSERVATION_ONLY` is a historical phase description, not a current runtime enum.
 
 ## CANCELED spelling
-Canonical enums use `CANCELED` (single `L`) for consistency with order-state terminology. Historical documents may contain `CANCELLED`.
+Canonical enums use `CANCELED` (single `L`). Historical documents may contain `CANCELLED`.
