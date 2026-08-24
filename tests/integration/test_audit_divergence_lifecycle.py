@@ -21,11 +21,13 @@ from multi_market_arbitrage.core.time import MonotonicTimestamp, UtcTimestamp
 from multi_market_arbitrage.journal import JournalReader
 from multi_market_arbitrage.observability import (
     AvailabilityCause,
+    AvailabilityIntervalContribution,
     AvailabilityRecoveryAction,
     AvailabilityRecoveryOutcome,
     AvailabilityScope,
     HealthDecisionReason,
     SupervisedAvailabilityIntervalWriter,
+    health_decision_reasons_from_mask,
 )
 from multi_market_arbitrage.observability.availability import AvailabilityInterval
 from multi_market_arbitrage.pipeline import observe as observe_module
@@ -58,6 +60,16 @@ from multi_market_arbitrage.venues.polymarket import (
 from multi_market_arbitrage.venues.polymarket.schemas import parse_gamma_markets
 
 FIXTURES = Path(__file__).parents[1] / "golden" / "fixtures"
+
+
+def _record_decision_reasons(
+    record: dict[str, object],
+    *,
+    sticky: bool = False,
+) -> tuple[HealthDecisionReason, ...]:
+    decisions = cast(dict[str, object], record["decisions"])
+    key = "gate1_sticky_reason_mask" if sticky else "reason_mask"
+    return health_decision_reasons_from_mask(cast(int, decisions[key]))
 
 
 def _fixture(name: str) -> bytes:
@@ -100,10 +112,23 @@ def _divergent_yes_payload() -> bytes:
     return _canonical_bytes(payload)
 
 
-def _replacement_ws_book_payload(asset_id: str) -> bytes:
+def _divergent_no_payload() -> bytes:
+    payload = cast(dict[str, object], json.loads(_no_book_payload()))
+    bids = cast(list[dict[str, object]], payload["bids"])
+    bids[0]["size"] = "21"
+    payload["hash"] = "opaque-divergent-rest-hash-no"
+    payload["timestamp"] = "1787198401124"
+    return _canonical_bytes(payload)
+
+
+def _replacement_ws_book_payload(asset_id: str, *, divergent_no: bool = False) -> bytes:
     rest = cast(
         dict[str, object],
-        json.loads(_divergent_yes_payload() if asset_id == "token-yes" else _no_book_payload()),
+        json.loads(
+            _divergent_yes_payload()
+            if asset_id == "token-yes"
+            else (_divergent_no_payload() if divergent_no else _no_book_payload())
+        ),
     )
     return _canonical_bytes(
         {
@@ -268,6 +293,7 @@ class _LifecycleSocket:
     final_snapshot_preservation_started: ClassVar[asyncio.Event | None] = None
     sibling_bbo_admitted: ClassVar[asyncio.Event | None] = None
     sibling_transition_processed: ClassVar[asyncio.Event | None] = None
+    first_generation_cancel_delay_seconds: ClassVar[float] = 0.0
 
     def __init__(self, asset_ids: tuple[str, ...], **kwargs: object) -> None:
         assert asset_ids == ("token-yes", "token-no")
@@ -303,7 +329,10 @@ class _LifecycleSocket:
                 await asyncio.sleep(type(self).replacement_sibling_delay_seconds)
                 admit(
                     ReceivedWebSocketMessage(
-                        payload_bytes=_replacement_ws_book_payload("token-no"),
+                        payload_bytes=_replacement_ws_book_payload(
+                            "token-no",
+                            divergent_no=_LifecyclePublicClient.diverge_both,
+                        ),
                         received_wall_time=UtcTimestamp.now(),
                         received_monotonic_ns=time.monotonic_ns(),
                         message_type="TEXT",
@@ -334,7 +363,10 @@ class _LifecycleSocket:
                     await sibling_transition_processed.wait()
                     admit(
                         ReceivedWebSocketMessage(
-                            payload_bytes=_replacement_ws_book_payload("token-no"),
+                            payload_bytes=_replacement_ws_book_payload(
+                                "token-no",
+                                divergent_no=_LifecyclePublicClient.diverge_both,
+                            ),
                             received_wall_time=UtcTimestamp.now(),
                             received_monotonic_ns=time.monotonic_ns(),
                             message_type="TEXT",
@@ -347,6 +379,10 @@ class _LifecycleSocket:
                     await allow_replacement_end.wait()
                     return
             await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if self.generation == 1:
+                await asyncio.sleep(type(self).first_generation_cancel_delay_seconds)
+            raise
         finally:
             self.stopped = True
             if self.generation == 2:
@@ -358,6 +394,7 @@ class _LifecycleSocket:
 
 class _LifecyclePublicClient:
     fail_resnapshot: ClassVar[bool] = False
+    diverge_both: ClassVar[bool] = False
     latest: ClassVar[_LifecyclePublicClient | None] = None
 
     def __init__(self, **kwargs: object) -> None:
@@ -390,7 +427,11 @@ class _LifecyclePublicClient:
     ) -> PublicReadResult:
         del deadline
         self.audit_calls.append(asset_id)
-        payload = _divergent_yes_payload() if asset_id == "token-yes" else _no_book_payload()
+        payload = (
+            _divergent_yes_payload()
+            if asset_id == "token-yes"
+            else (_divergent_no_payload() if type(self).diverge_both else _no_book_payload())
+        )
         return _public_read(payload, on_response_body_complete)
 
     async def fetch_gamma_market_raw(
@@ -442,24 +483,41 @@ class _LifecyclePublicClient:
                 attempt=1,
                 detail="injected authoritative resnapshot failure",
             )
-        return _divergent_yes_payload() if asset_id == "token-yes" else _no_book_payload()
+        return (
+            _divergent_yes_payload()
+            if asset_id == "token-yes"
+            else (_divergent_no_payload() if type(self).diverge_both else _no_book_payload())
+        )
 
 
 def _configured_service(
     tmp_path: Path,
     *,
     maximum_book_age_seconds: float | None = None,
+    max_reconnect_attempts: int | None = None,
 ) -> PolymarketObservationService:
     source_commit = _initialize_clean_source(tmp_path)
     config = load_phase1_config(Path("config/phase1.toml"))
     config = config.model_copy(
         update={
-            "health": config.health.model_copy(update={"checkpoint_interval_seconds": 0.01}),
+            # Twenty hertz preserves several checkpoints in the shortest
+            # causal path without overwhelming the bounded evidence writer on
+            # NTFS-backed WSL temporary directories during longer regressions.
+            "health": config.health.model_copy(update={"checkpoint_interval_seconds": 0.05}),
             "polymarket": config.polymarket.model_copy(
                 update={
-                    "snapshot_audit_freshness_guard_seconds": 0.01,
+                    # Keep the audit launch guard large enough to dominate the
+                    # fixture's real journal/staging latency.  A 10 ms guard
+                    # made cutoff behavior depend on host load and could stage
+                    # a synthetic RUN_ENDED pair immediately before shutdown.
+                    "snapshot_audit_freshness_guard_seconds": 0.15,
                     "snapshot_audit_interval_seconds": 0.12,
                     "snapshot_audit_race_retry_quiet_seconds": 0.005,
+                    "max_reconnect_attempts": (
+                        config.polymarket.max_reconnect_attempts
+                        if max_reconnect_attempts is None
+                        else max_reconnect_attempts
+                    ),
                 }
             ),
             "scanner": (
@@ -501,8 +559,10 @@ def _prepare_runtime(
     _LifecycleSocket.final_snapshot_preservation_started = asyncio.Event()
     _LifecycleSocket.sibling_bbo_admitted = asyncio.Event()
     _LifecycleSocket.sibling_transition_processed = asyncio.Event()
+    _LifecycleSocket.first_generation_cancel_delay_seconds = 0.0
     _LifecyclePublicClient.latest = None
     _LifecyclePublicClient.fail_resnapshot = fail_resnapshot
+    _LifecyclePublicClient.diverge_both = False
     monkeypatch.setattr(observe_module, "PolymarketPublicClient", _LifecyclePublicClient)
     monkeypatch.setattr(observe_module, "PolymarketMarketWebSocket", _LifecycleSocket)
     monkeypatch.setattr(
@@ -510,6 +570,159 @@ def _prepare_runtime(
         "_bootstrap_explicit",
         _bootstrap_fixture,
     )
+
+
+@pytest.mark.asyncio
+async def test_paired_response_is_classified_before_slow_mismatch_socket_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mismatch recovery cannot delay an already-received sibling response."""
+
+    maximum_book_age_seconds = 2.0
+    service = _configured_service(
+        tmp_path,
+        maximum_book_age_seconds=maximum_book_age_seconds,
+    )
+    _prepare_runtime(monkeypatch, fail_resnapshot=False)
+    # Preserve the discriminating condition: awaiting generation cleanup would
+    # carry the already-received sibling response past its hard expiry.
+    _LifecycleSocket.first_generation_cancel_delay_seconds = maximum_book_age_seconds + 0.1
+
+    summary = await service.run(duration_seconds=5.0, gamma_market_id="101")
+
+    first_generation_outcomes = tuple(
+        outcome
+        for outcome in summary.processor.audit_outcomes
+        if outcome.connection_id.value == summary.processor.audit_outcomes[0].connection_id.value
+    )
+    assert len(first_generation_outcomes) == 2
+    assert tuple(outcome.outcome.value for outcome in first_generation_outcomes) == (
+        "MISMATCH",
+        "MATCH",
+    )
+    assert all(outcome.reason is None for outcome in first_generation_outcomes)
+    records = JournalReader(
+        summary.journal_root,
+        summary.collector_run_id,
+    ).read_all()
+    first_request_ids = {outcome.request_id for outcome in first_generation_outcomes}
+    classifications = tuple(
+        cast(dict[str, object], json.loads(record.payload_bytes))
+        for record in records
+        if record.channel == "mma.control.rest-audit-classify.v1"
+        and cast(dict[str, object], json.loads(record.payload_bytes))["request_id"]
+        in first_request_ids
+    )
+    assert len(classifications) == 2
+    assert all(
+        cast(int, item["classification_monotonic_ns"]) < cast(int, item["hard_expiry_monotonic_ns"])
+        for item in classifications
+    )
+    assert summary.runtime_health.availability_contributions_emitted >= 1
+
+
+@pytest.mark.asyncio
+async def test_paired_mismatches_create_two_direct_contributions_and_two_captures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both explicit binary legs can diverge in one cycle under one union interval."""
+
+    service = _configured_service(tmp_path)
+    _prepare_runtime(monkeypatch, fail_resnapshot=False)
+    _LifecyclePublicClient.diverge_both = True
+    first_replacement_processed = _LifecycleSocket.first_replacement_processed
+    assert first_replacement_processed is not None
+    first_replacement_processed.set()
+    capture_states: list[tuple[str, int, int]] = []
+    original_preserve = observe_module._RawCaptureBoundary.preserve_then_process  # pyright: ignore[reportPrivateUsage]
+
+    async def observe_two_capture_authorities(
+        capture: observe_module._RawCaptureBoundary,  # pyright: ignore[reportPrivateUsage]
+        *,
+        channel: str,
+        payload: bytes,
+        transport_type: str,
+        semantics_hash: str,
+        connection_id: ConnectionId | None = None,
+        subscription_id: SubscriptionId | None = None,
+        transport_metadata: dict[str, str | int | bool] | None = None,
+        received_wall_time: UtcTimestamp | None = None,
+        received_monotonic_ns: int | None = None,
+    ) -> ProcessedEnvelope:
+        recovery_active = bool(capture.processor.audit_divergence_pending_records)
+        result = await original_preserve(
+            capture,
+            channel=channel,
+            payload=payload,
+            transport_type=transport_type,
+            semantics_hash=semantics_hash,
+            connection_id=connection_id,
+            subscription_id=subscription_id,
+            transport_metadata=transport_metadata,
+            received_wall_time=received_wall_time,
+            received_monotonic_ns=received_monotonic_ns,
+        )
+        if channel == REST_BOOK and recovery_active:
+            native_asset_id = cast(dict[str, object], json.loads(payload))["asset_id"]
+            assert isinstance(native_asset_id, str)
+            capture_states.append(
+                (
+                    native_asset_id,
+                    capture.processor.audit_replacement_captures_pending,
+                    len(capture.processor.audit_divergence_pending_records),
+                )
+            )
+        return result
+
+    monkeypatch.setattr(
+        observe_module._RawCaptureBoundary,  # pyright: ignore[reportPrivateUsage]
+        "preserve_then_process",
+        observe_two_capture_authorities,
+    )
+
+    summary = await service.run(duration_seconds=3.0, gamma_market_id="101")
+
+    first_connection = summary.processor.audit_outcomes[0].connection_id
+    first_generation_outcomes = tuple(
+        outcome
+        for outcome in summary.processor.audit_outcomes
+        if outcome.connection_id == first_connection
+    )
+    assert tuple(outcome.outcome.value for outcome in first_generation_outcomes) == (
+        "MISMATCH",
+        "MISMATCH",
+    )
+    assert capture_states == [
+        ("token-yes", 1, 1),
+        ("token-no", 2, 0),
+    ]
+    assert summary.processor.audit_divergences_observed == 2
+    assert summary.processor.audit_divergences_resolved_by_authoritative_resnapshot == 2
+    assert summary.processor.audit_divergences_pending == 0
+    assert summary.processor.audit_replacement_captures_pending == 0
+    assert summary.processor.audit_divergence_lifecycle_reconciled
+    assert summary.runtime_health.unavailable_intervals == 1
+    assert summary.runtime_health.availability_contributions_emitted == 2
+    contribution_path = summary.availability_evidence.contribution_path
+    assert contribution_path is not None
+    contributions = tuple(
+        cast(dict[str, object], json.loads(line))
+        for line in contribution_path.read_text(encoding="utf-8").splitlines()
+    )
+    assert len(contributions) == 2
+    assert len({item["interval_id"] for item in contributions}) == 1
+    assert len({item["request_id"] for item in contributions}) == 2
+    assert len({item["divergence_id"] for item in contributions}) == 2
+    assert {item["instrument_id"] for item in contributions} == {
+        outcome.starting_book.instrument_id.value for outcome in first_generation_outcomes
+    }
+    assert sum(cast(bool, item["initiating_contributor"]) for item in contributions) == 1
+    assert all(
+        item["recovery_outcome"] == AvailabilityRecoveryOutcome.RESTORED for item in contributions
+    )
+    assert summary.health_decision.gate1_eligible_so_far
 
 
 @pytest.mark.asyncio
@@ -521,7 +734,9 @@ async def test_observed_divergence_resnapshot_replacement_generation_restores_cu
     _prepare_runtime(
         monkeypatch,
         fail_resnapshot=False,
-        replacement_sibling_delay_seconds=0.15,
+        # Hold replacement capture across several 120 ms audit periods so the
+        # launch-suppression assertion is independent of journal/fsync speed.
+        replacement_sibling_delay_seconds=0.4,
     )
     recovery_states: list[tuple[str, int, tuple[str, ...]]] = []
     replacement_states: list[tuple[str, int, tuple[str, ...]]] = []
@@ -627,7 +842,7 @@ async def test_observed_divergence_resnapshot_replacement_generation_restores_cu
         observe_replacement_snapshots,
     )
 
-    summary = await service.run(duration_seconds=0.6, gamma_market_id="101")
+    summary = await service.run(duration_seconds=3.0, gamma_market_id="101")
 
     client = _LifecyclePublicClient.latest
     assert client is not None
@@ -675,7 +890,7 @@ async def test_observed_divergence_resnapshot_replacement_generation_restores_cu
     )
 
     interval = json.loads(summary.availability_evidence.path.read_text(encoding="utf-8"))
-    assert interval["cause_type"] == AvailabilityCause.AUDIT_MISMATCH_RESYNCHRONIZATION
+    assert interval["cause_type"] == AvailabilityCause.AUDIT_MISMATCH_RECOVERY
     assert interval["reason_code"] == "REST_AUDIT_MISMATCH"
     assert interval["recovery_action"] == AvailabilityRecoveryAction.RESNAPSHOT
     assert interval["recovery_outcome"] == AvailabilityRecoveryOutcome.RESTORED
@@ -698,7 +913,7 @@ async def test_observed_divergence_resnapshot_replacement_generation_restores_cu
     assert final_checkpoint["decisions"]["capture_healthy"] is True
     assert final_checkpoint["decisions"]["research_eligible"] is True
     assert final_checkpoint["decisions"]["gate1_eligible_so_far"] is True
-    assert final_checkpoint["decisions"]["reason_codes"] == []
+    assert _record_decision_reasons(final_checkpoint) == ()
     assert summary.status is ComponentHealth.HEALTHY
     assert summary.health_decision.capture_healthy
     assert summary.health_decision.research_eligible
@@ -858,7 +1073,9 @@ async def test_sibling_reported_top_blocks_release_until_authoritative_reconcili
         observe_sibling_overlap,
     )
 
-    summary = await service.run(duration_seconds=0.7, gamma_market_id="101")
+    # Give the fixture's event-driven second generation enough acquisition
+    # time even when the preceding tests leave the host under I/O pressure.
+    summary = await service.run(duration_seconds=3.0, gamma_market_id="101")
 
     assert overlap_scan_counts == [0]
     assert summary.processor.audit_replacement_captures_pending == 0
@@ -920,7 +1137,10 @@ async def test_stale_first_replacement_snapshot_cannot_close_recovery_interval(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    maximum_book_age_seconds = 0.2
+    # The same age bound governs the initial durable audit protocol and the
+    # replacement pair. One second leaves deterministic NTFS/fsync headroom;
+    # the event-gated sibling delay below still proves replacement staleness.
+    maximum_book_age_seconds = 1.0
     service = _configured_service(
         tmp_path,
         maximum_book_age_seconds=maximum_book_age_seconds,
@@ -970,7 +1190,7 @@ async def test_stale_first_replacement_snapshot_cannot_close_recovery_interval(
         signal_first_replacement_processed,
     )
 
-    summary = await service.run(duration_seconds=0.8, gamma_market_id="101")
+    summary = await service.run(duration_seconds=3.0, gamma_market_id="101")
 
     assert processed_replacement_assets == ["token-yes", "token-no"]
     processor = summary.processor
@@ -979,6 +1199,42 @@ async def test_stale_first_replacement_snapshot_cannot_close_recovery_interval(
     assert processor.audit_divergences_pending == 0
     assert processor.audit_replacement_captures_pending == 1
     assert processor.audit_ineligible_books == 1
+
+    raw_records = JournalReader(summary.journal_root, summary.collector_run_id).read_all()
+    assert len(processor.audit_divergence_resolution_records) == 1
+    resolution = processor.audit_divergence_resolution_records[0]
+    authoritative_index = next(
+        index
+        for index, record in enumerate(raw_records)
+        if record.ingest_id == resolution.authoritative_snapshot_source.ingest_id
+    )
+    replacement_records = tuple(
+        (index, record, cast(dict[str, object], json.loads(record.payload_bytes)))
+        for index, record in enumerate(raw_records)
+        if record.channel == WS_MARKET
+        and cast(dict[str, object], json.loads(record.payload_bytes)).get("event_type") == "book"
+    )
+    assert tuple(item[2].get("asset_id") for item in replacement_records) == (
+        "token-yes",
+        "token-no",
+    )
+    yes_index, yes_record, _yes_payload = replacement_records[0]
+    no_index, no_record, _no_payload = replacement_records[1]
+    authoritative_record = raw_records[authoritative_index]
+    assert authoritative_index < yes_index < no_index
+    assert (
+        authoritative_record.received_monotonic.epoch_id
+        == yes_record.received_monotonic.epoch_id
+        == no_record.received_monotonic.epoch_id
+    )
+    assert (
+        authoritative_record.received_monotonic.nanoseconds
+        <= yes_record.received_monotonic.nanoseconds
+    )
+    assert (
+        no_record.received_monotonic.nanoseconds - yes_record.received_monotonic.nanoseconds
+        > int(maximum_book_age_seconds * 1_000_000_000)
+    )
     assert not summary.health_decision.research_eligible
     assert not summary.health_decision.gate1_eligible_so_far
     assert HealthDecisionReason.AUDIT_REPLACEMENT_CAPTURE_PENDING in (
@@ -996,7 +1252,7 @@ async def test_stale_first_replacement_snapshot_cannot_close_recovery_interval(
     assert runtime.availability_records_emitted == 1
     assert summary.availability_evidence.open_at_shutdown_intervals == 1
     interval = json.loads(summary.availability_evidence.path.read_text(encoding="utf-8"))
-    assert interval["cause_type"] == AvailabilityCause.AUDIT_MISMATCH_RESYNCHRONIZATION
+    assert interval["cause_type"] == AvailabilityCause.AUDIT_MISMATCH_RECOVERY
     assert interval["recovery_outcome"] == (AvailabilityRecoveryOutcome.NOT_RESTORED_AT_SHUTDOWN)
     assert interval["research_eligibility_restored"] is False
     assert interval["open_at_shutdown"] is True
@@ -1009,10 +1265,7 @@ async def test_stale_first_replacement_snapshot_cannot_close_recovery_interval(
     assert divergences["replacement_captures_pending"] == 1
     assert divergences["replacement_captures_unresolved"] == 1
     assert final_checkpoint["audit"]["current_eligibility"]["eligible"] is False
-    assert (
-        "AUDIT_DIVERGENCE_UNRESOLVED"
-        in (final_checkpoint["decisions"]["gate1_sticky_reason_codes"])
-    )
+    assert "AUDIT_DIVERGENCE_UNRESOLVED" in _record_decision_reasons(final_checkpoint, sticky=True)
 
 
 @pytest.mark.asyncio
@@ -1020,7 +1273,9 @@ async def test_slow_canonical_return_cannot_scan_or_release_stale_replacement_ca
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    maximum_book_age_seconds = 0.2
+    # This age also bounds the initial audit protocol; retain ample durable-I/O
+    # headroom and cross the bound only after both replacement frames process.
+    maximum_book_age_seconds = 1.0
     service = _configured_service(
         tmp_path,
         maximum_book_age_seconds=maximum_book_age_seconds,
@@ -1076,7 +1331,7 @@ async def test_slow_canonical_return_cannot_scan_or_release_stale_replacement_ca
         delay_completed_replacement_batch,
     )
 
-    summary = await service.run(duration_seconds=0.8, gamma_market_id="101")
+    summary = await service.run(duration_seconds=3.0, gamma_market_id="101")
 
     assert processed_replacement_assets == ["token-yes", "token-no"]
     assert replacement_scan_counts == [0, 0]
@@ -1111,7 +1366,7 @@ async def test_ended_replacement_generation_cannot_release_after_canonical_retur
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service = _configured_service(tmp_path)
+    service = _configured_service(tmp_path, max_reconnect_attempts=0)
     _prepare_runtime(monkeypatch, fail_resnapshot=False)
     _LifecycleSocket.end_replacement_before_canonical_return = True
     original_preserve_websocket = (
@@ -1165,7 +1420,11 @@ async def test_ended_replacement_generation_cannot_release_after_canonical_retur
         end_acquisition_before_completed_replacement_return,
     )
 
-    summary = await service.run(duration_seconds=0.8, gamma_market_id="101")
+    # Generation two intentionally ends only after the exact canonical-return
+    # fence below. With reconnects disabled for this test, that event completes
+    # the observation immediately; five seconds is solely a failure deadline
+    # for loaded CI hosts, not a normal-path sleep.
+    summary = await service.run(duration_seconds=5.0, gamma_market_id="101")
 
     assert processed_replacement_assets == ["token-yes", "token-no"]
     assert replacement_scan_counts == [0, 0]
@@ -1204,7 +1463,7 @@ async def test_generation_end_after_sampled_release_decision_does_not_retroactiv
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service = _configured_service(tmp_path)
+    service = _configured_service(tmp_path, max_reconnect_attempts=0)
     _prepare_runtime(monkeypatch, fail_resnapshot=False)
     _LifecycleSocket.end_replacement_before_canonical_return = True
     original_preserve_websocket = (
@@ -1287,7 +1546,10 @@ async def test_generation_end_after_sampled_release_decision_does_not_retroactiv
         end_generation_during_release_durability,
     )
 
-    summary = await service.run(duration_seconds=0.8, gamma_market_id="101")
+    # The sampled-release fence intentionally ends generation two. Disabling
+    # reconnects makes that event the successful completion path; five seconds
+    # is only a loaded-host failure deadline.
+    summary = await service.run(duration_seconds=5.0, gamma_market_id="101")
 
     assert len(release_chronology) == 1
     decision_ns, ended_ns = release_chronology[0]
@@ -1305,7 +1567,7 @@ async def test_generation_end_after_sampled_release_decision_does_not_retroactiv
     mismatch_interval = next(
         interval
         for interval in intervals
-        if interval["cause_type"] == AvailabilityCause.AUDIT_MISMATCH_RESYNCHRONIZATION
+        if interval["cause_type"] == AvailabilityCause.AUDIT_MISMATCH_RECOVERY
     )
     assert mismatch_interval["ended_monotonic_ns"] == decision_ns
     assert mismatch_interval["research_eligibility_restored"] is True
@@ -1335,9 +1597,11 @@ async def test_resnapshot_failure_keeps_divergence_terminally_unresolved(
         def fail_availability_admission(
             writer: SupervisedAvailabilityIntervalWriter,
             interval: AvailabilityInterval,
+            *,
+            contributions: tuple[AvailabilityIntervalContribution, ...] = (),
         ) -> bool:
             writer.record_failure(OSError("injected availability writer failure while pending"))
-            return original_enqueue(writer, interval)
+            return original_enqueue(writer, interval, contributions=contributions)
 
         monkeypatch.setattr(
             SupervisedAvailabilityIntervalWriter,
@@ -1345,7 +1609,9 @@ async def test_resnapshot_failure_keeps_divergence_terminally_unresolved(
             fail_availability_admission,
         )
 
-    summary = await service.run(duration_seconds=0.6, gamma_market_id="101")
+    # The injected non-retryable resnapshot failure terminates causally; this
+    # bound protects only against a loaded host failing to reach that event.
+    summary = await service.run(duration_seconds=5.0, gamma_market_id="101")
 
     client = _LifecyclePublicClient.latest
     assert client is not None
@@ -1392,7 +1658,7 @@ async def test_resnapshot_failure_keeps_divergence_terminally_unresolved(
         assert runtime.availability_records_emitted == 1
         assert summary.availability_evidence.open_at_shutdown_intervals == 1
         interval = json.loads(summary.availability_evidence.path.read_text(encoding="utf-8"))
-        assert interval["cause_type"] == (AvailabilityCause.AUDIT_MISMATCH_RESYNCHRONIZATION)
+        assert interval["cause_type"] == (AvailabilityCause.AUDIT_MISMATCH_RECOVERY)
         assert interval["recovery_action"] == AvailabilityRecoveryAction.RESNAPSHOT
         assert interval["recovery_outcome"] == (
             AvailabilityRecoveryOutcome.NOT_RESTORED_AT_SHUTDOWN
@@ -1407,9 +1673,10 @@ async def test_resnapshot_failure_keeps_divergence_terminally_unresolved(
     assert final_checkpoint["audit"]["divergences"]["pending"] == 1
     assert final_checkpoint["audit"]["divergences"]["unresolved"] == 1
     assert final_checkpoint["decisions"]["research_eligible"] is False
-    assert "AUDIT_DIVERGENCE_PENDING" in final_checkpoint["decisions"]["reason_codes"]
-    assert "AUDIT_DIVERGENCE_UNRESOLVED" in final_checkpoint["decisions"]["reason_codes"]
-    assert (
-        "AUDIT_DIVERGENCE_UNRESOLVED"
-        in (final_checkpoint["decisions"]["gate1_sticky_reason_codes"])
+    assert HealthDecisionReason.AUDIT_DIVERGENCE_PENDING in _record_decision_reasons(
+        final_checkpoint
     )
+    assert HealthDecisionReason.AUDIT_DIVERGENCE_UNRESOLVED in _record_decision_reasons(
+        final_checkpoint
+    )
+    assert "AUDIT_DIVERGENCE_UNRESOLVED" in _record_decision_reasons(final_checkpoint, sticky=True)

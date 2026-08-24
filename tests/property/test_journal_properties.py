@@ -87,6 +87,11 @@ def test_sealed_journal_round_trip_and_hash_chain(payloads: list[bytes]) -> None
         assert metrics.durable == len(payloads)
         assert metrics.sealed == len(payloads)
         assert metrics.verified == len(payloads)
+        assert metrics.queue_capacity == 3
+        assert metrics.active_segment_events == 0
+        assert metrics.active_segment_uncompressed_bytes == 0
+        assert metrics.maximum_segment_events == 3
+        assert metrics.maximum_segment_uncompressed_bytes > 0
         assert writer.durability_watermark is not None
         assert writer.durability_watermark.state is JournalDurabilityState.VERIFIED
 

@@ -2,22 +2,31 @@
 
 from .availability import (
     AVAILABILITY_EVIDENCE_SUMMARY_VERSION,
+    AVAILABILITY_INTERVAL_CONTRIBUTION_SCHEMA_VERSION,
     AVAILABILITY_INTERVAL_SCHEMA_VERSION,
     AvailabilityCause,
+    AvailabilityContributionReconciliation,
     AvailabilityEvidenceRuntimeSnapshot,
     AvailabilityEvidenceSummary,
     AvailabilityInterval,
+    AvailabilityIntervalContribution,
     AvailabilityLedgerReconciliation,
     AvailabilityRecoveryAction,
     AvailabilityRecoveryOutcome,
     AvailabilityScope,
+    PublishedAvailabilityEvidenceReconciliation,
     SupervisedAvailabilityIntervalWriter,
+    is_audit_mismatch_availability_cause,
+    reconcile_availability_contributions,
     reconcile_availability_intervals,
+    reconcile_published_availability_evidence,
 )
 from .checkpoints import (
     HEALTH_CHECKPOINT_SCHEMA_VERSION,
     HEALTH_CHECKPOINT_V1_SCHEMA_VERSION,
     HEALTH_CHECKPOINT_V2_SCHEMA_VERSION,
+    HEALTH_CHECKPOINT_V3_SCHEMA_VERSION,
+    HEALTH_DECISION_REASON_MASK_SCHEMA,
     HEALTH_EVIDENCE_SUMMARY_VERSION,
     HealthCheckpoint,
     HealthCheckpointChronology,
@@ -29,6 +38,8 @@ from .checkpoints import (
     PeriodicHealthCheckpointEmitter,
     SupervisedHealthCheckpointWriter,
     evaluate_health_decision,
+    health_decision_reason_mask,
+    health_decision_reasons_from_mask,
     validate_health_checkpoint_chronology,
 )
 from .host import (
@@ -38,7 +49,13 @@ from .host import (
     filesystem_identity,
     normalize_git_commit,
 )
-from .metrics import HistogramSnapshot, InMemoryMetrics, MetricKey, MetricsSnapshot
+from .metrics import (
+    HistogramSnapshot,
+    InMemoryMetrics,
+    MetricKey,
+    MetricsRetentionSnapshot,
+    MetricsSnapshot,
+)
 from .structured_logging import (
     SAFE_LOG_FIELDS,
     AllowlistJsonFormatter,
@@ -49,18 +66,23 @@ from .structured_logging import (
 
 __all__ = [
     "AVAILABILITY_EVIDENCE_SUMMARY_VERSION",
+    "AVAILABILITY_INTERVAL_CONTRIBUTION_SCHEMA_VERSION",
     "AVAILABILITY_INTERVAL_SCHEMA_VERSION",
     "HEALTH_CHECKPOINT_SCHEMA_VERSION",
     "HEALTH_CHECKPOINT_V1_SCHEMA_VERSION",
     "HEALTH_CHECKPOINT_V2_SCHEMA_VERSION",
+    "HEALTH_CHECKPOINT_V3_SCHEMA_VERSION",
+    "HEALTH_DECISION_REASON_MASK_SCHEMA",
     "HEALTH_EVIDENCE_SUMMARY_VERSION",
     "HOST_RUNTIME_IDENTITY_SCHEMA_VERSION",
     "SAFE_LOG_FIELDS",
     "AllowlistJsonFormatter",
     "AvailabilityCause",
+    "AvailabilityContributionReconciliation",
     "AvailabilityEvidenceRuntimeSnapshot",
     "AvailabilityEvidenceSummary",
     "AvailabilityInterval",
+    "AvailabilityIntervalContribution",
     "AvailabilityLedgerReconciliation",
     "AvailabilityRecoveryAction",
     "AvailabilityRecoveryOutcome",
@@ -76,8 +98,10 @@ __all__ = [
     "HostRuntimeIdentity",
     "InMemoryMetrics",
     "MetricKey",
+    "MetricsRetentionSnapshot",
     "MetricsSnapshot",
     "PeriodicHealthCheckpointEmitter",
+    "PublishedAvailabilityEvidenceReconciliation",
     "StructuredLogger",
     "SupervisedAvailabilityIntervalWriter",
     "SupervisedHealthCheckpointWriter",
@@ -86,7 +110,12 @@ __all__ = [
     "configure_json_logger",
     "evaluate_health_decision",
     "filesystem_identity",
+    "health_decision_reason_mask",
+    "health_decision_reasons_from_mask",
+    "is_audit_mismatch_availability_cause",
     "normalize_git_commit",
+    "reconcile_availability_contributions",
     "reconcile_availability_intervals",
+    "reconcile_published_availability_evidence",
     "validate_health_checkpoint_chronology",
 ]

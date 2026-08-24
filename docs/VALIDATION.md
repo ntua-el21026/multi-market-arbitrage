@@ -76,7 +76,18 @@ Checks where supported:
 - generation/epoch transitions;
 - reconnect semantics.
 
+For ADR-0055 audit evidence, an independent bounded received-prefix oracle
+checks whether production exact depth equals the exact full snapshot plus the
+ordered quantity-bearing frames admitted through the response watermark. Its
+result is separate from external causal attribution.
+
 Failure invalidates sequence-dependent state.
+
+`INTERNAL_RECONSTRUCTION_DEFECT` and
+`INTERNAL_RECONSTRUCTION_INDETERMINATE` fail closed. A separately typed
+`EXTERNAL_CAUSE_UNATTRIBUTED` result is not internal indeterminacy and is
+eligible for recovery review only after all required ADR-0055 validation,
+contribution and reconciliation layers pass.
 
 ## 6. V3 — Canonical state
 

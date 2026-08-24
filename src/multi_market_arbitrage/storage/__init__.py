@@ -2,6 +2,7 @@
 
 from .analytical import (
     AnalyticalDatasetWriter,
+    AnalyticalFragmentLimitError,
     AnalyticalStorageClosedError,
     analytical_run_completion_path,
     load_analytical_run_completion,
@@ -29,6 +30,7 @@ __all__ = [
     "AnalyticalDatasetCompletion",
     "AnalyticalDatasetConfig",
     "AnalyticalDatasetWriter",
+    "AnalyticalFragmentLimitError",
     "AnalyticalProvenance",
     "AnalyticalRunCompletionHead",
     "AnalyticalSchemaError",

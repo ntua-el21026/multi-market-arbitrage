@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from enum import StrEnum
-from typing import Self
+from typing import Final, Self
 
 
 class PolymarketEndpointClass(StrEnum):
@@ -46,6 +47,74 @@ class PolymarketRetryAfterDisposition(StrEnum):
     MALFORMED = "MALFORMED"
 
 
+RECOVERABLE_HTTP_STATUS_CODES: Final = frozenset({408, 425, 429, 500, 502, 503, 504})
+MAXIMUM_RETRY_AFTER_EVIDENCE_NANOSECONDS: Final = 10_000_000_000_000_000_000
+MAXIMUM_RETRY_AFTER_EVIDENCE_SECONDS: Final = (
+    MAXIMUM_RETRY_AFTER_EVIDENCE_NANOSECONDS / 1_000_000_000
+)
+
+
+def validate_polymarket_http_failure_metadata(
+    *,
+    category: PolymarketHttpFailureCategory,
+    retryable: bool,
+    status_code: int | None,
+    retry_after_disposition: PolymarketRetryAfterDisposition,
+    has_retry_after: bool,
+    retry_exhausted: bool,
+    retry_blocked_reason: PolymarketRetryBlockedReason | None,
+    final_failure: bool,
+) -> None:
+    """Reject contradictory public-HTTP failure evidence.
+
+    Transport/protocol failures may carry a status only after a successful
+    response header, so that status must be 2xx.  Conversely, ``HTTP_STATUS``
+    denotes a non-success response and its retryability is the adapter's fixed
+    public-read whitelist.  The retry-policy fields describe a final failure
+    only when ``final_failure`` is true.
+    """
+
+    if category is PolymarketHttpFailureCategory.HTTP_STATUS:
+        if status_code is None or 200 <= status_code <= 299:
+            raise ValueError("HTTP_STATUS failure requires a non-success status code")
+        expected_retryable = status_code in RECOVERABLE_HTTP_STATUS_CODES
+        if retryable is not expected_retryable:
+            raise ValueError("HTTP_STATUS retryability contradicts the fixed status whitelist")
+    elif status_code is not None and not 200 <= status_code <= 299:
+        raise ValueError("non-HTTP_STATUS failure cannot carry a non-success status code")
+
+    if (
+        category is not PolymarketHttpFailureCategory.HTTP_STATUS
+        and retry_after_disposition is not PolymarketRetryAfterDisposition.ABSENT
+    ):
+        raise ValueError("only HTTP_STATUS failures may carry Retry-After evidence")
+    if (retry_after_disposition is PolymarketRetryAfterDisposition.PARSED) is not has_retry_after:
+        raise ValueError("parsed Retry-After disposition must agree with its delay")
+
+    fixed_nonretryable = {
+        PolymarketHttpFailureCategory.CLIENT_CLOSED,
+        PolymarketHttpFailureCategory.DEADLINE_EXCEEDED,
+        PolymarketHttpFailureCategory.REMOTE_PROTOCOL,
+        PolymarketHttpFailureCategory.LOCAL_PROTOCOL,
+        PolymarketHttpFailureCategory.RESPONSE_PROTOCOL,
+    }
+    if category in fixed_nonretryable and retryable:
+        raise ValueError(f"{category.value} failure cannot be retryable")
+
+    attempts_exhausted = retry_blocked_reason is PolymarketRetryBlockedReason.ATTEMPTS_EXHAUSTED
+    if retry_exhausted is not attempts_exhausted:
+        raise ValueError("retry exhaustion and blocked reason disagree")
+    if retry_blocked_reason is not None and not retryable:
+        raise ValueError("non-retryable failure cannot carry a retry-blocked reason")
+    if retry_blocked_reason is PolymarketRetryBlockedReason.RETRY_AFTER_POLICY and (
+        category is not PolymarketHttpFailureCategory.HTTP_STATUS
+        or retry_after_disposition is not PolymarketRetryAfterDisposition.PARSED
+    ):
+        raise ValueError("Retry-After policy block requires parsed HTTP_STATUS evidence")
+    if final_failure and retryable and retry_blocked_reason is None:
+        raise ValueError("final retryable failure requires a retry-blocked reason")
+
+
 class PolymarketWebSocketFailureCategory(StrEnum):
     """Finite WebSocket transport/protocol failure categories."""
 
@@ -86,10 +155,17 @@ class PolymarketHttpError(PolymarketTransportError):
             raise ValueError("HTTP errors require an HTTP endpoint class")
         if attempt < 0:
             raise ValueError("HTTP attempt cannot be negative")
+        if attempt == 0 and category is not PolymarketHttpFailureCategory.DEADLINE_EXCEEDED:
+            raise ValueError(
+                "HTTP attempt zero is reserved for deadline expiry before the first attempt"
+            )
         if status_code is not None and not 100 <= status_code <= 599:
             raise ValueError("HTTP status code must be between 100 and 599")
-        if retry_after_seconds is not None and retry_after_seconds < 0:
-            raise ValueError("Retry-After delay cannot be negative")
+        if retry_after_seconds is not None and (
+            not math.isfinite(retry_after_seconds)
+            or not 0 <= retry_after_seconds <= MAXIMUM_RETRY_AFTER_EVIDENCE_SECONDS
+        ):
+            raise ValueError("Retry-After delay must be finite and within the evidence bound")
         if retry_after_disposition is None:
             retry_after_disposition = (
                 PolymarketRetryAfterDisposition.PARSED
@@ -100,6 +176,16 @@ class PolymarketHttpError(PolymarketTransportError):
             retry_after_seconds is not None
         ):
             raise ValueError("parsed Retry-After disposition must agree with its delay")
+        validate_polymarket_http_failure_metadata(
+            category=category,
+            retryable=retryable,
+            status_code=status_code,
+            retry_after_disposition=retry_after_disposition,
+            has_retry_after=retry_after_seconds is not None,
+            retry_exhausted=retry_exhausted,
+            retry_blocked_reason=retry_blocked_reason,
+            final_failure=False,
+        )
         if not detail or detail != detail.strip():
             raise ValueError("HTTP error detail must be non-empty without surrounding whitespace")
         self.endpoint_class = endpoint_class

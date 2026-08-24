@@ -187,6 +187,40 @@ async def test_streaming_replay_terminal_summary_equals_read_all_path(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_public_replay_observer_streams_262_results_without_summary_retention(
+    tmp_path: Path,
+) -> None:
+    run = CollectorRunId("public-observer-262-streaming-replay")
+    await _write_completed(tmp_path, run, count=262, max_events_per_segment=17)
+
+    class _Observer:
+        def __init__(self) -> None:
+            self.count = 0
+            self.last_sequence = -1
+
+        def observe_replayed_envelope(
+            self,
+            envelope: RawEventEnvelope,
+            processed: ProcessedEnvelope,
+        ) -> None:
+            assert envelope.ingest_seq == self.last_sequence + 1
+            assert processed.ingest_seq == envelope.ingest_seq
+            self.last_sequence = envelope.ingest_seq
+            self.count += 1
+
+    observer = _Observer()
+    replay = replay_journal(
+        tmp_path,
+        run,
+        load_phase1_config(Path("config/phase1.toml")),
+        envelope_observer=observer,
+    )
+
+    assert observer.count == replay.raw_record_count == 262
+    assert observer.last_sequence == 261
+
+
+@pytest.mark.asyncio
 async def test_validation_exhausts_streaming_reader_without_materializing_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import os
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import pairwise
 from pathlib import Path
 from types import TracebackType
@@ -140,12 +140,21 @@ class RawJournalWriter:
 
     @property
     def metrics(self) -> JournalMetricsSnapshot:
-        return self._metrics.snapshot(
+        snapshot = self._metrics.snapshot(
             queue_depth=self._queue.qsize(),
             run_uncompressed_bytes=self._run_uncompressed_bytes,
             durability_watermark_sequence=(
                 self._watermark.ingest_seq if self._watermark is not None else None
             ),
+        )
+        active = self._active
+        return replace(
+            snapshot,
+            queue_capacity=self._config.queue_capacity,
+            active_segment_events=0 if active is None else active.event_count,
+            active_segment_uncompressed_bytes=(0 if active is None else active.uncompressed_bytes),
+            maximum_segment_events=self._config.max_events_per_segment,
+            maximum_segment_uncompressed_bytes=(self._config.max_uncompressed_bytes_per_segment),
         )
 
     @property
@@ -482,6 +491,24 @@ class RawJournalWriter:
             self._config.collector_run_id,
             stream=self._config.stream,
         ).manifests()
+        expected_writer_provenance = (
+            self._config.git_commit,
+            self._config.writer_id,
+            self._config.writer_software_version,
+        )
+        if any(
+            (
+                manifest.git_commit,
+                manifest.writer_id,
+                manifest.writer_software_version,
+            )
+            != expected_writer_provenance
+            for manifest in manifests
+        ):
+            raise JournalConfigurationError(
+                "existing sealed journal writer provenance differs from current "
+                "writer configuration"
+            )
         if manifests:
             self._previous_segment_digest = manifests[-1].segment_digest
             self._last_ingest_seq = manifests[-1].last_ingest_seq

@@ -221,6 +221,11 @@ Health is scoped:
 
 Do not reuse one ambiguous global health enum.
 
+Periodic health consumes an immutable bounded `ProcessorOperationalSnapshot`
+whose construction is independent of recent diagnostic-history occupancy. Full
+processor summaries and terminal hashes are finalization/replay/offline
+authorities and are not periodic health-path work.
+
 ## 12. Research economics
 
 Canonical layers:
@@ -294,6 +299,10 @@ No unbounded queues or untracked fire-and-forget tasks.
 Expected invalid external state produces typed validation outcomes.
 
 Transient infrastructure faults use bounded retries when safe.
+
+Audit evidence separates exact observation, independently verified received-
+prefix integrity, external causal attribution, and recovery state. Public-read
+fault history is separate from current pending/resolved state.
 
 Programming invariant failures fail affected scope closed; they are not swallowed.
 

@@ -53,6 +53,18 @@ class MetricsSnapshot:
     histograms: tuple[tuple[MetricKey, HistogramSnapshot], ...]
 
 
+@dataclass(frozen=True, slots=True)
+class MetricsRetentionSnapshot:
+    """O(1) registry occupancy and bounded histogram-memory evidence."""
+
+    max_series: int
+    series_count: int
+    histogram_series: int
+    histogram_sample_capacity_per_series: int
+    histogram_samples_retained: int
+    histogram_observations_total: int
+
+
 @dataclass(slots=True)
 class _HistogramState:
     samples: deque[float]
@@ -209,4 +221,20 @@ class InMemoryMetrics:
                 counters=tuple(sorted(self._counters.items())),
                 gauges=tuple(sorted(self._gauges.items())),
                 histograms=tuple(sorted(histogram_items)),
+            )
+
+    @property
+    def retention_snapshot(self) -> MetricsRetentionSnapshot:
+        with self._lock:
+            return MetricsRetentionSnapshot(
+                max_series=self._max_series,
+                series_count=(len(self._counters) + len(self._gauges) + len(self._histograms)),
+                histogram_series=len(self._histograms),
+                histogram_sample_capacity_per_series=self._histogram_sample_capacity,
+                histogram_samples_retained=sum(
+                    len(state.samples) for state in self._histograms.values()
+                ),
+                histogram_observations_total=sum(
+                    state.total_count for state in self._histograms.values()
+                ),
             )

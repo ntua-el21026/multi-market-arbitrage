@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -23,6 +24,7 @@ from multi_market_arbitrage.core.time import MonotonicTimestamp, UtcTimestamp
 from multi_market_arbitrage.ingestion import RawEventEnvelope
 from multi_market_arbitrage.journal import (
     JournalBackpressureError,
+    JournalConfigurationError,
     JournalReader,
     JournalRecoveryError,
     JournalWriteError,
@@ -221,6 +223,65 @@ async def test_queue_saturation_is_explicit_backpressure(
 
 
 @pytest.mark.asyncio
+async def test_thread_pool_contention_keeps_slow_journal_nondurable_and_event_loop_live(
+    tmp_path: Path,
+) -> None:
+    run = CollectorRunId("thread-pool-contention-run")
+    loop = asyncio.get_running_loop()
+    # A single-worker default executor makes contention exact: the journal's
+    # durability call cannot begin until this independently owned job exits.
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+    writer = RawJournalWriter(writer_config(tmp_path, run))
+    await writer.start()
+
+    worker_entered = asyncio.Event()
+    release_worker = threading.Event()
+
+    def occupy_default_worker() -> None:
+        loop.call_soon_threadsafe(worker_entered.set)
+        if not release_worker.wait(timeout=5):
+            raise TimeoutError("test did not release the contended thread-pool worker")
+
+    occupier = asyncio.create_task(asyncio.to_thread(occupy_default_worker))
+    async with asyncio.timeout(5):
+        await worker_entered.wait()
+    submission = asyncio.create_task(writer.submit(envelope(run, 0)))
+    receipt = None
+    try:
+        for _ in range(100):
+            if writer.metrics.enqueued == 1:
+                break
+            await asyncio.sleep(0)
+
+        # Executor contention may delay physical durability, but it must not
+        # manufacture a durable receipt or block unrelated event-loop work.
+        assert writer.metrics.enqueued == 1
+        assert writer.metrics.durable == 0
+        assert writer.durability_watermark is None
+        assert not submission.done()
+        event_loop_advanced = asyncio.Event()
+        loop.call_soon(event_loop_advanced.set)
+        async with asyncio.timeout(1):
+            await event_loop_advanced.wait()
+
+        release_worker.set()
+        await occupier
+        async with asyncio.timeout(5):
+            receipt = await submission
+    finally:
+        release_worker.set()
+        await occupier
+        if not submission.done():
+            async with asyncio.timeout(5):
+                receipt = await submission
+        await writer.close()
+
+    assert receipt is not None
+    assert receipt.durability_watermark is not None
+    assert writer.metrics.durable == 1
+
+
+@pytest.mark.asyncio
 async def test_sealed_segment_tampering_is_detected(tmp_path: Path) -> None:
     run = CollectorRunId("tamper-run")
     writer = RawJournalWriter(writer_config(tmp_path, run))
@@ -273,6 +334,69 @@ async def test_startup_completes_orphan_sealed_segment_after_manifest_crash(
     manifests = JournalReader(tmp_path, run, stream="market").manifests()
     assert "manifest_reconstructed_after_seal_crash" in manifests[0].recovery_evidence
     assert manifests[1].previous_segment_digest == manifests[0].segment_digest
+    assert all(manifest.writer_id == WriterId("recovery-writer") for manifest in manifests)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement_value"),
+    [
+        pytest.param("git_commit", "different-commit", id="git-commit"),
+        pytest.param("writer_id", WriterId("different-writer"), id="writer-id"),
+        pytest.param(
+            "writer_software_version",
+            "different-version",
+            id="writer-software-version",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_startup_rejects_existing_manifest_writer_provenance_mismatch(
+    tmp_path: Path,
+    field_name: str,
+    replacement_value: str | WriterId,
+) -> None:
+    run = CollectorRunId(f"resume-provenance-{field_name}")
+    config = writer_config(tmp_path, run)
+    first_writer = RawJournalWriter(config)
+    await first_writer.start()
+    await first_writer.submit(envelope(run, 0))
+    await first_writer.close(completed=False)
+    reader = JournalReader(tmp_path, run, stream="market")
+    manifests_before = reader.manifests()
+
+    resumed_writer = RawJournalWriter(replace(config, **{field_name: replacement_value}))
+    with pytest.raises(JournalConfigurationError, match="writer provenance differs"):
+        await resumed_writer.start()
+
+    assert not completion_path_for_run(tmp_path, run, "market").exists()
+    assert reader.manifests() == manifests_before
+    assert [item.ingest_seq for item in reader.read_all(include_partial=True)] == [0]
+
+
+@pytest.mark.asyncio
+async def test_startup_resumes_existing_manifests_with_identical_writer_provenance(
+    tmp_path: Path,
+) -> None:
+    run = CollectorRunId("resume-matching-provenance")
+    config = writer_config(tmp_path, run, max_events_per_segment=1)
+    first_writer = RawJournalWriter(config)
+    await first_writer.start()
+    await first_writer.submit(envelope(run, 0))
+    await first_writer.close(completed=False)
+
+    resumed_writer = RawJournalWriter(config)
+    await resumed_writer.start()
+    await resumed_writer.submit(envelope(run, 1))
+    await resumed_writer.close()
+
+    reader = JournalReader(tmp_path, run, stream="market")
+    assert [item.ingest_seq for item in reader.read_all()] == [0, 1]
+    head = reader.completion_heads()[0]
+    assert all(
+        (manifest.git_commit, manifest.writer_id, manifest.writer_software_version)
+        == (head.git_commit, head.writer_id, head.writer_software_version)
+        for manifest in reader.manifests()
+    )
 
 
 @pytest.mark.asyncio

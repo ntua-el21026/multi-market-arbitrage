@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TypeVar
+from typing import TypeVar, cast
 
 from multi_market_arbitrage.core.provenance import Provenance
 from multi_market_arbitrage.core.time import UtcTimestamp
@@ -17,7 +17,12 @@ from multi_market_arbitrage.scanners.polymarket_complete_set import (
     OpportunityLifecycle,
 )
 
-from .outputs import Phase1AnalyticalOutputs, ResearchOutputSummary
+from .outputs import (
+    AnalyticalFragmentRetentionSnapshot,
+    AnalyticalOutputRuntimeSnapshot,
+    Phase1AnalyticalOutputs,
+    ResearchOutputSummary,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +58,15 @@ class AnalyticalRuntimeSnapshot:
     rejected_records: int
     queues: tuple[AnalyticalQueueSnapshot, ...]
     failure_type: str | None
+    buffered_records: int = 0
+    buffered_bytes: int = 0
+    buffered_records_high_water: int = 0
+    buffered_bytes_high_water: int = 0
+    flushes: int = 0
+    flushed_records: int = 0
+    pyarrow_current_bytes: int = 0
+    pyarrow_peak_bytes: int = 0
+    fragment_retention: tuple[AnalyticalFragmentRetentionSnapshot, ...] = ()
 
 
 CommandT = TypeVar("CommandT")
@@ -126,6 +140,15 @@ class SupervisedAnalyticalOutputs:
     @property
     def runtime_snapshot(self) -> AnalyticalRuntimeSnapshot:
         owners = (self._references, self._canonical, self._scans)
+        output_snapshot_method = getattr(self._outputs, "operational_snapshot", None)
+        output_snapshot = (
+            cast(
+                Callable[[], AnalyticalOutputRuntimeSnapshot],
+                output_snapshot_method,
+            )()
+            if callable(output_snapshot_method)
+            else AnalyticalOutputRuntimeSnapshot(0, 0, 0, 0, 0, 0, 0, 0)
+        )
         return AnalyticalRuntimeSnapshot(
             healthy=self._healthy,
             accepted_records=self._accepted,
@@ -140,6 +163,15 @@ class SupervisedAnalyticalOutputs:
                 for owner in owners
             ),
             failure_type=self._failure_type,
+            buffered_records=output_snapshot.buffered_records,
+            buffered_bytes=output_snapshot.buffered_bytes,
+            buffered_records_high_water=output_snapshot.buffered_records_high_water,
+            buffered_bytes_high_water=output_snapshot.buffered_bytes_high_water,
+            flushes=output_snapshot.flushes,
+            flushed_records=output_snapshot.flushed_records,
+            pyarrow_current_bytes=output_snapshot.pyarrow_current_bytes,
+            pyarrow_peak_bytes=output_snapshot.pyarrow_peak_bytes,
+            fragment_retention=output_snapshot.fragment_retention,
         )
 
     def _reject_or_put(self, owner: _DomainOwner[CommandT], command: CommandT) -> None:

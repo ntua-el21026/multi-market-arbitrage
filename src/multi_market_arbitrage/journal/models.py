@@ -143,6 +143,11 @@ class JournalMetricsSnapshot:
     group_shutdown_flushes: int = 0
     run_uncompressed_bytes: int = 0
     durability_watermark_sequence: int | None = None
+    queue_capacity: int = 0
+    active_segment_events: int = 0
+    active_segment_uncompressed_bytes: int = 0
+    maximum_segment_events: int = 0
+    maximum_segment_uncompressed_bytes: int = 0
 
 
 @dataclass(slots=True)

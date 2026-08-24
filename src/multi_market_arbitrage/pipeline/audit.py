@@ -20,15 +20,30 @@ from multi_market_arbitrage.core.ids import (
 from multi_market_arbitrage.core.provenance import RawSourceRef
 from multi_market_arbitrage.core.serialization import canonical_json_bytes, canonical_sha256
 from multi_market_arbitrage.core.time import UtcTimestamp
+from multi_market_arbitrage.venues.polymarket.errors import (
+    MAXIMUM_RETRY_AFTER_EVIDENCE_NANOSECONDS,
+    PolymarketEndpointClass,
+    PolymarketHttpError,
+    PolymarketHttpFailureCategory,
+    PolymarketRetryAfterDisposition,
+    PolymarketRetryBlockedReason,
+    validate_polymarket_http_failure_metadata,
+)
 
 AUDIT_START_V1_SCHEMA: Final = "mma-rest-audit-start-v1"
 AUDIT_START_V2_SCHEMA: Final = "mma-rest-audit-start-v2"
 # New producers use v2.  The explicit v1 constant remains available to readers
 # that must interpret immutable historical controls without upgrading them.
 AUDIT_START_SCHEMA: Final = AUDIT_START_V2_SCHEMA
-AUDIT_FAILURE_SCHEMA: Final = "mma-rest-audit-failure-v1"
+AUDIT_FAILURE_V1_SCHEMA: Final = "mma-rest-audit-failure-v1"
+AUDIT_FAILURE_V2_SCHEMA: Final = "mma-rest-audit-failure-v2"
+AUDIT_FAILURE_SCHEMA: Final = AUDIT_FAILURE_V2_SCHEMA
 AUDIT_EXPIRY_SCHEMA: Final = "mma-rest-audit-expiry-v1"
-AUDIT_CLASSIFICATION_SCHEMA: Final = "mma-rest-audit-classification-v1"
+AUDIT_CLASSIFICATION_V1_SCHEMA: Final = "mma-rest-audit-classification-v1"
+AUDIT_CLASSIFICATION_V2_SCHEMA: Final = "mma-rest-audit-classification-v2"
+AUDIT_CLASSIFICATION_SCHEMA: Final = AUDIT_CLASSIFICATION_V2_SCHEMA
+AUDIT_CLASSIFICATION_PREPARE_SCHEMA: Final = "mma-rest-audit-classification-prepare-v1"
+AUDIT_CLASSIFICATION_PREPARE_ATTEST_PROTOCOL: Final = "PREPARE_ATTEST_V1"
 AUDIT_REPLACEMENT_RELEASE_SCHEMA: Final = "mma-rest-audit-replacement-release-v1"
 AUDIT_MISMATCH_DIAGNOSTIC_SCHEMA: Final = "mma-rest-audit-mismatch-diagnostic-v1"
 AUDIT_REST_BOOK_IDENTITY_SCHEMA: Final = "mma-rest-audit-rest-book-identity-v1"
@@ -36,6 +51,7 @@ AUDIT_EXACT_DEPTH_DIFFERENCE_SCHEMA: Final = "mma-rest-audit-depth-difference-v1
 AUDIT_RAW_SOURCE_SUMMARY_SCHEMA: Final = "mma-rest-audit-raw-source-summary-v1"
 AUDIT_DIVERGENCE_PENDING_SCHEMA: Final = "mma-rest-audit-divergence-pending-v1"
 AUDIT_DIVERGENCE_RESOLUTION_SCHEMA: Final = "mma-rest-audit-divergence-resolution-v1"
+AUDIT_FAULT_LIFECYCLE_SCHEMA: Final = "mma-rest-audit-fault-lifecycle-v1"
 AUDIT_REPLACEMENT_CAPTURE_MAX_BYTES: Final = 65_536
 
 # These limits match or exceed the corresponding owner bounds while ensuring
@@ -101,6 +117,109 @@ class AuditFailureReason(StrEnum):
     RACE_RETRY_EXHAUSTED = "RACE_RETRY_EXHAUSTED"
     RUN_ENDED = "RUN_ENDED"
     BOOK_FRESHNESS_EXPIRED = "BOOK_FRESHNESS_EXPIRED"
+
+
+_DEADLINE_EFFECTIVE_AUDIT_FAILURE_REASONS: Final = frozenset(
+    {
+        AuditFailureReason.OBSERVATION_DEADLINE,
+        AuditFailureReason.BOOK_FRESHNESS_EXPIRED,
+    }
+)
+_KNOWN_INTERNAL_AUDIT_FAILURE_REASONS: Final = frozenset(
+    reason for reason in AuditFailureReason if reason is not AuditFailureReason.HTTP_REQUEST_FAILED
+)
+
+
+def _accepted_audit_http_error_types(
+    category: PolymarketHttpFailureCategory,
+) -> frozenset[str]:
+    if category is PolymarketHttpFailureCategory.HTTP_STATUS:
+        error_classes = ("PolymarketHttpStatusError",)
+    elif category in {
+        PolymarketHttpFailureCategory.LOCAL_PROTOCOL,
+        PolymarketHttpFailureCategory.RESPONSE_PROTOCOL,
+    }:
+        # New producers retain the concrete protocol-error class.  The
+        # transport spelling remains readable for already durable v2 controls
+        # emitted under the original category-only validator.
+        error_classes = (
+            "PolymarketHttpProtocolError",
+            "PolymarketHttpTransportError",
+        )
+    else:
+        error_classes = ("PolymarketHttpTransportError",)
+    return frozenset(f"{error_class}:{category.value}" for error_class in error_classes)
+
+
+class AuditFaultOrigin(StrEnum):
+    """Whether retained evidence localizes a fault inside or outside the process."""
+
+    EXTERNAL = "EXTERNAL"
+    INTERNAL = "INTERNAL"
+    INDETERMINATE = "INDETERMINATE"
+
+
+class AuditFaultStatus(StrEnum):
+    """Current lifecycle state for one durable audit failure."""
+
+    CURRENT = "CURRENT"
+    RESOLVED = "RESOLVED"
+    PERMANENT = "PERMANENT"
+
+
+class AuditFaultResolution(StrEnum):
+    """Evidence that cleared a non-permanent current audit fault."""
+
+    LATER_FENCED_MATCH = "LATER_FENCED_MATCH"
+    AUTHORITATIVE_RESNAPSHOT = "AUTHORITATIVE_RESNAPSHOT"
+    REPLACEMENT_CAPTURE_COMPLETED = "REPLACEMENT_CAPTURE_COMPLETED"
+
+
+class AuditFaultAffectedScope(StrEnum):
+    """Fail-closed scopes made unavailable by one audit fault."""
+
+    AUDIT_ELIGIBILITY = "AUDIT_ELIGIBILITY"
+    SCANNER_RESEARCH_ELIGIBILITY = "SCANNER_RESEARCH_ELIGIBILITY"
+
+
+class AuditFaultFailureEvidenceKind(StrEnum):
+    """Durable source whose processing produced one FAILED audit outcome."""
+
+    AUDIT_FAILURE_CONTROL = "AUDIT_FAILURE_CONTROL"
+    AUDIT_CLASSIFICATION_CONTROL = "AUDIT_CLASSIFICATION_CONTROL"
+    REST_AUDIT_RESPONSE = "REST_AUDIT_RESPONSE"
+    BOOK_INVALIDATION_CONTROL = "BOOK_INVALIDATION_CONTROL"
+
+
+def audit_fault_evidence_blocks_current_scope(
+    *,
+    kind: AuditFaultFailureEvidenceKind,
+    audit_start_schema: str,
+    failure_schema: str | None,
+) -> bool:
+    """Return authority from exact durable source kind/schema, never error text."""
+
+    if not isinstance(cast(object, kind), AuditFaultFailureEvidenceKind):
+        raise ValueError("audit fault failure evidence kind is unsupported")
+    if kind is AuditFaultFailureEvidenceKind.AUDIT_FAILURE_CONTROL:
+        if failure_schema == AUDIT_FAILURE_V1_SCHEMA:
+            return False
+        if failure_schema == AUDIT_FAILURE_V2_SCHEMA:
+            return True
+        raise ValueError("audit failure-control source schema is unsupported")
+    if kind is AuditFaultFailureEvidenceKind.AUDIT_CLASSIFICATION_CONTROL:
+        if failure_schema == AUDIT_CLASSIFICATION_V1_SCHEMA:
+            return False
+        if failure_schema == AUDIT_CLASSIFICATION_V2_SCHEMA:
+            return True
+        raise ValueError("audit classification-control source schema is unsupported")
+    if failure_schema is not None:
+        raise ValueError("unversioned audit fault source cannot claim a source schema")
+    if audit_start_schema == AUDIT_START_V1_SCHEMA:
+        return False
+    if audit_start_schema == AUDIT_START_V2_SCHEMA:
+        return True
+    raise ValueError("audit fault start schema is unsupported")
 
 
 class AuditMismatchCause(StrEnum):
@@ -667,19 +786,472 @@ class AuditFailureCommand:
 
     request_id: str
     reason: AuditFailureReason
+    error_type: str | None = None
+    endpoint_class: PolymarketEndpointClass | None = None
+    category: PolymarketHttpFailureCategory | None = None
+    retryable: bool | None = None
+    attempt: int | None = None
+    status_code: int | None = None
+    retry_after_nanoseconds: int | None = None
+    retry_after_disposition: PolymarketRetryAfterDisposition | None = None
+    retry_exhausted: bool | None = None
+    retry_blocked_reason: PolymarketRetryBlockedReason | None = None
+    schema: str = AUDIT_FAILURE_SCHEMA
 
     def __post_init__(self) -> None:
         if not self.request_id or len(self.request_id) > 128:
             raise ValueError("audit request ID must be non-empty and bounded")
 
-    def to_payload(self) -> bytes:
-        return canonical_json_bytes(
-            {
+        if self.schema == AUDIT_FAILURE_V1_SCHEMA:
+            if any(
+                value is not None
+                for value in (
+                    self.error_type,
+                    self.endpoint_class,
+                    self.category,
+                    self.retryable,
+                    self.attempt,
+                    self.status_code,
+                    self.retry_after_nanoseconds,
+                    self.retry_after_disposition,
+                    self.retry_exhausted,
+                    self.retry_blocked_reason,
+                )
+            ):
+                raise ValueError("v1 audit failure cannot carry v2 metadata")
+            return
+        if self.schema != AUDIT_FAILURE_V2_SCHEMA:
+            raise ValueError("audit failure schema is unsupported")
+        if self.error_type is not None and (not self.error_type or len(self.error_type) > 256):
+            raise ValueError("audit failure type must be bounded non-empty text")
+        http_values = (
+            self.endpoint_class,
+            self.category,
+            self.retryable,
+            self.attempt,
+            self.retry_after_disposition,
+            self.retry_exhausted,
+        )
+        has_http_metadata = any(value is not None for value in http_values) or any(
+            value is not None
+            for value in (
+                self.status_code,
+                self.retry_after_nanoseconds,
+                self.retry_blocked_reason,
+            )
+        )
+        if has_http_metadata and any(value is None for value in http_values):
+            raise ValueError("audit HTTP failure metadata must be complete")
+        deadline_evidence_for_effective_reason = (
+            self.reason in _DEADLINE_EFFECTIVE_AUDIT_FAILURE_REASONS
+            and self.category is PolymarketHttpFailureCategory.DEADLINE_EXCEEDED
+            and self.retryable is False
+        )
+        if (
+            has_http_metadata
+            and self.reason is not AuditFailureReason.HTTP_REQUEST_FAILED
+            and not deadline_evidence_for_effective_reason
+        ):
+            raise ValueError(
+                "non-HTTP audit failure reason cannot carry HTTP metadata other than "
+                "non-retryable deadline evidence"
+            )
+        if (
+            self.endpoint_class is not None
+            and self.endpoint_class is not PolymarketEndpointClass.CLOB_BOOK
+        ):
+            raise ValueError("audit HTTP failure must name the CLOB book endpoint")
+        if self.attempt is not None and self.attempt < 0:
+            raise ValueError("audit HTTP failure attempt cannot be negative")
+        if (
+            self.attempt == 0
+            and self.category is not PolymarketHttpFailureCategory.DEADLINE_EXCEEDED
+        ):
+            raise ValueError("audit HTTP attempt zero is reserved for pre-attempt deadline expiry")
+        if self.status_code is not None and not 100 <= self.status_code <= 599:
+            raise ValueError("audit HTTP status must be between 100 and 599")
+        if self.retry_after_nanoseconds is not None and not (
+            0 <= self.retry_after_nanoseconds <= MAXIMUM_RETRY_AFTER_EVIDENCE_NANOSECONDS
+        ):
+            raise ValueError("audit Retry-After duration is outside its evidence bound")
+        if (self.retry_after_disposition is PolymarketRetryAfterDisposition.PARSED) != (
+            self.retry_after_nanoseconds is not None
+        ):
+            raise ValueError("audit Retry-After value and disposition disagree")
+        if has_http_metadata:
+            accepted_error_types = _accepted_audit_http_error_types(
+                cast(PolymarketHttpFailureCategory, self.category)
+            )
+            if self.error_type not in accepted_error_types:
+                raise ValueError("audit HTTP failure type contradicts its typed category")
+            validate_polymarket_http_failure_metadata(
+                category=cast(PolymarketHttpFailureCategory, self.category),
+                retryable=cast(bool, self.retryable),
+                status_code=self.status_code,
+                retry_after_disposition=cast(
+                    PolymarketRetryAfterDisposition,
+                    self.retry_after_disposition,
+                ),
+                has_retry_after=self.retry_after_nanoseconds is not None,
+                retry_exhausted=cast(bool, self.retry_exhausted),
+                retry_blocked_reason=self.retry_blocked_reason,
+                final_failure=True,
+            )
+
+    def validate_against_public_read_policy(
+        self,
+        *,
+        maximum_attempts: int,
+        maximum_retry_after_nanoseconds: int,
+    ) -> None:
+        """Bind v2 final-failure evidence to the frozen adapter policy."""
+
+        if self.schema == AUDIT_FAILURE_V1_SCHEMA or self.attempt is None:
+            return
+        if maximum_attempts <= 0:
+            raise ValueError("public-read maximum attempts must be positive")
+        if maximum_retry_after_nanoseconds <= 0:
+            raise ValueError("public-read maximum Retry-After must be positive")
+        if self.attempt > maximum_attempts:
+            raise ValueError("audit HTTP attempt exceeds the configured public-read bound")
+        blocked_reason = self.retry_blocked_reason
+        if blocked_reason is PolymarketRetryBlockedReason.ATTEMPTS_EXHAUSTED:
+            if self.attempt != maximum_attempts:
+                raise ValueError(
+                    "attempt-exhaustion evidence must end on the configured final attempt"
+                )
+            return
+        if (
+            blocked_reason
+            in {
+                PolymarketRetryBlockedReason.DEADLINE,
+                PolymarketRetryBlockedReason.RETRY_AFTER_POLICY,
+            }
+            and self.attempt >= maximum_attempts
+        ):
+            raise ValueError("deadline/Retry-After policy cannot override final-attempt exhaustion")
+        if blocked_reason is PolymarketRetryBlockedReason.RETRY_AFTER_POLICY:
+            if (
+                self.retry_after_nanoseconds is None
+                or self.retry_after_nanoseconds <= maximum_retry_after_nanoseconds
+            ):
+                raise ValueError(
+                    "Retry-After policy block requires a delay above the configured bound"
+                )
+        elif (
+            self.retry_after_nanoseconds is not None
+            and self.retry_after_nanoseconds > maximum_retry_after_nanoseconds
+        ):
+            raise ValueError(
+                "above-policy Retry-After evidence requires a Retry-After policy block"
+            )
+
+    @classmethod
+    def from_http_error(
+        cls,
+        *,
+        request_id: str,
+        effective_reason: AuditFailureReason,
+        error: PolymarketHttpError,
+    ) -> AuditFailureCommand:
+        retry_after_nanoseconds = (
+            None
+            if error.retry_after_seconds is None
+            else round(error.retry_after_seconds * 1_000_000_000)
+        )
+        return cls(
+            request_id=request_id,
+            # The command retains the coordinator's effective reason while the
+            # typed HTTP category records the original adapter failure.  The
+            # cross-field validator permits this pairing only for proven,
+            # non-retryable deadline expiry.
+            reason=effective_reason,
+            error_type=f"{type(error).__name__}:{error.category.value}",
+            endpoint_class=error.endpoint_class,
+            category=error.category,
+            retryable=error.retryable,
+            attempt=error.attempt,
+            status_code=error.status_code,
+            retry_after_nanoseconds=retry_after_nanoseconds,
+            retry_after_disposition=error.retry_after_disposition,
+            retry_exhausted=error.retry_exhausted,
+            retry_blocked_reason=error.retry_blocked_reason,
+        )
+
+    def to_record(self) -> dict[str, object]:
+        if self.schema == AUDIT_FAILURE_V1_SCHEMA:
+            return {
                 "reason": self.reason.value,
                 "request_id": self.request_id,
-                "schema": AUDIT_FAILURE_SCHEMA,
+                "schema": self.schema,
             }
+        return {
+            "category": None if self.category is None else self.category.value,
+            "endpoint_class": (None if self.endpoint_class is None else self.endpoint_class.value),
+            "error_type": self.error_type or self.reason.value,
+            "http_attempt": self.attempt,
+            "reason": self.reason.value,
+            "request_id": self.request_id,
+            "retry_after_disposition": (
+                None if self.retry_after_disposition is None else self.retry_after_disposition.value
+            ),
+            "retry_after_nanoseconds": self.retry_after_nanoseconds,
+            "retry_blocked_reason": (
+                None if self.retry_blocked_reason is None else self.retry_blocked_reason.value
+            ),
+            "retry_exhausted": self.retry_exhausted,
+            "retryable": self.retryable,
+            "schema": self.schema,
+            "status_code": self.status_code,
+        }
+
+    def to_payload(self) -> bytes:
+        return canonical_json_bytes(self.to_record())
+
+
+@dataclass(frozen=True, slots=True)
+class AuditFaultLifecycleRecord:
+    """Current or terminal state of one durable audit-failure observation."""
+
+    fault_id: str
+    request_id: str
+    instrument_id: InstrumentId
+    market_id: MarketId
+    native_asset_id: str
+    original_reason: AuditFailureReason
+    reason: AuditFailureReason
+    origin: AuditFaultOrigin
+    status: AuditFaultStatus
+    request_started_monotonic_ns: int
+    audit_start_source: RawSourceRef
+    failure_source: RawSourceRef
+    observed_at: UtcTimestamp
+    observed_monotonic_ns: int
+    error_type: str
+    audit_start_schema: str
+    failure_evidence_kind: AuditFaultFailureEvidenceKind
+    failure_schema: str | None
+    blocks_current_scope: bool
+    affected_scopes: tuple[AuditFaultAffectedScope, ...] = (
+        AuditFaultAffectedScope.AUDIT_ELIGIBILITY,
+        AuditFaultAffectedScope.SCANNER_RESEARCH_ELIGIBILITY,
+    )
+    response_completed_monotonic_ns: int | None = None
+    endpoint_class: PolymarketEndpointClass | None = None
+    category: PolymarketHttpFailureCategory | None = None
+    retryable: bool | None = None
+    attempt: int | None = None
+    status_code: int | None = None
+    retry_after_nanoseconds: int | None = None
+    retry_after_disposition: PolymarketRetryAfterDisposition | None = None
+    retry_exhausted: bool | None = None
+    retry_blocked_reason: PolymarketRetryBlockedReason | None = None
+    resolution: AuditFaultResolution | None = None
+    resolution_source: RawSourceRef | None = None
+    resolved_at: UtcTimestamp | None = None
+    resolved_monotonic_ns: int | None = None
+    schema: str = AUDIT_FAULT_LIFECYCLE_SCHEMA
+
+    def __post_init__(self) -> None:
+        if self.schema != AUDIT_FAULT_LIFECYCLE_SCHEMA:
+            raise ValueError("audit fault lifecycle schema is unsupported")
+        if not is_sha256_hex(self.fault_id):
+            raise ValueError("audit fault ID must be SHA-256 hex")
+        if not self.request_id or len(self.request_id) > 128:
+            raise ValueError("audit fault request ID must be non-empty and bounded")
+        if not self.native_asset_id or len(self.native_asset_id) > 2048:
+            raise ValueError("audit fault native asset ID must be non-empty and bounded")
+        if not self.error_type or len(self.error_type) > 256:
+            raise ValueError("audit fault error type must be non-empty and bounded")
+        if self.audit_start_schema not in {AUDIT_START_V1_SCHEMA, AUDIT_START_V2_SCHEMA}:
+            raise ValueError("audit fault start schema is unsupported")
+        try:
+            source_blocks_current_scope = audit_fault_evidence_blocks_current_scope(
+                kind=self.failure_evidence_kind,
+                audit_start_schema=self.audit_start_schema,
+                failure_schema=self.failure_schema,
+            )
+        except ValueError as error:
+            raise ValueError("audit fault failure source authority is unsupported") from error
+        if type(self.blocks_current_scope) is not bool:
+            raise ValueError("audit fault current-scope authority must be an exact boolean")
+        if min(self.request_started_monotonic_ns, self.observed_monotonic_ns) < 0:
+            raise ValueError("audit fault observation monotonic time cannot be negative")
+        if self.observed_monotonic_ns < self.request_started_monotonic_ns:
+            raise ValueError("audit fault observation precedes request start")
+        if (
+            self.response_completed_monotonic_ns is not None
+            and not self.request_started_monotonic_ns
+            <= self.response_completed_monotonic_ns
+            <= self.observed_monotonic_ns
+        ):
+            raise ValueError("audit fault response-completion chronology is invalid")
+        if not self.affected_scopes or len(set(self.affected_scopes)) != len(self.affected_scopes):
+            raise ValueError("audit fault affected scopes must be non-empty and unique")
+        http_required_values = (
+            self.category,
+            self.retryable,
+            self.attempt,
+            self.retry_after_disposition,
+            self.retry_exhausted,
         )
+        has_http_metadata = self.endpoint_class is not None or any(
+            value is not None
+            for value in (
+                *http_required_values,
+                self.status_code,
+                self.retry_after_nanoseconds,
+                self.retry_blocked_reason,
+            )
+        )
+        if has_http_metadata:
+            if self.endpoint_class is not PolymarketEndpointClass.CLOB_BOOK:
+                raise ValueError("audit fault HTTP evidence must name the CLOB book endpoint")
+            if any(value is None for value in http_required_values):
+                raise ValueError("audit fault HTTP evidence must be complete")
+            category = cast(PolymarketHttpFailureCategory, self.category)
+            attempt = cast(int, self.attempt)
+            if attempt == 0 and category is not PolymarketHttpFailureCategory.DEADLINE_EXCEEDED:
+                raise ValueError(
+                    "audit fault attempt zero is reserved for pre-attempt deadline expiry"
+                )
+            if self.error_type not in _accepted_audit_http_error_types(category):
+                raise ValueError("audit fault HTTP type contradicts its typed category")
+            validate_polymarket_http_failure_metadata(
+                category=category,
+                retryable=cast(bool, self.retryable),
+                status_code=self.status_code,
+                retry_after_disposition=cast(
+                    PolymarketRetryAfterDisposition,
+                    self.retry_after_disposition,
+                ),
+                has_retry_after=self.retry_after_nanoseconds is not None,
+                retry_exhausted=cast(bool, self.retry_exhausted),
+                retry_blocked_reason=self.retry_blocked_reason,
+                final_failure=True,
+            )
+        resolution_values = (
+            self.resolution,
+            self.resolution_source,
+            self.resolved_at,
+            self.resolved_monotonic_ns,
+        )
+        if self.status is AuditFaultStatus.RESOLVED:
+            if any(value is None for value in resolution_values):
+                raise ValueError("resolved audit fault requires complete resolution evidence")
+            if cast(int, self.resolved_monotonic_ns) < self.observed_monotonic_ns:
+                raise ValueError("audit fault resolution precedes observation")
+        elif any(value is not None for value in resolution_values):
+            raise ValueError("unresolved audit fault cannot carry resolution evidence")
+        if self.status in {AuditFaultStatus.CURRENT, AuditFaultStatus.RESOLVED} and (
+            self.origin is not AuditFaultOrigin.EXTERNAL
+        ):
+            raise ValueError("recoverable audit fault lifecycle requires proven external origin")
+        if not source_blocks_current_scope:
+            if self.status is not AuditFaultStatus.PERMANENT or self.blocks_current_scope:
+                raise ValueError(
+                    "historical v1 audit fault must remain non-resolving permanent history"
+                )
+        elif self.blocks_current_scope is (self.status is AuditFaultStatus.RESOLVED):
+            raise ValueError("audit fault current-scope authority contradicts lifecycle status")
+        if self.reason in _KNOWN_INTERNAL_AUDIT_FAILURE_REASONS and (
+            self.origin is not AuditFaultOrigin.INTERNAL
+            or self.status is not AuditFaultStatus.PERMANENT
+        ):
+            raise ValueError("known effective internal audit failure must be INTERNAL/PERMANENT")
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "attempt": self.attempt,
+            "category": None if self.category is None else self.category.value,
+            "endpoint_class": (None if self.endpoint_class is None else self.endpoint_class.value),
+            "error_type": self.error_type,
+            "affected_scopes": tuple(scope.value for scope in self.affected_scopes),
+            "audit_start_schema": self.audit_start_schema,
+            "audit_start_source": self.audit_start_source,
+            "failure_evidence_kind": self.failure_evidence_kind.value,
+            "failure_source": self.failure_source,
+            "failure_schema": self.failure_schema,
+            "fault_id": self.fault_id,
+            "instrument_id": self.instrument_id.value,
+            "market_id": self.market_id.value,
+            "native_asset_id": self.native_asset_id,
+            "observed_at_utc_ns": self.observed_at.nanoseconds_since_epoch,
+            "observed_monotonic_ns": self.observed_monotonic_ns,
+            "origin": self.origin.value,
+            "original_reason": self.original_reason.value,
+            "reason": self.reason.value,
+            "request_started_monotonic_ns": self.request_started_monotonic_ns,
+            "request_id": self.request_id,
+            "blocks_current_scope": self.blocks_current_scope,
+            "resolution": None if self.resolution is None else self.resolution.value,
+            "resolution_source": self.resolution_source,
+            "resolved_at_utc_ns": (
+                None if self.resolved_at is None else self.resolved_at.nanoseconds_since_epoch
+            ),
+            "resolved_monotonic_ns": self.resolved_monotonic_ns,
+            "retry_after_disposition": (
+                None if self.retry_after_disposition is None else self.retry_after_disposition.value
+            ),
+            "retry_after_nanoseconds": self.retry_after_nanoseconds,
+            "retry_blocked_reason": (
+                None if self.retry_blocked_reason is None else self.retry_blocked_reason.value
+            ),
+            "retry_exhausted": self.retry_exhausted,
+            "retryable": self.retryable,
+            "response_completed_monotonic_ns": self.response_completed_monotonic_ns,
+            "schema": self.schema,
+            "status": self.status.value,
+            "status_code": self.status_code,
+        }
+
+
+def audit_fault_origin(command: AuditFailureCommand) -> AuditFaultOrigin:
+    """Classify only what durable typed evidence proves; never infer externally."""
+
+    if command.schema == AUDIT_FAILURE_V1_SCHEMA:
+        return AuditFaultOrigin.INDETERMINATE
+    if command.reason in _KNOWN_INTERNAL_AUDIT_FAILURE_REASONS:
+        return AuditFaultOrigin.INTERNAL
+    if command.endpoint_class is not None:
+        if command.category is PolymarketHttpFailureCategory.LOCAL_PROTOCOL:
+            return AuditFaultOrigin.INTERNAL
+        if command.category is PolymarketHttpFailureCategory.RESPONSE_PROTOCOL:
+            return AuditFaultOrigin.INDETERMINATE
+        return AuditFaultOrigin.EXTERNAL
+    # A current-schema command without HTTP endpoint metadata is a local
+    # coordinator/processor decision. It must never be softened into an
+    # externally recoverable venue incident.
+    return AuditFaultOrigin.INTERNAL
+
+
+def initial_audit_fault_status(
+    command: AuditFailureCommand,
+    *,
+    origin: AuditFaultOrigin,
+) -> AuditFaultStatus:
+    """Classify only fully evidenced external transients as recoverable."""
+
+    if command.schema == AUDIT_FAILURE_V1_SCHEMA or origin is not AuditFaultOrigin.EXTERNAL:
+        return AuditFaultStatus.PERMANENT
+    if command.retryable is not True:
+        return AuditFaultStatus.PERMANENT
+    if command.category in {
+        PolymarketHttpFailureCategory.TIMEOUT,
+        PolymarketHttpFailureCategory.NETWORK,
+    }:
+        return AuditFaultStatus.CURRENT
+    if command.category is PolymarketHttpFailureCategory.HTTP_STATUS and command.status_code in {
+        408,
+        425,
+        429,
+        500,
+        502,
+        503,
+        504,
+    }:
+        return AuditFaultStatus.CURRENT
+    return AuditFaultStatus.PERMANENT
 
 
 @dataclass(frozen=True, slots=True)
@@ -708,6 +1280,13 @@ class AuditExpiryCommand:
         )
 
 
+def _require_nonnegative_audit_integer(value: object, label: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label} must be an integer")
+    if value < 0:
+        raise ValueError(f"{label} cannot be negative")
+
+
 @dataclass(frozen=True, slots=True)
 class AuditClassificationCommand:
     """Durable decision that releases one captured response to canonical comparison."""
@@ -716,16 +1295,28 @@ class AuditClassificationCommand:
     response_ingest_seq: int
     classification_monotonic_ns: int
     hard_expiry_monotonic_ns: int
+    schema: str = AUDIT_CLASSIFICATION_SCHEMA
 
     def __post_init__(self) -> None:
         if not self.request_id or len(self.request_id) > 128:
             raise ValueError("audit request ID must be non-empty and bounded")
-        if self.response_ingest_seq < 0:
-            raise ValueError("audit response ingest sequence cannot be negative")
-        if self.classification_monotonic_ns < 0:
-            raise ValueError("audit classification monotonic time cannot be negative")
-        if self.hard_expiry_monotonic_ns < 0:
-            raise ValueError("audit hard expiry monotonic time cannot be negative")
+        _require_nonnegative_audit_integer(
+            self.response_ingest_seq,
+            "audit response ingest sequence",
+        )
+        _require_nonnegative_audit_integer(
+            self.classification_monotonic_ns,
+            "audit classification monotonic time",
+        )
+        _require_nonnegative_audit_integer(
+            self.hard_expiry_monotonic_ns,
+            "audit hard expiry monotonic time",
+        )
+        if self.schema not in {
+            AUDIT_CLASSIFICATION_V1_SCHEMA,
+            AUDIT_CLASSIFICATION_V2_SCHEMA,
+        }:
+            raise ValueError("audit classification schema is unsupported")
 
     def to_payload(self) -> bytes:
         return canonical_json_bytes(
@@ -734,7 +1325,38 @@ class AuditClassificationCommand:
                 "hard_expiry_monotonic_ns": self.hard_expiry_monotonic_ns,
                 "request_id": self.request_id,
                 "response_ingest_seq": self.response_ingest_seq,
-                "schema": AUDIT_CLASSIFICATION_SCHEMA,
+                "schema": self.schema,
+            }
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AuditClassificationPrepareCommand:
+    """Durable no-outcome preparation for one bounded audit classification."""
+
+    request_id: str
+    response_ingest_seq: int
+    hard_expiry_monotonic_ns: int
+
+    def __post_init__(self) -> None:
+        if not self.request_id or len(self.request_id) > 128:
+            raise ValueError("audit request ID must be non-empty and bounded")
+        _require_nonnegative_audit_integer(
+            self.response_ingest_seq,
+            "audit response ingest sequence",
+        )
+        _require_nonnegative_audit_integer(
+            self.hard_expiry_monotonic_ns,
+            "audit hard expiry monotonic time",
+        )
+
+    def to_payload(self) -> bytes:
+        return canonical_json_bytes(
+            {
+                "hard_expiry_monotonic_ns": self.hard_expiry_monotonic_ns,
+                "request_id": self.request_id,
+                "response_ingest_seq": self.response_ingest_seq,
+                "schema": AUDIT_CLASSIFICATION_PREPARE_SCHEMA,
             }
         )
 
@@ -855,6 +1477,7 @@ class AuditHttpResponseHandoff:
     received_wall_time: UtcTimestamp
     received_monotonic_ns: int
     response_boundary_watermark: WebSocketAdmissionWatermark
+    request_completed_monotonic_ns: int | None = None
 
     def __post_init__(self) -> None:
         if not self.request_id or len(self.request_id) > 128:
@@ -863,6 +1486,11 @@ class AuditHttpResponseHandoff:
             raise ValueError("audit response monotonic time cannot be negative")
         if self.response_boundary_watermark.connection_id != self.connection_id:
             raise ValueError("audit response watermark belongs to another connection")
+        if (
+            self.request_completed_monotonic_ns is not None
+            and self.request_completed_monotonic_ns < self.received_monotonic_ns
+        ):
+            raise ValueError("audit request completion precedes its response body")
 
     @property
     def payload_sha256(self) -> str:
@@ -877,12 +1505,70 @@ class AuditHttpFailureHandoff:
     connection_id: ConnectionId
     reason: AuditFailureReason
     error_type: str
+    endpoint_class: PolymarketEndpointClass | None = None
+    category: PolymarketHttpFailureCategory | None = None
+    retryable: bool | None = None
+    attempt: int | None = None
+    status_code: int | None = None
+    retry_after_nanoseconds: int | None = None
+    retry_after_disposition: PolymarketRetryAfterDisposition | None = None
+    retry_exhausted: bool | None = None
+    retry_blocked_reason: PolymarketRetryBlockedReason | None = None
 
     def __post_init__(self) -> None:
         if not self.request_id or len(self.request_id) > 128:
             raise ValueError("audit request ID must be non-empty and bounded")
         if not self.error_type or len(self.error_type) > 256:
             raise ValueError("audit failure type must be non-empty and bounded")
+        # Reuse the durable command validator so handoff and journal contracts
+        # cannot drift while keeping the connection binding out of the payload.
+        self.to_command()
+
+    @classmethod
+    def from_http_error(
+        cls,
+        *,
+        request_id: str,
+        connection_id: ConnectionId,
+        effective_reason: AuditFailureReason,
+        error: PolymarketHttpError,
+    ) -> AuditHttpFailureHandoff:
+        command = AuditFailureCommand.from_http_error(
+            request_id=request_id,
+            effective_reason=effective_reason,
+            error=error,
+        )
+        return cls(
+            request_id=request_id,
+            connection_id=connection_id,
+            reason=effective_reason,
+            error_type=command.error_type or effective_reason.value,
+            endpoint_class=command.endpoint_class,
+            category=command.category,
+            retryable=command.retryable,
+            attempt=command.attempt,
+            status_code=command.status_code,
+            retry_after_nanoseconds=command.retry_after_nanoseconds,
+            retry_after_disposition=command.retry_after_disposition,
+            retry_exhausted=command.retry_exhausted,
+            retry_blocked_reason=command.retry_blocked_reason,
+        )
+
+    def to_command(self) -> AuditFailureCommand:
+        return AuditFailureCommand(
+            request_id=self.request_id,
+            reason=self.reason,
+            error_type=self.error_type,
+            endpoint_class=self.endpoint_class,
+            category=self.category,
+            retryable=self.retryable,
+            attempt=self.attempt,
+            status_code=self.status_code,
+            retry_after_nanoseconds=self.retry_after_nanoseconds,
+            retry_after_disposition=self.retry_after_disposition,
+            retry_exhausted=self.retry_exhausted,
+            retry_blocked_reason=self.retry_blocked_reason,
+        )
 
 
 type AuditHttpHandoff = AuditHttpResponseHandoff | AuditHttpFailureHandoff
@@ -915,6 +1601,11 @@ class AuditOutcomeEvidence:
     mismatch_diagnostic: AuditMismatchDiagnostic | None = None
     audit_start_schema: str = AUDIT_START_SCHEMA
     trigger_reason: AuditTriggerReason = AuditTriggerReason.OTHER_TYPED_REASON
+    # Additive exact raw identities. Historical callers may omit them, while
+    # all current processor paths bind both the staged start and the durable
+    # response/failure classification source.
+    audit_start_source: RawSourceRef | None = None
+    classification_source: RawSourceRef | None = None
 
     def __post_init__(self) -> None:
         if not self.request_id or len(self.request_id) > 128:
@@ -986,6 +1677,57 @@ class AuditOutcomeEvidence:
                 raise ValueError("v2 audit outcome cannot claim a legacy-unknown trigger")
         else:
             raise ValueError("audit outcome start schema is unsupported")
+        if (self.audit_start_source is None) != (self.classification_source is None):
+            raise ValueError("audit outcome raw control identities must be present together")
+        if (
+            self.classification_source is not None
+            and self.response_ingest_id is not None
+            and self.classification_source.ingest_id == self.response_ingest_id
+            and self.classification_source.payload_sha256 != self.raw_response_sha256
+        ):
+            raise ValueError("audit classification source conflicts with response identity")
+
+
+def _audit_outcome_divergence_identity_v1(
+    audit_outcome: AuditOutcomeEvidence,
+) -> dict[str, object]:
+    """Return the immutable pending-v1 outcome identity projection.
+
+    ``mma-rest-audit-divergence-pending-v1`` predates the additive exact raw
+    identities on :class:`AuditOutcomeEvidence`.  Historical v2 audit-start
+    journals therefore committed this precise projection (with neither raw
+    identity key present) into their divergence IDs and replacement-release
+    capture records.  Keep the projection explicit so future additive outcome
+    evidence cannot silently rewrite that durable identity contract.
+
+    The full enriched outcome remains part of ``AuditDivergencePending`` and
+    its retained/history records; only the content-addressed v1 ID preimage is
+    projected to preserve that durable identity contract during replay.
+    """
+
+    return {
+        "request_id": audit_outcome.request_id,
+        "connection_id": audit_outcome.connection_id,
+        "native_asset_id": audit_outcome.native_asset_id,
+        "attempt": audit_outcome.attempt,
+        "request_started_monotonic_ns": audit_outcome.request_started_monotonic_ns,
+        "starting_admission_ordinal": audit_outcome.starting_admission_ordinal,
+        "starting_processed_ordinal": audit_outcome.starting_processed_ordinal,
+        "starting_book": audit_outcome.starting_book,
+        "outcome": audit_outcome.outcome,
+        "reason": audit_outcome.reason,
+        "response_ingest_id": audit_outcome.response_ingest_id,
+        "raw_response_sha256": audit_outcome.raw_response_sha256,
+        "response_received_wall_time": audit_outcome.response_received_wall_time,
+        "response_received_monotonic_ns": audit_outcome.response_received_monotonic_ns,
+        "response_boundary_ordinal": audit_outcome.response_boundary_ordinal,
+        "barrier_processed_ordinal": audit_outcome.barrier_processed_ordinal,
+        "barrier_book": audit_outcome.barrier_book,
+        "requires_resync": audit_outcome.requires_resync,
+        "mismatch_diagnostic": audit_outcome.mismatch_diagnostic,
+        "audit_start_schema": audit_outcome.audit_start_schema,
+        "trigger_reason": audit_outcome.trigger_reason,
+    }
 
 
 def _audit_divergence_id(
@@ -997,7 +1739,7 @@ def _audit_divergence_id(
 ) -> str:
     return canonical_sha256(
         {
-            "audit_outcome": audit_outcome,
+            "audit_outcome": _audit_outcome_divergence_identity_v1(audit_outcome),
             "audit_start_control_source": audit_start_control_source,
             "classification_source": classification_source,
             "classification_control_source": classification_control_source,
@@ -1030,6 +1772,20 @@ class AuditDivergencePending:
             raise ValueError("audit divergence requires an exact mismatch diagnostic")
         if diagnostic.rest_book.market_id != self.market_id:
             raise ValueError("audit divergence market differs from its REST target")
+        nested_audit_start_source = self.audit_outcome.audit_start_source
+        if (
+            nested_audit_start_source is not None
+            and nested_audit_start_source != self.audit_start_control_source
+        ):
+            raise ValueError("audit divergence start source conflicts with its outcome evidence")
+        nested_classification_source = self.audit_outcome.classification_source
+        if (
+            nested_classification_source is not None
+            and nested_classification_source != self.classification_source
+        ):
+            raise ValueError(
+                "audit divergence classification source conflicts with its outcome evidence"
+            )
         response_monotonic_ns = self.audit_outcome.response_received_monotonic_ns
         response_wall_time = self.audit_outcome.response_received_wall_time
         if response_monotonic_ns is None or response_wall_time is None:
@@ -1188,12 +1944,19 @@ class AuditDivergenceResolution:
 
 
 __all__ = [
+    "AUDIT_CLASSIFICATION_PREPARE_ATTEST_PROTOCOL",
+    "AUDIT_CLASSIFICATION_PREPARE_SCHEMA",
     "AUDIT_CLASSIFICATION_SCHEMA",
+    "AUDIT_CLASSIFICATION_V1_SCHEMA",
+    "AUDIT_CLASSIFICATION_V2_SCHEMA",
     "AUDIT_DIVERGENCE_PENDING_SCHEMA",
     "AUDIT_DIVERGENCE_RESOLUTION_SCHEMA",
     "AUDIT_EXACT_DEPTH_DIFFERENCE_SCHEMA",
     "AUDIT_EXPIRY_SCHEMA",
     "AUDIT_FAILURE_SCHEMA",
+    "AUDIT_FAILURE_V1_SCHEMA",
+    "AUDIT_FAILURE_V2_SCHEMA",
+    "AUDIT_FAULT_LIFECYCLE_SCHEMA",
     "AUDIT_MISMATCH_DIAGNOSTIC_SCHEMA",
     "AUDIT_MISMATCH_MAX_CONTEXT_IDENTITIES",
     "AUDIT_MISMATCH_MAX_LEVELS_PER_SIDE",
@@ -1210,6 +1973,7 @@ __all__ = [
     "AuditBookIdentity",
     "AuditBookSide",
     "AuditClassificationCommand",
+    "AuditClassificationPrepareCommand",
     "AuditDivergencePending",
     "AuditDivergenceResolution",
     "AuditDivergenceResolutionStatus",
@@ -1218,6 +1982,12 @@ __all__ = [
     "AuditExpiryCommand",
     "AuditFailureCommand",
     "AuditFailureReason",
+    "AuditFaultAffectedScope",
+    "AuditFaultFailureEvidenceKind",
+    "AuditFaultLifecycleRecord",
+    "AuditFaultOrigin",
+    "AuditFaultResolution",
+    "AuditFaultStatus",
     "AuditHttpFailureHandoff",
     "AuditHttpHandoff",
     "AuditHttpResponseHandoff",
@@ -1233,7 +2003,10 @@ __all__ = [
     "AuditTriggerReason",
     "WebSocketAdmissionWatermark",
     "audit_exact_depth_identity",
+    "audit_fault_evidence_blocks_current_scope",
+    "audit_fault_origin",
     "build_audit_mismatch_diagnostic",
     "compare_audit_exact_depth",
+    "initial_audit_fault_status",
     "summarize_audit_raw_sources",
 ]

@@ -14,7 +14,7 @@ Every stage ends with tests, reproducible evidence and an explicit gate. Code pr
 | F1 — Canonical core | Implemented |
 | F2 — Immutable raw journal | Implemented |
 | F3 — Canonical analytical storage | Implemented; incremental long-run report path present |
-| P1 — Polymarket read-only vertical slice | Implemented; ADR-0053/0054 remediation candidate present |
+| P1 — Polymarket read-only vertical slice | Implemented; ADR-0053/0054 baseline with ADR-0055 final remediation current |
 | P2 — Ordinary-binary complete-set scanner | Implemented |
 | P3 — Deterministic replay/rebuild | Implemented and passed first-soak review |
 | P4 — First six-hour Polymarket soak | Executed; `GATE 1: FAIL` |
@@ -24,10 +24,12 @@ Every stage ends with tests, reproducible evidence and an explicit gate. Code pr
 
 The first soak ran from `a382b93220011428703fe02483f7034f59c1f045` and is documented in `GATE_1_FAILURE_20260822.md`.
 
-Gate 1 remains `FAIL`. The current candidate adds ADR-0054 audit-divergence
-recovery and Gate semantics, but final offline gates and new exact-SHA public
-smoke/stability evidence remain pending. No six-hour rerun was performed in the
-ADR-0054 remediation task.
+Gate 1 remains `FAIL`. The 45-minute ADR-0054 candidate observation exposed
+remaining operational-summary/history-memory, external-attribution, public-read
+fault-lifecycle, interval-contribution, typed-resync and local classification-
+latency defects. ADR-0055 governs their correction. Final offline gates and new
+exact-SHA 60-second smoke plus 5,400–7,200 second post-saturation stability
+evidence remain pending. No six-hour rerun was performed.
 
 ## 2. Completed foundation
 
@@ -101,7 +103,8 @@ The evidence remains useful and must be preserved as a permanent regression corp
 
 ## 5. Current slice P4R — Gate-1 remediation
 
-The normative contract is `GATE_1_REMEDIATION_SPEC.md`, ADR-0053 and ADR-0054.
+The normative contract is `GATE_1_REMEDIATION_SPEC.md`, ADR-0053, ADR-0054 and
+ADR-0055.
 
 ### R1 — Failure-window analysis
 
@@ -132,24 +135,40 @@ The normative contract is `GATE_1_REMEDIATION_SPEC.md`, ADR-0053 and ADR-0054.
 - retain the 512 MiB limit;
 - prove identical summaries on small data and success on >512 MiB materialized-size fixtures.
 
-### R4 — Observability v2
+### R4 — Observability v4
 
 - add checkpoint monotonic epoch/nanoseconds;
 - add typed availability-interval ledger with cause/recovery evidence;
 - reconcile interval ledger with aggregates;
 - record CPU model/logical cores/total memory;
 - record current and peak RSS.
+- emit checkpoint v4 from a lightweight immutable operational snapshot with
+  v1-v3 historical compatibility;
+- emit a separate direct interval-contribution stream and typed resync reasons;
+- retain public-read/audit fault observed/pending/resolved lifecycles;
+- report retention occupancy, Python/PyArrow/native memory and post-saturation
+  slope.
 
 ### R5 — Audit/memory diagnosis
 
 - classify online mismatch causes and full-depth causal-generation relations;
 - report transition-attributed mismatches and invalidations;
 - retain mismatch history after recovery;
-- separate observed, pending, authoritative-resnapshot resolution, terminal
-  unresolved, new-contract unknown and local-book-defect state;
+- separate exact observation, independent received-prefix integrity, external
+  causal attribution and recovery state;
+- allow `EXTERNAL_CAUSE_UNATTRIBUTED` only after independent prefix proof and
+  complete ADR-0055 recovery/contribution/replay reconciliation;
+- retain pending, authoritative-resnapshot resolution, terminal unresolved,
+  unsupported generic unknown and local-book-defect state;
 - emit v2 audit triggers while replaying v1 controls as `UNKNOWN_LEGACY`;
-- make current and Gate-sticky health reasons explicit in checkpoint v3;
+- make current and Gate-sticky health reasons explicit in checkpoint v4;
 - measure RSS slope, latency tails and queue HWMs.
+- preserve strict pre-expiry classification, remove the demonstrated
+  socket-acquisition cleanup wait from mismatch classification, and remove the
+  independently unbounded operational-summary/history work from the
+  latency-critical path;
+- make recent full-object retention diagnostic-only while preserving durable
+  analytical output, exact totals/chains and current pending/recovery authority.
 
 ### R6 — Failed-run regression replay
 
@@ -157,20 +176,24 @@ The normative contract is `GATE_1_REMEDIATION_SPEC.md`, ADR-0053 and ADR-0054.
 - require deterministic corrected identities;
 - require no identified primary invariant failures;
 - require successful scan report, rebuild and validation;
-- require byte-identical causal reports over all 262 failed-soak and 20 prior
-  stability mismatches without relabeling recovery-generation equality as
-  natural convergence;
-- require deterministic trigger/lifecycle/interval/terminal reconciliation;
+- require byte-identical reports over all retained failed-soak, prior-stability
+  and current 45-minute mismatches without relabeling recovery-generation
+  equality as natural convergence;
+- require the independent prefix oracle, fault lifecycles and direct interval
+  contribution for every current-schema mismatch;
+- require deterministic trigger/lifecycle/contribution/interval/terminal
+  reconciliation;
 - verify raw immutability.
 
 ### R7 — Short preflight
 
 - full lock/SCA/lint/type/test/pre-commit/build/no-live gates;
 - 60-second explicit-target smoke;
-- 45–60 minute stability observation;
+- 5,400–7,200 second post-saturation stability observation, preferring 7,200;
 - independent review of transitions, audit triggers, causal mismatches,
-  divergence states, intervals, chronology, RSS slope, queues, tails and
-  storage.
+  orthogonal divergence state, fault lifecycles, interval contributions,
+  chronology, operational/terminal latency, memory attribution/plateau, queues,
+  tails and storage.
 
 The final-SHA smoke and stability runs are pending until the implementation and
 offline gates are frozen. Older public runs are forensic inputs, not acceptance

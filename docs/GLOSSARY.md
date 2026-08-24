@@ -46,6 +46,25 @@ Bounded auxiliary state defined by ADR-0053 for a book whose exact quantity-bear
 
 It is not a `BookHealth` value and does not make the book healthy. While unresolved, exact valid L2/provenance may be retained, but audit, scanner and research eligibility remain blocked. The transition clears only by exact convergence, authoritative snapshot/resnapshot or deterministic supersession; ambiguity/bound expiry fails closed.
 
+## AuditEvidenceDimensions
+
+ADR-0055 separates four orthogonal questions for a REST/local comparison:
+
+```text
+observation_fact
+internal_received_prefix_integrity
+external_causal_attribution
+recovery_state
+```
+
+`EXACT_FULL_DEPTH_DIVERGENCE` is a known observation. Independent reconstruction
+may prove `PROVEN_RECEIVED_PREFIX_RECONSTRUCTION`, find an
+`INTERNAL_RECONSTRUCTION_DEFECT`, or remain
+`INTERNAL_RECONSTRUCTION_INDETERMINATE`. External attribution may be
+`EXTERNAL_CAUSE_UNATTRIBUTED` when official protocol/run evidence cannot prove a
+unique cause. That typed conclusion is not generic `UNKNOWN` and does not weaken
+the required internal-integrity or recovery proofs.
+
 ## AuditDivergence
 
 A race-free exact disagreement between the normalized REST book and the fenced
@@ -82,7 +101,11 @@ It is a current audit/scanner/research blocker; an incomplete record at terminal
 cutoff is reported as `replacement_captures_unresolved` and produces sticky
 `AUDIT_DIVERGENCE_UNRESOLVED`. Observed, fully recovered external divergence
 remains visible but is not equivalent to current unresolved state. Terminal
-unresolved, new-contract unknown and local-book-defect state are Gate-sticky.
+unresolved, internal reconstruction indeterminate/defect, unsupported generic
+unknown and local-book-defect state are Gate-sticky. Under ADR-0055,
+`EXTERNAL_CAUSE_UNATTRIBUTED` is nonsticky only after independent received-
+prefix proof, complete authoritative recovery, direct interval contribution and
+exact lifecycle/replay/rebuild reconciliation.
 
 ## AuditTriggerReason
 
@@ -103,6 +126,55 @@ not inferred from timing. New v2 controls cannot use it.
 
 ## AvailabilityInterval
 Versioned evidence record for one period during which required observation continuity was unavailable or indeterminate. It binds UTC and monotonic start/end, socket/connection identity, typed cause, affected scope and recovery outcome. Aggregate unavailable counters must reconcile with the interval ledger.
+
+## AvailabilityIntervalContribution
+
+Versioned ADR-0055 record binding one audit divergence/request/instrument
+directly to the non-overlapping `AvailabilityInterval` whose union contains its
+lost-eligibility period. Contributions may overlap and join one global interval;
+global unavailable duration remains the interval union, not the sum of
+contribution durations. New producers use
+`gate1-availability-interval-contribution-v1`.
+
+## ProcessorOperationalSnapshot
+
+Immutable lightweight processor projection used by periodic health. It contains
+only current state, finite counters/matrices, compact representatives and
+incrementally maintained chain identities. Its work is independent of retained
+diagnostic-history occupancy and it is not a full `ProcessorSummary` or terminal
+hash authority.
+
+## PublicReadFaultLifecycle
+
+Versioned evidence separating immutable HTTP/audit/retry-exhaustion history from
+current unavailable/recovery-pending state and exact resolution. Current-schema
+health exposes observed, current, resolved, and permanent counts plus exact
+lifecycle reconciliation. Recoverable state requires proven external origin,
+`retryable=true`, and `TIMEOUT`, `NETWORK`, or HTTP status
+408/425/429/500/502/503/504; retry exhaustion alone does not qualify. Historical
+v1, protocol/indeterminate, non-retryable, and other-status faults are permanent.
+A qualifying recovered transient may clear current gating without erasing
+history; unresolved, internal, permanent, or inconsistent faults remain sticky.
+
+## RecoveryResyncReason
+
+Finite end-to-end reason carried from the initiating processor/recovery decision
+through health, interval/contribution evidence, replay and terminal
+reconciliation. Known causes remain typed; genuinely unsupported causes remain
+`UNKNOWN` rather than being relabeled.
+
+```text
+AUDIT_MISMATCH_RECOVERY
+REPORTED_TOP_TRANSITION_FAILURE
+FRESHNESS_EXPIRY
+REFERENCE_REFRESH
+TRANSPORT_DISCONNECT
+CANONICAL_STATE_INVALIDATION
+SCHEMA_PROTOCOL_ERROR
+BACKPRESSURE_RESOURCE
+TARGET_LIFECYCLE
+UNKNOWN
+```
 
 ## ComponentHealth
 Operational health of a component:

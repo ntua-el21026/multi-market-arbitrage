@@ -134,6 +134,12 @@ A failure in derived research persistence should not unnecessarily stop healthy 
 
 A failure that invalidates a prerequisite for economic decisions removes decision eligibility for the affected scope.
 
+Periodic health consumes a lightweight immutable operational snapshot. Full
+processor-summary, terminal-hash, and history-sized diagnostic work remains off
+the active acquisition/classification path. Fault and availability-contribution
+writers are separately bounded derived-evidence owners and cannot take
+canonical-state ownership.
+
 ## 7. Technology baseline
 
 Initial:

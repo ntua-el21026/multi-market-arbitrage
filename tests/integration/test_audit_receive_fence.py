@@ -35,6 +35,7 @@ from multi_market_arbitrage.pipeline import (
     CONTROL_BOOK_INVALIDATION,
     CONTROL_REPORTED_TOP_TRANSITION_EXPIRED,
     CONTROL_REST_AUDIT_CLASSIFY,
+    CONTROL_REST_AUDIT_CLASSIFY_PREPARE,
     CONTROL_REST_AUDIT_EXPIRED,
     CONTROL_REST_AUDIT_FAILED,
     CONTROL_REST_AUDIT_START,
@@ -43,6 +44,8 @@ from multi_market_arbitrage.pipeline import (
     REST_BOOK_AUDIT,
     WS_MARKET,
     AuditFailureReason,
+    AuditFaultOrigin,
+    AuditFaultStatus,
     AuditHttpFailureHandoff,
     AuditHttpHandoff,
     AuditHttpResponseHandoff,
@@ -81,6 +84,7 @@ FIXTURES = Path(__file__).parents[1] / "golden" / "fixtures"
 BACKLOG_MESSAGES = 128
 
 FenceStage = Literal["journal_durability", "canonical_processing"]
+ClassificationDelayStage = Literal["classification_durability", "classification_processing"]
 
 
 def _fixture(name: str) -> bytes:
@@ -459,6 +463,7 @@ async def test_pre_response_update_queued_in_ingress_is_inside_audit_fence(
         CONTROL_REST_AUDIT_START,
         *(WS_MARKET for _ in range(BACKLOG_MESSAGES)),
         REST_BOOK_AUDIT,
+        CONTROL_REST_AUDIT_CLASSIFY_PREPARE,
         CONTROL_REST_AUDIT_CLASSIFY,
     )
     replayed = replay_journal(tmp_path / "raw", run_id, config).processor
@@ -599,19 +604,255 @@ async def test_response_durable_before_expiry_but_classified_after_expiry_fails_
     assert outcome.reason is AuditFailureReason.BOOK_FRESHNESS_EXPIRED
     scan_latency_after = metrics.histogram_snapshot("mma_receive_to_scan_complete_ns")
     assert scan_latency_after is not None
-    assert scan_latency_after.total_sum - scan_latency_sum_before >= (hard_expiry_ns - response_ns)
+    assert scan_latency_after.total_sum == scan_latency_sum_before
+    assert result.scan_count == 0
     assert outcome.raw_response_sha256 == response.payload_sha256
     live = processor.summary()
     records = JournalReader(tmp_path / "raw", run_id).read_all()
     response_record = next(record for record in records if record.channel == REST_BOOK_AUDIT)
+    prepare_record = next(
+        record for record in records if record.channel == CONTROL_REST_AUDIT_CLASSIFY_PREPARE
+    )
     classify_record = next(
         record for record in records if record.channel == CONTROL_REST_AUDIT_CLASSIFY
     )
-    assert response_record.ingest_seq < classify_record.ingest_seq
+    assert response_record.ingest_seq < prepare_record.ingest_seq < classify_record.ingest_seq
     decision = cast(dict[str, object], json.loads(classify_record.payload_bytes))
     assert cast(int, decision["classification_monotonic_ns"]) >= hard_expiry_ns
     replayed = replay_journal(tmp_path / "raw", run_id, config).processor
     assert replayed.audit_outcomes == live.audit_outcomes
+    assert replayed.terminal_hash == live.terminal_hash
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        pytest.param("classification_durability", id="delayed-classification-fsync"),
+        pytest.param("classification_processing", id="delayed-classification-processing"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_prepare_attest_classification_deadline_is_transactional_and_replayable(
+    stage: ClassificationDelayStage,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Neither a late prepare fsync nor late processing can provisionally classify."""
+
+    config = load_phase1_config(Path("config/phase1.toml"))
+    config = config.model_copy(
+        update={
+            "scanner": config.scanner.model_copy(
+                update={
+                    "maximum_book_age_seconds": 0.3,
+                    "maximum_interleg_skew_seconds": 0.1,
+                }
+            )
+        }
+    )
+    run_id = CollectorRunId(f"audit-prepare-attest-{stage}")
+    writer = RawJournalWriter(
+        JournalWriterConfig(
+            root=tmp_path / "raw",
+            collector_run_id=run_id,
+            venue_id=POLYMARKET_VENUE_ID,
+            stream="polymarket-public",
+            writer_id=WriterId(f"writer-audit-prepare-attest-{stage}"),
+            writer_software_version="test",
+            git_commit="fixture",
+        )
+    )
+    processor = CanonicalProcessor(config)
+    metrics = InMemoryMetrics()
+    capture = observe_module._RawCaptureBoundary(  # pyright: ignore[reportPrivateUsage]
+        collector_run_id=run_id,
+        writer=writer,
+        processor=processor,
+        metrics=metrics,
+    )
+    service = PolymarketObservationService(config, workspace_root=tmp_path, code_commit="fixture")
+    connection_id = ConnectionId(f"audit-prepare-attest-{stage}")
+    subscription_id = SubscriptionId(f"audit-prepare-attest-{stage}-subscription")
+    ingress = BoundedRawIngress(
+        max_items=config.system.queue_capacity,
+        max_bytes=config.polymarket.maximum_ingress_queue_bytes,
+        connection_id=connection_id,
+    )
+    delay_used = False
+    prepare_results: list[ProcessedEnvelope] = []
+    prepare_state_pairs: list[tuple[object, object]] = []
+
+    await writer.start()
+    try:
+        await _initialize_books(capture)
+        instrument_id = processor.audit_book_identity("token-yes").instrument_id
+        hard_expiry_ns = capture.book_freshness_receive_ns_by_instrument[instrument_id] + int(
+            config.scanner.maximum_book_age_seconds * 1_000_000_000
+        )
+        start, start_result = await service._stage_audit_start(  # pyright: ignore[reportPrivateUsage]
+            capture=capture,
+            ingress=ingress,
+            native_asset_id="token-yes",
+            attempt=1,
+            connection_id=connection_id,
+            subscription_id=subscription_id,
+            hard_expiry_monotonic_ns=hard_expiry_ns,
+            run_deadline_monotonic_ns=hard_expiry_ns,
+        )
+        assert start_result.success
+        response_ns = time.monotonic_ns()
+        assert response_ns < hard_expiry_ns
+        response = AuditHttpResponseHandoff(
+            request_id=start.request_id,
+            connection_id=connection_id,
+            payload_bytes=_fixture("polymarket_rest_book_yes.json"),
+            received_wall_time=UtcTimestamp.now(),
+            received_monotonic_ns=response_ns,
+            response_boundary_watermark=WebSocketAdmissionWatermark(
+                connection_id=connection_id,
+                ordinal=0,
+            ),
+        )
+        scans_before = processor.summary().scans
+
+        if stage == "classification_durability":
+            original_append = cast(
+                Callable[[object, object], object],
+                writer.__getattribute__("_append_durability_subgroup"),
+            )
+
+            def delayed_append(records: object, commit_started: object) -> object:
+                nonlocal delay_used
+                typed_records = cast(
+                    tuple[tuple[RawEventEnvelope, object], ...],
+                    records,
+                )
+                if not delay_used and any(
+                    envelope.channel == CONTROL_REST_AUDIT_CLASSIFY_PREPARE
+                    for envelope, _admitted_at in typed_records
+                ):
+                    delay_used = True
+                    time.sleep(max(0.0, (hard_expiry_ns - time.monotonic_ns()) / 1e9) + 0.02)
+                return original_append(records, commit_started)
+
+            monkeypatch.setattr(  # pyright: ignore[reportPrivateUsage]
+                writer,
+                "_append_durability_subgroup",
+                delayed_append,
+            )
+            original_process_durable = processor.process_durable
+
+            def recording_process_durable(
+                envelope: RawEventEnvelope,
+                receipt: JournalReceipt,
+            ) -> ProcessedEnvelope:
+                before = (processor.snapshots(), processor.audit_ineligible_instruments)
+                processed = original_process_durable(envelope, receipt)
+                if envelope.channel == CONTROL_REST_AUDIT_CLASSIFY_PREPARE:
+                    prepare_results.append(processed)
+                    prepare_state_pairs.append(
+                        (before, (processor.snapshots(), processor.audit_ineligible_instruments))
+                    )
+                return processed
+
+            monkeypatch.setattr(processor, "process_durable", recording_process_durable)
+        else:
+            original_process_durable = processor.process_durable
+
+            def delayed_process_durable(
+                envelope: RawEventEnvelope,
+                receipt: JournalReceipt,
+            ) -> ProcessedEnvelope:
+                nonlocal delay_used
+                if not delay_used and envelope.channel == CONTROL_REST_AUDIT_CLASSIFY_PREPARE:
+                    delay_used = True
+                    time.sleep(max(0.0, (hard_expiry_ns - time.monotonic_ns()) / 1e9) + 0.02)
+                before = (processor.snapshots(), processor.audit_ineligible_instruments)
+                processed = original_process_durable(envelope, receipt)
+                if envelope.channel == CONTROL_REST_AUDIT_CLASSIFY_PREPARE:
+                    prepare_results.append(processed)
+                    prepare_state_pairs.append(
+                        (before, (processor.snapshots(), processor.audit_ineligible_instruments))
+                    )
+                return processed
+
+            monkeypatch.setattr(processor, "process_durable", delayed_process_durable)
+
+        result = await service._preserve_audit_response(  # pyright: ignore[reportPrivateUsage]
+            capture=capture,
+            response=response,
+            start=start,
+            barrier_ordinal=0,
+            subscription_id=subscription_id,
+            hard_expiry_monotonic_ns=hard_expiry_ns,
+        )
+    except BaseException:
+        with suppress(Exception):
+            await writer.close(completed=False)
+        raise
+    else:
+        await writer.close()
+
+    assert delay_used
+    assert len(prepare_results) == 1
+    prepared_result = prepare_results[0]
+    assert prepared_result.success
+    assert prepared_result.canonical_event_count == 0
+    assert prepared_result.scan_count == 0
+    assert prepared_result.scan_triggers == ()
+    assert prepared_result.audit_outcomes == ()
+    assert prepared_result.book_freshness_updates == ()
+    assert prepared_result.audit_divergences_opened == ()
+    assert prepare_state_pairs[0][0] == prepare_state_pairs[0][1]
+    assert result.success
+    assert result.scan_count == 0
+    assert result.scan_triggers == ()
+    assert result.book_freshness_updates == ()
+    assert result.audit_divergences_opened == ()
+    assert result.audit_divergences_eligibility_restored == ()
+    assert tuple(outcome.outcome for outcome in result.audit_outcomes) == (AuditOutcome.FAILED,)
+    assert result.audit_outcomes[0].reason is AuditFailureReason.BOOK_FRESHNESS_EXPIRED
+    assert instrument_id in processor.audit_ineligible_instruments
+
+    live = processor.summary()
+    assert live.scans == scans_before
+    assert live.rest_audit_matches == 0
+    assert live.rest_audit_mismatches == 0
+    assert live.rest_audit_raced == 0
+    assert live.rest_audit_failed == 1
+    assert live.audit_faults_current == 0
+    assert live.audit_faults_resolved == 0
+    assert live.audit_faults_permanent == 1
+    assert live.audit_fault_lifecycle_reconciled
+    assert len(live.audit_fault_lifecycle_records) == 1
+    lifecycle = live.audit_fault_lifecycle_records[0]
+    assert lifecycle.origin is AuditFaultOrigin.INTERNAL
+    assert lifecycle.status is AuditFaultStatus.PERMANENT
+    assert lifecycle.reason is AuditFailureReason.BOOK_FRESHNESS_EXPIRED
+
+    records = JournalReader(tmp_path / "raw", run_id).read_all()
+    assert sum(record.channel == CONTROL_REST_AUDIT_CLASSIFY_PREPARE for record in records) == 1
+    assert sum(record.channel == CONTROL_REST_AUDIT_CLASSIFY for record in records) == 1
+    classify_record = next(
+        record for record in records if record.channel == CONTROL_REST_AUDIT_CLASSIFY
+    )
+    durable_ns = cast(
+        int,
+        classify_record.transport_metadata["classification_prepare_durable_monotonic_ns"],
+    )
+    processed_ns = cast(
+        int,
+        classify_record.transport_metadata["classification_prepare_processed_monotonic_ns"],
+    )
+    if stage == "classification_durability":
+        assert durable_ns >= hard_expiry_ns
+    else:
+        assert durable_ns < hard_expiry_ns <= processed_ns
+
+    replayed = replay_journal(tmp_path / "raw", run_id, config).processor
+    assert replayed.audit_outcomes == live.audit_outcomes
+    assert replayed.audit_fault_lifecycle_records == live.audit_fault_lifecycle_records
+    assert replayed.audit_ineligible_books == live.audit_ineligible_books
     assert replayed.terminal_hash == live.terminal_hash
 
 
@@ -904,15 +1145,15 @@ async def test_pre_response_update_cannot_false_match_across_receive_fence(
     if stage == "journal_durability":
         assert first_response_probe["dequeued"] == 1
         assert first_response_probe["ingress_depth"] == BACKLOG_MESSAGES - 1
-        assert first_response_probe["writer_received"] == 9
-        assert first_response_probe["durable"] == 8
-        assert first_response_probe["writer_watermark"] == 7
+        assert first_response_probe["writer_received"] == 10
+        assert first_response_probe["durable"] == 9
+        assert first_response_probe["writer_watermark"] == 8
     else:
         assert first_response_probe["dequeued"] == 1
         assert first_response_probe["ingress_depth"] == BACKLOG_MESSAGES - 1
-        assert first_response_probe["writer_received"] == 9
-        assert first_response_probe["durable"] == 9
-        assert first_response_probe["writer_watermark"] == 8
+        assert first_response_probe["writer_received"] == 10
+        assert first_response_probe["durable"] == 10
+        assert first_response_probe["writer_watermark"] == 9
 
     ingress_metrics = generation.ingress_metrics
     assert ingress_metrics.received == BACKLOG_MESSAGES
@@ -949,7 +1190,7 @@ async def test_pre_response_update_cannot_false_match_across_receive_fence(
     assert second.response_ingest_id is not None
     assert generation.interruption_started_at is not None
     assert generation.interruption is not None
-    assert generation.interruption.cause is AvailabilityCause.AUDIT_MISMATCH_RESYNCHRONIZATION
+    assert generation.interruption.cause is AvailabilityCause.AUDIT_MISMATCH_RECOVERY
     assert generation.interruption.reason_code == "REST_AUDIT_MISMATCH"
     assert generation.interruption.source_evidence_ids == (
         f"audit-request:{second.request_id}",
@@ -2515,7 +2756,7 @@ async def test_second_start_crossing_leg_expiry_closes_all_staged_legs_without_h
     [
         pytest.param(
             "new_market",
-            AvailabilityCause.PROTOCOL_SCHEMA_INVARIANT,
+            AvailabilityCause.REFERENCE_REFRESH,
             "REFERENCE_PRECISION_REFRESH",
             (AuditOutcome.MATCH, AuditOutcome.MATCH),
             id="reference-precision",
@@ -2789,6 +3030,7 @@ async def test_unhealthy_generation_records_expiry_without_http(
     await _initialize_books(capture)
     invalidation = await capture.preserve_invalidation(InvalidationReason.SCHEMA_VIOLATION)
     assert invalidation.needs_resync
+    runtime_health = ObservationRuntimeHealth()
     try:
         async with asyncio.timeout(10.0):
             generation = await service._run_generation(  # pyright: ignore[reportPrivateUsage]
@@ -2802,7 +3044,7 @@ async def test_unhealthy_generation_records_expiry_without_http(
                 connection_id=connection_id,
                 subscription_id=SubscriptionId("adversarial-audit-start-unhealthy-subscription"),
                 unavailable_started_ns=None,
-                runtime_health=ObservationRuntimeHealth(),
+                runtime_health=runtime_health,
             )
     except BaseException:
         with suppress(Exception):
@@ -2812,6 +3054,9 @@ async def test_unhealthy_generation_records_expiry_without_http(
         await writer.close()
 
     assert generation.reason.value == "RESYNC_REQUIRED"
+    assert generation.interruption is not None
+    assert generation.interruption.cause is AvailabilityCause.FRESHNESS_EXPIRY
+    assert generation.interruption.reason_code == AuditFailureReason.BOOK_FRESHNESS_EXPIRED.value
     assert client.calls == 0
     live = processor.summary()
     assert live.audit_outcomes == ()
@@ -2821,6 +3066,16 @@ async def test_unhealthy_generation_records_expiry_without_http(
     assert tuple(record.channel for record in records[-2:]) == (
         CONTROL_BOOK_INVALIDATION,
         CONTROL_REST_AUDIT_EXPIRED,
+    )
+    expiry_record = records[-1]
+    assert generation.interruption.source_evidence_ids == (
+        f"ingest-seq:{expiry_record.ingest_seq}",
+        f"raw-source-ingest:{expiry_record.ingest_id.value}",
+    )
+    runtime = runtime_health.snapshot(now_ns=time.monotonic_ns())
+    assert runtime.current_unavailable_cause is AvailabilityCause.FRESHNESS_EXPIRY
+    assert runtime.current_unavailable_reason_code == (
+        AuditFailureReason.BOOK_FRESHNESS_EXPIRED.value
     )
     replayed = replay_journal(tmp_path / "raw", run_id, config).processor
     assert replayed.audit_outcomes == live.audit_outcomes
@@ -3938,11 +4193,15 @@ async def test_public_controller_deadline_wins_run_end_without_duplicate_failure
     config = config.model_copy(
         update={
             "polymarket": config.polymarket.model_copy(
-                update={"snapshot_audit_freshness_guard_seconds": 0.025}
+                update={"snapshot_audit_freshness_guard_seconds": 0.05}
             ),
             "scanner": config.scanner.model_copy(
                 update={
-                    "maximum_book_age_seconds": 0.03,
+                    # This is a deadline-ordering test, not a journal-fsync
+                    # latency test.  Keep the per-book hard expiry before
+                    # run end while allowing both durable START controls to
+                    # launch on slower Windows-backed test filesystems.
+                    "maximum_book_age_seconds": 0.5,
                     "maximum_interleg_skew_seconds": 0.01,
                 }
             ),
@@ -4006,7 +4265,7 @@ async def test_public_controller_deadline_wins_run_end_without_duplicate_failure
     await writer.start()
     await _initialize_books(capture)
     loop = asyncio.get_running_loop()
-    remaining_seconds = 0.05
+    remaining_seconds = 0.75
     deadline = loop.time() + remaining_seconds
     deadline_ns = time.monotonic_ns() + int(remaining_seconds * 1e9)
     async with PolymarketPublicClient(
@@ -4280,7 +4539,7 @@ async def test_idle_reported_top_transition_expires_through_durable_supervisor_c
         assert generation.interruption is None
     else:
         assert generation.interruption is not None
-        assert generation.interruption.cause.value == "REPORTED_TOP_TRANSITION_EXPIRY"
+        assert generation.interruption.cause.value == "REPORTED_TOP_TRANSITION_FAILURE"
     live = processor.summary()
     assert live.pending_reported_top_transitions == 0
     assert live.reported_top_transitions_expired == 1

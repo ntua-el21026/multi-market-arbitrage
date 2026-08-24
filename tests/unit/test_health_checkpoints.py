@@ -14,12 +14,16 @@ from multi_market_arbitrage.observability import (
     HEALTH_CHECKPOINT_SCHEMA_VERSION,
     HEALTH_CHECKPOINT_V1_SCHEMA_VERSION,
     HEALTH_CHECKPOINT_V2_SCHEMA_VERSION,
+    HEALTH_CHECKPOINT_V3_SCHEMA_VERSION,
+    HEALTH_DECISION_REASON_MASK_SCHEMA,
     HealthCheckpoint,
     HealthDecisionInputs,
     HealthDecisionReason,
     PeriodicHealthCheckpointEmitter,
     SupervisedHealthCheckpointWriter,
     evaluate_health_decision,
+    health_decision_reason_mask,
+    health_decision_reasons_from_mask,
     validate_health_checkpoint_chronology,
 )
 
@@ -187,6 +191,77 @@ def test_recovered_integrity_history_is_gate_sticky_but_not_current_research_blo
     assert decision.research_eligible is True
     assert decision.gate1_eligible_so_far is False
     assert decision.reason_codes == (reason,)
+    assert decision.gate1_sticky_reason_codes == (reason,)
+
+
+@pytest.mark.parametrize(
+    ("counter", "reason"),
+    [
+        ("audit_failures_current", HealthDecisionReason.AUDIT_FAILED),
+        ("http_final_failures_current", HealthDecisionReason.HTTP_FINAL_FAILURE),
+        (
+            "http_retry_budget_exhaustions_current",
+            HealthDecisionReason.HTTP_INTEGRITY_UNAVAILABLE,
+        ),
+    ],
+)
+def test_recoverable_current_integrity_fault_is_visible_but_not_gate_sticky(
+    counter: str,
+    reason: HealthDecisionReason,
+) -> None:
+    decision = evaluate_health_decision(
+        _decision_inputs(
+            all_required_books_healthy=False,
+            **{counter: 1},
+        )
+    )
+
+    assert decision.capture_healthy is True
+    assert decision.research_eligible is False
+    assert decision.gate1_eligible_so_far is False
+    assert set(decision.reason_codes) == {
+        HealthDecisionReason.BOOK_NOT_HEALTHY,
+        reason,
+    }
+    assert decision.gate1_sticky_reason_codes == ()
+
+
+@pytest.mark.parametrize(
+    ("current_counter", "permanent_counter", "reason"),
+    [
+        (
+            "audit_failures_current",
+            "audit_failures",
+            HealthDecisionReason.AUDIT_FAILED,
+        ),
+        (
+            "http_final_failures_current",
+            "http_final_failures",
+            HealthDecisionReason.HTTP_FINAL_FAILURE,
+        ),
+        (
+            "http_retry_budget_exhaustions_current",
+            "http_retry_budget_exhaustions",
+            HealthDecisionReason.HTTP_INTEGRITY_UNAVAILABLE,
+        ),
+    ],
+)
+def test_mixed_current_and_permanent_integrity_fault_remains_gate_sticky(
+    current_counter: str,
+    permanent_counter: str,
+    reason: HealthDecisionReason,
+) -> None:
+    decision = evaluate_health_decision(
+        _decision_inputs(
+            **{
+                current_counter: 1,
+                permanent_counter: 1,
+            }
+        )
+    )
+
+    assert decision.reason_codes == (reason,)
+    assert decision.gate1_sticky_reason_codes == (reason,)
 
 
 @pytest.mark.parametrize(
@@ -419,18 +494,40 @@ async def test_health_writer_publishes_bounded_canonical_jsonl(tmp_path: Path) -
     assert record["emitted_monotonic_epoch_id"] == run_id.value
     assert isinstance(record["emitted_monotonic_ns"], int)
     assert record["decisions"]["gate1_eligible_so_far"] is True
-    assert record["decisions"]["gate1_sticky_reason_codes"] == []
+    assert record["decisions"]["gate1_sticky_reason_mask"] == 0
+    assert record["decisions"]["reason_mask"] == 0
+    assert record["decisions"]["reason_mask_schema"] == HEALTH_DECISION_REASON_MASK_SCHEMA
 
 
-def test_checkpoint_v3_chronology_uses_monotonic_when_utc_regresses() -> None:
+def test_v4_health_decision_reason_mask_has_fixed_exact_round_trip() -> None:
+    reasons = tuple(HealthDecisionReason)
+    mask = health_decision_reason_mask(reasons)
+
+    assert health_decision_reason_mask((HealthDecisionReason.SOCKET_DISCONNECTED,)) == 1
+    assert health_decision_reason_mask((HealthDecisionReason.CODE_IDENTITY_UNAVAILABLE,)) == 4
+    assert health_decision_reasons_from_mask(mask) == reasons
+    with pytest.raises(ValueError, match="unknown bits"):
+        health_decision_reasons_from_mask(1 << len(reasons))
+
+
+@pytest.mark.parametrize(
+    "schema_version",
+    [HEALTH_CHECKPOINT_V3_SCHEMA_VERSION, HEALTH_CHECKPOINT_SCHEMA_VERSION],
+)
+def test_checkpoint_v3_and_v4_chronology_use_monotonic_when_utc_regresses(
+    schema_version: str,
+) -> None:
     run_id = CollectorRunId.new()
     first = _checkpoint(run_id, emitted_monotonic_ns=10).to_record()
     second = _checkpoint(run_id, emitted_monotonic_ns=20).to_record()
+    first["schema_version"] = schema_version
+    second["schema_version"] = schema_version
     first["emitted_at_utc_ns"] = 200
     second["emitted_at_utc_ns"] = 100
 
     chronology = validate_health_checkpoint_chronology((first, second))
 
+    assert chronology.schema_version == schema_version
     assert chronology.monotonic_chronology_available is True
     assert chronology.first_emitted_monotonic == MonotonicTimestamp(run_id.value, 10)
     assert chronology.last_emitted_monotonic == MonotonicTimestamp(run_id.value, 20)
@@ -444,8 +541,11 @@ def test_checkpoint_v2_chronology_remains_readable() -> None:
     second["schema_version"] = HEALTH_CHECKPOINT_V2_SCHEMA_VERSION
     first_decisions = cast(dict[str, object], first["decisions"])
     second_decisions = cast(dict[str, object], second["decisions"])
-    first_decisions.pop("gate1_sticky_reason_codes")
-    second_decisions.pop("gate1_sticky_reason_codes")
+    for decisions in (first_decisions, second_decisions):
+        decisions.pop("gate1_sticky_reason_mask")
+        decisions.pop("reason_mask")
+        decisions.pop("reason_mask_schema")
+        decisions["reason_codes"] = ()
 
     chronology = validate_health_checkpoint_chronology((first, second))
 

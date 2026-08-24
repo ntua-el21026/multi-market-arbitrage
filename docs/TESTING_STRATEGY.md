@@ -22,7 +22,7 @@ long-run evidence
 
 ## 3. Unit tests
 
-Cover exact arithmetic, quantization, costs, book application, reported-top transitions, semantic relations, capacity, lifecycle, typed transport faults, retry/rate policy, versioned audit triggers, audit-divergence lifecycle, target validation, health decisions, availability intervals, calibration and bounded reporting.
+Cover exact arithmetic, quantization, costs, book application, reported-top transitions, semantic relations, capacity, lifecycle, typed transport faults, retry/rate policy, versioned audit triggers, audit-divergence evidence dimensions/lifecycle, public-read fault lifecycle, target validation, operational health snapshots, availability intervals/contributions, typed resync reasons, calibration and bounded reporting.
 
 ## 4. Property-based testing
 
@@ -41,6 +41,10 @@ Examples:
 - terminal pending divergence is unresolved and Gate-sticky;
 - trigger/outcome matrices reconcile with audit totals;
 - interval ledger aggregates reconcile exactly.
+- external causal unattribution cannot substitute for independent internal-
+  prefix proof or complete recovery;
+- every new mismatch has exactly one interval contribution;
+- diagnostic-sample capacity cannot change new-schema semantic identity.
 
 The optimized complete-set solver remains differentially tested against the exhaustive oracle across randomized and targeted fee/depth/minimum/threshold cases.
 
@@ -118,6 +122,14 @@ Same raw data, commit, config, reference interpretation and model versions must 
 
 Replay covers audit starts/responses/failures/classification, watermarks, barriers, transition state/bounds, availability evidence and terminal hash inputs without repeating external I/O or depending on current scheduler time.
 
+New replay also covers the ADR-0055 observation/internal-prefix/external-cause/
+recovery dimensions, public-read fault lifecycles, availability contributions,
+typed resync reasons, and operational-snapshot/full-summary parity. Historical
+raw, control and journal bytes remain immutable, and their recorded terminal
+hashes remain historical evidence. Replay under terminal-v3 semantics
+deterministically produces and documents a new terminal identity without
+invented fault closures or contributions.
+
 Current v2 replacement eligibility releases only through a self-contained
 durable control that binds the exact capture preimage, digest, and one sampled
 freshness decision. Its durable envelope must also bind that decision's exact
@@ -129,15 +141,17 @@ and interval closure at exactly that decision boundary after successful durable
 processing. Missing, malformed, noncanonical, capture-mismatched,
 wrong-connection, cross-epoch, future and stale controls must leave state pending
 and fail closed. Historical v1 replacement snapshots retain their bounded
-snapshot-only replay path and terminal hash without a synthesized control solely
-for immutable replay compatibility; new producers cannot select v1 or that
-path.
+snapshot-only replay path without a synthesized control solely for immutable
+replay compatibility. Their recorded terminal hashes remain historical
+evidence, while terminal-v3 replay deterministically produces and documents a
+new terminal identity; new producers cannot select v1 or that path.
 
 Tests also prove explicit positive admission ordinals and strictly
 post-resolution ingest/same-epoch receive chronology on a connection absent from
 the committed pre-resolution set; complete admitted-prefix draining before the
 no-await decision/projection; latest-L2 chronology; pending reported-top and
-transition-resync blocking; `UNKNOWN`/local-defect blocking; deterministic
+transition-resync blocking; unsupported generic `UNKNOWN`, internal-
+reconstruction and local-defect blocking; deterministic
 multi-capture prefix controls; and separate post-decision socket interruption.
 
 New audit starts use deterministic v2 trigger encoding. Historical v1 controls
@@ -157,10 +171,20 @@ Inject:
 - clock-quality/UTC regression;
 - reported-top transition conflict/expiry;
 - audit backlog/races/deadlines;
+- response before deadline with classification after hard expiry, which remains
+  `FAILED/BOOK_FRESHNESS_EXPIRED` without freshness promotion;
+- PREPARE durability and canonical-processing completion on each side of hard
+  expiry, plus delayed final attestation of a timely PREPARE;
+- PREPARE/attestation source, timestamp, state and protocol-selector mismatch,
+  proving no comparison, scan, restoration or freshness promotion;
 - mismatch while a journal/canonical backlog exists;
 - disconnect, resnapshot failure and shutdown while audit divergence is pending;
 - slow journal and slow canonical processor during divergence recovery;
 - health/availability writer failure during recovery;
+- slow full summary and slow operational health projection;
+- slow analytical flush, thread-pool contention and contribution-writer
+  failure/saturation;
+- every typed processor-to-observer resync reason and genuine `UNKNOWN`;
 - resource pressure.
 
 Expected response is explicit fail-closed/quarantine/resync, not silent continuation.
@@ -183,7 +207,10 @@ Do not test success by raising the resource limit.
 
 Required:
 
-- checkpoint v3 UTC plus monotonic epoch/ns and separate current/sticky reasons;
+- checkpoint v4 UTC plus monotonic epoch/ns, operational-snapshot evidence,
+  nested `audit.fault_lifecycles` observed/current/resolved/permanent counts and
+  chain/reconciliation, contribution reconciliation, and separate current/
+  sticky reasons; explicit v1-v3 historical compatibility;
 - exact `audit.current_eligibility` shape and reconciliation against processor
   ineligible books, required-ineligible instruments, divergence pending and
   replacement-capture pending;
@@ -191,14 +218,19 @@ Required:
   projection for every bounded current pending record, one latest
   `gate1-audit-divergence-resolution-representative-v1`, and deterministic
   resolution truncation;
-- complete pending/resolution processor-summary and terminal-hash authority,
+- complete current pending/recovery processor-summary and terminal-hash authority,
   with checkpoint totals and lifecycle chain unchanged by representative
   projection;
-- explicit v1/v2 compatibility without synthesized chronology, trigger or
-  divergence-lifecycle evidence;
+- explicit v1-v3 compatibility without synthesized chronology, trigger,
+  evidence dimensions, fault closure, contribution or divergence-lifecycle
+  evidence;
 - monotonic chronology under UTC regression;
 - final cutoff consistency;
 - interval start/end/cause/recovery;
+- exactly one direct contribution per new mismatch, one interval with paired or
+  overlapping contributions, duplicate/orphan/source mismatch rejection,
+  interval-union rather than contribution-sum duration, and independently
+  derivable per-instrument coverage;
 - open interval at shutdown;
 - aggregate/ledger reconciliation;
 - exact causal interval starts before ordered drain for mismatch, freshness,
@@ -213,14 +245,23 @@ Required:
   non-ignored-untracked cleanliness, and unknown probe handling, including the
   terminal Gate-only decision and continued raw capture;
 - writer failure without raw-capture contamination;
-- sticky Gate reason history.
+- sticky Gate reason history;
+- operational/full-summary field parity at zero, half and full history capacity;
+- proof periodic health neither copies full histories nor computes a terminal
+  hash, and has fixed construction cost as retained history grows;
+- external transient HTTP/audit failure observed, pending and exactly resolved
+  without erasing cumulative history; unresolved/internal/permanent failures
+  remain sticky.
 
 Required ADR-0054 cases are:
 
 - observed and fully resolved external divergence with no false sticky blocker;
 - current pending divergence;
 - terminal unresolved divergence;
-- new-contract unknown divergence;
+- unsupported generic/new-contract unknown divergence;
+- exact observation with proven received-prefix reconstruction and
+  `EXTERNAL_CAUSE_UNATTRIBUTED` external attribution;
+- internal reconstruction defect and indeterminate oracle result;
 - local-book defect;
 - authoritative-resnapshot resolution;
 - reserved same-generation resolution count remaining zero in live Phase 1;
@@ -270,9 +311,10 @@ Required ADR-0054 cases are:
 - missing, malformed, noncanonical, capture-mismatched, wrong-connection,
   future, cross-epoch and stale v2 controls are rejected before state mutation
   and leave capture/ineligibility and the interval pending;
-- historical v1 snapshot-only auto-release replays to the unchanged terminal
-  hash without synthesizing a control, while new producers cannot emit v1 state
-  or use the compatibility path;
+- historical v1 snapshot-only auto-release replays without synthesizing a
+  control, preserves immutable raw/control evidence, and records a distinct
+  deterministic terminal-v3 hash, while new producers cannot emit v1 state or
+  use the compatibility path;
 - slow canonical return after mutually fresh snapshot receipt but beyond the
   book-age bound yields zero snapshot scans, no release control, capture pending
   and an open availability interval;
@@ -281,6 +323,12 @@ Required ADR-0054 cases are:
   `AUDIT_DIVERGENCE_UNRESOLVED`;
 - scanner/research blocked until complete global restoration;
 - all mismatch and lost-eligibility history retained after recovery.
+
+Required ADR-0055 cases additionally include one typed observation, internal-
+prefix result, external attribution and recovery state per new mismatch; no
+release for internal defect/indeterminacy or unsupported generic `UNKNOWN`;
+release for `EXTERNAL_CAUSE_UNATTRIBUTED` only after complete independent proof;
+and exact fault/contribution/resync reconciliation.
 
 The paired health benchmark regression covers availability-interval
 construction/serialization, non-blocking producer enqueue and CPU, actual
@@ -310,6 +358,32 @@ all 262 failed-soak mismatches. A recovery-generation match is never reported
 as natural same-generation convergence. Historical cases with no exact matching
 state remain `NOT_FOUND`; classifications are not forced.
 
+Recovery-authority tests stream more than the 64-record diagnostic retention
+limit and the complete 262-mismatch corpus through the public replay observer,
+repeat the stream for byte-deterministic output, and reject cross-divergence
+binding. They separately cover accepted v1 REST recovery without invented
+release evidence, accepted v2 release with exact published-ledger
+reconciliation, rejected REST/control candidates, and generation evidence that
+cannot by itself prove recovery completion.
+
+Reporter tests separately exercise canonical empty/legacy-unverifiable mode,
+strict historical-v1 summary-plus-interval mode, and full current-v2 summary,
+interval and contribution mode. They reject noncanonical or duplicate-key
+ledger rows, raw-source cross-binding, incomplete published/replay binding sets,
+and attempts to reuse contribution ordering as processor-restoration ordering.
+
+The reproducible retained-corpus reporter is
+`benchmarks/gate1_audit_mismatch_report.py`. It discovers observations and
+recovery authorities through the public bounded replay observer, requires the
+expected terminal hash, and emits canonical JSON without private processor
+monkeypatches or external I/O.
+
+The ADR-0055 oracle independently reconstructs every current-run mismatch from
+the exact full snapshot and ordered quantity-bearing received prefix. Tests
+prove production/oracle exact equality, deliberate production mutation-defect
+detection, insufficient-evidence indeterminacy, external unattribution with
+known observation, and prohibition on relabeling a local defect as external.
+
 ## 15. Audit trigger tests
 
 Test every v2 trigger (`PERIODIC`, `FRESHNESS_GUARD`, `RACE_RETRY`,
@@ -323,9 +397,14 @@ initiating v2 trigger.
 
 ## 16. Long-run stability tests
 
-Before another six-hour soak, run 45–60 minutes against the intended target and report:
+Before another six-hour soak, run 5,400–7,200 seconds against the intended
+target, preferring 7,200 seconds, and materially beyond retained-history
+saturation. Report:
 
 - current/peak RSS and slope;
+- Python/PyArrow/native allocation attribution and post-saturation slope;
+- operational-snapshot and terminal-summary p50/p95/p99/max;
+- retained-history occupancy and per-domain retained bytes;
 - latency tails;
 - queue HWMs;
 - transition counts/durations;
@@ -333,8 +412,14 @@ Before another six-hour soak, run 45–60 minutes against the intended target an
   p50/p95/p99/max, HTTP latency, remaining freshness budget, request load,
   freshness safety margin and research-eligible coverage by trigger;
 - mismatch causal relations and divergence lifecycle counts;
-- pending/unresolved/unknown/local-defect state and lifecycle reconciliation;
+- observation/internal-prefix/external-attribution/recovery dimensions;
+- pending/unresolved/unsupported-unknown/local-defect state and lifecycle
+  reconciliation;
+- public-read/audit fault observed/pending/resolved state and every audit stage
+  latency;
 - availability intervals;
+- one direct interval contribution per new mismatch and per-instrument
+  research-ineligible coverage;
 - raw/analytical growth;
 - incremental report resource usage.
 

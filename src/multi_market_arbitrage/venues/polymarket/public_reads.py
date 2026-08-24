@@ -17,6 +17,7 @@ from multi_market_arbitrage.core.time import UtcTimestamp
 from multi_market_arbitrage.observability import HistogramSnapshot, InMemoryMetrics
 
 from .errors import (
+    MAXIMUM_RETRY_AFTER_EVIDENCE_SECONDS,
     PolymarketEndpointClass,
     PolymarketHttpError,
     PolymarketHttpFailureCategory,
@@ -321,13 +322,14 @@ def _parse_retry_after(  # pyright: ignore[reportUnusedFunction]
         return _RetryAfterParseResult(None, PolymarketRetryAfterDisposition.MALFORMED)
     if stripped.isascii() and stripped.isdecimal():
         normalized = stripped.lstrip("0") or "0"
-        if len(normalized) > 12:
+        maximum_seconds = int(MAXIMUM_RETRY_AFTER_EVIDENCE_SECONDS)
+        if len(normalized) > len(str(maximum_seconds)):
             return _RetryAfterParseResult(
-                float("inf"),
+                MAXIMUM_RETRY_AFTER_EVIDENCE_SECONDS,
                 PolymarketRetryAfterDisposition.PARSED,
             )
         return _RetryAfterParseResult(
-            float(int(normalized)),
+            float(min(int(normalized), maximum_seconds)),
             PolymarketRetryAfterDisposition.PARSED,
         )
     try:
@@ -339,7 +341,10 @@ def _parse_retry_after(  # pyright: ignore[reportUnusedFunction]
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("Retry-After wall clock must be timezone-aware")
     return _RetryAfterParseResult(
-        max(0.0, (parsed.astimezone(UTC) - now.astimezone(UTC)).total_seconds()),
+        min(
+            MAXIMUM_RETRY_AFTER_EVIDENCE_SECONDS,
+            max(0.0, (parsed.astimezone(UTC) - now.astimezone(UTC)).total_seconds()),
+        ),
         PolymarketRetryAfterDisposition.PARSED,
     )
 

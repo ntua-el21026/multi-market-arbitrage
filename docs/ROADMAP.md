@@ -49,13 +49,16 @@ and no-live boundary passed. The first-soak defects were concentrated in:
 - monotonic checkpoint chronology and typed availability intervals;
 - audit-mismatch and long-run memory/tail diagnosis.
 
-The remediation candidate now includes bounded reported-top handling,
-incremental reporting, monotonic/interval evidence, causal mismatch reporting,
-ADR-0054 immediate fail-closed authoritative-resnapshot lifecycle, v2 audit
-triggers with v1 compatibility, and health-checkpoint v3 current/sticky Gate
-semantics. Final offline gates plus a new exact-SHA 60-second smoke and
-45–60 minute stability observation remain pending. No six-hour rerun was run
-for this remediation task.
+The ADR-0054 candidate included bounded reported-top handling, incremental
+reporting, monotonic/interval evidence, causal mismatch reporting, immediate
+fail-closed authoritative resnapshot, v2 audit triggers and checkpoint-v3 Gate
+semantics. Its exact-SHA 45-minute observation exposed remaining operational-
+summary/history-memory, external-attribution, public-read fault-lifecycle,
+direct-interval-contribution, typed-resync and local classification-latency
+defects. ADR-0055 governs the final correction, checkpoint v4 and strict pre-
+expiry classification. Final offline gates plus a new exact-SHA 60-second smoke
+and 5,400–7,200 second post-saturation stability observation remain pending. No
+six-hour rerun was run for this remediation task.
 
 ## 3. Phase A — Design foundation — COMPLETE
 
@@ -103,11 +106,20 @@ Implementation presence is not acceptance.
 - add monotonic checkpoint identity and typed unavailable-interval records;
 - add CPU/memory identity and current-RSS slope evidence;
 - classify audit mismatches by cause.
-- implement ADR-0054 observed/pending/resolved/unresolved/unknown/local-defect
-  separation with immediate authoritative resnapshot;
+- retain ADR-0054 observed/pending/resolved/unresolved/local-defect separation
+  with immediate authoritative resnapshot and refine external unattribution
+  under ADR-0055;
 - retain versioned v2 audit triggers and replay historical v1 as
   `UNKNOWN_LEGACY`;
-- emit health checkpoint v3 with separate current and Gate-sticky reasons.
+- replace periodic full-summary/checkpoint-v3 production with a bounded
+  immutable operational snapshot and checkpoint v4 with v1-v3 compatibility
+  and separate current versus Gate-sticky reasons;
+- separate exact observation, independently proven received-prefix integrity,
+  external causal attribution and recovery state;
+- retain explicit observed/pending/resolved public-read fault lifecycles;
+- add one direct contribution per new mismatch and typed resync reasons;
+- make diagnostic retention capacity independent of new-schema semantic
+  identity while preserving durable evidence, totals, chains and current state.
 
 ### C3. Regression replay
 
@@ -128,10 +140,12 @@ recovery-generation match is recovery evidence, not natural convergence.
 
 - full CI/static/SCA/security/no-live gates;
 - new 60-second explicit-target smoke;
-- new 45–60 minute stability observation;
+- new 5,400–7,200 second post-saturation stability observation;
 - inspect triggers, causal mismatch relations, divergence lifecycle and
-  pending/unresolved/unknown/local-defect state as well as transition behavior,
-  interval attribution, monotonic chronology, RSS slope, queues, tails and
+  exact observation/internal-prefix/external-attribution/recovery state,
+  pending/unresolved/unsupported-unknown/local-defect state, transition
+  behavior, fault lifecycles, direct interval attribution, monotonic chronology,
+  operational/terminal latency, memory attribution/plateau, queues, tails and
   storage projection.
 
 ### C5. Fresh Gate-1 rerun
@@ -141,7 +155,7 @@ recovery-generation match is recovery evidence, not natural convergence.
 - accept only `PASS` under `GATE_1_SOAK_SPEC.md`.
 
 This step requires later independent authorization and is not part of the
-ADR-0054 remediation task.
+ADR-0055 remediation task.
 
 **Gate:** G1 — currently failed; rerun required.
 

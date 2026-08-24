@@ -268,8 +268,30 @@ class AnalyticalDatasetWriter:
     def __init__(self, config: AnalyticalDatasetConfig, provenance: AnalyticalProvenance) -> None:
         self._config = config
         self._provenance = provenance
+        venue = _safe_venue_component(config.venue_id.value)
+        venue_root = config.root / config.dataset / f"venue={venue}"
+        # Writer admission is conservative across runs and schema versions.
+        # A successful flush may add one physical fragment, so reserve against
+        # the exact verified inventory that existed when this single-owner
+        # writer opened.  Historical datasets above the current ceiling remain
+        # readable, but have no admission capacity for new fragments.
+        self._existing_fragment_count = len(
+            _verified_fragment_inventory(
+                venue_root,
+                dataset=config.dataset,
+                venue_id=config.venue_id,
+            )
+        )
+        self._fragment_capacity = max(
+            0,
+            config.maximum_fragments - self._existing_fragment_count,
+        )
         self._buffer: list[dict[str, object]] = []
         self._buffered_bytes = 0
+        self._buffered_records_high_water = 0
+        self._buffered_bytes_high_water = 0
+        self._flush_count = 0
+        self._flushed_records = 0
         self._field_names: tuple[str, ...] | None = None
         self._arrow_schema: str | None = None
         self._arrow_schema_sha256: str | None = None
@@ -292,6 +314,36 @@ class AnalyticalDatasetWriter:
         return self._buffered_bytes
 
     @property
+    def buffered_records_high_water(self) -> int:
+        return self._buffered_records_high_water
+
+    @property
+    def buffered_bytes_high_water(self) -> int:
+        return self._buffered_bytes_high_water
+
+    @property
+    def flush_count(self) -> int:
+        return self._flush_count
+
+    @property
+    def flushed_records(self) -> int:
+        return self._flushed_records
+
+    @property
+    def existing_fragment_count(self) -> int:
+        return self._existing_fragment_count
+
+    @property
+    def fragment_capacity(self) -> int:
+        """Maximum new fragment identities admitted by this writer."""
+
+        return self._fragment_capacity
+
+    @property
+    def maximum_fragments(self) -> int:
+        return self._config.maximum_fragments
+
+    @property
     def partition_directory(self) -> Path:
         venue = _safe_venue_component(self._config.venue_id.value)
         return (
@@ -304,6 +356,7 @@ class AnalyticalDatasetWriter:
     def append(self, record: Mapping[str, object]) -> ParquetFragmentManifest | None:
         if self._closed:
             raise AnalyticalStorageClosedError("analytical dataset writer is closed")
+        self._require_fragment_slot()
         normalized = _normalize_record(record)
         field_names = tuple(normalized)
         if self._field_names is not None and field_names != self._field_names:
@@ -326,11 +379,26 @@ class AnalyticalDatasetWriter:
             self._buffer
             and self._buffered_bytes + record_bytes > self._config.maximum_buffered_bytes
         ):
+            # Flushing the existing buffer consumes one slot.  Reject this
+            # incoming record before that write when no slot would remain for
+            # the record itself; every admitted record must remain closable.
+            if self._flush_count + 1 >= self._fragment_capacity:
+                raise AnalyticalFragmentLimitError(
+                    "analytical fragment limit would leave an admitted record unflushable"
+                )
             flushed = self.flush()
         if self._field_names is None:
             self._field_names = field_names
         self._buffer.append(normalized)
         self._buffered_bytes += record_bytes
+        self._buffered_records_high_water = max(
+            self._buffered_records_high_water,
+            len(self._buffer),
+        )
+        self._buffered_bytes_high_water = max(
+            self._buffered_bytes_high_water,
+            self._buffered_bytes,
+        )
         if len(self._buffer) >= self._config.batch_size:
             return self.flush()
         return flushed
@@ -348,6 +416,9 @@ class AnalyticalDatasetWriter:
     def flush(self) -> ParquetFragmentManifest | None:
         if not self._buffer:
             return None
+        # This guard precedes directory creation, buffer detachment, Arrow
+        # materialization, and every physical write/rename.
+        self._require_fragment_slot()
         partition = self.partition_directory
         partition.mkdir(parents=True, exist_ok=True)
         records = self._buffer
@@ -436,6 +507,8 @@ class AnalyticalDatasetWriter:
             self._arrow_schema = arrow_schema
             self._arrow_schema_sha256 = arrow_schema_sha256
             self._wrote_fragment = True
+            self._flush_count += 1
+            self._flushed_records += len(records)
             return manifest
         except Exception:
             self._buffer = records + self._buffer
@@ -463,6 +536,12 @@ class AnalyticalDatasetWriter:
         self._buffered_bytes = 0
         self._closed = True
 
+    def _require_fragment_slot(self) -> None:
+        if self._flush_count >= self._fragment_capacity:
+            raise AnalyticalFragmentLimitError(
+                "analytical fragment limit reached before writer admission"
+            )
+
     def __enter__(self) -> AnalyticalDatasetWriter:
         return self
 
@@ -473,6 +552,10 @@ class AnalyticalDatasetWriter:
 
 class AnalyticalStorageClosedError(AnalyticalSchemaError):
     """An append was attempted after deterministic finalization."""
+
+
+class AnalyticalFragmentLimitError(AnalyticalSchemaError):
+    """A write would exceed the exact analytical fragment inventory bound."""
 
 
 def _require_matching_existing_arrow_schema(
@@ -595,6 +678,7 @@ def validate_dataset_manifest(path: Path) -> DatasetManifest:
 
 __all__ = [
     "AnalyticalDatasetWriter",
+    "AnalyticalFragmentLimitError",
     "AnalyticalStorageClosedError",
     "analytical_run_completion_path",
     "load_analytical_run_completion",

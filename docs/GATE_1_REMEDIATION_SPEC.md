@@ -4,15 +4,19 @@
 
 This is the normative correction specification following the failed 2026-08-22 Polymarket Gate-1 soak recorded in `GATE_1_FAILURE_20260822.md`.
 
-The current phase is Phase-1 remediation. Gate 1 remains failed until a fresh six-hour run passes the unchanged acceptance contract in `GATE_1_SOAK_SPEC.md`.
+The current phase is Phase-1 remediation. Gate 1 remains failed until a fresh
+six-hour run passes the current acceptance contract in `GATE_1_SOAK_SPEC.md`.
 
 ADR-0053 corrected the original reported-top defect class. Retained failed-run
-and corrected-stability evidence now supports ADR-0054's immediate fail-closed
-authoritative-resnapshot decision. The implementation candidate must still
-complete offline validation, a new 60-second smoke, and a new 45–60 minute
-stability observation before independent pre-soak review. No six-hour rerun was
-performed as part of the ADR-0054 remediation work; the first soak remains
-`FAIL`.
+and corrected-stability evidence supports ADR-0054's immediate fail-closed
+authoritative-resnapshot decision. A later exact-SHA 45-minute observation
+proved that recovery state reconciled but exposed remaining periodic-summary,
+retained-history memory, external-attribution, fault-lifecycle, direct-interval-
+contribution, typed-resync, and local classification-latency defects. ADR-0055
+governs their final correction. The candidate must still complete offline
+validation, a new 60-second smoke, and a new 5,400- to 7,200-second stability
+observation before independent pre-soak review. No six-hour rerun was performed;
+the first soak remains `FAIL`.
 
 Design Freeze v0.1 remains locked.
 
@@ -29,13 +33,18 @@ Correct the smallest proven defects while preserving:
 - single-owner canonical mutation;
 - no live/authenticated venue capability.
 
-The remediation has five primary tracks:
+The remediation has ten primary tracks:
 
 1. bounded reported-top transition semantics;
 2. incremental bounded analytical reporting;
 3. complete monotonic and unavailable-interval evidence;
 4. causal mismatch and long-run resource diagnosis;
-5. audit-divergence lifecycle, trigger and Gate-evidence correction.
+5. audit-divergence lifecycle, trigger and Gate-evidence correction;
+6. lightweight periodic operational snapshots and bounded diagnostic retention;
+7. orthogonal observation/internal-prefix/external-cause/recovery evidence;
+8. public-read/audit fault lifecycles with strict pre-expiry classification;
+9. direct interval contributions and typed resynchronization reasons; and
+10. post-saturation memory/latency validation.
 
 ## 3. Authoritative failure corpus
 
@@ -54,6 +63,20 @@ The source raw data remains outside Git under the retained Gate-1 worktree/evide
 - nearby REST audits, BBO messages, quantity-bearing deltas and resnapshots.
 
 Sanitized byte-exact minimal fixtures derived from those windows may be committed. The authoritative raw run must not be modified.
+
+Additional immutable forensic/regression corpora are:
+
+```text
+prior corrected 30-minute run: 01a02f61-1019-74f0-b69d-abd7810d564d
+current-SHA 60-second smoke:    01a030d0-da92-7aa7-adc8-8ccb6833bbb2
+current-SHA 45-minute run:      01a030d4-18c0-7868-9375-22bc83e9acd9
+current-SHA commit:             ee240c51184cccfc6e425906097758b5ca019a95
+```
+
+The 45-minute run's 22 mismatches, three audit failures, two HTTP final
+failures, classification delay, interval attribution and memory trajectory are
+mandatory ADR-0055 regression inputs. They do not constitute final pre-soak
+acceptance and their raw/evidence artifacts remain immutable.
 
 ## 4. Track A — bounded reported-top transition
 
@@ -160,9 +183,9 @@ Do not raise DuckDB/PyArrow materialization limits to make the failed run pass.
 
 ## 6. Track C — complete clock and availability evidence
 
-### 6.1 Health checkpoint v3
+### 6.1 Health checkpoint v4
 
-The rerun requires `gate1-health-checkpoint-v3`, containing both:
+The rerun requires `gate1-health-checkpoint-v4`, containing both:
 
 - UTC emission timestamp; and
 - monotonic timestamp with explicit clock epoch/run identity.
@@ -177,10 +200,21 @@ emitted_monotonic_ns
 
 Chronology validation must use monotonic evidence. UTC remains for operator correlation.
 
-The checkpoint must also separate current `reason_codes` from the finite
-`gate1_sticky_reason_codes` set and expose cumulative, pending, resolved,
-unresolved, unknown and local-defect audit-divergence counts. Historical v1/v2
-checkpoints remain readable without inferred trigger/lifecycle evidence.
+The checkpoint must also separate the current reason set from the finite sticky
+reason set. In v4 these are serialized exactly as the schema-tagged
+`reason_mask` and `gate1_sticky_reason_mask`; earlier schemas retain their
+historical string arrays. It must expose cumulative, pending, resolved,
+unresolved, unsupported-unknown and local-defect audit-divergence counts plus
+fault lifecycles, retention occupancy and contribution reconciliation. The
+orthogonal observation/internal-prefix/external-attribution/recovery dimensions
+are emitted by the deterministic offline mismatch-lineage report, not invented
+as periodic-checkpoint fields.
+Historical v1-v3 checkpoints remain readable without inferred trigger,
+dimension, lifecycle, fault-closure or contribution evidence.
+
+The nested `audit.fault_lifecycles` object reports observed/current/resolved/
+permanent counts, reconciliation, lifecycle-chain identity, and bounded current
+and representative records.
 
 The audit group must expose `current_eligibility` with `eligible`,
 `evidence_reconciled`, `pending_divergence_count`,
@@ -191,9 +225,12 @@ The audit group must expose `current_eligibility` with `eligible`,
 `replacement_captures_unresolved`. Periodic checkpoints serialize every bounded
 current pending object as a compact raw-linked
 `gate1-audit-divergence-pending-representative-v1` and at most one latest compact
-`gate1-audit-divergence-resolution-representative-v1`. Complete bounded pending
-and resolution objects remain in the processor summary and terminal hash;
-cumulative totals and the lifecycle chain remain authoritative.
+`gate1-audit-divergence-resolution-representative-v1`. Complete current pending
+and recovery objects remain in processor-summary and terminal-hash authority;
+cumulative totals and the lifecycle chain remain authoritative. Periodic v4
+construction consumes the immutable lightweight processor operational snapshot;
+it cannot call full summary/terminal-hash construction or copy complete recent
+histories.
 
 ### 6.2 Typed unavailable intervals
 
@@ -215,6 +252,15 @@ Every completed/uncompleted unavailable interval must have a machine-readable re
 
 The interval ledger and aggregate counters must reconcile exactly.
 
+Every new mismatch must also have exactly one separately versioned
+`AvailabilityIntervalContribution` bound to exactly one global interval. The
+contribution records request/divergence/instrument/market and audit raw sources,
+cause/scopes, resolution/release and opener-versus-join status. Global duration
+remains the interval union, while per-instrument coverage is independently
+derivable. Duplicate, orphan, missing or source-mismatched contributions fail
+closed. Historical v1 interval files remain unchanged and never receive
+synthesized contributors.
+
 Routine audits must not be mislabeled as socket downtime.
 
 ### 6.3 Host identity and memory slope
@@ -228,6 +274,23 @@ Run identity must include:
 - Python/uv/lock/config/code identity.
 
 Periodic resource evidence must include current RSS as well as peak RSS so long-run slope can be evaluated.
+
+It also includes operational-snapshot latency, retained-history occupancy/
+capacity/total/truncation and an O(1) shallow byte estimate, cheap Python
+tracemalloc current/peak bytes, PyArrow current/peak bytes, a defensible native
+residual, and constant-memory all-run/post-saturation Python/RSS slopes.
+`tracemalloc.take_snapshot()` is prohibited on periodic/acquisition paths.
+At most 12 filename allocation-group representatives are captured once, after
+capture cutoff, with a distinct terminal monotonic timestamp; failure degrades
+health evidence and the sample is never backdated into the cutoff checkpoint.
+The analytical group emits current/high-water buffered records and bytes,
+flushes, flushed records, and process-wide PyArrow current/peak allocated
+bytes. Its three exact run-completion fragment-SHA histories additionally emit
+current-run retained/capacity, verified inventory-at-open plus reservations,
+the fixed 4,096-fragment dataset ceiling, and bounded O(1) shallow byte
+estimates. The producer rejects before an over-bound fragment write; terminal
+authority is never truncated. Terminal-summary latency and deep retained sizes are post-cutoff final/
+offline evidence, never periodic checkpoint work.
 
 ## 7. Track D/E — audit mismatch causality, lifecycle and long-run diagnosis
 
@@ -289,7 +352,10 @@ The coordinator must drain the complete admitted WebSocket prefix and require
 no deferred/queued item plus active acquisition before sampling the decision;
 the fence/sample/projection sequence has no await. Pending reported-top or
 transition-resync state, a non-capture scope blocker, a stale/future latest-L2
-receive time, `UNKNOWN`, or `LOCAL_BOOK_DEFECT` prevents release. A socket end
+receive time, unsupported generic `UNKNOWN`, internal reconstruction defect/
+indeterminacy, or `LOCAL_BOOK_DEFECT` prevents release. An
+`EXTERNAL_CAUSE_UNATTRIBUTED` result is permitted only after independent prefix
+proof and complete ADR-0055 recovery/contribution/replay reconciliation. A socket end
 after the sampled decision is a later distinct interruption. For a same-market
 multi-capture group, deterministic prefix controls scan zero times and only the
 final control may restore and scan.
@@ -298,9 +364,10 @@ A missing v2 release control, or a malformed, noncanonical, capture-mismatched,
 wrong-connection, future, cross-epoch or stale control, fails before state
 mutation. Capture/ineligibility and the interval remain pending and terminal
 evaluation is Gate-sticky unresolved. Immutable v1 journals retain their exact
-deterministic snapshot-only auto-release and terminal hash without a synthesized
-control solely for replay compatibility; new producers cannot use v1 or that
-exception.
+deterministic snapshot-only auto-release semantics without a synthesized control
+solely for replay compatibility. Their raw/control bytes and previously recorded
+terminal hashes remain immutable historical evidence; terminal-v3 replay records
+a distinct deterministic hash. New producers cannot use v1 or that exception.
 
 Health and terminal evidence must reconcile:
 
@@ -310,7 +377,8 @@ Health and terminal evidence must reconcile:
 - current pending and terminal unresolved state;
 - current replacement-capture pending and terminal replacement-unresolved
   state;
-- new-contract unknown and local-book-defect counts;
+- unsupported generic/new-contract unknown, internal-integrity and local-book-
+  defect counts;
 - bounded compact checkpoint representatives, complete processor/terminal
   pending and resolution objects, and the lifecycle hash chain.
 
@@ -321,9 +389,10 @@ replacement capture incomplete produces Gate-sticky
 
 Observed and fully authoritatively resolved external divergence is retained
 history, not automatically a permanent Gate blocker. Pending state is a
-current blocker. Terminal unresolved, new-contract unknown, local-book defect,
-failed recovery, or lifecycle/writer/availability/replay/hash inconsistency is
-Gate-sticky.
+current blocker. Terminal unresolved, unsupported generic/new-contract unknown,
+internal reconstruction indeterminacy/defect, local-book defect, locally caused
+classification deadline miss, failed recovery, or lifecycle/writer/
+availability/replay/hash inconsistency is Gate-sticky.
 
 ### 7.2 Offline causal lineage result
 
@@ -351,6 +420,14 @@ The prior 25 diagnostic `UNKNOWN` cases are now 0 natural convergence,
 3 `SAME_GENERATION_CONFLICT_BEFORE_CONVERGENCE`, 4 recovery, 13 prior-state,
 1 persistent-divergence and 4 `NOT_FOUND`; the four absent exact states remain
 explicit negative evidence rather than forced convergence.
+
+The current-SHA 45-minute corpus has 22 exact online full-depth divergence
+observations. Its pre-ADR-0055 causal report could not attribute an external
+cause: 21 equalities occur only on recovery generations and one trajectory has
+a same-generation conflict. Those are inputs, not final internal-integrity
+results. Corrected offline regression must run the independent prefix oracle
+for all 22 and emit separate observation, internal-prefix, external-attribution
+and recovery dimensions without changing the retained raw evidence.
 
 ### 7.3 Trigger and cadence evidence
 
@@ -386,6 +463,131 @@ Long-run validation must report:
   research-eligible coverage by v2 trigger;
 - transition counts/durations;
 - scan-report peak memory and throughput.
+
+### 7.5 Lightweight operational snapshot and retention
+
+Periodic health uses an immutable `ProcessorOperationalSnapshot` containing
+current books/transitions, finite counters and trigger/cause/outcome matrices,
+current divergence/capture/fault state, compact latest representatives,
+incremental chain identities and retention occupancy/capacity/truncation. Its
+work cannot grow with recent diagnostic-history occupancy.
+
+Checkpoint v4 encodes those exact retention values as the compact,
+schema-defined `mma-processor-retention-telemetry-table-v1`; the shared byte
+estimation method and positional row schema avoid repeating identical field
+names for every bounded domain. No occupancy, bound, total, truncation, or byte
+estimate is omitted.
+
+It must not construct/copy full scan or audit histories, invoke full
+`ProcessorSummary`, compute a terminal hash, or canonicalize history-sized
+objects. The full summary remains finalization/replay/offline authority and is
+built only after capture cutoff. Field parity is exact.
+
+Recent scan/audit/diagnostic/completed-resolution full objects are bounded
+diagnostic samples. Eviction preserves analytical persistence, cumulative
+counts, ordered chains, compact representatives, durable raw/control links and
+complete current pending/recovery objects. Diagnostic capacity cannot alter
+new-schema replay semantic identity.
+
+Current producer caps are 256 scan results, 256 audit outcomes, 64 mismatch
+diagnostics, 64 completed divergence resolutions, 64 audit-fault lifecycle
+records, 256 reported-top outcomes, 1,024 validated-opportunity hashes, and 256
+reference-refresh requests. V4 reports each domain's occupancy, capacity,
+cumulative total, and truncation.
+These are implementation defaults subject to the deterministic post-saturation
+benchmark, not evidence-proven final capacities.
+
+### 7.6 Orthogonal divergence evidence and independent oracle
+
+Every new mismatch records separately:
+
+1. exact observation fact;
+2. independent received-prefix reconstruction integrity;
+3. external causal attribution; and
+4. recovery state.
+
+The bounded oracle starts from the exact full WebSocket snapshot, applies the
+ordered exact quantity-bearing frames through the response watermark using
+implementation-independent mutation structures, and compares exact full depth
+with production barrier state. `INTERNAL_RECONSTRUCTION_DEFECT` and
+`INTERNAL_RECONSTRUCTION_INDETERMINATE` remain sticky. An external cause may be
+`EXTERNAL_CAUSE_UNATTRIBUTED` only when observation is exact, internal prefix
+correctness is proven, no local defect exists, eligibility failed closed,
+authoritative recovery completed, every interval contribution reconciles, and
+raw/replay/rebuild identities agree.
+
+### 7.7 Public-read/audit fault lifecycle and strict deadline
+
+Cumulative HTTP failure, audit failure and retry exhaustion are immutable
+history. Each has explicit observed/pending/resolved state bound to endpoint,
+request, attempt, instrument/scope, error/times, fail-closed action, recovery
+source and closure. Recoverable state requires failure-v2 evidence, proven
+external origin, `retryable=true`, and `TIMEOUT`, `NETWORK`, or HTTP status
+408/425/429/500/502/503/504; retry exhaustion alone does not qualify.
+Failure-v1, protocol/indeterminate, non-retryable, and other-status faults
+are permanent. A qualifying recovered transient may clear current gating;
+unresolved required integrity, data loss, internal/permanent fault, locally
+caused deadline miss, missing coverage, or inconsistent recovery remains sticky.
+
+Exact failure-evidence kind and source schema determine lifecycle authority;
+error text does not. Failure-v1 and classification-v1 are historical-only,
+while failure-v2 and newly emitted classification-v2 carry current authority.
+Direct REST responses and unversioned invalidation controls claim no source
+schema and use their bound start schema. Fault identity binds kind, actual
+nullable source schema, start schema, and exact Boolean authority. Release may
+discount sibling ineligibility only when it is proved solely by historical-
+only faults; every nonfault/current blocker remains fail-closed and history is
+not erased.
+
+Current-schema audit HTTP evidence must name `CLOB_BOOK` and pass the exact
+category/status/retry-policy matrix. A non-book endpoint, a non-2xx status
+relabeled as a transport timeout, mismatched status retryability, or
+contradictory Retry-After/exhaustion closure is rejected and cannot cancel
+another endpoint's public-read failure. The typed error name, positive or
+pre-attempt-deadline attempt semantics, configured final-attempt bound, and
+configured Retry-After threshold are also exact provenance. A local effective
+failure reason dominates the original transport category and cannot be softened
+into recoverable external state. Periodic current-recoverable reasons are
+visible but nonsticky; unresolved terminal current state is sticky.
+
+The strict deferred-bound rule remains: response body/watermark and
+classification control complete strictly inside their deadlines. A response
+received before expiry but classified at or after hard expiry remains
+`FAILED/BOOK_FRESHNESS_EXPIRED` and cannot produce a historical outcome or
+freshness. First remove local operational-summary/history/scheduling work;
+neither the guard nor deadline is enlarged to hide the failure.
+
+Stage histograms separately measure network response, raw durability, barrier
+wait, classification construction, classification durability, classification
+processing and total response-to-classification latency.
+
+### 7.8 Interval contributions and typed resynchronization
+
+Each new mismatch emits exactly one separate versioned interval contribution
+bound to exactly one global interval. Paired/overlapping contributions retain
+all request/instrument sources while global duration remains the interval union
+and per-instrument coverage remains derivable.
+
+The processor-to-observer recovery contract carries one of
+`AUDIT_MISMATCH_RECOVERY`, `REPORTED_TOP_TRANSITION_FAILURE`,
+`FRESHNESS_EXPIRY`, `REFERENCE_REFRESH`, `TRANSPORT_DISCONNECT`,
+`CANONICAL_STATE_INVALIDATION`, `SCHEMA_PROTOCOL_ERROR`,
+`BACKPRESSURE_RESOURCE`, `TARGET_LIFECYCLE`, or `UNKNOWN`. Known sources cannot
+collapse into a generic schema/protocol label; genuine unknown remains explicit.
+
+### 7.9 Saturation evidence
+
+The offline capacity benchmark exceeds 4,096 scans/outcomes, multiple
+analytical flushes and one journal rotation. It reports operational/terminal
+latency, event-loop blocking, per-domain occupancy/retained bytes, Python
+allocations, PyArrow current/peak bytes, current/peak RSS, native residual,
+post-saturation slope, queue high-water marks and classification latency during
+real production health-checkpoint construction/persistence. Success requires
+zero retained-record and deep retained-byte slopes for the saturated scan/audit
+domains, config-derived scheduling limits, a capacity-derived latency-constancy
+factor, and allocator-phase-derived Python/RSS/PyArrow limits. The JSON records
+every formula, operand and boolean; GC or allocator trimming is not the primary
+correction.
 
 ## 8. Required tests
 
@@ -428,7 +630,8 @@ If corrected semantics intentionally change terminal hashes, bind and explain th
 
 ### 8.4 Observability
 
-- checkpoint v3 chronology and explicit v1/v2 compatibility;
+- checkpoint v4 chronology, operational snapshot, fault/retention/contribution
+  evidence, and explicit v1-v3 compatibility;
 - exact `audit.current_eligibility` field shape and reconciliation;
 - bounded compact pending representatives, one compact latest resolution
   representative, resolution truncation, and complete processor/terminal
@@ -437,9 +640,16 @@ If corrected semantics intentionally change terminal hashes, bind and explain th
 - interval open/close/recovery;
 - each cause class;
 - aggregate/ledger reconciliation;
+- exactly one contribution per new mismatch, paired/overlapping contributors,
+  union/per-instrument duration, and duplicate/orphan/source mismatch rejection;
 - shutdown with an open interval;
 - health writer failure without raw-capture contamination;
 - current/peak RSS evidence.
+- operational/full-summary parity and fixed operational cost at zero, half,
+  full and post-saturation history occupancy;
+- proof periodic health does not copy full histories or compute terminal hash;
+- diagnostic eviction without loss of analytical output, counts, chains or
+  semantic identity.
 
 ### 8.5 Audit causality and divergence lifecycle
 
@@ -457,7 +667,10 @@ If corrected semantics intentionally change terminal hashes, bind and explain th
   chronology;
 - observed plus fully authoritatively resolved divergence;
 - current pending and terminal unresolved divergence;
-- new-contract unknown and local-book defect;
+- unsupported generic/new-contract unknown, internal-prefix indeterminacy/
+  defect and local-book defect;
+- exact observation with independent prefix proof and
+  `EXTERNAL_CAUSE_UNATTRIBUTED` external attribution;
 - resnapshot failure, disconnect and shutdown while pending;
 - REST resolution opening `AUDIT_REPLACEMENT_CAPTURE_PENDING` without restoring
   eligibility;
@@ -481,9 +694,10 @@ If corrected semantics intentionally change terminal hashes, bind and explain th
 - missing, malformed, noncanonical, capture-mismatched, wrong-connection,
   future, cross-epoch and stale v2 release controls leave state pending and fail
   closed; slow canonical return beyond the age bound emits no control or scan;
-- deterministic historical v1 snapshot-only replay and terminal-hash
-  compatibility without synthesizing a control, and proof new producers cannot
-  select that path;
+- deterministic historical v1 snapshot-only replay without synthesizing a
+  control, immutable raw/control and previously recorded terminal-hash evidence,
+  a distinct deterministic terminal-v3 replay hash, and proof new producers
+  cannot select that path;
 - terminal incomplete replacement capture becoming
   `replacement_captures_unresolved` and Gate-sticky unresolved divergence;
 - no scanner/research use throughout pending state;
@@ -499,12 +713,20 @@ If corrected semantics intentionally change terminal hashes, bind and explain th
   recovery is pending;
 - per-trigger effective interval, HTTP latency and remaining freshness budget;
 - slow journal and slow canonical processor;
+- response before deadline/classification after expiry remains
+  `FAILED/BOOK_FRESHNESS_EXPIRED` without freshness promotion;
+- slow full summary, slow operational projection, analytical flush and thread-
+  pool contention;
 - slow canonical return after mutually fresh snapshots such that the
   coordinator decision occurs beyond the freshness bound: zero snapshot scans,
   no release control, capture pending and interval open;
 - mismatch while backlog exists;
 - queue saturation and health/availability writer failure;
 - authoritative resnapshot failure and disconnect while pending;
+- external transient 5xx/timeout with exact fault closure, unresolved failure at
+  shutdown and locally caused deadline miss;
+- contribution writer failure/saturation and every typed/genuine-unknown resync
+  route;
 - clean and failed shutdown with pending divergence;
 - exact live/replay terminal equality.
 
@@ -515,15 +737,19 @@ If corrected semantics intentionally change terminal hashes, bind and explain th
 3. Successful incremental scan report over original and rebuilt analytical data.
 4. Successful analytical rebuild and validation.
 5. New 60-second explicit-target smoke.
-6. New 45–60 minute stability observation on the intended target/host/filesystem.
+6. New 5,400–7,200 second stability observation, preferring 7,200 seconds, on
+   the intended target/host/filesystem and materially beyond history saturation.
 7. Independent pre-soak review of:
    - invariant errors;
    - transition metrics;
    - audit triggers, mismatches and causal relations;
-   - pending/resolved/unresolved/unknown/local-defect divergence state;
-   - unavailable-interval attribution;
+   - observation/internal-prefix/external-attribution/recovery divergence state;
+   - pending/resolved/unresolved/unsupported-unknown/local-defect state;
+   - public-read/audit fault lifecycles and classification-stage timing;
+   - unavailable-interval attribution and direct contributions;
    - monotonic checkpoint chronology;
-   - memory slope;
+   - operational/full-summary latency and post-saturation memory attribution/
+     slope;
    - storage projection;
    - scan-report scalability.
 8. Fresh six-hour Gate-1 soak.
@@ -536,13 +762,20 @@ The rerun is not authorized until:
 - all primary failed-run windows have regression coverage;
 - corrected replay is deterministic and free of the identified primary invariant failures;
 - scan-report succeeds within current bounds;
-- health v3, trigger/lifecycle and interval evidence validate;
+- health v4 operational snapshot, fault lifecycle, retention and contribution
+  evidence validate with v1-v3 compatibility;
 - no unresolved no-pending transition assumption remains;
 - no terminal pending/unresolved divergence, pending/unresolved replacement
-  capture, newly produced causal unknown, or local-book defect remains;
+  capture, unsupported generic unknown, internal reconstruction
+  indeterminacy/defect, local-book defect, unresolved required fault, or locally
+  caused classification deadline miss remains;
 - every observed divergence resolves through the ADR-0054 authoritative path
-  and all counts, chains, intervals and eligibility state reconcile;
-- the short stability run has acceptable memory/latency/queue behavior;
+  with an exact observation and independent prefix result, and all counts,
+  chains, contributions, intervals and eligibility state reconcile;
+- external unattribution, where present, is explicitly
+  `EXTERNAL_CAUSE_UNATTRIBUTED` under ADR-0055 and never guessed;
+- the final stability run has bounded operational-snapshot cost and acceptable
+  post-saturation memory/latency/queue behavior;
 - current official Polymarket documentation is rechecked;
 - the implementation remains structurally read-only.
 

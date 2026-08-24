@@ -9,9 +9,12 @@ from multi_market_arbitrage.core.exact import ExactDecimal, Price, Quantity
 from multi_market_arbitrage.core.ids import (
     CanonicalEventId,
     ConfigHash,
+    CostRuleSetVersionId,
     IngestId,
     InstrumentId,
     MarketId,
+    MarketVersionId,
+    PrecisionRuleVersionId,
     VersionId,
 )
 from multi_market_arbitrage.core.provenance import (
@@ -336,6 +339,30 @@ class CanonicalL2BookOwner:
     @property
     def health(self) -> BookHealth:
         return self._health
+
+    @property
+    def invalidation_reason(self) -> InvalidationReason | None:
+        """Return the current scalar invalidation state without building a snapshot."""
+
+        return self._reason
+
+    @property
+    def market_version_id(self) -> MarketVersionId:
+        """Return the currently bound market reference version in O(1)."""
+
+        return self._market_version_id
+
+    @property
+    def precision_rule_version_id(self) -> PrecisionRuleVersionId:
+        """Return the currently bound precision version in O(1)."""
+
+        return self._precision_version_id
+
+    @property
+    def cost_rule_set_version_id(self) -> CostRuleSetVersionId:
+        """Return the currently bound cost-rule version in O(1)."""
+
+        return self._cost_version_id
 
     @staticmethod
     def _baseline_level_provenance(

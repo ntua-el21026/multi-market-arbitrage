@@ -486,6 +486,22 @@ class JournalReader:
                 f"completed journal venue differs across stream {head.stream}"
             )
         if any(
+            (
+                segment.manifest.git_commit,
+                segment.manifest.writer_id,
+                segment.manifest.writer_software_version,
+            )
+            != (
+                head.git_commit,
+                head.writer_id,
+                head.writer_software_version,
+            )
+            for segment in segments
+        ):
+            raise JournalCorruptionError(
+                f"completed journal writer provenance differs across stream {head.stream}"
+            )
+        if any(
             segment.manifest.uncompressed_bytes > head.max_uncompressed_bytes_per_segment
             for segment in segments
         ):

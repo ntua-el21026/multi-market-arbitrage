@@ -32,8 +32,9 @@ An apparent arbitrage is not treated as executable until data health, settlement
 - [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) — staged engineering sequence and current remediation
 - [`docs/GATE_1_FAILURE_20260822.md`](docs/GATE_1_FAILURE_20260822.md) — evidence summary for the failed first six-hour soak
 - [`docs/GATE_1_REMEDIATION_SPEC.md`](docs/GATE_1_REMEDIATION_SPEC.md) — normative correction and rerun requirements
-- [`docs/GATE_1_SOAK_SPEC.md`](docs/GATE_1_SOAK_SPEC.md) — unchanged Gate-1 acceptance contract
+- [`docs/GATE_1_SOAK_SPEC.md`](docs/GATE_1_SOAK_SPEC.md) — normative Gate-1 acceptance contract
 - [`docs/adr/0054-audit-divergence-state-and-gate-eligibility.md`](docs/adr/0054-audit-divergence-state-and-gate-eligibility.md) — immediate fail-closed audit-divergence recovery and Gate semantics
+- [`docs/adr/0055-audit-public-read-fault-evidence-and-lifecycles.md`](docs/adr/0055-audit-public-read-fault-evidence-and-lifecycles.md) — orthogonal divergence evidence, fault lifecycles, direct interval attribution and bounded operational diagnostics
 - [`docs/PHASE_2_RESEARCH_AND_SPEC.md`](docs/PHASE_2_RESEARCH_AND_SPEC.md) — planning-only multi-venue/semantic specification; production work remains blocked
 - [`docs/EXTERNAL_REFERENCE_BACKLOG.md`](docs/EXTERNAL_REFERENCE_BACKLOG.md) — non-normative external systems, strategy priorities, and future ADR candidates
 - [`docs/ADR_INDEX.md`](docs/ADR_INDEX.md) — architecture decision index
@@ -74,10 +75,23 @@ processing, with same-epoch nonfuture sources no older than
 epoch coverage, socket readiness, incrementals or partial coverage cannot restore
 eligibility. It does not accept same-generation waiting as a live closure.
 
-Gate 1 remains `FAIL`. A new final-SHA 60-second smoke and 45–60 minute
-stability observation are still required before independent pre-soak review.
+The later exact-SHA 45-minute preflight retained complete recovery but exposed
+remaining periodic full-summary/history-memory work, external causal
+unattribution, cumulative fault-history stickiness, missing direct bindings for
+paired interval contributors, a generic resync label and one locally delayed
+classification. ADR-0055 separates exact observation, independently proven
+received-prefix integrity, external causal attribution and recovery; keeps
+internal defect/indeterminacy sticky; permits explicit
+`EXTERNAL_CAUSE_UNATTRIBUTED` only after complete independent proof and recovery;
+retains strict pre-expiry classification; and requires checkpoint v4 from a
+lightweight bounded operational snapshot plus separate fault and contribution
+evidence.
+
+Gate 1 remains `FAIL`. A new final-SHA 60-second smoke and 5,400–7,200 second
+post-saturation stability observation are still required before independent
+pre-soak review.
 A fresh six-hour soak is mandatory only after later independent authorization;
-no six-hour rerun was performed for the ADR-0054 remediation.
+no six-hour rerun was performed for this remediation.
 
 Phase-2 research may continue in parallel. Production Kalshi, Kraken, semantic-engine, paper/shadow or live implementation must not be merged or promoted until Gate 1 receives an accepted `PASS`.
 

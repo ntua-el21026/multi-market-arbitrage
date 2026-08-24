@@ -30,6 +30,9 @@ from multi_market_arbitrage.core.ids import (  # noqa: E402
     InstrumentId,
     SubscriptionId,
 )
+from multi_market_arbitrage.core.limits import (  # noqa: E402
+    MAX_ANALYTICAL_FRAGMENTS_PER_DATASET,
+)
 from multi_market_arbitrage.core.serialization import canonical_json_bytes  # noqa: E402
 from multi_market_arbitrage.core.time import (  # noqa: E402
     MonotonicTimestamp,
@@ -41,10 +44,12 @@ from multi_market_arbitrage.observability import (  # noqa: E402
     AvailabilityCause,
     AvailabilityEvidenceRuntimeSnapshot,
     AvailabilityInterval,
+    AvailabilityIntervalContribution,
     AvailabilityRecoveryAction,
     AvailabilityRecoveryOutcome,
     AvailabilityScope,
     HealthCheckpoint,
+    HealthDecisionReason,
     HealthEvidenceRuntimeSnapshot,
     HistogramSnapshot,
     HostRuntimeIdentity,
@@ -59,15 +64,20 @@ from multi_market_arbitrage.pipeline import (  # noqa: E402
     CanonicalProcessor,
 )
 from multi_market_arbitrage.pipeline.health import (  # noqa: E402
+    AUDIT_STAGE_TIMING_TELEMETRY_STAGES,
+    MAXIMUM_REPORTED_RESOURCE_DISCONTINUITIES,
     ObservationRuntimeHealthSnapshot,
+    ProcessResourceDiscontinuity,
     ProcessResourceSnapshot,
     ProcessResourceTrendSnapshot,
+    PythonAllocationGroup,
     build_observation_health_checkpoint,
 )
 from multi_market_arbitrage.pipeline.ingress import RawIngressMetricsSnapshot  # noqa: E402
 from multi_market_arbitrage.pipeline.targeting import resolve_polymarket_target  # noqa: E402
 from multi_market_arbitrage.reference import POLYMARKET_VENUE_ID  # noqa: E402
 from multi_market_arbitrage.research import (  # noqa: E402
+    AnalyticalFragmentRetentionSnapshot,
     AnalyticalQueueSnapshot,
     AnalyticalRuntimeSnapshot,
 )
@@ -81,6 +91,155 @@ SCHEMA_VERSION = "gate1-health-benchmark-v2"
 PROJECTED_SECONDS = 21_600
 CADENCES_SECONDS = (1, 5, 10, 30)
 FIXTURES = REPOSITORY / "tests" / "golden" / "fixtures"
+
+
+def _capacity_analytical_runtime() -> AnalyticalRuntimeSnapshot:
+    representative_hash_bytes = 113
+    container_bytes = 33_048
+    estimated_bytes = (
+        container_bytes + MAX_ANALYTICAL_FRAGMENTS_PER_DATASET * representative_hash_bytes
+    )
+    return AnalyticalRuntimeSnapshot(
+        healthy=True,
+        accepted_records=12_288_000,
+        processed_records=12_288_000,
+        rejected_records=0,
+        queues=tuple(
+            AnalyticalQueueSnapshot(domain=domain, depth=0, high_water=1_024)
+            for domain in ("reference", "canonical_events", "complete_set_scans")
+        ),
+        failure_type=None,
+        buffered_records=3_000,
+        buffered_bytes=201_326_592,
+        buffered_records_high_water=3_000,
+        buffered_bytes_high_water=201_326_592,
+        flushes=3 * MAX_ANALYTICAL_FRAGMENTS_PER_DATASET,
+        flushed_records=12_288_000,
+        pyarrow_current_bytes=4_294_967_296,
+        pyarrow_peak_bytes=8_589_934_592,
+        fragment_retention=tuple(
+            AnalyticalFragmentRetentionSnapshot(
+                domain=domain,
+                retained=MAX_ANALYTICAL_FRAGMENTS_PER_DATASET,
+                capacity=MAX_ANALYTICAL_FRAGMENTS_PER_DATASET,
+                dataset_fragments_at_open=0,
+                dataset_fragment_reservations=MAX_ANALYTICAL_FRAGMENTS_PER_DATASET,
+                maximum_dataset_fragments=MAX_ANALYTICAL_FRAGMENTS_PER_DATASET,
+                container_shallow_bytes=container_bytes,
+                representative_hash_shallow_bytes=representative_hash_bytes,
+                estimated_retained_bytes=estimated_bytes,
+                maximum_estimated_retained_bytes=estimated_bytes,
+            )
+            for domain in ("reference", "canonical_events", "complete_set_scans")
+        ),
+    )
+
+
+def _capacity_process_resources(*, terminal: bool) -> ProcessResourceSnapshot:
+    allocation_groups = (
+        tuple(
+            PythonAllocationGroup(
+                filename=f"{index:02d}-" + "x" * 1_021,
+                size_bytes=9_223_372_036_854_775_807 - index,
+                allocation_count=9_223_372_036_854_775_807 - index,
+            )
+            for index in range(12)
+        )
+        if terminal
+        else ()
+    )
+    return ProcessResourceSnapshot(
+        sampled_monotonic_ns=5_000_000_000,
+        free_disk_bytes=9_223_372_036_854_775_807,
+        cpu_user_seconds=21_600.123456,
+        cpu_system_seconds=10_800.654321,
+        current_rss_bytes=9_000_000_000_000,
+        peak_rss_bytes=9_100_000_000_000,
+        current_rss_source="proc-statusm-statm-benchmark-capacity",
+        python_tracemalloc_current_bytes=2_000_000_000_000,
+        python_tracemalloc_peak_bytes=2_100_000_000_000,
+        python_tracemalloc_source="tracemalloc-get-traced-memory-benchmark-capacity",
+        pyarrow_current_bytes=3_000_000_000_000,
+        pyarrow_peak_bytes=3_100_000_000_000,
+        python_allocation_group_capture=(
+            "TERMINAL_POST_CUTOFF_FILENAME_GROUPS" if terminal else "PERIODIC_NOT_CAPTURED"
+        ),
+        python_allocation_groups=allocation_groups,
+    )
+
+
+def _capacity_public_reads(latency: HistogramSnapshot) -> PublicReadMetricsSnapshot:
+    endpoints = tuple(
+        endpoint
+        for endpoint in PolymarketEndpointClass
+        if endpoint is not PolymarketEndpointClass.MARKET_WEBSOCKET
+    )
+    return PublicReadMetricsSnapshot(
+        endpoints=tuple(
+            PublicReadEndpointMetricsSnapshot(
+                endpoint_class=endpoint,
+                requests=9_223_372_036_854_775_807,
+                attempts=9_223_372_036_854_775_807,
+                first_attempt_successes=9_223_372_036_854_775_807,
+                retries=9_223_372_036_854_775_807,
+                status_classes=tuple(
+                    (status_class, 9_223_372_036_854_775_807)
+                    for status_class in ("1xx", "2xx", "3xx", "4xx", "5xx")
+                ),
+                timeouts=9_223_372_036_854_775_807,
+                temporary_network_errors=9_223_372_036_854_775_807,
+                throttle_observations=9_223_372_036_854_775_807,
+                retry_after_observations=9_223_372_036_854_775_807,
+                retry_after_parsed_observations=9_223_372_036_854_775_807,
+                retry_after_malformed_observations=9_223_372_036_854_775_807,
+                cumulative_backoff_seconds=9_999_999_999.999999,
+                exhausted_retry_budget=9_223_372_036_854_775_807,
+                final_failures=9_223_372_036_854_775_807,
+                local_rate_limit_waits=9_223_372_036_854_775_807,
+                local_rate_limit_wait_seconds=9_999_999_999.999999,
+                latency_seconds=latency,
+            )
+            for endpoint in endpoints
+        ),
+        active_attempts=9_223_372_036_854_775_807,
+        active_attempts_high_water=9_223_372_036_854_775_807,
+    )
+
+
+def _capacity_resource_trend() -> ProcessResourceTrendSnapshot:
+    discontinuities = tuple(
+        ProcessResourceDiscontinuity(
+            previous_sample_monotonic_ns=1_000_000_000 + index * 100_000_000,
+            sample_monotonic_ns=1_050_000_000 + index * 100_000_000,
+            previous_rss_bytes=8_000_000_000_000 + index * 100_000_000,
+            rss_bytes=8_000_050_000_000 + index * 100_000_000,
+            delta_bytes=50_000_000,
+        )
+        for index in range(MAXIMUM_REPORTED_RESOURCE_DISCONTINUITIES)
+    )
+    return ProcessResourceTrendSnapshot(
+        sample_count=2_161,
+        known_rss_sample_count=2_161,
+        first_sample_monotonic_ns=1_000_000_000,
+        last_sample_monotonic_ns=5_000_000_000,
+        start_rss_bytes=8_000_000_000_000,
+        end_rss_bytes=9_000_000_000_000,
+        maximum_current_rss_bytes=9_100_000_000_000,
+        largest_absolute_step_bytes=50_000_000,
+        linear_slope_bytes_per_second=250_000_000_000.125,
+        major_discontinuities=discontinuities,
+        python_tracemalloc_known_sample_count=2_161,
+        python_tracemalloc_start_bytes=1_000_000_000_000,
+        python_tracemalloc_end_bytes=2_000_000_000_000,
+        python_tracemalloc_maximum_bytes=2_100_000_000_000,
+        python_tracemalloc_linear_slope_bytes_per_second=250_000_000_000.25,
+        history_saturation_started_monotonic_ns=2_000_000_000,
+        post_saturation_sample_count=1_537,
+        post_saturation_rss_known_sample_count=1_537,
+        post_saturation_rss_linear_slope_bytes_per_second=125_000_000_000.5,
+        post_saturation_python_known_sample_count=1_537,
+        post_saturation_python_linear_slope_bytes_per_second=62_500_000_000.75,
+    )
 
 
 def _sha256_file(path: Path) -> str:
@@ -176,6 +335,9 @@ def _production_checkpoint_builder(
     run_id: CollectorRunId,
     git_commit: str,
     processor_override: CanonicalProcessor | None = None,
+    capacity_telemetry: bool = False,
+    capacity_host_source_unknown: bool = False,
+    terminal: bool = False,
 ) -> Callable[[], HealthCheckpoint]:
     """Construct the same immutable owner snapshots used by production observe.
 
@@ -205,7 +367,7 @@ def _production_checkpoint_builder(
                 )
     else:
         book_last_valid_receive_monotonic_ns.update(
-            (snapshot.instrument_id, 1_000) for snapshot in processor.snapshots()
+            (snapshot.instrument_id, 1_000) for snapshot in processor.operational_snapshot().books
         )
     market = processor.discovered_markets[0]
     target = resolve_polymarket_target(
@@ -279,6 +441,8 @@ def _production_checkpoint_builder(
         ),
         failure_type=None,
     )
+    if capacity_telemetry:
+        analytical = _capacity_analytical_runtime()
     health_writer = HealthEvidenceRuntimeSnapshot(
         healthy=True,
         queue_depth=0,
@@ -325,10 +489,22 @@ def _production_checkpoint_builder(
         active_attempts=0,
         active_attempts_high_water=1,
     )
+    if capacity_telemetry:
+        public_reads = _capacity_public_reads(latency)
     metrics = InMemoryMetrics()
     for scanner_ns, t_obs_ns in ((25_000, 100_000), (50_000, 250_000), (75_000, 500_000)):
         metrics.observe_histogram("mma_scanner_latency_ns", scanner_ns)
         metrics.observe_histogram("mma_receive_to_scan_complete_ns", t_obs_ns)
+    if capacity_telemetry:
+        for _, metric_name in (
+            *AUDIT_STAGE_TIMING_TELEMETRY_STAGES,
+            (
+                "processor_operational_snapshot",
+                "mma_processor_operational_snapshot_latency_ns",
+            ),
+        ):
+            for value in (99_999_999_999, 999_999_999_999, 9_999_999_999_999):
+                metrics.observe_histogram(metric_name, value)
     resources = ProcessResourceSnapshot(
         sampled_monotonic_ns=5_000_000_000,
         free_disk_bytes=100 * 1024 * 1024 * 1024,
@@ -349,6 +525,9 @@ def _production_checkpoint_builder(
         largest_absolute_step_bytes=1024 * 1024,
         linear_slope_bytes_per_second=512 * 1024,
     )
+    if capacity_telemetry:
+        resources = _capacity_process_resources(terminal=terminal)
+        resource_trend = _capacity_resource_trend()
     availability_writer = AvailabilityEvidenceRuntimeSnapshot(
         healthy=True,
         queue_depth=0,
@@ -362,8 +541,21 @@ def _production_checkpoint_builder(
         open_at_shutdown_intervals=0,
         failure_type=None,
     )
+    if capacity_host_source_unknown and not capacity_telemetry:
+        raise ValueError("unknown-host capacity shape requires capacity telemetry")
+    source_unknown_fields = (
+        "code_commit",
+        "code_commit_matches_repository",
+        "imported_package_root",
+        "repository_head_commit",
+        "repository_root",
+        "source_binding_valid",
+        "source_root",
+        "tracked_source_clean",
+        "untracked_source_clean",
+    )
     host_identity = HostRuntimeIdentity(
-        code_commit=git_commit,
+        code_commit=None if capacity_host_source_unknown else git_commit,
         config_sha256=config.config_hash.value,
         lock_sha256="b" * 64,
         python="CPython benchmark fixture",
@@ -375,19 +567,21 @@ def _production_checkpoint_builder(
         total_memory_bytes=16 * 1024 * 1024 * 1024,
         kernel="Linux benchmark fixture",
         filesystem="benchmark-filesystem",
-        source_root="/workspace",
-        repository_root="/workspace",
-        repository_head_commit=git_commit,
-        imported_package_root="/workspace/src/multi_market_arbitrage",
-        code_commit_matches_repository=True,
-        source_binding_valid=True,
-        tracked_source_clean=True,
-        untracked_source_clean=True,
-        unknown_fields=(),
+        source_root=None if capacity_host_source_unknown else "/workspace",
+        repository_root=None if capacity_host_source_unknown else "/workspace",
+        repository_head_commit=None if capacity_host_source_unknown else git_commit,
+        imported_package_root=(
+            None if capacity_host_source_unknown else "/workspace/src/multi_market_arbitrage"
+        ),
+        code_commit_matches_repository=None if capacity_host_source_unknown else True,
+        source_binding_valid=None if capacity_host_source_unknown else True,
+        tracked_source_clean=None if capacity_host_source_unknown else True,
+        untracked_source_clean=None if capacity_host_source_unknown else True,
+        unknown_fields=source_unknown_fields if capacity_host_source_unknown else (),
     )
 
     def build() -> HealthCheckpoint:
-        return build_observation_health_checkpoint(
+        checkpoint = build_observation_health_checkpoint(
             config=config,
             collector_run_id=run_id,
             git_commit=git_commit,
@@ -407,6 +601,27 @@ def _production_checkpoint_builder(
             book_last_valid_receive_monotonic_ns=book_last_valid_receive_monotonic_ns,
             emitted_at=UtcTimestamp(1_787_198_410_000_000_000),
             monotonic_now_ns=5_000_000_000,
+            terminal=terminal,
+        )
+        if not capacity_telemetry:
+            return checkpoint
+        reason_codes = tuple(sorted(HealthDecisionReason, key=str))
+        transient_reasons = {
+            HealthDecisionReason.SOCKET_DISCONNECTED,
+            HealthDecisionReason.BOOK_NOT_HEALTHY,
+            HealthDecisionReason.AUDIT_DIVERGENCE_PENDING,
+            HealthDecisionReason.AUDIT_REPLACEMENT_CAPTURE_PENDING,
+        }
+        return replace(
+            checkpoint,
+            git_commit=None,
+            capture_healthy=False,
+            research_eligible=False,
+            gate1_eligible_so_far=False,
+            reason_codes=reason_codes,
+            gate1_sticky_reason_codes=tuple(
+                reason for reason in reason_codes if reason not in transient_reasons
+            ),
         )
 
     return build
@@ -472,6 +687,33 @@ def _availability_interval(
         recovery_outcome=AvailabilityRecoveryOutcome.RESTORED,
         research_eligibility_restored=True,
         open_at_shutdown=False,
+    )
+
+
+def _availability_contribution(
+    interval: AvailabilityInterval,
+) -> AvailabilityIntervalContribution:
+    """Build the canonical initiating contribution for one benchmark interval."""
+
+    return AvailabilityIntervalContribution(
+        contribution_id=f"{interval.interval_id}-opener",
+        interval_id=interval.interval_id,
+        collector_run_id=interval.collector_run_id,
+        socket_generation=interval.socket_generation,
+        connection_id=interval.connection_id,
+        started_at=interval.started_at,
+        started_monotonic=interval.started_monotonic,
+        ended_at=interval.ended_at,
+        ended_monotonic=interval.ended_monotonic,
+        duration_nanoseconds=interval.duration_nanoseconds,
+        cause=interval.cause,
+        reason_code=interval.reason_code,
+        source_evidence_ids=interval.source_evidence_ids,
+        affected_instruments=interval.affected_instruments,
+        affected_scopes=interval.affected_scopes,
+        recovery_action=interval.recovery_action,
+        initiating_contributor=True,
+        recovery_outcome=interval.recovery_outcome,
     )
 
 
@@ -587,8 +829,9 @@ async def _measure_actual_availability_writes(
     cpu_started = time.process_time_ns()
     for expected in range(1, repetitions + 1):
         interval = _availability_interval(run_id, expected)
+        contribution = _availability_contribution(interval)
         started = time.perf_counter_ns()
-        if not writer.enqueue_nowait(interval):
+        if not writer.enqueue_nowait(interval, contributions=(contribution,)):
             raise RuntimeError("availability benchmark unexpectedly rejected an interval")
         while writer.runtime_snapshot.written < expected:
             if not writer.runtime_snapshot.healthy:
@@ -681,12 +924,19 @@ async def _run(output: Path) -> dict[str, object]:
         maximum_intervals=5_000,
         maximum_file_bytes=64 * 1024 * 1024,
     )
-    availability_enqueue_intervals = iter(
-        tuple(_availability_interval(run_id, index) for index in range(1, 5_001))
+    availability_enqueue_bundles = iter(
+        tuple(
+            (interval, (_availability_contribution(interval),))
+            for interval in (_availability_interval(run_id, index) for index in range(1, 5_001))
+        )
     )
 
     def enqueue_availability_interval() -> None:
-        if not availability_enqueue_writer.enqueue_nowait(next(availability_enqueue_intervals)):
+        interval, contributions = next(availability_enqueue_bundles)
+        if not availability_enqueue_writer.enqueue_nowait(
+            interval,
+            contributions=contributions,
+        ):
             raise RuntimeError("availability enqueue benchmark rejected an interval")
 
     availability_enqueue = _measure_sync(

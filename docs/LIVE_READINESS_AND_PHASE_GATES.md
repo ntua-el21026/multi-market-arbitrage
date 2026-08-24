@@ -18,6 +18,7 @@ The first six-hour run completed but failed independent acceptance. Evidence is 
 - `GATE_1_REMEDIATION_SPEC.md`;
 - ADR-0053;
 - ADR-0054;
+- ADR-0055;
 - retained local raw/analysis manifests.
 
 The following foundation evidence passed:
@@ -34,19 +35,29 @@ Gate 1 failed on:
 - scan-report materialization exceeding the valid resource bound;
 - incomplete monotonic checkpoint and per-interval availability evidence.
 
+The later ADR-0054 45-minute preflight is retained as forensic evidence, not a
+replacement pass. It exposed remaining periodic-summary/history-memory,
+external-attribution, fault-lifecycle, direct-contribution, typed-resync and
+classification-latency defects now governed by ADR-0055.
+
 Before a rerun:
 
 - implement bounded reported-top transition semantics;
 - replay the failed raw run deterministically without identified primary failures;
 - make reporting incremental within existing limits;
-- emit monotonic checkpoint v3, versioned trigger/divergence evidence and typed
-  availability intervals;
+- emit monotonic checkpoint v4 from a bounded operational snapshot with
+  versioned trigger/divergence/fault/retention evidence, typed availability
+  intervals and direct contributions;
 - prove ADR-0054 immediate authoritative-resnapshot lifecycle and current versus
   Gate-sticky health semantics;
-- pass a new exact-SHA 60-second smoke and 45–60 minute stability observation.
+- prove ADR-0055 orthogonal divergence evidence, independent received-prefix
+  integrity, public-read fault lifecycle, strict pre-expiry classification,
+  typed resync and diagnostic-retention semantics;
+- pass a new exact-SHA 60-second smoke and 5,400–7,200 second post-saturation
+  stability observation.
 
 A fresh six-hour run and full independent post-run audit are mandatory.
-Neither has been run for the ADR-0054 remediation candidate.
+Neither has been run for the final ADR-0055 remediation candidate.
 
 No later production phase may be promoted while G1 is failed.
 

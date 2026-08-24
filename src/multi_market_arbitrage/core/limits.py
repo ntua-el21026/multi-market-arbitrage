@@ -7,4 +7,13 @@ from __future__ import annotations
 # intentionally patchable in focused tests.
 MAX_ARTIFACT_PATHS_PER_ROOT = 65_536
 
-__all__ = ["MAX_ARTIFACT_PATHS_PER_ROOT"]
+# The streaming scan-report reader and every analytical dataset writer share
+# this ceiling.  Completion heads retain the exact ordered fragment-manifest
+# identities, so the producer must reject before a 4,097th fragment rather
+# than truncate terminal authority.
+MAX_ANALYTICAL_FRAGMENTS_PER_DATASET = 4_096
+
+__all__ = [
+    "MAX_ANALYTICAL_FRAGMENTS_PER_DATASET",
+    "MAX_ARTIFACT_PATHS_PER_ROOT",
+]

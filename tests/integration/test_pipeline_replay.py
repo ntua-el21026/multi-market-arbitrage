@@ -21,6 +21,7 @@ from multi_market_arbitrage.core.ids import (
     SubscriptionId,
     WriterId,
 )
+from multi_market_arbitrage.core.provenance import RawSourceRef
 from multi_market_arbitrage.core.time import MonotonicTimestamp, UtcTimestamp
 from multi_market_arbitrage.ingestion import RawEventEnvelope
 from multi_market_arbitrage.journal import (
@@ -50,7 +51,12 @@ from multi_market_arbitrage.pipeline import (
 from multi_market_arbitrage.pipeline import observe as observe_module
 from multi_market_arbitrage.pipeline.health import ObservationRuntimeHealth
 from multi_market_arbitrage.pipeline.observe import PolymarketObservationService
-from multi_market_arbitrage.pipeline.processor import ProcessedEnvelope, ReferenceRefreshRequest
+from multi_market_arbitrage.pipeline.processor import (
+    ProcessedEnvelope,
+    ProcessorRecoveryReason,
+    ProcessorRecoveryRequest,
+    ReferenceRefreshRequest,
+)
 from multi_market_arbitrage.reference import POLYMARKET_VENUE_ID
 from multi_market_arbitrage.replay import (
     ReplayTerminalHashMismatch,
@@ -1084,6 +1090,25 @@ async def test_ingress_overflow_is_journaled_and_forces_rest_resnapshot(
             receipt: JournalReceipt,
         ) -> ProcessedEnvelope:
             assert receipt.ingest_id == envelope.ingest_id
+            backpressure_recovery = (
+                (
+                    ProcessorRecoveryRequest(
+                        reason=ProcessorRecoveryReason.BACKPRESSURE_RESOURCE,
+                        source=RawSourceRef(
+                            ingest_id=envelope.ingest_id,
+                            payload_sha256=envelope.payload_sha256,
+                        ),
+                        affected_instrument_ids=(
+                            InstrumentId("token-yes"),
+                            InstrumentId("token-no"),
+                        ),
+                        original_reason_code=(InvalidationReason.BACKPRESSURE_DATA_LOSS.value),
+                        effective_invalidation_reason=(InvalidationReason.BACKPRESSURE_DATA_LOSS),
+                    ),
+                )
+                if envelope.channel == CONTROL_BOOK_INVALIDATION
+                else ()
+            )
             return ProcessedEnvelope(
                 ingest_seq=envelope.ingest_seq,
                 success=True,
@@ -1095,6 +1120,7 @@ async def test_ingress_overflow_is_journaled_and_forces_rest_resnapshot(
                 book_freshness_updates=(),
                 scan_triggers=(),
                 error_type=None,
+                recovery_requests=backpressure_recovery,
             )
 
         def on_backpressure(self) -> None:
@@ -1157,8 +1183,9 @@ async def test_ingress_overflow_is_journaled_and_forces_rest_resnapshot(
         selected: tuple[GammaMarket, ...],
         deadline: float | None = None,
         refresh_reference: bool = True,
+        runtime_health: ObservationRuntimeHealth | None = None,
     ) -> None:
-        del service, client, capture, deadline, refresh_reference
+        del service, client, capture, deadline, refresh_reference, runtime_health
         resnapshots.append(tuple(market.gamma_market_id for market in selected))
 
     monkeypatch.setattr(
@@ -1270,7 +1297,10 @@ async def test_continuous_audit_fences_response_without_replacing_socket_generat
             ready: asyncio.Event,
         ) -> None:
             ready.set()
-            for _ in range(100):
+            # Keep frames available throughout the widened run budget.  The
+            # response-fence scenario must end by its typed deadline, not by a
+            # finite synthetic frame source starving the race retry.
+            for _ in range(500):
                 await asyncio.sleep(0.003)
                 payload = (
                     _fixture("polymarket_ws_price_change.json")
@@ -1389,14 +1419,15 @@ async def test_continuous_audit_fences_response_without_replacing_socket_generat
     client = _AuditClient()
     runtime_health = ObservationRuntimeHealth()
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + 0.2
+    remaining_seconds = 0.75
+    deadline = loop.time() + remaining_seconds
     generation = await service._run_generation(  # pyright: ignore[reportPrivateUsage]
         client=cast(PolymarketPublicClient, client),
         capture=capture,
         selected=(selected,),
         asset_ids=selected.clob_token_ids,
         deadline=deadline,
-        deadline_ns=observe_module.time.monotonic_ns() + 200_000_000,
+        deadline_ns=observe_module.time.monotonic_ns() + int(remaining_seconds * 1e9),
         periodic_audit_due_ns=observe_module.time.monotonic_ns(),
         connection_id=ConnectionId("continuous-audit-socket"),
         subscription_id=SubscriptionId("continuous-audit-subscription"),
@@ -1802,6 +1833,7 @@ async def test_refresh_requests_are_selected_market_bounded_and_coalesced(
             ReferenceRefreshRequest(
                 source_event_id=CanonicalEventId(f"refresh-{index}"),
                 event_type=CanonicalEventType.TICK_SIZE_CHANGE,
+                recovery_reason=ProcessorRecoveryReason.REFERENCE_REFRESH,
                 market_id=None,
                 native_market_id=selected.gamma_market_id,
                 native_condition_id=selected.condition_id,
@@ -1812,6 +1844,7 @@ async def test_refresh_requests_are_selected_market_bounded_and_coalesced(
         ReferenceRefreshRequest(
             source_event_id=CanonicalEventId("refresh-unrelated"),
             event_type=CanonicalEventType.TICK_SIZE_CHANGE,
+            recovery_reason=ProcessorRecoveryReason.REFERENCE_REFRESH,
             market_id=None,
             native_market_id="unrelated-market",
             native_condition_id="unrelated-condition",
@@ -1841,8 +1874,9 @@ async def test_refresh_requests_are_selected_market_bounded_and_coalesced(
         selected: tuple[GammaMarket, ...],
         deadline: float | None = None,
         refresh_reference: bool = True,
+        runtime_health: ObservationRuntimeHealth | None = None,
     ) -> None:
-        del service, client, capture
+        del service, client, capture, runtime_health
         snapshots.append(
             (tuple(market.gamma_market_id for market in selected), deadline, refresh_reference)
         )

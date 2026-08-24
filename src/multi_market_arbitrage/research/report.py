@@ -13,6 +13,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from multi_market_arbitrage.core.ids import is_sha256_hex
+from multi_market_arbitrage.core.limits import MAX_ANALYTICAL_FRAGMENTS_PER_DATASET
 from multi_market_arbitrage.core.serialization import canonical_sha256
 from multi_market_arbitrage.storage import (
     ParquetFragmentManifest,
@@ -107,7 +108,7 @@ class ScanReportLimits:
 
     maximum_registered_bytes: int = 512 * 1024 * 1024
     maximum_rows: int = 5_000_000
-    maximum_fragments: int = 4_096
+    maximum_fragments: int = MAX_ANALYTICAL_FRAGMENTS_PER_DATASET
     maximum_row_groups: int = 65_536
     maximum_batch_rows: int = 4_096
     maximum_selected_row_group_bytes: int = 64 * 1024 * 1024

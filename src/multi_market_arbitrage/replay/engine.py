@@ -7,6 +7,7 @@ import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Protocol
 
 from multi_market_arbitrage.core.config import (
     Phase1Config,
@@ -25,7 +26,11 @@ from multi_market_arbitrage.journal.reader import (
     load_segment_manifest,
 )
 from multi_market_arbitrage.journal.recovery import fsync_directory
-from multi_market_arbitrage.pipeline.processor import CanonicalProcessor, ProcessorSummary
+from multi_market_arbitrage.pipeline.processor import (
+    CanonicalProcessor,
+    ProcessedEnvelope,
+    ProcessorSummary,
+)
 from multi_market_arbitrage.research.outputs import (
     Phase1AnalyticalOutputs,
     ResearchOutputSummary,
@@ -69,6 +74,21 @@ class ReplayTerminalHashMismatch(RuntimeError):
         self.actual = actual
 
 
+class ReplayEnvelopeObserver(Protocol):
+    """Public streaming observer for deterministic replay results.
+
+    Replay invokes the observer exactly once, in ingest order, immediately
+    after each envelope is processed. The engine retains no observer output;
+    consumers must enforce their own explicit state bound.
+    """
+
+    def observe_replayed_envelope(
+        self,
+        envelope: RawEventEnvelope,
+        processed: ProcessedEnvelope,
+    ) -> None: ...
+
+
 def _new_rebuild_root(journal_root: Path, output_root: Path) -> Path:
     """Require a fresh, disjoint destination below an existing real parent."""
 
@@ -109,6 +129,7 @@ def _run_replay(
     source_journal_git_commit: str | None,
     first_envelope: RawEventEnvelope | None = None,
     analytical_outputs: Phase1AnalyticalOutputs | None = None,
+    envelope_observer: ReplayEnvelopeObserver | None = None,
 ) -> ReplayResult:
     processor = CanonicalProcessor(
         config,
@@ -121,7 +142,9 @@ def _run_replay(
 
     def process(envelope: RawEventEnvelope) -> None:
         nonlocal first_ingest_seq, last_ingest_seq, raw_record_count
-        processor.process_replayed(envelope)
+        processed = processor.process_replayed(envelope)
+        if envelope_observer is not None:
+            envelope_observer.observe_replayed_envelope(envelope, processed)
         if first_ingest_seq is None:
             first_ingest_seq = envelope.ingest_seq
         last_ingest_seq = envelope.ingest_seq
@@ -179,19 +202,24 @@ def replay_journal(
     config: Phase1Config,
     *,
     include_partial: bool = False,
+    envelope_observer: ReplayEnvelopeObserver | None = None,
 ) -> ReplayResult:
-    """Replay in run-scoped ingest order with no wall-clock reads or sleeps."""
+    """Replay in run-scoped ingest order with optional bounded stream observation."""
 
     _validate_replay_config(config)
     reader = JournalReader(journal_root, collector_run_id)
     heads = reader.completion_heads()
-    source_journal_git_commit = heads[0].git_commit if len(heads) == 1 else None
+    # An uncompleted/ambiguous journal has no positive historical compatibility
+    # authority.  The non-commit sentinel therefore selects the current strict
+    # protocol rather than silently treating omission as legacy evidence.
+    source_journal_git_commit = heads[0].git_commit if len(heads) == 1 else "UNBOUND_REPLAY_SOURCE"
     return _run_replay(
         journal_root=journal_root,
         collector_run_id=collector_run_id,
         config=config,
         envelopes=reader.iter_verified(include_partial=include_partial),
         source_journal_git_commit=source_journal_git_commit,
+        envelope_observer=envelope_observer,
     )
 
 
@@ -312,6 +340,7 @@ def rebuild_analytical_from_journal(
 
 __all__ = [
     "AnalyticalRebuildResult",
+    "ReplayEnvelopeObserver",
     "ReplayResult",
     "ReplayTerminalHashMismatch",
     "rebuild_analytical_from_journal",

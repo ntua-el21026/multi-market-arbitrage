@@ -76,6 +76,30 @@ Subscription options that change interpretation are recorded.
 ### I-24 Single-owner mutable state
 Mutable state domains have explicit owners; cross-module communication uses bounded message passing/immutable snapshots.
 
+### I-25 Orthogonal audit evidence
+Exact divergence observation, independent received-prefix reconstruction
+integrity, external causal attribution, and recovery state are separate evidence
+dimensions. An unattributable external cause never substitutes for required
+internal correctness or recovery proof.
+
+### I-26 Diagnostic retention is not semantic authority
+Changing the capacity of a bounded recent diagnostic sample cannot change new-
+schema replay semantic identity. Full raw/control evidence, analytical output,
+cumulative counts, ordered chains, and current pending/recovery state remain
+authoritative.
+
+### I-27 Direct availability attribution
+Every new exact audit divergence has exactly one direct contribution bound to
+exactly one non-overlapping availability interval. Global unavailable duration
+is the interval union, never the sum of contributions, and per-instrument
+research-ineligible coverage remains independently derivable.
+
+### I-28 Fault history is not current state
+Immutable public-read/audit fault observations and cumulative counters are not
+erased and do not alone proxy current gating. Exact lifecycle state governs
+current eligibility; unresolved, internal, permanent, or inconsistent faults
+remain Gate-sticky.
+
 ## B. Research invariants
 
 ### R-01 Layered economics
@@ -255,3 +279,13 @@ Every task has supervision, health, startup, and shutdown semantics.
 
 ### E-06 Performance cannot weaken correctness
 No validator/provenance/risk control is disabled to hit a latency target.
+
+### E-07 Operational diagnostics are bounded
+Periodic health projection is immutable, bounded by current state and finite
+matrices, and does not perform history-sized or terminal-hash work on the active
+acquisition/classification path.
+
+### E-08 Recovery reasons remain typed
+A known recovery/resynchronization initiating route retains one finite end-to-
+end reason. It is never collapsed into a generic schema/protocol or unknown
+label.

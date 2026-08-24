@@ -27,8 +27,10 @@ from .host import normalize_git_commit
 
 HEALTH_CHECKPOINT_V1_SCHEMA_VERSION: Final = "gate1-health-checkpoint-v1"
 HEALTH_CHECKPOINT_V2_SCHEMA_VERSION: Final = "gate1-health-checkpoint-v2"
-HEALTH_CHECKPOINT_SCHEMA_VERSION: Final = "gate1-health-checkpoint-v3"
+HEALTH_CHECKPOINT_V3_SCHEMA_VERSION: Final = "gate1-health-checkpoint-v3"
+HEALTH_CHECKPOINT_SCHEMA_VERSION: Final = "gate1-health-checkpoint-v4"
 HEALTH_EVIDENCE_SUMMARY_VERSION: Final = "gate1-health-evidence-summary-v2"
+HEALTH_DECISION_REASON_MASK_SCHEMA: Final = "gate1-health-decision-reason-mask-v1"
 
 
 class HealthDecisionReason(StrEnum):
@@ -72,6 +74,72 @@ class HealthDecisionReason(StrEnum):
     DISK_HEADROOM_LOW = "DISK_HEADROOM_LOW"
 
 
+_HEALTH_DECISION_REASON_MASK_ORDER: Final = (
+    HealthDecisionReason.SOCKET_DISCONNECTED,
+    HealthDecisionReason.TARGET_NOT_EXPLICIT,
+    HealthDecisionReason.CODE_IDENTITY_UNAVAILABLE,
+    HealthDecisionReason.SOURCE_IDENTITY_UNAVAILABLE,
+    HealthDecisionReason.SOURCE_IDENTITY_MISMATCH,
+    HealthDecisionReason.SOURCE_TREE_DIRTY,
+    HealthDecisionReason.BOOK_NOT_HEALTHY,
+    HealthDecisionReason.INGRESS_DATA_LOSS,
+    HealthDecisionReason.INGRESS_QUEUE_SATURATED,
+    HealthDecisionReason.JOURNAL_UNHEALTHY,
+    HealthDecisionReason.JOURNAL_BACKPRESSURE,
+    HealthDecisionReason.ANALYTICAL_UNHEALTHY,
+    HealthDecisionReason.ANALYTICAL_QUEUE_SATURATED,
+    HealthDecisionReason.HEALTH_EVIDENCE_UNHEALTHY,
+    HealthDecisionReason.HEALTH_QUEUE_SATURATED,
+    HealthDecisionReason.AVAILABILITY_EVIDENCE_UNHEALTHY,
+    HealthDecisionReason.AVAILABILITY_QUEUE_SATURATED,
+    HealthDecisionReason.AVAILABILITY_RECONCILIATION_FAILED,
+    HealthDecisionReason.HTTP_INTEGRITY_UNAVAILABLE,
+    HealthDecisionReason.HTTP_FINAL_FAILURE,
+    HealthDecisionReason.AUDIT_MISMATCH,
+    HealthDecisionReason.AUDIT_DIVERGENCE_PENDING,
+    HealthDecisionReason.AUDIT_REPLACEMENT_CAPTURE_PENDING,
+    HealthDecisionReason.AUDIT_DIVERGENCE_UNRESOLVED,
+    HealthDecisionReason.AUDIT_DIVERGENCE_UNKNOWN,
+    HealthDecisionReason.AUDIT_LOCAL_BOOK_DEFECT,
+    HealthDecisionReason.AUDIT_DIVERGENCE_RECONCILIATION_FAILED,
+    HealthDecisionReason.AUDIT_TRIGGER_RECONCILIATION_FAILED,
+    HealthDecisionReason.AUDIT_FAILED,
+    HealthDecisionReason.AUDIT_RACE_BUDGET_EXHAUSTED,
+    HealthDecisionReason.PROTOCOL_DEVIATION,
+    HealthDecisionReason.RAW_RUN_CAP_REACHED,
+    HealthDecisionReason.DISK_HEADROOM_LOW,
+)
+if set(_HEALTH_DECISION_REASON_MASK_ORDER) != set(HealthDecisionReason):
+    raise RuntimeError("health-decision reason mask schema does not cover the finite enum")
+_HEALTH_DECISION_REASON_MASK_INDEX: Final = {
+    reason: index for index, reason in enumerate(_HEALTH_DECISION_REASON_MASK_ORDER)
+}
+
+
+def health_decision_reason_mask(reasons: Iterable[HealthDecisionReason]) -> int:
+    """Encode the finite append-only reason enum as an exact v4 bit mask."""
+
+    mask = 0
+    for reason in reasons:
+        mask |= 1 << _HEALTH_DECISION_REASON_MASK_INDEX[reason]
+    return mask
+
+
+def health_decision_reasons_from_mask(mask: object) -> tuple[HealthDecisionReason, ...]:
+    """Decode one v4 reason mask and reject bits outside the declared schema."""
+
+    if isinstance(mask, bool) or not isinstance(mask, int) or mask < 0:
+        raise ValueError("health-decision reason mask must be a non-negative integer")
+    maximum_mask = (1 << len(_HEALTH_DECISION_REASON_MASK_ORDER)) - 1
+    if mask & ~maximum_mask:
+        raise ValueError("health-decision reason mask contains unknown bits")
+    return tuple(
+        reason
+        for reason, index in _HEALTH_DECISION_REASON_MASK_INDEX.items()
+        if mask & (1 << index)
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class HealthDecisionInputs:
     explicit_target: bool
@@ -113,6 +181,9 @@ class HealthDecisionInputs:
     audit_local_book_defects: int = 0
     audit_divergence_lifecycle_reconciled: bool = True
     audit_trigger_reconciled: bool = True
+    audit_failures_current: int = 0
+    http_final_failures_current: int = 0
+    http_retry_budget_exhaustions_current: int = 0
 
     def __post_init__(self) -> None:
         counts = (
@@ -120,9 +191,12 @@ class HealthDecisionInputs:
             self.journal_backpressure_failures,
             self.audit_mismatches,
             self.audit_failures,
+            self.audit_failures_current,
             self.audit_race_budget_exhaustions,
             self.http_final_failures,
+            self.http_final_failures_current,
             self.http_retry_budget_exhaustions,
+            self.http_retry_budget_exhaustions_current,
             self.protocol_deviations,
             self.raw_run_bytes,
             self.free_disk_bytes,
@@ -220,13 +294,13 @@ def evaluate_health_decision(inputs: HealthDecisionInputs) -> HealthDecision:
         reasons.add(HealthDecisionReason.AUDIT_DIVERGENCE_RECONCILIATION_FAILED)
     if not inputs.audit_trigger_reconciled:
         reasons.add(HealthDecisionReason.AUDIT_TRIGGER_RECONCILIATION_FAILED)
-    if inputs.audit_failures:
+    if inputs.audit_failures or inputs.audit_failures_current:
         reasons.add(HealthDecisionReason.AUDIT_FAILED)
     if inputs.audit_race_budget_exhaustions:
         reasons.add(HealthDecisionReason.AUDIT_RACE_BUDGET_EXHAUSTED)
-    if inputs.http_final_failures:
+    if inputs.http_final_failures or inputs.http_final_failures_current:
         reasons.add(HealthDecisionReason.HTTP_FINAL_FAILURE)
-    if inputs.http_retry_budget_exhaustions:
+    if inputs.http_retry_budget_exhaustions or inputs.http_retry_budget_exhaustions_current:
         reasons.add(HealthDecisionReason.HTTP_INTEGRITY_UNAVAILABLE)
     if inputs.protocol_deviations:
         reasons.add(HealthDecisionReason.PROTOCOL_DEVIATION)
@@ -256,11 +330,9 @@ def evaluate_health_decision(inputs: HealthDecisionInputs) -> HealthDecision:
         HealthDecisionReason.AUDIT_DIVERGENCE_RECONCILIATION_FAILED,
         HealthDecisionReason.AUDIT_TRIGGER_RECONCILIATION_FAILED,
     }
-    # Audit, HTTP, and protocol counters are cumulative evidence, not
-    # current-state flags.
-    # Their typed reasons remain Gate-1-sticky, while current dependent-scope
-    # eligibility is represented by ``all_required_books_healthy`` (including
-    # the processor's audit-ineligible set) and current capture state.
+    # Current recoverable lifecycle state is visible but not sticky. Permanent
+    # or unreconciled state uses the legacy scalar and remains sticky. Cumulative
+    # observations stay in checkpoint evidence and never become state proxies.
     ordered = tuple(sorted(reasons, key=str))
     transient_gate_reasons = {
         HealthDecisionReason.SOCKET_DISCONNECTED,
@@ -268,7 +340,14 @@ def evaluate_health_decision(inputs: HealthDecisionInputs) -> HealthDecision:
         HealthDecisionReason.AUDIT_DIVERGENCE_PENDING,
         HealthDecisionReason.AUDIT_REPLACEMENT_CAPTURE_PENDING,
     }
-    sticky = tuple(sorted(reasons.difference(transient_gate_reasons), key=str))
+    sticky_reasons = reasons.difference(transient_gate_reasons)
+    if inputs.audit_failures == 0:
+        sticky_reasons.discard(HealthDecisionReason.AUDIT_FAILED)
+    if inputs.http_final_failures == 0:
+        sticky_reasons.discard(HealthDecisionReason.HTTP_FINAL_FAILURE)
+    if inputs.http_retry_budget_exhaustions == 0:
+        sticky_reasons.discard(HealthDecisionReason.HTTP_INTEGRITY_UNAVAILABLE)
+    sticky = tuple(sorted(sticky_reasons, key=str))
     capture_healthy = not reasons.intersection(capture_blockers)
     research_eligible = not reasons.intersection(research_blockers)
     gate1_eligible = not reasons and not sticky
@@ -356,8 +435,11 @@ class HealthCheckpoint:
             "decisions": {
                 "capture_healthy": self.capture_healthy,
                 "gate1_eligible_so_far": self.gate1_eligible_so_far,
-                "gate1_sticky_reason_codes": self.gate1_sticky_reason_codes,
-                "reason_codes": self.reason_codes,
+                "gate1_sticky_reason_mask": health_decision_reason_mask(
+                    self.gate1_sticky_reason_codes
+                ),
+                "reason_mask": health_decision_reason_mask(self.reason_codes),
+                "reason_mask_schema": HEALTH_DECISION_REASON_MASK_SCHEMA,
                 "research_eligible": self.research_eligible,
             },
             "emitted_at_utc_ns": self.emitted_at.nanoseconds_since_epoch,
@@ -429,7 +511,7 @@ def _record_integer(record: Mapping[str, object], key: str) -> int:
 def validate_health_checkpoint_chronology(
     records: Iterable[Mapping[str, object]],
 ) -> HealthCheckpointChronology:
-    """Validate v2/v3 monotonic chronology without inventing timestamps for v1.
+    """Validate v2-v4 monotonic chronology without inventing timestamps for v1.
 
     Historical v1 files remain readable evidence, but their omitted monotonic
     emission timestamps are reported as unavailable and cannot satisfy the v2
@@ -462,6 +544,7 @@ def validate_health_checkpoint_chronology(
         )
     if version not in {
         HEALTH_CHECKPOINT_V2_SCHEMA_VERSION,
+        HEALTH_CHECKPOINT_V3_SCHEMA_VERSION,
         HEALTH_CHECKPOINT_SCHEMA_VERSION,
     }:
         raise ValueError("unsupported health-checkpoint schema version")
@@ -867,6 +950,8 @@ __all__ = [
     "HEALTH_CHECKPOINT_SCHEMA_VERSION",
     "HEALTH_CHECKPOINT_V1_SCHEMA_VERSION",
     "HEALTH_CHECKPOINT_V2_SCHEMA_VERSION",
+    "HEALTH_CHECKPOINT_V3_SCHEMA_VERSION",
+    "HEALTH_DECISION_REASON_MASK_SCHEMA",
     "HEALTH_EVIDENCE_SUMMARY_VERSION",
     "HealthCheckpoint",
     "HealthCheckpointChronology",
@@ -878,5 +963,7 @@ __all__ = [
     "PeriodicHealthCheckpointEmitter",
     "SupervisedHealthCheckpointWriter",
     "evaluate_health_decision",
+    "health_decision_reason_mask",
+    "health_decision_reasons_from_mask",
     "validate_health_checkpoint_chronology",
 ]

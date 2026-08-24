@@ -9,12 +9,15 @@ from typing import cast
 import pytest
 
 from multi_market_arbitrage.core.ids import VenueId
+from multi_market_arbitrage.core.limits import MAX_ANALYTICAL_FRAGMENTS_PER_DATASET
 from multi_market_arbitrage.core.serialization import canonical_json_bytes, canonical_sha256
 from multi_market_arbitrage.research import validate_data
 from multi_market_arbitrage.research import validation as validation_module
 from multi_market_arbitrage.storage import (
+    AnalyticalDatasetCompletion,
     AnalyticalDatasetConfig,
     AnalyticalDatasetWriter,
+    AnalyticalFragmentLimitError,
     AnalyticalProvenance,
     AnalyticalSchemaError,
     DuckDBReadOnlyQuery,
@@ -45,6 +48,7 @@ def config(
     partition_date: str = "2026-08-20",
     maximum_record_bytes: int = 8 * 1024 * 1024,
     maximum_buffered_bytes: int = 64 * 1024 * 1024,
+    maximum_fragments: int = MAX_ANALYTICAL_FRAGMENTS_PER_DATASET,
 ) -> AnalyticalDatasetConfig:
     return AnalyticalDatasetConfig(
         root=tmp_path,
@@ -55,6 +59,7 @@ def config(
         batch_size=batch_size,
         maximum_record_bytes=maximum_record_bytes,
         maximum_buffered_bytes=maximum_buffered_bytes,
+        maximum_fragments=maximum_fragments,
         zstd_level=3,
     )
 
@@ -72,6 +77,12 @@ def test_parquet_batches_manifest_provenance_and_duckdb_query(tmp_path: Path) ->
 
     assert len(flushed) == 1
     assert final_fragment is not None
+    assert writer.buffered_records == 0
+    assert writer.buffered_bytes == 0
+    assert writer.buffered_records_high_water == 2
+    assert writer.buffered_bytes_high_water > 0
+    assert writer.flush_count == 2
+    assert writer.flushed_records == 3
     parquet_files = sorted(tmp_path.rglob("*.parquet"))
     assert len(parquet_files) == 2
     for path in parquet_files:
@@ -146,6 +157,81 @@ def test_analytical_writer_bounds_single_records_and_flushes_on_byte_budget(
     assert writer.buffered_records == 1
     assert writer.buffered_bytes == first_bytes
     writer.close()
+
+
+def test_analytical_fragment_limit_rejects_before_any_over_bound_write(
+    tmp_path: Path,
+) -> None:
+    writer = AnalyticalDatasetWriter(
+        config(tmp_path, batch_size=1, maximum_fragments=1),
+        provenance(),
+    )
+    first = writer.append({"id": "one"})
+    assert first is not None
+    files_at_limit = tuple(sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*")))
+
+    with pytest.raises(AnalyticalFragmentLimitError, match="before writer admission"):
+        writer.append({"id": "two"})
+
+    assert writer.flush_count == 1
+    assert writer.flushed_records == 1
+    assert writer.buffered_records == 0
+    assert tuple(sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))) == (
+        files_at_limit
+    )
+    writer.close()
+    assert len(tuple(tmp_path.rglob("*.parquet"))) == 1
+
+
+def test_analytical_fragment_limit_rejects_before_last_slot_preflush(
+    tmp_path: Path,
+) -> None:
+    writer = AnalyticalDatasetWriter(
+        config(
+            tmp_path,
+            batch_size=100,
+            maximum_record_bytes=2_048,
+            maximum_buffered_bytes=2_048,
+            maximum_fragments=1,
+        ),
+        provenance(),
+    )
+    writer.append({"id": "one", "payload": "x" * 800})
+    buffered_bytes = writer.buffered_bytes
+
+    with pytest.raises(AnalyticalFragmentLimitError, match="unflushable"):
+        writer.append({"id": "two", "payload": "y" * 800})
+
+    assert writer.flush_count == 0
+    assert writer.buffered_records == 1
+    assert writer.buffered_bytes == buffered_bytes
+    assert not tuple(tmp_path.rglob("*.parquet"))
+    final = writer.close()
+    assert final is not None
+    assert final.row_count == 1
+
+
+def test_analytical_fragment_admission_accounts_for_existing_inventory(
+    tmp_path: Path,
+) -> None:
+    first = AnalyticalDatasetWriter(
+        config(tmp_path, batch_size=1, maximum_fragments=2),
+        provenance(),
+    )
+    assert first.append({"id": "one"}) is not None
+    first.close()
+
+    second = AnalyticalDatasetWriter(
+        config(tmp_path, batch_size=1, maximum_fragments=2),
+        provenance(),
+    )
+    assert second.existing_fragment_count == 1
+    assert second.fragment_capacity == 1
+    assert second.append({"id": "two"}) is not None
+    with pytest.raises(AnalyticalFragmentLimitError, match="before writer admission"):
+        second.append({"id": "three"})
+    second.close()
+    assert len(tuple(tmp_path.rglob("*.parquet"))) == 2
 
 
 def test_arrow_type_drift_across_fragments_fails_closed(tmp_path: Path) -> None:
@@ -269,6 +355,24 @@ def test_analytical_provenance_requires_config_content_hash() -> None:
             producer="writer",
             producer_version="1",
         )
+
+
+def test_historical_completion_parser_does_not_apply_new_writer_ceiling() -> None:
+    hashes = tuple(
+        hashlib.sha256(f"historical-fragment-{index}".encode()).hexdigest()
+        for index in range(MAX_ANALYTICAL_FRAGMENTS_PER_DATASET + 1)
+    )
+
+    completion = AnalyticalDatasetCompletion.from_record(
+        {
+            "dataset": "complete_set_scans",
+            "fragment_manifest_sha256s": list(hashes),
+            "record_count": len(hashes),
+            "schema_version": "phase1-complete-set-scan-flat-v1",
+        }
+    )
+
+    assert completion.fragment_manifest_sha256s == hashes
 
 
 def test_dataset_validation_rejects_deleted_fragment_inventory(tmp_path: Path) -> None:
