@@ -64,6 +64,7 @@
 | 0053 | Bounded reported-top transition state | Accepted |
 | 0054 | Audit divergence state and Gate eligibility | Accepted |
 | 0055 | Audit/public-read fault evidence dimensions and lifecycles | Accepted |
+| 0056 | Availability contributor ownership and bounded replacement recovery | Accepted |
 
 ## Rule
 

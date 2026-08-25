@@ -19,6 +19,7 @@ The first six-hour run completed but failed independent acceptance. Evidence is 
 - ADR-0053;
 - ADR-0054;
 - ADR-0055;
+- ADR-0056;
 - retained local raw/analysis manifests.
 
 The following foundation evidence passed:
@@ -39,6 +40,9 @@ The later ADR-0054 45-minute preflight is retained as forensic evidence, not a
 replacement pass. It exposed remaining periodic-summary/history-memory,
 external-attribution, fault-lifecycle, direct-contribution, typed-resync and
 classification-latency defects now governed by ADR-0055.
+The later contributor-capacity failure exposed completed history retained as
+active plus replacement capture without bounded exhaustion. ADR-0056 reconciles
+that governance; implementation remediation remains pending.
 
 Before a rerun:
 
@@ -51,13 +55,16 @@ Before a rerun:
 - prove ADR-0054 immediate authoritative-resnapshot lifecycle and current versus
   Gate-sticky health semantics;
 - prove ADR-0055 orthogonal divergence evidence, independent received-prefix
-  integrity, public-read fault lifecycle, strict pre-expiry classification,
-  typed resync and diagnostic-retention semantics;
-- pass a new exact-SHA 60-second smoke and 5,400–7,200 second post-saturation
+  integrity, public-read fault lifecycle, pre-expiry PREPARE plus exact possibly
+  later unchanged attestation, typed resync and diagnostic-retention semantics;
+- prove ADR-0056 unresolved-only active contributors, independent completion,
+  separate active/cumulative bounds, interval-union/cross-stream reconciliation
+  and bounded replacement retry/deadline/exhaustion;
+- pass a new post-fix exact-SHA 60-second smoke and 5,400–7,200 second
   stability observation.
 
 A fresh six-hour run and full independent post-run audit are mandatory.
-Neither has been run for the final ADR-0055 remediation candidate.
+Neither has been run for the pending ADR-0056 implementation remediation.
 
 No later production phase may be promoted while G1 is failed.
 

@@ -4,7 +4,7 @@ Multi-venue quantitative arbitrage, market-making, and delta-neutral trading res
 
 **Initial venues:** Polymarket, Kalshi, Kraken  
 **Architecture:** Python modular monolith  
-**Current project state:** Phase-1 Gate-1 audit-divergence remediation; first six-hour soak remains failed
+**Current project state:** Phase-1 Gate-1 ADR-0056 implementation remediation pending; first six-hour soak remains failed
 
 **Live trading:** Structurally unavailable in Phase 1
 
@@ -35,6 +35,7 @@ An apparent arbitrage is not treated as executable until data health, settlement
 - [`docs/GATE_1_SOAK_SPEC.md`](docs/GATE_1_SOAK_SPEC.md) — normative Gate-1 acceptance contract
 - [`docs/adr/0054-audit-divergence-state-and-gate-eligibility.md`](docs/adr/0054-audit-divergence-state-and-gate-eligibility.md) — immediate fail-closed audit-divergence recovery and Gate semantics
 - [`docs/adr/0055-audit-public-read-fault-evidence-and-lifecycles.md`](docs/adr/0055-audit-public-read-fault-evidence-and-lifecycles.md) — orthogonal divergence evidence, fault lifecycles, direct interval attribution and bounded operational diagnostics
+- [`docs/adr/0056-availability-contributor-ownership-and-bounded-replacement-recovery.md`](docs/adr/0056-availability-contributor-ownership-and-bounded-replacement-recovery.md) — unresolved-only contributor ownership, interval-union reconciliation and bounded replacement recovery
 - [`docs/PHASE_2_RESEARCH_AND_SPEC.md`](docs/PHASE_2_RESEARCH_AND_SPEC.md) — planning-only multi-venue/semantic specification; production work remains blocked
 - [`docs/EXTERNAL_REFERENCE_BACKLOG.md`](docs/EXTERNAL_REFERENCE_BACKLOG.md) — non-normative external systems, strategy priorities, and future ADR candidates
 - [`docs/ADR_INDEX.md`](docs/ADR_INDEX.md) — architecture decision index
@@ -83,13 +84,23 @@ classification. ADR-0055 separates exact observation, independently proven
 received-prefix integrity, external causal attribution and recovery; keeps
 internal defect/indeterminacy sticky; permits explicit
 `EXTERNAL_CAUSE_UNATTRIBUTED` only after complete independent proof and recovery;
-retains strict pre-expiry classification; and requires checkpoint v4 from a
+requires PREPARE to become durable and be processed strictly before hard expiry,
+with exact unchanged attestation durability/processing permitted later; and
+requires checkpoint v4 from a
 lightweight bounded operational snapshot plus separate fault and contribution
 evidence.
 
-Gate 1 remains `FAIL`. A new final-SHA 60-second smoke and 5,400–7,200 second
-post-saturation stability observation are still required before independent
-pre-soak review.
+The preserved ADR-0055 candidate then exposed completed contributor history
+retained in active authority until a shared interval closed and replacement
+capture without bounded exhaustion. ADR-0056 reconciles documentation only: it
+requires unresolved-only active causal keys, independent completed-contributor
+publication, separate active/cumulative bounds, global interval-union and cross-
+stream reconciliation, plus bounded retry/deadline/exhaustion under one stable
+replacement-recovery identity. Implementation remediation remains pending.
+
+Gate 1 remains `FAIL`. A new post-fix final-SHA 60-second smoke and 5,400–7,200
+second stability observation are still required before independent pre-soak
+review.
 A fresh six-hour soak is mandatory only after later independent authorization;
 no six-hour rerun was performed for this remediation.
 

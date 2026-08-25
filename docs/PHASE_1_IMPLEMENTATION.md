@@ -12,12 +12,14 @@ The supported runtime roles are `OBSERVE`, `RESEARCH`, and `REPLAY`. Trading is
 unavailable.
 
 Gate 1 remains `FAIL` because the first six-hour soak is historical failure
-evidence and no replacement six-hour soak was run. ADR-0055 governs the final
-pre-soak correction after the exact-SHA 45-minute observation exposed remaining
-operational-summary, memory, attribution, fault, interval-contribution, resync
-and classification-latency defects. Final offline gates, a new exact-SHA
-60-second smoke, and a new exact-SHA 5,400- to 7,200-second post-saturation
-stability observation must complete before independent pre-soak review.
+evidence and no replacement six-hour soak was run. The preserved candidate
+`6dc5dc43bbb673a35ff960bb7d84fed062aefda4` implements the ADR-0055 baseline but
+does not implement ADR-0056 unresolved-only contributor ownership, independent
+completed-contributor persistence, cross-stream interval reconciliation or
+bounded replacement-recovery exhaustion. ADR-0056 reconciles governance only;
+implementation remediation and final offline gates remain pending. A new exact-
+SHA 60-second smoke and 5,400- to 7,200-second post-saturation stability
+observation are required only after that implementation is complete and frozen.
 
 ## Toolchain
 
@@ -127,7 +129,8 @@ incident reconstruction while retaining strict file and count headroom.
 `snapshot_audit_freshness_guard_seconds` is a four-second audit-launch guard,
 strictly smaller than the unchanged five-second hard book-age limit. It creates
 time for both bounded binary-leg public reads, their independent receive fences,
-and serialized canonical classification without adding any acceptance
+and serialized PREPARE decision plus exact attestation without adding any
+acceptance
 tolerance: an L2 message beyond the hard age still invalidates fail closed.
 After a fenced `RACED` result, the coordinator waits for the configured
 `snapshot_audit_race_retry_quiet_seconds` without blocking WebSocket admission.
@@ -136,6 +139,12 @@ receive, so correlated activity bursts are not sampled repeatedly without a
 quiet boundary. At most four retries (five real attempts) are allowed; the run
 deadline, current leg hard expiry, or socket-generation exit always suppresses
 later work, and exhaustion remains a durable fail-closed outcome.
+
+ADR-0056 replacement-capture attempt, retry and hard-recovery limits are not yet
+present in this candidate configuration. Implementation remediation must add
+explicit measured limits for attempts, next-retry timing and hard recovery
+duration, bounded by the absolute run deadline. Those numeric values belong in
+Phase-1 configuration/specification and tests, not foundational architecture.
 
 Retained failed-run and corrected-stability cadence evidence supports keeping
 the 30-second periodic cap and four-second guard. A 15-second periodic cap did
@@ -415,11 +424,12 @@ Each audit is an ordered, replayable protocol:
    actual times, and its decision time is the PREPARE processing-completion
    time. The processor releases the staged response only if the attestation is
    exact and PREPARE-to-attestation fence, book, health, transition,
-   eligibility and fault state still reconcile. Equality/lateness or any
-   reconciliation failure yields only permanent internal
+   eligibility and fault state still reconcile. PREPARE deadline equality/
+   lateness or any attestation reconciliation failure yields only permanent
+   internal
    `FAILED/BOOK_FRESHNESS_EXPIRED`, with no scan or restoration. The final
-   attestation may itself become durable later because it can commit only the
-   already completed pre-expiry preparation; this is not a second
+   attestation may itself become durable or be processed later because it can
+   commit only the already completed pre-expiry preparation; this is not a second
    historical-boundary outcome path.
 
 At each cycle the two explicit binary legs are ordered by their independent
@@ -519,6 +529,15 @@ count of the pre-resolution connection set.
 Incrementals, reported BBO, socket readiness, partial market coverage, or the
 first binary leg cannot restore eligibility.
 
+The preserved candidate has no ADR-0056 attempt/deadline authority around this
+capture. The required remediation must retain one stable recovery identity and
+causal contributor across permitted connection generations, with bounded
+attempts, first/latest attempt times, next retry, hard recovery and run
+deadlines, required/captured instruments, last typed failure and deterministic
+attempt chain. Exhaustion must retain unresolved/open evidence, keep eligibility
+blocked and transition to typed fail-closed degraded or terminal behavior; it
+must not remain indefinitely pending or create duplicate contributors.
+
 Replacement-capture pending continues to block audit starts, scanner, and
 research. For current v2 audit state it clears only after complete full-snapshot
 coverage from the one new connection; an independent post-processing observer
@@ -603,8 +622,9 @@ inputs even after
 all requests close. The sorted per-instrument audit-economic generations are
 committed as well because they determine the identity and race fence of the
 next audit even when current L2 and pending markers are otherwise equal. Replay
-consumes the durable classification time and never substitutes the current clock or the
-wall-clock schedule. Historical all-inline runs remain supported for old
+consumes the recorded PREPARE decision/source times and final-attestation
+evidence and never substitutes the current clock or wall-clock schedule.
+Historical all-inline runs remain supported for old
 datasets, but a run cannot upgrade or downgrade between inline and bound
 deferred modes. A bound start cannot be completed by an inline response or
 expiry record; mixed, mismatched, and malformed controls fail closed.
@@ -617,8 +637,9 @@ not independently recoverable. Historical v1, protocol/indeterminate,
 non-retryable, and other-status faults are permanent. A qualifying transient may
 clear current gating after a later exact integrity proof, but its historical
 fact and lost coverage remain. Unresolved required failure, exhausted recovery
-at shutdown, internal/permanent fault, locally caused classification deadline
-miss, missing coverage, or lifecycle inconsistency remains Gate-sticky. The strict
+at shutdown, internal/permanent fault, locally caused PREPARE durability/
+processing deadline miss, missing coverage, or lifecycle inconsistency remains
+Gate-sticky. The strict
 pre-expiry rule is unchanged: a response received before expiry whose PREPARE
 durability or canonical processing completes at or after hard expiry remains
 permanent internal `FAILED/BOOK_FRESHNESS_EXPIRED` and never produces a scan,
@@ -686,16 +707,19 @@ payload or transport metadata changes. Two independent executions must be
 byte-identical.
 
 The causal exact-frame limit is one cumulative unique-raw-frame search budget
-per observation. Its pre-classification anchor is free; the original connection
+per observation. Its pre-decision anchor is free; the original connection
 starts charging strictly after the REST response admission boundary and later
-generations charge after classification. Full snapshots and reconnects cannot
+generations charge after the frozen decision boundary. Full snapshots and reconnects cannot
 reset it, multi-action payloads count once, and the first decisive exact match
 ends causal search while the journal-identity pass continues. The first frame
 beyond the limit fails closed as `AMBIGUOUS`/`UNKNOWN` with equality
-`NOT_PROVEN`. Classification control monotonic time must exactly equal its raw
-receive time and a `MISMATCH` must precede hard expiry.
+`NOT_PROVEN`. For verified historical direct controls, classification monotonic
+time must equal raw receive time. For `PREPARE_ATTEST_V1`, PREPARE processing-
+completion is the frozen decision time and must precede hard expiry; the final
+attestation raw receipt/durability/processing may be later only when it exactly
+attests unchanged PREPARE state and actual times.
 
-A parseable post-classification raw `REST_BOOK` is only a recovery candidate in
+A parseable post-decision raw `REST_BOOK` is only a recovery candidate in
 this raw-only report. Channel membership cannot prove canonical apply, a healthy
 exact baseline, recovery completion, or eligibility restoration. A same-
 original-connection match after that candidate is therefore ambiguous unless a
@@ -900,7 +924,8 @@ current unresolved state.
 
 Data loss, terminal unresolved divergence, unsupported generic/new-contract
 unknown, internal reconstruction indeterminacy/defect, local-book defect,
-locally caused classification deadline miss, failed recovery, and lifecycle/
+locally caused PREPARE durability/processing deadline miss, failed recovery, and
+lifecycle/
 trigger/writer/availability/replay/hash inconsistency remain sticky. An
 analytical or audit-integrity failure can block research without falsifying raw-
 journal durability, while a health-writer failure leaves authoritative capture
@@ -986,6 +1011,10 @@ cutoff.
 
 ### Separate availability ledger
 
+This subsection records the preserved candidate topology. ADR-0056 does not
+require that topology, and the contributor-ownership behavior below is
+explicitly pending remediation.
+
 Availability intervals are not mixed into checkpoint JSONL. A second bounded,
 single-owner writer publishes
 `gate1-availability-interval-v1` records to the run-scoped
@@ -1028,15 +1057,18 @@ same maximum-age bound and verifies every required canonical book is healthy.
 The completing v2 snapshot still emits zero scans and leaves capture/
 ineligibility pending. The coordinator samples one paired decision boundary,
 durably journals the replacement-release control at that same wall/monotonic
-time, and waits for successful canonical processing. The interval closes at
-exactly that decision time only after the control clears replacement-capture
-pending and ineligibility, produces the recovery scan, and every required scope,
-current audit eligibility and scanner/research eligibility are restored. It may
-then set
-`research_eligibility_restored=true`. Incrementals, reported BBO, socket
-readiness, partial coverage, or one leg of a multi-leg market cannot close it.
-Missing or rejected v2 release evidence keeps the interval open. An unreconciled
-or open-at-shutdown interval remains a Gate blocker.
+time, and waits for successful canonical processing. The global interval closes
+at exactly that decision time only when the control clears replacement-capture
+pending and ineligibility, produces the recovery scan, restores every required
+scope, current audit eligibility and scanner/research eligibility, and closing
+the mismatch contributor makes the complete active-contributor set empty. If
+another contributor remains active, the mismatch contributor still closes at
+the control decision but the global interval remains open. A closed interval may
+then set `research_eligibility_restored=true`. Incrementals, reported BBO, socket
+readiness, partial coverage, or one leg of a multi-leg market cannot close the
+mismatch contributor. Missing or rejected v2 release evidence keeps that
+contributor active. An unreconciled or open-at-shutdown interval remains a Gate
+blocker.
 
 Interval admission is non-blocking and separately bounded by queue, count, and
 file bytes. Serialization, append, and `fsync` run off the capture path, and
@@ -1053,20 +1085,35 @@ cadence/overhead.
 
 ### Separate availability-contribution ledger
 
-New producers publish bounded
-`gate1-availability-interval-contribution-v1` records to a separate homogeneous
-file through the same single-owner non-blocking availability evidence bundle.
-Every new mismatch has exactly one direct contribution bound to exactly one
-global interval and retains request,
-divergence, instrument, market, audit raw-source, cause/scope, authoritative
-resolution, replacement-release and opener-versus-join evidence.
+The preserved candidate publishes bounded
+`gate1-availability-interval-contribution-v1` records through the same
+single-owner availability evidence bundle and retains completed contributions in
+active authority until the global interval closes. That behavior does not
+conform to ADR-0056 and must not be treated as the target contract.
 
-Multiple paired/overlapping contributions may join one non-overlapping global
-interval. Global unavailable duration remains the interval union, while per-
-instrument research-ineligible duration is derived from contributions. Missing,
-duplicate, orphan, source-mismatched, saturated or failed contribution evidence
-blocks automatic Gate eligibility. Historical v1 intervals remain unchanged
-and never receive synthesized contributors.
+The remediation assigns the global interval ID at open and keeps only unresolved
+deterministic causal keys active. Repeated symptoms update one bounded count and
+evidence digest. A resolved contributor independently freezes one immutable
+completed record, hands it to bounded durable derived-evidence persistence and
+leaves active authority even while the interval remains open. Active-contributor
+capacity and cumulative completed count/file/byte capacity are separate hard
+bounds. The global interval remains the union of nonempty-active-set time, not a
+sum, and closes only when that set becomes empty or at terminal cutoff.
+
+The implementation may retain a composite owner with independently admitted
+logical streams or use separately supervised bounded owners. Each logical stream
+has one mutable owner, non-blocking admission, explicit partials, durable writes,
+atomic clean completion and exact cross-stream interval/contribution count,
+digest, union, sequence and hash reconciliation. Missing, duplicate, orphan,
+source-mismatched, saturated, failed or partial-as-complete evidence blocks
+automatic Gate eligibility without changing raw capture.
+
+ADR-0056 requires explicitly newer interval and contribution producer schemas
+rather than assigning new semantics to interval-v1 or contribution-v1.
+Historical interval/contribution evidence remains immutable; interval-v1 lacks
+the new contributor count/digest, and absent causal keys, observation counts,
+independent completion, retry/deadline or reconciliation fields are reported
+unavailable/not retained and never synthesized.
 
 The health path is derived diagnostic evidence. It never mutates canonical
 state and is not permitted to block socket acquisition or raw durability.
@@ -1221,6 +1268,6 @@ Current protocol conclusions:
   Gate 1.
 - The new final-SHA 60-second smoke and 5,400–7,200 second post-saturation
   stability evidence remain required before independent pre-soak review; older
-  public runs do not validate the ADR-0055 candidate.
+  public runs do not validate the pending ADR-0056 implementation remediation.
 - Long-duration data-quality soak evidence remains an independent Gate 1
   operator activity.

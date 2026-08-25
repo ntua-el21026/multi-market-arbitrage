@@ -13,10 +13,13 @@ authoritative-resnapshot decision. A later exact-SHA 45-minute observation
 proved that recovery state reconciled but exposed remaining periodic-summary,
 retained-history memory, external-attribution, fault-lifecycle, direct-interval-
 contribution, typed-resync, and local classification-latency defects. ADR-0055
-governs their final correction. The candidate must still complete offline
-validation, a new 60-second smoke, and a new 5,400- to 7,200-second stability
-observation before independent pre-soak review. No six-hour rerun was performed;
-the first soak remains `FAIL`.
+governs those corrections. A later pre-soak stability attempt exposed completed
+contributors retained in active authority until interval closure and replacement
+capture without bounded exhaustion. ADR-0056 reconciles that governance;
+implementation remediation remains pending. The post-fix candidate must complete
+offline validation, a new 60-second smoke, and a new 5,400- to 7,200-second
+stability observation before independent pre-soak review. No six-hour rerun was
+performed; the first soak remains `FAIL`.
 
 Design Freeze v0.1 remains locked.
 
@@ -33,7 +36,7 @@ Correct the smallest proven defects while preserving:
 - single-owner canonical mutation;
 - no live/authenticated venue capability.
 
-The remediation has ten primary tracks:
+The remediation has eleven primary tracks:
 
 1. bounded reported-top transition semantics;
 2. incremental bounded analytical reporting;
@@ -42,9 +45,12 @@ The remediation has ten primary tracks:
 5. audit-divergence lifecycle, trigger and Gate-evidence correction;
 6. lightweight periodic operational snapshots and bounded diagnostic retention;
 7. orthogonal observation/internal-prefix/external-cause/recovery evidence;
-8. public-read/audit fault lifecycles with strict pre-expiry classification;
-9. direct interval contributions and typed resynchronization reasons; and
-10. post-saturation memory/latency validation.
+8. public-read/audit fault lifecycles with strict pre-expiry decision
+   preparation plus exact source-bound attestation;
+9. direct interval contributions, unresolved-only contributor ownership and
+   typed resynchronization reasons;
+10. bounded replacement-capture recovery and exact cross-stream reconciliation;
+11. post-saturation memory/latency validation.
 
 ## 3. Authoritative failure corpus
 
@@ -261,6 +267,24 @@ derivable. Duplicate, orphan, missing or source-mismatched contributions fail
 closed. Historical v1 interval files remain unchanged and never receive
 synthesized contributors.
 
+ADR-0056 assigns the interval ID when the interval opens and restricts active
+contributor authority to unresolved causal lifecycles. One deterministic causal
+key represents each audit divergence, public-read fault, transport interruption,
+reported-top transition, reference recovery, resource/writer fault, or target
+lifecycle. Repeated symptoms update that key's bounded count/evidence digest.
+Contributor resolution independently freezes and queues one immutable completed
+record and removes the lifecycle from active authority; it does not wait for the
+global interval to close. Active-concurrency bounds and cumulative completed
+count/file/byte bounds are distinct.
+
+The global interval is the union of periods when the active set is nonempty and
+closes only when that set becomes empty or at the exact terminal cutoff. One
+composite owner with independent logical streams or separately supervised
+bounded writers may persist intervals and contributions, provided each stream
+has one mutable owner, non-blocking admission, explicit partials, durable/atomic
+clean completion and exact cross-stream reconciliation. Failure or saturation
+blocks Gate evidence eligibility without contaminating raw capture.
+
 Routine audits must not be mislabeled as socket downtime.
 
 ### 6.3 Host identity and memory slope
@@ -343,10 +367,12 @@ the original/replacement connections and every full-snapshot raw source,
 admission/ingest and receive-monotonic identity. Incrementals, reported BBO,
 socket readiness, partial coverage or the first binary leg are insufficient.
 New audit launches are suppressed before a START is journaled while either
-recovery state is pending. The availability interval ends at the control's exact
+recovery state is pending. The mismatch contributor ends at the control's exact
 decision time only after its successful durable canonical processing and full
-scope/current-eligibility reconciliation. Same-generation equality is not a
-live closure path.
+scope/current-eligibility reconciliation. The global availability interval ends
+at that boundary only if this removal empties the complete active-contributor
+set; otherwise it remains open for the other active causes. Same-generation
+equality is not a live closure path.
 
 The coordinator must drain the complete admitted WebSocket prefix and require
 no deferred/queued item plus active acquisition before sampling the decision;
@@ -391,7 +417,7 @@ Observed and fully authoritatively resolved external divergence is retained
 history, not automatically a permanent Gate blocker. Pending state is a
 current blocker. Terminal unresolved, unsupported generic/new-contract unknown,
 internal reconstruction indeterminacy/defect, local-book defect, locally caused
-classification deadline miss, failed recovery, or lifecycle/writer/
+PREPARE durability/processing deadline miss, failed recovery, or lifecycle/writer/
 availability/replay/hash inconsistency is Gate-sticky.
 
 ### 7.2 Offline causal lineage result
@@ -550,16 +576,25 @@ failure reason dominates the original transport category and cannot be softened
 into recoverable external state. Periodic current-recoverable reasons are
 visible but nonsticky; unresolved terminal current state is sticky.
 
-The strict deferred-bound rule remains: response body/watermark and
-classification control complete strictly inside their deadlines. A response
-received before expiry but classified at or after hard expiry remains
-`FAILED/BOOK_FRESHNESS_EXPIRED` and cannot produce a historical outcome or
-freshness. First remove local operational-summary/history/scheduling work;
-neither the guard nor deadline is enlarged to hide the failure.
+The strict deferred-bound rule remains: the response body and exact watermark
+arrive strictly before the response deadline; every admitted WebSocket frame
+through that watermark becomes durable and canonically processed; and the inert
+PREPARE becomes journal-durable and finishes canonical processing strictly
+before the start-bound hard expiry. PREPARE freezes the exact response, fence,
+book identity, health, transition, eligibility, fault and timing inputs without
+creating an outcome or freshness mutation. Final classification-v2 may become
+durable or be processed after hard expiry only as an exact attestation of the
+unchanged PREPARE raw identity and actual durability/processing times. It cannot
+use later state, recompute, create a new decision, or promote expired freshness
+or current eligibility. A body without timely PREPARE, or a missing, malformed,
+mismatched or unreconciled attestation, is permanent internal
+`FAILED/BOOK_FRESHNESS_EXPIRED`. This is not a historical-boundary outcome path.
+First remove local operational-summary/history/scheduling work; neither the
+guard nor deadline is enlarged to hide the failure.
 
 Stage histograms separately measure network response, raw durability, barrier
-wait, classification construction, classification durability, classification
-processing and total response-to-classification latency.
+wait, PREPARE construction/durability/processing, final-attestation durability/
+processing, response-to-PREPARE-decision and response-to-attestation latency.
 
 ### 7.8 Interval contributions and typed resynchronization
 
@@ -567,6 +602,28 @@ Each new mismatch emits exactly one separate versioned interval contribution
 bound to exactly one global interval. Paired/overlapping contributions retain
 all request/instrument sources while global duration remains the interval union
 and per-instrument coverage remains derivable.
+
+Post-ADR-0056 interval records carrying contributor count/digest and
+post-ADR-0056 contribution records both require explicitly newer schemas chosen
+during implementation. Existing interval-v1 and contribution-v1 evidence
+remains immutable and does not acquire or imply the new fields.
+
+Contributor closure is independent of interval closure. Completion freezes one
+immutable record, hands it to bounded derived-evidence persistence and removes
+the causal key from unresolved active authority. At run completion every
+contributor must map to one stable interval ID; interval count/digest, sequence/
+hash chain and active-period union must match the contribution stream, with no
+orphans, duplicate causal keys or completed contributors still active. A crash
+may leave explicit partial evidence but cannot claim clean completion.
+
+Replacement capture retains one stable recovery identity and causal contributor
+across permitted new connection generations. Phase configuration must bound
+attempts, first/latest attempt times, next retry, hard recovery and run deadlines,
+required/captured instrument state, last typed failure and the deterministic
+evidence chain. Exhaustion is typed unresolved/open, leaves eligibility blocked,
+and produces fail-closed degraded or terminal behavior rather than remaining
+indefinitely pending. At shutdown every active contributor receives explicit
+open-at-shutdown evidence at the exact paired cutoff and becomes Gate-sticky.
 
 The processor-to-observer recovery contract carries one of
 `AUDIT_MISMATCH_RECOVERY`, `REPORTED_TOP_TRANSITION_FAILURE`,
@@ -641,7 +698,11 @@ If corrected semantics intentionally change terminal hashes, bind and explain th
 - each cause class;
 - aggregate/ledger reconciliation;
 - exactly one contribution per new mismatch, paired/overlapping contributors,
-  union/per-instrument duration, and duplicate/orphan/source mismatch rejection;
+  unresolved-only active authority, independent contributor closure,
+  union/per-instrument duration, separate active/cumulative bounds, and
+  duplicate/orphan/source mismatch rejection;
+- completed contributors leaving active authority while a shared interval stays
+  open, plus exact count/digest/sequence/hash cross-stream reconciliation;
 - shutdown with an open interval;
 - health writer failure without raw-capture contamination;
 - current/peak RSS evidence.
@@ -663,8 +724,9 @@ If corrected semantics intentionally change terminal hashes, bind and explain th
 - one cumulative exact-frame budget that cannot reset on a snapshot/reconnect,
   counts one multi-action raw frame once, starts at the response admission
   boundary, and fails closed with an exact bound reason;
-- exact classification-control/raw-receive time binding and pre-expiry MISMATCH
-  chronology;
+- verified historical direct-control/raw-receive time binding; for
+  `PREPARE_ATTEST_V1`, exact PREPARE source/times, pre-expiry PREPARE decision,
+  and a possibly later unchanged final attestation;
 - observed plus fully authoritatively resolved divergence;
 - current pending and terminal unresolved divergence;
 - unsupported generic/new-contract unknown, internal-prefix indeterminacy/
@@ -678,8 +740,10 @@ If corrected semantics intentionally change terminal hashes, bind and explain th
   and a first binary leg as replacement proof;
 - full snapshots for every required instrument from one new connection, with a
   further connection change restarting incomplete coverage;
-- durable/canonical processing before each snapshot counts and interval closure
-  only after final-snapshot processing plus full health/eligibility restoration;
+- durable/canonical processing before each snapshot counts, mismatch-contributor
+  closure only after final-snapshot processing plus full health/eligibility
+  restoration, and global interval closure at that boundary only when the full
+  active-contributor set becomes empty;
 - same-epoch replacement sources, pruning of stale/future/cross-epoch sources,
   and an independent post-processing check that all receive times are nonfuture
   and within `scanner.maximum_book_age`;
@@ -690,7 +754,8 @@ If corrected semantics intentionally change terminal hashes, bind and explain th
   journaled and successfully canonically processed;
 - exact release binding of the capture preimage/digest, decision wall/monotonic
   time, replacement connection and every full-snapshot raw source, with the
-  availability interval ending at that same decision only after acceptance;
+  mismatch contributor ending at that same decision only after acceptance and
+  the global interval ending there only if no other contributor is active;
 - missing, malformed, noncanonical, capture-mismatched, wrong-connection,
   future, cross-epoch and stale v2 release controls leave state pending and fail
   closed; slow canonical return beyond the age bound emits no control or scan;
@@ -700,6 +765,9 @@ If corrected semantics intentionally change terminal hashes, bind and explain th
   cannot select that path;
 - terminal incomplete replacement capture becoming
   `replacement_captures_unresolved` and Gate-sticky unresolved divergence;
+- bounded replacement attempts, next-retry/hard/run deadlines, connection-
+  generation retry under one recovery/contributor identity, deterministic
+  failure chain and typed exhaustion without indefinite pending;
 - no scanner/research use throughout pending state;
 - no REST audit comparison or WebSocket frame mutates/clears pending state;
 - exact lifecycle, interval and terminal-hash reconciliation.
@@ -713,8 +781,9 @@ If corrected semantics intentionally change terminal hashes, bind and explain th
   recovery is pending;
 - per-trigger effective interval, HTTP latency and remaining freshness budget;
 - slow journal and slow canonical processor;
-- response before deadline/classification after expiry remains
-  `FAILED/BOOK_FRESHNESS_EXPIRED` without freshness promotion;
+- response before deadline but PREPARE durability/processing at or after expiry
+  remains `FAILED/BOOK_FRESHNESS_EXPIRED`, while delayed exact attestation of a
+  timely unchanged PREPARE succeeds without freshness promotion;
 - slow full summary, slow operational projection, analytical flush and thread-
   pool contention;
 - slow canonical return after mutually fresh snapshots such that the
@@ -768,12 +837,15 @@ The rerun is not authorized until:
 - no terminal pending/unresolved divergence, pending/unresolved replacement
   capture, unsupported generic unknown, internal reconstruction
   indeterminacy/defect, local-book defect, unresolved required fault, or locally
-  caused classification deadline miss remains;
+  caused PREPARE durability/processing deadline miss remains;
 - every observed divergence resolves through the ADR-0054 authoritative path
   with an exact observation and independent prefix result, and all counts,
   chains, contributions, intervals and eligibility state reconcile;
 - external unattribution, where present, is explicitly
   `EXTERNAL_CAUSE_UNATTRIBUTED` under ADR-0055 and never guessed;
+- ADR-0056 active and cumulative contributor bounds, independent closure,
+  interval-union/cross-stream reconciliation, replacement retry/deadline/
+  exhaustion, and shutdown evidence all pass offline tests;
 - the final stability run has bounded operational-snapshot cost and acceptable
   post-saturation memory/latency/queue behavior;
 - current official Polymarket documentation is rechecked;

@@ -89,6 +89,13 @@ Failure invalidates sequence-dependent state.
 eligible for recovery review only after all required ADR-0055 validation,
 contribution and reconciliation layers pass.
 
+ADR-0056 validation additionally proves one stable causal key per unresolved
+lifecycle, independent contributor closure/publication, separate active and
+cumulative bounds, global active-period union, exact interval/contribution
+count/digest/sequence/hash reconciliation, and bounded replacement attempts,
+deadlines and typed exhaustion. Historical schemas report unavailable fields;
+validation never synthesizes them.
+
 ## 6. V3 — Canonical state
 
 Checks:

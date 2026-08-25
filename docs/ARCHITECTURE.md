@@ -136,9 +136,14 @@ A failure that invalidates a prerequisite for economic decisions removes decisio
 
 Periodic health consumes a lightweight immutable operational snapshot. Full
 processor-summary, terminal-hash, and history-sized diagnostic work remains off
-the active acquisition/classification path. Fault and availability-contribution
-writers are separately bounded derived-evidence owners and cannot take
-canonical-state ownership.
+the active acquisition/classification path. Derived-evidence persistence has
+explicit bounded single ownership and never owns canonical state. It may use one
+composite owner with independent logical streams or multiple supervised domain
+owners when justified, provided each stream has one mutable owner, acquisition
+remains non-blocking, partial output and failure are explicit, clean completion
+is durable and atomic, and cross-stream identities reconcile deterministically.
+Exact topology is a phase-contract and implementation decision; acquisition and
+canonical ownership remain unchanged.
 
 ## 7. Technology baseline
 

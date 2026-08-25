@@ -123,12 +123,17 @@ Same raw data, commit, config, reference interpretation and model versions must 
 Replay covers audit starts/responses/failures/classification, watermarks, barriers, transition state/bounds, availability evidence and terminal hash inputs without repeating external I/O or depending on current scheduler time.
 
 New replay also covers the ADR-0055 observation/internal-prefix/external-cause/
-recovery dimensions, public-read fault lifecycles, availability contributions,
-typed resync reasons, and operational-snapshot/full-summary parity. Historical
+recovery dimensions, public-read fault lifecycles, and the ADR-0056 active-
+versus-completed contributor lifecycle, interval-union/cross-stream identities,
+bounded replacement-recovery authority, typed resync reasons, and operational-
+snapshot/full-summary parity. Historical
 raw, control and journal bytes remain immutable, and their recorded terminal
 hashes remain historical evidence. Replay under terminal-v3 semantics
 deterministically produces and documents a new terminal identity without
-invented fault closures or contributions.
+invented fault closures, contributions, causal keys or retry fields. A producer
+implementing ADR-0056 uses an explicitly newer interval schema and contribution
+schema; replay never silently assigns the new contract to interval-v1 or
+contribution-v1 evidence.
 
 Current v2 replacement eligibility releases only through a self-contained
 durable control that binds the exact capture preimage, digest, and one sampled
@@ -137,8 +142,10 @@ wall/monotonic time, replacement connection and raw control source, while the
 capture preimage binds every replacement full-snapshot raw source and receive
 chronology. Tests require live/replay terminal equality; zero scans from all v2
 replacement snapshots; release-control processing as the first permitted scan;
-and interval closure at exactly that decision boundary after successful durable
-processing. Missing, malformed, noncanonical, capture-mismatched,
+and mismatch-contributor closure at exactly that decision boundary after
+successful durable processing. Global interval closure occurs there only if the
+complete active-contributor set becomes empty. Missing, malformed, noncanonical,
+capture-mismatched,
 wrong-connection, cross-epoch, future and stale controls must leave state pending
 and fail closed. Historical v1 replacement snapshots retain their bounded
 snapshot-only replay path without a synthesized control solely for immutable
@@ -171,10 +178,11 @@ Inject:
 - clock-quality/UTC regression;
 - reported-top transition conflict/expiry;
 - audit backlog/races/deadlines;
-- response before deadline with classification after hard expiry, which remains
-  `FAILED/BOOK_FRESHNESS_EXPIRED` without freshness promotion;
-- PREPARE durability and canonical-processing completion on each side of hard
-  expiry, plus delayed final attestation of a timely PREPARE;
+- response before deadline with PREPARE durability and canonical-processing
+  completion on each side of hard expiry, plus delayed final attestation of a
+  timely PREPARE; late/equal PREPARE remains
+  `FAILED/BOOK_FRESHNESS_EXPIRED`, while the exact delayed attestation creates no
+  new decision or freshness promotion;
 - PREPARE/attestation source, timestamp, state and protocol-selector mismatch,
   proving no comparison, scan, restoration or freshness promotion;
 - mismatch while a journal/canonical backlog exists;
@@ -184,6 +192,11 @@ Inject:
 - slow full summary and slow operational health projection;
 - slow analytical flush, thread-pool contention and contribution-writer
   failure/saturation;
+- completed-contributor publication while another causal key keeps the interval
+  open, active/cumulative bound saturation, cross-stream failure and crash
+  partials;
+- replacement-capture connection churn, attempt/deadline exhaustion and
+  shutdown under one stable recovery/contributor identity;
 - every typed processor-to-observer resync reason and genuine `UNKNOWN`;
 - resource pressure.
 
@@ -231,6 +244,12 @@ Required:
   overlapping contributions, duplicate/orphan/source mismatch rejection,
   interval-union rather than contribution-sum duration, and independently
   derivable per-instrument coverage;
+- deterministic causal keys, repeated-symptom count/digest updates without
+  duplicate active entries, independent closure/removal while the interval stays
+  open, and separate active-contributor versus cumulative count/file/byte bounds;
+- exact cross-stream interval/contribution count, digest, union, sequence and
+  hash-chain reconciliation, including explicit partial artifacts that cannot
+  claim clean completion;
 - open interval at shutdown;
 - aggregate/ledger reconciliation;
 - exact causal interval starts before ordered drain for mismatch, freshness,
@@ -285,7 +304,7 @@ Required ADR-0054 cases are:
   availability interval, while exact-boundary coverage remains valid;
 - after completing-snapshot processing, the observer independently rejects a
   missing, future or older-than-maximum-age required-book timestamp before
-  interval closure;
+  mismatch-contributor closure;
 - every v2 replacement snapshot, including the completing one, emits zero scans
   and leaves capture/ineligibility pending until a durable release control is
   successfully processed;
@@ -304,10 +323,11 @@ Required ADR-0054 cases are:
   the decision is a distinct interruption and does not rewrite the decision;
 - two same-market captures release in deterministic instrument order, with zero
   scans for the first control and one scan only after the final control;
-- control processing is the first permitted recovery scan, and the availability
-  interval ends at exactly the same decision time only after successful durable
-  processing, zero pending capture, healthy required scopes, explicit current
-  audit eligibility and restored scanner/research eligibility;
+- control processing is the first permitted recovery scan, the mismatch
+  contributor ends at exactly the same decision time only after successful
+  durable processing, zero pending capture, healthy required scopes, explicit
+  current audit eligibility and restored scanner/research eligibility, and the
+  global interval ends there only if no other contributor remains active;
 - missing, malformed, noncanonical, capture-mismatched, wrong-connection,
   future, cross-epoch and stale v2 controls are rejected before state mutation
   and leave capture/ineligibility and the interval pending;
@@ -330,6 +350,17 @@ release for internal defect/indeterminacy or unsupported generic `UNKNOWN`;
 release for `EXTERNAL_CAUSE_UNATTRIBUTED` only after complete independent proof;
 and exact fault/contribution/resync reconciliation.
 
+Required ADR-0056 cases additionally include every supported causal-key family;
+bounded repeated-symptom updates; completed-history saturation without active-
+map retention; one immutable completion record; one composite-owner and
+separately supervised-owner conformance fixtures; exact interval ID assignment
+at open; terminal open-at-shutdown evidence; and no synthesized fields for
+historical schemas. Replacement recovery tests retain stable identity across
+permitted connection generations, bounded attempts, first/latest times, next-
+retry/hard/run deadlines, required/captured instruments, last typed cause and a
+deterministic attempt chain. Exhaustion remains unresolved/open and Gate-sticky,
+never restores eligibility and never remains indefinitely pending.
+
 The paired health benchmark regression covers availability-interval
 construction/serialization, non-blocking producer enqueue and CPU, actual
 enqueue-through-`fsync` latency, and exact file growth as well as checkpoints.
@@ -350,8 +381,9 @@ The offline reporter must cover:
 - detection of a changed complete raw-envelope identity.
 - cumulative exact-frame bounds that full snapshots/reconnects cannot reset,
   response-admission boundary charging, multi-action single-frame accounting,
-  first-decisive-match termination, classification receive-time equality, and
-  pre-hard-expiry MISMATCH chronology.
+  first-decisive-match termination, verified historical direct-control receive-
+  time equality, and for `PREPARE_ATTEST_V1` a pre-hard-expiry PREPARE decision
+  plus an exact possibly later attestation.
 
 The mandatory retained-corpus regression covers all 20 corrected-stability and
 all 262 failed-soak mismatches. A recovery-generation match is never reported
@@ -365,6 +397,11 @@ binding. They separately cover accepted v1 REST recovery without invented
 release evidence, accepted v2 release with exact published-ledger
 reconciliation, rejected REST/control candidates, and generation evidence that
 cannot by itself prove recovery completion.
+
+ADR-0056 recovery-authority tests additionally exercise connection churn under
+one recovery/contributor key, attempt and deadline exhaustion, typed terminal
+degradation, and exact deterministic attempt-chain replay. They reject a retry
+that creates another contributor or restores eligibility after exhaustion.
 
 Reporter tests separately exercise canonical empty/legacy-unverifiable mode,
 strict historical-v1 summary-plus-interval mode, and full current-v2 summary,
@@ -418,8 +455,11 @@ saturation. Report:
 - public-read/audit fault observed/pending/resolved state and every audit stage
   latency;
 - availability intervals;
-- one direct interval contribution per new mismatch and per-instrument
-  research-ineligible coverage;
+- active and cumulative contributor occupancy/bounds, independent completions,
+  one direct contribution per new mismatch, interval-union/cross-stream
+  reconciliation and per-instrument research-ineligible coverage;
+- replacement-recovery attempts, deadlines, last typed failure, exhaustion and
+  deterministic evidence chain;
 - raw/analytical growth;
 - incremental report resource usage.
 

@@ -198,7 +198,7 @@ while present, but does not remain sticky merely because a later checkpoint
 proves complete recovery. Data loss, terminal unresolved divergence including
 an incomplete terminal replacement capture, unsupported generic/new-contract
 unknown, internal reconstruction indeterminacy/defect, local-book defect,
-locally caused classification deadline miss, failed recovery, and
+locally caused PREPARE durability/processing deadline miss, failed recovery, and
 evidence/replay/reconciliation inconsistency remain sticky. Historical
 mismatch/HTTP/audit-failure counts are evidence, not current-state proxies. A
 fully evidenced recovered external transient and an externally unattributed
@@ -322,8 +322,12 @@ must not extend the claimed observation duration.
 
 ## 9. Availability interval ledger
 
-The observer writes a separate homogeneous
-`gate1-availability-interval-v1` JSONL ledger. Each record is:
+The observer writes a versioned logical availability-interval stream. The
+interval ID is assigned at open, before any contributor can reference it. The
+target record below is carried only by an explicitly newer post-ADR-0056 interval
+schema. Existing `gate1-availability-interval-v1` records are immutable, do not
+acquire `contributor_count` or `contributor_digest`, and cannot be used to infer
+those fields. Each completed or terminal-cutoff target record includes:
 
 ```text
 AvailabilityInterval
@@ -346,6 +350,8 @@ AvailabilityInterval
 ├── affected_scopes
 ├── recovery_action
 ├── recovery_outcome
+├── contributor_count
+├── contributor_digest
 ├── research_eligibility_restored
 └── open_at_shutdown
 ```
@@ -396,9 +402,12 @@ Complete v2 capture remains pending/ineligible and all of its replacement
 snapshots have emitted zero scans at this point. The coordinator next preserves
 `mma.control.rest-audit-replacement-release.v1` at that same boundary and waits
 for successful canonical processing. Only that accepted durable control may
-clear replacement-capture pending, clear audit ineligibility and produce the
-recovery scan. The interval then closes with exactly the control envelope's
-decision UTC/monotonic time, not a later post-durability clock sample, and carries
+clear replacement-capture pending, clear audit ineligibility, produce the
+recovery scan, and close the mismatch contributor at exactly the control
+envelope's decision UTC/monotonic time, not a later post-durability clock sample.
+The global interval closes at that boundary only if removing this contributor
+makes the entire active-contributor set empty; otherwise the shared interval
+remains open for the other active causes. A closed interval carries
 `research_eligibility_restored=true` only after pending is zero, every required
 book is healthy, explicit current audit eligibility is true, and
 scanner/research eligibility is restored. At shutdown an unrecovered interval
@@ -411,11 +420,14 @@ Pre-decision input therefore cannot be overtaken. A generation end strictly
 after the decision is recorded as a separate later interruption and does not
 rewrite the accepted boundary. Same-market multi-capture controls are ordered by
 instrument; intermediate controls retain the group blocker and emit zero scans,
-and only the final accepted control can close the interval and scan.
+and only the final accepted control can close the mismatch contributor and scan.
+It closes the global interval only when no other contributor remains active.
 
-The ledger has its own non-blocking 64-command queue, 8,192-record limit, and
-64 MiB file bound. A supervised owner serializes, appends, and `fsync`s outside
-the capture path, then atomically publishes the partial file only after clean
+Phase implementation/configuration defines separate hard bounds for active
+contributors and cumulative interval/contributor records, artifacts and bytes.
+Derived-evidence admission is non-blocking and bounded. A supervised single
+owner per logical stream serializes, appends and durably persists outside the
+capture path, then atomically publishes a final artifact only after clean
 completion. An unrecovered interval is bounded at the exact terminal capture
 cutoff and marked `open_at_shutdown`.
 
@@ -426,10 +438,13 @@ freshness/transition expiry, or acquisition termination for transport failure.
 Later coordination or durability work does not move that start.
 
 Runtime/writer summaries reconcile record count, unavailable duration, longest
-interval, and shutdown-open count exactly; the offline reconciliation helper
-also rejects mixed runs, duplicate IDs, overlaps, and non-terminal open
-intervals. Missing, contradictory, saturated, or failed interval evidence
-blocks automatic Gate evidence eligibility without contaminating raw capture.
+interval, shutdown-open count, contributor count/digest and sequence/hash chains
+exactly. The offline reconciliation helper also rejects mixed runs, duplicate
+IDs, overlaps, non-terminal open intervals, orphan/duplicate contributors,
+completed contributors still active, or duration different from the union of
+active-contributor periods. Missing, contradictory, saturated, partial-as-final,
+or failed interval evidence blocks automatic Gate evidence eligibility without
+contaminating raw capture.
 
 The paired health benchmark covers production interval construction and
 serialization, non-blocking enqueue producer CPU, actual
@@ -437,27 +452,51 @@ enqueue-through-`fsync` latency, and observed JSONL byte growth per interval.
 
 ### 9.1 Availability interval contributions
 
-New ADR-0055 producers write a separate homogeneous
-`gate1-availability-interval-contribution-v1` stream. Every exact audit
-divergence emits exactly one deterministic contribution linked to exactly one
-global interval. A contribution binds interval/request/divergence/instrument/
-market identity, audit start/response/classification raw sources, start/cause,
-affected scopes, authoritative resolution, replacement release, and whether it
-opened or joined the interval.
+ADR-0055 producers retain the historical
+`gate1-availability-interval-contribution-v1` contract. ADR-0056 producers use an
+explicitly newer homogeneous contribution schema; they do not assign new fields
+or semantics to contribution-v1. Each active entry has one deterministic causal
+key: audit request/divergence, public-read fault lifecycle, transport
+interruption, reported-top transition, reference recovery, resource/writer
+fault, or target lifecycle. Every entry references the stable global interval ID
+assigned when that interval opened. Repeated symptoms update one bounded
+observation count and deterministic evidence digest/chain; they never duplicate
+an unresolved key.
 
-Contributions may overlap while global intervals remain non-overlapping. Global
-unavailable duration is the interval union, not the contribution sum;
-per-instrument research-ineligible duration is derived from its contributions.
-The offline reconciler rejects a missing divergence binding, orphan, duplicate,
-wrong source/instrument, or interval mismatch.
+The active map contains unresolved lifecycles only. When its own authoritative
+lifecycle resolves, a contributor freezes one immutable completed record,
+hands it independently to bounded durable derived-evidence persistence and is
+removed from active authority even if another cause keeps the global interval
+open. The record retains its interval/causal identity, exact start/end,
+request/divergence/instrument/market identities where applicable, raw sources,
+cause/scopes, resolution/release evidence and opener-versus-join status. Active-
+contributor capacity is distinct from cumulative completed count, artifact/file
+inventory and byte capacity.
 
-The bounded availability owner publishes the contribution stream to its own
-homogeneous partial/final file in the same admitted evidence bundle as the
-corresponding interval. Queue, interval/contribution count, and each file's byte
-growth remain bounded, and deterministic count/chain reconciliation is
-required. Failure or saturation blocks automatic Gate eligibility without
-blocking raw capture. Historical v1 interval files remain unchanged and report
-direct contribution coverage as unavailable rather than synthesizing records.
+Contributors may overlap while global intervals remain non-overlapping. Global
+unavailable duration is the union of periods with a nonempty active set, not the
+contribution sum; per-instrument and per-scope unavailable duration is derived
+from contributions. At shutdown every remaining active contributor receives
+explicit open-at-shutdown evidence at the exact paired cutoff and remains
+Gate-sticky; research eligibility is not restored.
+
+Logical interval and contribution streams may share one composite derived-
+evidence owner or use separately supervised bounded owners. Each stream has one
+mutable owner, non-blocking admission, explicit partial output, durable writes
+and atomic clean completion. Cross-stream reconciliation rejects a missing
+binding, orphan, duplicate causal key, wrong source/instrument, interval mismatch,
+completed contributor still active, count/digest mismatch, union-duration
+mismatch or sequence/hash-chain mismatch. Failure or saturation blocks automatic
+Gate eligibility without blocking raw capture. Existing
+`gate1-availability-interval-v1` and
+`gate1-availability-interval-contribution-v1` files remain immutable; both the
+post-ADR-0056 interval and contribution streams require explicitly newer schemas
+whose exact versions are selected during implementation. Readers report direct
+coverage, stable causal key, active/completed classification, observation count/
+digest, independent completion/publication order, interval contributor count/
+digest, replacement attempt count/bound, first/latest/next-retry times, hard/run
+deadlines, last typed failure, attempt chain and typed pre-shutdown exhaustion as
+unavailable/not retained rather than synthesizing records or fields.
 
 ## 10. Reported-top transition observability
 
@@ -560,6 +599,17 @@ scans and leaves capture/ineligibility pending. All sources must share one
 monotonic epoch and be nonfuture and within `scanner.maximum_book_age` at the
 decision; the observer's independent post-processing freshness check and all
 required canonical-book health checks must pass first.
+
+The recovery record also carries one stable recovery identity, bounded attempt
+count, first/latest attempt times, next retry deadline, hard recovery deadline,
+the enclosing run deadline, required/captured instrument state, last typed
+failure and a deterministic evidence chain. A permitted new connection
+generation updates this same recovery and causal contributor. Attempt or
+deadline exhaustion records typed unresolved evidence, keeps contributor,
+interval and eligibility state open, and transitions to fail-closed degraded or
+terminal behavior; it never creates a duplicate contributor or remains
+indefinitely pending. Numeric limits are phase configuration/specification
+values justified by measurement.
 
 The coordinator then durably journals
 `mma.control.rest-audit-replacement-release.v1` at that exact sampled paired
@@ -685,8 +735,9 @@ failure-v2 evidence, proven external origin, `retryable=true`, and
 `TIMEOUT`, `NETWORK`, or `HTTP_STATUS` 408/425/429/500/502/503/504. Retry
 exhaustion alone does not qualify. Failure-v1, protocol/indeterminate,
 non-retryable, and other-status faults are permanent. Cumulative facts and lost
-coverage remain. Unresolved required integrity failure, local classification
-deadline miss, internal/permanent failure, missing coverage, and
+coverage remain. Unresolved required integrity failure, a locally caused
+PREPARE durability/processing deadline miss, internal/permanent failure, missing
+coverage, and
 lifecycle/recovery inconsistency remain Gate-sticky.
 
 Failure-v1 and classification-v1 records are permanent cumulative and Gate-

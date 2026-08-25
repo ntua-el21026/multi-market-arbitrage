@@ -14,7 +14,7 @@ Every stage ends with tests, reproducible evidence and an explicit gate. Code pr
 | F1 — Canonical core | Implemented |
 | F2 — Immutable raw journal | Implemented |
 | F3 — Canonical analytical storage | Implemented; incremental long-run report path present |
-| P1 — Polymarket read-only vertical slice | Implemented; ADR-0053/0054 baseline with ADR-0055 final remediation current |
+| P1 — Polymarket read-only vertical slice | Implemented baseline; ADR-0053/0054/0055 candidate preserved; ADR-0056 implementation remediation pending |
 | P2 — Ordinary-binary complete-set scanner | Implemented |
 | P3 — Deterministic replay/rebuild | Implemented and passed first-soak review |
 | P4 — First six-hour Polymarket soak | Executed; `GATE 1: FAIL` |
@@ -27,9 +27,12 @@ The first soak ran from `a382b93220011428703fe02483f7034f59c1f045` and is docume
 Gate 1 remains `FAIL`. The 45-minute ADR-0054 candidate observation exposed
 remaining operational-summary/history-memory, external-attribution, public-read
 fault-lifecycle, interval-contribution, typed-resync and local classification-
-latency defects. ADR-0055 governs their correction. Final offline gates and new
-exact-SHA 60-second smoke plus 5,400–7,200 second post-saturation stability
-evidence remain pending. No six-hour rerun was performed.
+latency defects. The later pre-soak stability attempt exposed that completed
+contributor history was retained in active authority until the shared interval
+closed and that replacement capture lacked bounded exhaustion. ADR-0056 now
+governs those corrections. Documentation is reconciled; implementation, final
+offline gates, a new exact-SHA 60-second smoke and 5,400–7,200 second post-fix
+stability evidence remain pending. No six-hour rerun was performed.
 
 ## 2. Completed foundation
 
@@ -103,8 +106,8 @@ The evidence remains useful and must be preserved as a permanent regression corp
 
 ## 5. Current slice P4R — Gate-1 remediation
 
-The normative contract is `GATE_1_REMEDIATION_SPEC.md`, ADR-0053, ADR-0054 and
-ADR-0055.
+The normative contract is `GATE_1_REMEDIATION_SPEC.md`, ADR-0053, ADR-0054,
+ADR-0055 and ADR-0056.
 
 ### R1 — Failure-window analysis
 
@@ -145,6 +148,10 @@ ADR-0055.
 - emit checkpoint v4 from a lightweight immutable operational snapshot with
   v1-v3 historical compatibility;
 - emit a separate direct interval-contribution stream and typed resync reasons;
+- retain only unresolved causal keys in active contributor authority, close and
+  publish completed contributors independently, enforce separate active and
+  cumulative history bounds, and reconcile global interval union across logical
+  streams;
 - retain public-read/audit fault observed/pending/resolved lifecycles;
 - report retention occupancy, Python/PyArrow/native memory and post-saturation
   slope.
@@ -163,12 +170,15 @@ ADR-0055.
 - emit v2 audit triggers while replaying v1 controls as `UNKNOWN_LEGACY`;
 - make current and Gate-sticky health reasons explicit in checkpoint v4;
 - measure RSS slope, latency tails and queue HWMs.
-- preserve strict pre-expiry classification, remove the demonstrated
+- preserve strict pre-expiry PREPARE durability/processing plus possibly later
+  exact unchanged attestation, remove the demonstrated
   socket-acquisition cleanup wait from mismatch classification, and remove the
   independently unbounded operational-summary/history work from the
   latency-critical path;
 - make recent full-object retention diagnostic-only while preserving durable
   analytical output, exact totals/chains and current pending/recovery authority.
+- bound replacement-capture attempts, next-retry/hard/run deadlines and typed
+  exhaustion under one stable recovery/contributor identity.
 
 ### R6 — Failed-run regression replay
 
@@ -183,6 +193,8 @@ ADR-0055.
   contribution for every current-schema mismatch;
 - require deterministic trigger/lifecycle/contribution/interval/terminal
   reconciliation;
+- require active-versus-completed contributor, interval-union/cross-stream and
+  bounded replacement-recovery/exhaustion regression coverage;
 - verify raw immutability.
 
 ### R7 — Short preflight
@@ -192,12 +204,13 @@ ADR-0055.
 - 5,400–7,200 second post-saturation stability observation, preferring 7,200;
 - independent review of transitions, audit triggers, causal mismatches,
   orthogonal divergence state, fault lifecycles, interval contributions,
-  chronology, operational/terminal latency, memory attribution/plateau, queues,
-  tails and storage.
+  active/cumulative contributor saturation, independent contributor closure,
+  replacement retry/exhaustion, chronology, operational/terminal latency,
+  memory attribution/plateau, queues, tails and storage.
 
-The final-SHA smoke and stability runs are pending until the implementation and
-offline gates are frozen. Older public runs are forensic inputs, not acceptance
-of this candidate.
+The post-fix final-SHA smoke and stability runs are pending until ADR-0056
+implementation and offline gates are frozen. Older public runs are forensic
+inputs, not acceptance of this candidate.
 
 ### R8 — Fresh six-hour soak
 

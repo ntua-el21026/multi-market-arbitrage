@@ -37,8 +37,9 @@ Current result:
 GATE 1: FAIL
 ```
 
-The failure is documented in `GATE_1_FAILURE_20260822.md` and remediated under
-`GATE_1_REMEDIATION_SPEC.md`, ADR-0053 and ADR-0054. The first result is not
+The failure is documented in `GATE_1_FAILURE_20260822.md`; its remediation is
+governed by `GATE_1_REMEDIATION_SPEC.md`, ADR-0053, ADR-0054, ADR-0055 and
+ADR-0056. The first result is not
 rewritten: Gate 1 remains `FAIL` until a new authorized six-hour run passes.
 
 The raw journal, deterministic replay, rebuild, data validation, immutability
@@ -55,10 +56,13 @@ fail-closed authoritative resnapshot, v2 audit triggers and checkpoint-v3 Gate
 semantics. Its exact-SHA 45-minute observation exposed remaining operational-
 summary/history-memory, external-attribution, public-read fault-lifecycle,
 direct-interval-contribution, typed-resync and local classification-latency
-defects. ADR-0055 governs the final correction, checkpoint v4 and strict pre-
-expiry classification. Final offline gates plus a new exact-SHA 60-second smoke
-and 5,400–7,200 second post-saturation stability observation remain pending. No
-six-hour rerun was run for this remediation task.
+defects. ADR-0055 governs checkpoint v4 and strict pre-expiry PREPARE plus exact
+attestation. A later stability attempt exposed cumulative completed contributors
+retained as active and replacement recovery without bounded exhaustion. ADR-0056
+reconciles that governance, but implementation remediation remains pending.
+Final offline gates plus a new post-fix exact-SHA 60-second smoke and 5,400–7,200
+second stability observation remain pending. No six-hour rerun was run for this
+remediation task.
 
 ## 3. Phase A — Design foundation — COMPLETE
 
@@ -118,6 +122,13 @@ Implementation presence is not acceptance.
   external causal attribution and recovery state;
 - retain explicit observed/pending/resolved public-read fault lifecycles;
 - add one direct contribution per new mismatch and typed resync reasons;
+- keep only unresolved causal lifecycles in active contribution authority;
+- close/publish contributors independently of global interval closure, with
+  separate active-concurrency and cumulative completed-history bounds;
+- assign interval identity at open and reconcile contribution count/digest,
+  active-period union, logical stream sequence and hashes exactly;
+- bound replacement-capture attempts, retry/hard/run deadlines and typed
+  exhaustion under one stable recovery/contributor identity;
 - make diagnostic retention capacity independent of new-schema semantic
   identity while preserving durable evidence, totals, chains and current state.
 
@@ -130,6 +141,8 @@ Replay the failed six-hour raw run twice with corrected code and require:
 - no permissive unresolved-book use;
 - successful bounded scan report;
 - successful rebuild and validation;
+- exact active/completed contributor, interval-union/cross-stream and bounded
+  replacement-recovery/exhaustion replay equality;
 - raw immutability.
 
 The retained causal reporter must also classify all 20 corrected-stability and
@@ -144,9 +157,10 @@ recovery-generation match is recovery evidence, not natural convergence.
 - inspect triggers, causal mismatch relations, divergence lifecycle and
   exact observation/internal-prefix/external-attribution/recovery state,
   pending/unresolved/unsupported-unknown/local-defect state, transition
-  behavior, fault lifecycles, direct interval attribution, monotonic chronology,
-  operational/terminal latency, memory attribution/plateau, queues, tails and
-  storage projection.
+  behavior, fault lifecycles, active/cumulative contributor bounds, independent
+  completion, direct interval attribution, bounded replacement exhaustion,
+  monotonic chronology, operational/terminal latency, memory attribution/
+  plateau, queues, tails and storage projection.
 
 ### C5. Fresh Gate-1 rerun
 
@@ -155,7 +169,7 @@ recovery-generation match is recovery evidence, not natural convergence.
 - accept only `PASS` under `GATE_1_SOAK_SPEC.md`.
 
 This step requires later independent authorization and is not part of the
-ADR-0055 remediation task.
+ADR-0055/ADR-0056 remediation.
 
 **Gate:** G1 — currently failed; rerun required.
 

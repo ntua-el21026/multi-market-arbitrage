@@ -104,19 +104,22 @@ the PREPARE ingest ID/SHA-256 and those actual times. The canonical processor
 alone releases staged response state, and only when the prepared state still
 reconciles exactly. A late or inconsistent preparation yields permanent
 internal `FAILED/BOOK_FRESHNESS_EXPIRED` with no scan/restoration. The final
-attestation may be written later because it cannot create a new decision; it
-commits only the already completed pre-expiry preparation. Pending response and
+attestation may become durable or be processed later because it cannot create a
+new decision; it commits only the already completed pre-expiry preparation.
+Pending response and
 PREPARE state are terminal deterministic-hash inputs. Every completed
 attestation also extends a dedicated ordered terminal chain over its exact
 sources, prepared state, actual times and reconciliation result.
 
 A response body completed before the deadline is not enough to authorize a
 post-expiry historical `MATCH`, `MISMATCH`, or `RACED`. Phase 1 retains the
-single strict pre-expiry classification path. Network, raw-response durability,
+single strict pre-expiry decision-preparation path plus exact source-bound
+attestation; the attestation may be persisted or processed later but cannot
+create a second post-expiry decision path. Network, raw-response durability,
 barrier, PREPARE construction/durability/processing, final-attestation
 durability/processing, analytical, health and queue latencies are measured
 separately so local scheduling work is corrected instead of hidden by a larger
-guard or a second late-classification path.
+guard or a second post-expiry decision path.
 
 Post-boundary frames may continue to enter ingress, but no request, retry, or
 terminal exhaustion start is created after its leg expiry or the run deadline.
@@ -138,6 +141,33 @@ only current state, finite matrices, compact representatives and incrementally
 maintained totals/chains. It does not call full summary/terminal-hash
 construction or copy recent full-object histories. Projection cost is bounded
 independently of diagnostic-history occupancy.
+
+### Availability-contributor and derived-evidence ownership
+
+One serialized availability authority owns the active causal-key map and the
+stable global interval ID assigned at interval open. The active map contains
+unresolved lifecycles only. Repeated symptoms update the existing contributor's
+bounded count/evidence digest. Contributor closure freezes one immutable
+completed record, hands it to bounded derived-evidence persistence and removes
+it from active authority without waiting for the shared interval to close.
+Active-contributor capacity and cumulative completed count/artifact/byte
+capacity are independently bounded.
+
+Interval and contribution persistence are independent logical streams. They may
+be owned by one composite derived-evidence task or by separately supervised
+bounded tasks, but each stream has exactly one mutable owner. Producer admission
+is non-blocking; partials and failures are explicit; clean publication is
+durable and atomic; and count/digest/sequence/hash identities reconcile across
+streams. Derived owners never mutate canonical state. Saturation or failure
+blocks Gate evidence eligibility without weakening raw capture.
+
+Replacement capture retains one stable recovery authority and contributor
+across permitted connection generations. That owner maintains the configured
+attempt bound, first/latest attempt times, next retry, hard recovery and run
+deadlines, required/captured instruments, last typed failure and deterministic
+evidence chain. Exhaustion transitions to typed unresolved fail-closed behavior;
+it cannot schedule indefinitely or create another contributor for the same
+causal lifecycle.
 
 ### Scanner tasks
 Consume immutable validated snapshots/events; they do not mutate canonical market state.
@@ -172,7 +202,9 @@ ambiguous, journals `BACKPRESSURE_DATA_LOSS`, invalidates affected state, and
 requires a new REST baseline/socket generation. The journal and analytical
 queues are separately bounded. The two-slot binary-leg audit handoff cannot accumulate
 responses, and the health queue degrades health evidence instead of applying
-backpressure to acquisition.
+backpressure to acquisition. Logical interval and contribution queues are also
+independently bounded even when a composite derived-evidence owner implements
+both streams.
 
 ## 5. Overflow
 
@@ -239,14 +271,17 @@ Shutdown is structured:
 1. stop new subscriptions/work creation;
 2. freeze the exact acquisition cutoff and stop periodic health emission;
 3. drain bounded work that was accepted before that cutoff;
-4. build and enqueue the terminal health checkpoint paired to the frozen
+4. freeze every still-active availability contributor with explicit open-at-
+   shutdown evidence, bound its interval at that same cutoff, and retain
+   unresolved Gate-sticky/ineligible state;
+5. build and enqueue the terminal health checkpoint paired to the frozen
    cutoff, after the accepted audit classifications are reflected;
-5. construct any full terminal processor summary outside the active capture
+6. construct any full terminal processor summary outside the active capture
    path, then drain/close producers and consumers, flush writers, and finalize
    manifests;
-6. close the health owner, then publish the complete health evidence or retain
+7. close the health owner, then publish the complete health evidence or retain
    an explicit partial-health artifact;
-7. emit the health/shutdown result.
+8. emit the health/shutdown result.
 
 The terminal checkpoint is a capture-boundary record, not a post-finalization
 record. Its timestamp is the frozen acquisition cutoff. No periodic checkpoint

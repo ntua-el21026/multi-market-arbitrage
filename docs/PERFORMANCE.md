@@ -391,7 +391,7 @@ Retain `gate1_audit_divergence_results.json`,
 `gate1_audit_divergence_artifacts.sha256` together with the exact source
 identity. This section intentionally records no unexecuted benchmark result.
 
-## 18. ADR-0055 operational-snapshot and saturation gate
+## 18. ADR-0055/ADR-0056 operational-snapshot and saturation gate
 
 Before the next public candidate is accepted, the exact implementation SHA must
 run one deterministic offline saturation benchmark that exceeds 4,096 scans,
@@ -405,8 +405,8 @@ Measure and retain:
 - full terminal-summary construction p50/p95/p99/max after frozen capture
   cutoff;
 - event-loop blocking and audit network, raw-durability, barrier,
-  classification-construction, classification-durability,
-  classification-processing, and response-to-classification latency;
+  PREPARE construction/durability/processing, final-attestation durability/
+  processing, response-to-PREPARE-decision and response-to-attestation latency;
 - occupancy and approximate/deep retained bytes for scan results, audit
   outcomes, mismatch diagnostics, divergence resolutions, reported-top
   outcomes, lifecycle state, journal/analytical buffers, metrics and health/
@@ -415,7 +415,14 @@ Measure and retain:
   current/peak RSS, native/allocator residual and post-saturation slope;
 - queue high-water marks, batch flushes, history saturation and segment seals;
 - independent received-prefix oracle cost/results, fault-lifecycle transitions,
-  interval-contribution construction/reconciliation and typed-resync routing.
+  interval-contribution construction/reconciliation and typed-resync routing;
+- true concurrent-active contributor occupancy separately from cumulative
+  completed count/backlog/file/byte growth, including independent completion
+  while a shared interval stays open;
+- global active-period union and cross-stream count/digest/sequence/hash
+  reconciliation for composite-owner and separately supervised-owner fixtures;
+- replacement-capture attempt/next-retry/hard/run deadlines, connection churn
+  under one recovery/contributor identity, typed exhaustion and shutdown cost.
 
 Operational-snapshot cost must remain approximately constant as diagnostic
 history grows. It may not construct/copy full recent histories, compute terminal
@@ -461,7 +468,10 @@ The `mma-gate1-final-pre-soak-capacity-v2` JSON includes `latency`,
 `history_retention`, `post_saturation`, `domain_capacity`, `production_health`,
 `memory`, `analytical`, `journal`, `acceptance_policy`, and `acceptance`.
 `domain_capacity` separately saturates mismatch/resolution, audit-fault,
-reported-top, and real availability interval/contribution histories. During
+reported-top, unresolved-active contributor and cumulative completed-
+contribution histories. It must exceed the active limit cumulatively without
+retaining completed records as active and exercise replacement exhaustion before
+shutdown. During
 every 64 audit outcomes (and the final outcome), it constructs and enqueues a real
 production health checkpoint, then performs audit classification before the
 event loop regains control. The report distinguishes health-build,
@@ -485,11 +495,15 @@ than one measured record phase; bounded shrinkage is not misclassified as
 growth. All formulas and numerical limits are emitted in `acceptance_policy`.
 
 After offline gates, the exact SHA must pass a new 60-second explicit-target
-smoke and a 5,400- to 7,200-second stability observation, preferring 7,200
+smoke and a 5,400- to 7,200-second post-fix stability observation, preferring 7,200
 seconds, that runs materially beyond all retained-history saturation points.
 The stability report must include operational/terminal latency, stage-specific
 audit timing, fault/divergence/contribution lifecycles, history occupancy,
 Python/PyArrow/RSS attribution and a defensible post-saturation plateau.
+
+The preserved candidate benchmark predates ADR-0056 and cannot satisfy this
+expanded gate. Its implementation and benchmark fixtures must be remediated and
+rerun before any new public validation.
 
 This section specifies evidence; it claims no benchmark or public-run result
 until exact commands, source/config/host identity, immutable artifacts and

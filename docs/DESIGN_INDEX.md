@@ -62,6 +62,7 @@ If current normative documents conflict, stop and report the contradiction.
 | ADR-0053 | Bounded reported-top transition state |
 | ADR-0054 | Audit divergence state and Gate eligibility |
 | ADR-0055 | Audit/public-read fault evidence dimensions and lifecycles |
+| ADR-0056 | Availability-contributor ownership, interval-union reconciliation and bounded replacement recovery |
 
 ## 5. Future phase specifications
 

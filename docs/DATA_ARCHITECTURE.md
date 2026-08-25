@@ -111,12 +111,13 @@ Use:
 Parquet + Zstandard
 ```
 
-Each dataset is owned by one writer at a time and admits at most 4,096 verified
-Parquet fragments across the shared root. Run-completion v1 retains the exact
-ordered fragment-manifest SHA-256 inventory; it is not sampled or truncated.
-Writer admission reserves against the verified inventory observed at open and
-fails before an over-bound write. Existing completion and dataset manifests
-remain readable under their v1 schemas.
+Each dataset has one mutable writer owner and a bounded artifact, path, and
+fragment inventory. Bounds are explicit phase/configuration limits; exhaustion
+fails closed before an over-bound admission. Versioned deterministic manifests
+bind ordered inventory and completion identity. Exact limits, schema versions,
+and admission mechanics belong in accepted phase ADRs, implementation
+specifications, configuration, and tests. Existing persisted manifests remain
+readable under their historical schemas.
 
 Query via:
 
@@ -157,11 +158,12 @@ health_events/
 validation_events/
 ```
 
-Run-scoped versioned JSONL Gate-evidence streams include health checkpoints,
-availability intervals, and separate ADR-0055 availability contributions.
-Public-read fault lifecycles are versioned processor/health evidence. These
-derived records use bounded single-owner publication and are not silently
-substituted for canonical Parquet datasets.
+Run-scoped versioned logical Gate-evidence streams include health checkpoints,
+availability intervals, ADR-0055/ADR-0056 availability contributions, and
+public-read fault lifecycles. These derived records use bounded single-owner
+publication per stream and are not silently substituted for canonical Parquet
+datasets. Their physical writer topology is selected by the accepted phase
+contract and implementation, not by this foundational document.
 
 Research:
 
@@ -217,10 +219,11 @@ Hash serialization is deterministic.
 
 Raw history is never rewritten to satisfy a new canonical schema.
 
-New ADR-0055 availability contributions and public-read fault lifecycles are
-versioned derived/control evidence linked to exact raw identities. Historical
-interval and audit schemas remain byte-faithful; compatibility views never
-invent missing contributors, evidence dimensions or fault closure.
+ADR-0055/ADR-0056 availability contributions and public-read fault lifecycles
+are versioned derived/control evidence linked to exact raw identities.
+Historical interval and audit schemas remain byte-faithful; compatibility views
+never invent missing contributors, evidence dimensions, recovery fields, or
+fault closure.
 
 ## 15. Decision-evidence durability for future live use
 
