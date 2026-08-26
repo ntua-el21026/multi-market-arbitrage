@@ -158,11 +158,18 @@ def _candidate_repository(tmp_path: Path) -> tuple[Path, str]:
     return repository, candidate
 
 
-def _configure_candidate_remote(tmp_path: Path, repository: Path, candidate: str) -> Path:
+def _configure_candidate_remote(
+    tmp_path: Path,
+    repository: Path,
+    candidate: str,
+    *,
+    main_sha: str | None = None,
+) -> Path:
     remote = tmp_path / "candidate-origin.git"
     _run(["git", "init", "--bare", remote], check=True)
     _git(repository, "remote", "set-url", "origin", str(remote))
-    _git(repository, "push", "origin", f"{candidate}:refs/heads/main")
+    expected_main = candidate if main_sha is None else main_sha
+    _git(repository, "push", "origin", f"{expected_main}:refs/heads/main")
     _git(
         repository,
         "push",
@@ -170,7 +177,7 @@ def _configure_candidate_remote(tmp_path: Path, repository: Path, candidate: str
         "refs/tags/design-freeze-v0.1:refs/tags/design-freeze-v0.1",
     )
     _git(repository, "fetch", "origin", "--tags", "--prune")
-    assert _git(repository, "rev-parse", "origin/main") == candidate
+    assert _git(repository, "rev-parse", "origin/main") == expected_main
     return remote
 
 
@@ -372,6 +379,8 @@ def test_launcher_rejects_wrong_design_freeze(tmp_path: Path) -> None:
 
 def test_real_launch_rejects_candidate_not_equal_to_origin_main(tmp_path: Path) -> None:
     repository, candidate = _candidate_repository(tmp_path)
+    fixture_main = _git(repository, "rev-parse", f"{candidate}^")
+    _configure_candidate_remote(tmp_path, repository, candidate, main_sha=fixture_main)
     completed = _run(_launcher_arguments(repository, candidate, tmp_path, validate_only=False))
     assert completed.returncode != 0
     assert "origin/main to equal" in completed.stderr
