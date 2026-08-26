@@ -19,8 +19,10 @@ from multi_market_arbitrage.availability_authority import (
     AuditAvailabilityAuthoritySnapshot,
     AuditAvailabilityBinding,
     AuditAvailabilityContributionChainSnapshot,
+    PublicReadFaultAvailabilityProjectionSnapshot,
     audit_availability_chain_extend,
     audit_availability_chain_seed,
+    empty_public_read_fault_availability_projection,
 )
 from multi_market_arbitrage.core.config import load_phase1_config
 from multi_market_arbitrage.core.ids import CollectorRunId, IngestId, is_sha256_hex
@@ -28,9 +30,12 @@ from multi_market_arbitrage.core.provenance import RawSourceRef
 from multi_market_arbitrage.core.serialization import canonical_json_bytes, canonicalize
 from multi_market_arbitrage.core.time import MonotonicTimestamp, UtcTimestamp
 from multi_market_arbitrage.observability import (
+    AVAILABILITY_EVIDENCE_SUMMARY_V2_VERSION,
     AVAILABILITY_EVIDENCE_SUMMARY_VERSION,
     AVAILABILITY_INTERVAL_CONTRIBUTION_SCHEMA_VERSION,
+    AVAILABILITY_INTERVAL_CONTRIBUTION_V2_SCHEMA_VERSION,
     AVAILABILITY_INTERVAL_SCHEMA_VERSION,
+    AVAILABILITY_INTERVAL_V2_SCHEMA_VERSION,
     AvailabilityCause,
     AvailabilityEvidenceSummary,
     AvailabilityInterval,
@@ -38,9 +43,14 @@ from multi_market_arbitrage.observability import (
     AvailabilityRecoveryOutcome,
     AvailabilityScope,
     PublishedAvailabilityEvidenceReconciliation,
+    availability_contribution_v2_from_record,
+    availability_interval_v2_from_record,
     is_audit_mismatch_availability_cause,
     reconcile_availability_intervals,
     reconcile_published_availability_evidence,
+)
+from multi_market_arbitrage.observability.availability import (
+    AvailabilityEvidencePublicationPhase,
 )
 from multi_market_arbitrage.replay import replay_journal
 from multi_market_arbitrage.research import (
@@ -460,6 +470,43 @@ def _audit_contribution_snapshot(
         raise AvailabilityReporterEvidenceError(f"{label} is inconsistent") from error
 
 
+def _public_read_fault_projection(
+    value: object,
+    *,
+    label: str,
+) -> PublicReadFaultAvailabilityProjectionSnapshot:
+    record = _as_record(value, label=label)
+    _require_exact_keys(
+        record,
+        keys=frozenset(
+            {
+                "completed",
+                "completion_chain_sha256",
+                "open_chain_sha256",
+                "opened",
+            }
+        ),
+        label=label,
+    )
+    try:
+        return PublicReadFaultAvailabilityProjectionSnapshot(
+            opened=_required_nonnegative_int(record, "opened", label=label),
+            completed=_required_nonnegative_int(record, "completed", label=label),
+            open_chain_sha256=_required_sha256(
+                record,
+                "open_chain_sha256",
+                label=label,
+            ),
+            completion_chain_sha256=_required_sha256(
+                record,
+                "completion_chain_sha256",
+                label=label,
+            ),
+        )
+    except ValueError as error:
+        raise AvailabilityReporterEvidenceError(f"{label} is inconsistent") from error
+
+
 def _availability_summary(
     value: object,
     *,
@@ -476,8 +523,126 @@ def _availability_summary(
     # with the caller-supplied actual paths so relocated evidence remains usable.
     _required_text(record, "path", label=label)
     _required_text(record, "contribution_path", label=label)
+    schema_version = _required_text(record, "schema_version", label=label)
+    if schema_version not in {
+        AVAILABILITY_EVIDENCE_SUMMARY_VERSION,
+        AVAILABILITY_EVIDENCE_SUMMARY_V2_VERSION,
+    }:
+        raise AvailabilityReporterEvidenceError("availability summary uses an unsupported schema")
+
+    contribution_queue_high_water = 0
+    contribution_rejected = 0
+    contribution_failure_type: str | None = None
+    contribution_chain_accepted_sha256 = "0" * 64
+    contribution_chain_written_sha256 = "0" * 64
+    completion_path: Path | None = None
+    completion_identity: str | None = None
+    interval_completion_identity: str | None = None
+    contribution_completion_identity: str | None = None
+    reconciliation_sha256: str | None = None
+    reconciliation_discrepancies: tuple[str, ...] = ()
+    terminal_active_causal_key_count = 0
+    terminal_active_causal_keys_sha256 = "0" * 64
+    publication_phase = AvailabilityEvidencePublicationPhase.PARTIAL
+    public_read_fault_projection_accepted = empty_public_read_fault_availability_projection()
+    public_read_fault_projection_written = empty_public_read_fault_availability_projection()
+    public_read_fault_completion_expected_written_chain_sha256 = (
+        public_read_fault_projection_written.completion_chain_sha256
+    )
+    if schema_version == AVAILABILITY_EVIDENCE_SUMMARY_V2_VERSION:
+        completion_path_text = _required_text(record, "completion_path", label=label)
+        completion_name = Path(completion_path_text).name
+        expected_completion_name = (
+            f"run-{collector_run_id.value}.availability-evidence-completion-v2.json"
+        )
+        if completion_name != expected_completion_name:
+            raise AvailabilityReporterEvidenceError(
+                "availability completion path does not bind the current run"
+            )
+        completion_path = interval_path.absolute().parent / completion_name
+        contribution_queue_high_water = _required_nonnegative_int(
+            record,
+            "contribution_queue_high_water",
+            label=label,
+        )
+        contribution_rejected = _required_nonnegative_int(
+            record,
+            "contribution_rejected",
+            label=label,
+        )
+        contribution_failure_type = _optional_text(
+            record,
+            "contribution_failure_type",
+            label=label,
+        )
+        contribution_chain_accepted_sha256 = _required_sha256(
+            record,
+            "contribution_chain_accepted_sha256",
+            label=label,
+        )
+        contribution_chain_written_sha256 = _required_sha256(
+            record,
+            "contribution_chain_written_sha256",
+            label=label,
+        )
+        completion_identity = _required_sha256(
+            record,
+            "completion_identity",
+            label=label,
+        )
+        interval_completion_identity = _required_sha256(
+            record,
+            "interval_completion_identity",
+            label=label,
+        )
+        contribution_completion_identity = _required_sha256(
+            record,
+            "contribution_completion_identity",
+            label=label,
+        )
+        reconciliation_sha256 = _required_sha256(
+            record,
+            "reconciliation_sha256",
+            label=label,
+        )
+        reconciliation_discrepancies = _required_text_tuple(
+            record,
+            "reconciliation_discrepancies",
+            label=label,
+        )
+        terminal_active_causal_key_count = _required_nonnegative_int(
+            record,
+            "terminal_active_causal_key_count",
+            label=label,
+        )
+        terminal_active_causal_keys_sha256 = _required_sha256(
+            record,
+            "terminal_active_causal_keys_sha256",
+            label=label,
+        )
+        try:
+            publication_phase = AvailabilityEvidencePublicationPhase(
+                _required_text(record, "publication_phase", label=label)
+            )
+        except ValueError as error:
+            raise AvailabilityReporterEvidenceError(
+                "availability summary publication phase is unsupported"
+            ) from error
+        public_read_fault_projection_accepted = _public_read_fault_projection(
+            record.get("public_read_fault_projection_accepted"),
+            label=f"{label}.public_read_fault_projection_accepted",
+        )
+        public_read_fault_projection_written = _public_read_fault_projection(
+            record.get("public_read_fault_projection_written"),
+            label=f"{label}.public_read_fault_projection_written",
+        )
+        public_read_fault_completion_expected_written_chain_sha256 = _required_sha256(
+            record,
+            "public_read_fault_completion_expected_written_chain_sha256",
+            label=label,
+        )
     evidence = AvailabilityEvidenceSummary(
-        schema_version=_required_text(record, "schema_version", label=label),
+        schema_version=schema_version,
         collector_run_id=collector_run_id,
         path=interval_path.absolute(),
         completed=_required_bool(record, "completed", label=label),
@@ -554,16 +719,44 @@ def _availability_summary(
             "audit_contribution_expected_written_chain_sha256",
             label=label,
         ),
+        contribution_queue_high_water=contribution_queue_high_water,
+        contribution_rejected=contribution_rejected,
+        contribution_failure_type=contribution_failure_type,
+        contribution_chain_accepted_sha256=contribution_chain_accepted_sha256,
+        contribution_chain_written_sha256=contribution_chain_written_sha256,
+        completion_path=completion_path,
+        completion_identity=completion_identity,
+        interval_completion_identity=interval_completion_identity,
+        contribution_completion_identity=contribution_completion_identity,
+        reconciliation_sha256=reconciliation_sha256,
+        reconciliation_discrepancies=reconciliation_discrepancies,
+        terminal_active_causal_key_count=terminal_active_causal_key_count,
+        terminal_active_causal_keys_sha256=terminal_active_causal_keys_sha256,
+        publication_phase=publication_phase,
+        public_read_fault_projection_accepted=(public_read_fault_projection_accepted),
+        public_read_fault_projection_written=(public_read_fault_projection_written),
+        public_read_fault_completion_expected_written_chain_sha256=(
+            public_read_fault_completion_expected_written_chain_sha256
+        ),
     )
     if (
-        evidence.schema_version != AVAILABILITY_EVIDENCE_SUMMARY_VERSION
-        or not evidence.completed
+        not evidence.completed
         or not evidence.gate1_evidence_eligible
         or evidence.failure_type is not None
         or evidence.accepted != evidence.written
         or evidence.rejected != 0
         or evidence.contributions_accepted != evidence.contributions_written
         or evidence.open_at_shutdown_intervals != 0
+        or (
+            evidence.schema_version == AVAILABILITY_EVIDENCE_SUMMARY_V2_VERSION
+            and (
+                evidence.contribution_rejected != 0
+                or evidence.contribution_failure_type is not None
+                or evidence.publication_phase is not AvailabilityEvidencePublicationPhase.COMPLETE
+                or evidence.reconciliation_discrepancies
+                or evidence.terminal_active_causal_key_count != 0
+            )
+        )
     ):
         raise AvailabilityReporterEvidenceError(
             "availability summary is not complete Gate-eligible evidence"
@@ -812,7 +1005,7 @@ def _validate_current_interval_writer_bytes(
     *,
     maximum_ledger_bytes: int,
 ) -> None:
-    """Require the exact canonical JSONL form emitted by the v1 interval writer."""
+    """Require the exact canonical JSONL form emitted by the selected writer."""
 
     payload = _read_bounded_file(
         evidence.path,
@@ -828,7 +1021,20 @@ def _validate_current_interval_writer_bytes(
         )
     records = _canonical_jsonl_records(payload, label="availability interval")
     for index, record in enumerate(records):
-        _historical_v1_interval(record, label=f"availability interval[{index}]")
+        label = f"availability interval[{index}]"
+        if evidence.schema_version == AVAILABILITY_EVIDENCE_SUMMARY_V2_VERSION:
+            try:
+                interval = availability_interval_v2_from_record(record)
+            except ValueError as error:
+                raise AvailabilityReporterEvidenceError(
+                    f"{label} is not a valid {AVAILABILITY_INTERVAL_V2_SCHEMA_VERSION} record"
+                ) from error
+            if interval.collector_run_id != evidence.collector_run_id:
+                raise AvailabilityReporterEvidenceError(
+                    "availability interval belongs to another run"
+                )
+        else:
+            _historical_v1_interval(record, label=label)
 
 
 def _validate_replay_release_authority(
@@ -870,7 +1076,12 @@ def _ordered_published_bindings(
 ) -> tuple[AuditAvailabilityBinding, ...]:
     contribution_result = reconciliation.contribution_reconciliation
     contribution_path = evidence.contribution_path
-    if not reconciliation.reconciled or contribution_result is None or contribution_path is None:
+    if not reconciliation.reconciled or contribution_path is None:
+        raise AvailabilityReporterEvidenceError("availability ledgers did not reconcile")
+    if (
+        evidence.schema_version != AVAILABILITY_EVIDENCE_SUMMARY_V2_VERSION
+        and contribution_result is None
+    ):
         raise AvailabilityReporterEvidenceError("availability ledgers did not reconcile")
     payload = _read_bounded_file(
         contribution_path,
@@ -887,10 +1098,25 @@ def _ordered_published_bindings(
     bindings: list[AuditAvailabilityBinding] = []
     records = _canonical_jsonl_records(payload, label="availability contribution")
     for index, record in enumerate(records):
+        label = f"availability contribution[{index}]"
+        if evidence.schema_version == AVAILABILITY_EVIDENCE_SUMMARY_V2_VERSION:
+            try:
+                contribution = availability_contribution_v2_from_record(record)
+            except ValueError as error:
+                raise AvailabilityReporterEvidenceError(
+                    f"{label} is not a valid "
+                    f"{AVAILABILITY_INTERVAL_CONTRIBUTION_V2_SCHEMA_VERSION} record"
+                ) from error
+            if contribution.collector_run_id != evidence.collector_run_id:
+                raise AvailabilityReporterEvidenceError(
+                    "availability contribution belongs to another run"
+                )
+            binding = contribution.audit_availability_binding()
+            if binding is not None:
+                bindings.append(binding)
+            continue
         try:
-            cause = AvailabilityCause(
-                _required_text(record, "cause_type", label=f"availability contribution[{index}]")
-            )
+            cause = AvailabilityCause(_required_text(record, "cause_type", label=label))
         except ValueError as error:  # pragma: no cover - reconciliation rejects first
             raise AvailabilityReporterEvidenceError(
                 "unknown availability contribution cause"
@@ -901,7 +1127,7 @@ def _ordered_published_bindings(
             _required_text(
                 record,
                 "schema_version",
-                label=f"availability contribution[{index}]",
+                label=label,
             )
             != AVAILABILITY_INTERVAL_CONTRIBUTION_SCHEMA_VERSION
         ):
@@ -911,10 +1137,18 @@ def _ordered_published_bindings(
         bindings.append(
             _audit_binding_from_contribution(
                 record,
-                label=f"availability contribution[{index}]",
+                label=label,
             )
         )
-    if len(bindings) != contribution_result.audit_mismatch_contribution_count:
+    if evidence.schema_version == AVAILABILITY_EVIDENCE_SUMMARY_V2_VERSION:
+        expected_binding_count = evidence.audit_contributions_written
+    else:
+        if contribution_result is None:  # pragma: no cover - rejected above
+            raise AvailabilityReporterEvidenceError(
+                "availability contribution reconciliation is absent"
+            )
+        expected_binding_count = contribution_result.audit_mismatch_contribution_count
+    if len(bindings) != expected_binding_count:
         raise AvailabilityReporterEvidenceError(
             "loaded audit bindings differ from reconciled contribution count"
         )
@@ -932,7 +1166,21 @@ def _load_published_availability_authority(
     replay_rest_audit_mismatches: int,
     expected_terminal_hash: str,
     maximum_ledger_bytes: int,
+    maximum_contribution_ledger_bytes: int | None = None,
+    expected_public_read_fault_projection: (
+        PublicReadFaultAvailabilityProjectionSnapshot | None
+    ) = None,
 ) -> _PublishedAvailabilityAuthority:
+    expected_public_faults = (
+        empty_public_read_fault_availability_projection()
+        if expected_public_read_fault_projection is None
+        else expected_public_read_fault_projection
+    )
+    selected_contribution_ledger_bytes = (
+        maximum_ledger_bytes
+        if maximum_contribution_ledger_bytes is None
+        else maximum_contribution_ledger_bytes
+    )
     supplied = (
         observation_summary_path is not None,
         interval_path is not None,
@@ -943,6 +1191,10 @@ def _load_published_availability_authority(
         ordered_replay_release_bindings,
     )
     if not any(supplied):
+        if expected_public_faults != empty_public_read_fault_availability_projection():
+            raise AvailabilityReporterEvidenceError(
+                "legacy omitted availability evidence cannot bind public-read fault authority"
+            )
         if not _canonical_unpublished_legacy_authority(
             replay_authority,
             rest_audit_mismatches=replay_rest_audit_mismatches,
@@ -953,6 +1205,10 @@ def _load_published_availability_authority(
             )
         return _PublishedAvailabilityAuthority(reconciliation=None, bindings=())
     if supplied == (True, True, False):
+        if expected_public_faults != empty_public_read_fault_availability_projection():
+            raise AvailabilityReporterEvidenceError(
+                "historical v1 availability evidence cannot bind public-read fault authority"
+            )
         summary_path = cast(Path, observation_summary_path)
         actual_interval_path = cast(Path, interval_path)
         if summary_path.absolute() == actual_interval_path.absolute():
@@ -1088,6 +1344,31 @@ def _load_published_availability_authority(
         runtime.get("audit_availability_contributions_emitted"),
         label=f"{runtime_label}.audit_availability_contributions_emitted",
     )
+    if evidence.schema_version == AVAILABILITY_EVIDENCE_SUMMARY_V2_VERSION:
+        processor_public_faults = _public_read_fault_projection(
+            processor.get("public_read_fault_availability_projection"),
+            label=f"{processor_label}.public_read_fault_availability_projection",
+        )
+        runtime_public_faults = _public_read_fault_projection(
+            runtime.get("public_read_fault_availability_projection"),
+            label=f"{runtime_label}.public_read_fault_availability_projection",
+        )
+        if not (
+            processor_public_faults
+            == runtime_public_faults
+            == expected_public_faults
+            == evidence.public_read_fault_projection_accepted
+            == evidence.public_read_fault_projection_written
+        ):
+            raise AvailabilityReporterEvidenceError(
+                "public-read fault availability projections do not reconcile"
+            )
+        if evidence.public_read_fault_completion_expected_written_chain_sha256 != (
+            evidence.public_read_fault_projection_written.completion_chain_sha256
+        ):
+            raise AvailabilityReporterEvidenceError(
+                "public-read fault completion chain differs from written projection"
+            )
     if runtime_authority != summary_processor_authority:
         raise AvailabilityReporterEvidenceError(
             "observation runtime audit authority differs from processor and replay"
@@ -1150,7 +1431,7 @@ def _load_published_availability_authority(
             "availability summary counters differ from emitted contribution authority"
         )
     if evidence.file_bytes > maximum_ledger_bytes or (
-        evidence.contribution_file_bytes > maximum_ledger_bytes
+        evidence.contribution_file_bytes > selected_contribution_ledger_bytes
     ):
         raise AvailabilityReporterEvidenceError("availability evidence exceeds configured bounds")
     _validate_current_interval_writer_bytes(
@@ -1164,6 +1445,7 @@ def _load_published_availability_authority(
     reconciliation = reconcile_published_availability_evidence(
         evidence,
         expected_audit_contributions=expected,
+        expected_public_read_fault_projection=expected_public_faults,
     )
     if not reconciliation.reconciled:
         discrepancies = ",".join(reconciliation.discrepancies)
@@ -1173,7 +1455,7 @@ def _load_published_availability_authority(
     bindings = _ordered_published_bindings(
         evidence,
         reconciliation,
-        maximum_ledger_bytes=maximum_ledger_bytes,
+        maximum_ledger_bytes=selected_contribution_ledger_bytes,
     )
     if len(bindings) != emitted.count:
         raise AvailabilityReporterEvidenceError(
@@ -1247,6 +1529,12 @@ def build_report(
         replay_rest_audit_mismatches=replay.processor.rest_audit_mismatches,
         expected_terminal_hash=expected_terminal_hash,
         maximum_ledger_bytes=config.health.maximum_availability_file_bytes,
+        maximum_contribution_ledger_bytes=(
+            config.health.maximum_availability_contribution_file_bytes
+        ),
+        expected_public_read_fault_projection=(
+            replay.processor.public_read_fault_availability_projection
+        ),
     )
     return build_journal_audit_mismatch_lineage_report(
         raw_root,

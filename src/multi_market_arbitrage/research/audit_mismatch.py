@@ -43,6 +43,8 @@ from multi_market_arbitrage.observability.availability import (
     PublishedAvailabilityEvidenceReconciliation,
 )
 from multi_market_arbitrage.pipeline.audit import (
+    AUDIT_CLASSIFICATION_PREPARE_ATTEST_PROTOCOL,
+    AUDIT_CLASSIFICATION_PREPARE_SCHEMA,
     AUDIT_CLASSIFICATION_V1_SCHEMA,
     AUDIT_CLASSIFICATION_V2_SCHEMA,
     AUDIT_MISMATCH_MAX_LEVELS_PER_SIDE,
@@ -63,6 +65,7 @@ from multi_market_arbitrage.pipeline.audit import (
 )
 from multi_market_arbitrage.pipeline.channels import (
     CONTROL_REST_AUDIT_CLASSIFY,
+    CONTROL_REST_AUDIT_CLASSIFY_PREPARE,
     CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
     CONTROL_REST_AUDIT_REPLACEMENT_RELEASE_V2,
     CONTROL_REST_AUDIT_START,
@@ -1022,9 +1025,16 @@ class _ResolvedObservation:
     reported_transition_first_source: RawSourceRef | None = None
     reported_transition_latest_source: RawSourceRef | None = None
     request_started_monotonic_ns: int | None = None
+    classification_schema: str | None = None
     classification_monotonic_ns: int | None = None
     classification_received_monotonic_ns: int | None = None
+    classification_hard_expiry_monotonic_ns: int | None = None
+    classification_attestation: _ClassificationAttestation | None = None
+    classification_prepare_source: RawSourceRef | None = None
+    classification_prepare_received_monotonic_ns: int | None = None
+    classification_prepare_durable_monotonic_ns: int | None = None
     response_received_monotonic_ns: int | None = None
+    response_deadline_monotonic_ns: int | None = None
     starting_admission_ordinal: int | None = None
     starting_processed_ordinal: int | None = None
     starting_book: AuditBookIdentity | None = None
@@ -1035,6 +1045,13 @@ class _ResolvedObservation:
     first_replacement_websocket: _RecoveryRawStage | None = None
     replay_recovery_authority: AuditMismatchReplayRecoveryAuthority | None = None
     published_availability_binding: AuditAvailabilityBinding | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ClassificationAttestation:
+    expected_prepare_source: RawSourceRef
+    durable_monotonic_ns: int
+    processed_monotonic_ns: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -2727,27 +2744,41 @@ def _reconciled_published_binding_map(
     contribution = reconciliation.contribution_reconciliation
     interval = reconciliation.interval_reconciliation
     if (
-        not reconciliation.reconciled
-        or interval is None
-        or not interval.reconciled
+        reconciliation.reconciled
+        and not reconciliation.discrepancies
+        and interval is None
+        and contribution is None
+    ):
+        # Availability v2 reconciliation is represented by the aggregate
+        # success flag and discrepancies because its richer many-to-one result
+        # is not losslessly expressible in the historical v1 summary slots.
+        # The reporter independently reloads every v2 contribution before
+        # reaching this boundary, so exact replay-binding equality remains the
+        # final authority check below.
+        pass
+    elif (
+        interval is None
         or contribution is None
+        or not reconciliation.reconciled
+        or not interval.reconciled
         or not contribution.reconciled
     ):
         raise AuditMismatchReportError(
             "published availability evidence is not successfully reconciled"
         )
     ordered = tuple(bindings)
-    if len(ordered) != contribution.audit_mismatch_contribution_count:
-        raise AuditMismatchReportError(
-            "published availability binding count differs from its reconciliation"
-        )
-    chain = audit_availability_chain_seed("contribution")
-    for binding in ordered:
-        chain = audit_availability_chain_extend(chain, "contribution", binding)
-    if chain != contribution.audit_mismatch_binding_chain_sha256:
-        raise AuditMismatchReportError(
-            "published availability binding chain differs from its reconciliation"
-        )
+    if contribution is not None:
+        if len(ordered) != contribution.audit_mismatch_contribution_count:
+            raise AuditMismatchReportError(
+                "published availability binding count differs from its reconciliation"
+            )
+        chain = audit_availability_chain_seed("contribution")
+        for binding in ordered:
+            chain = audit_availability_chain_extend(chain, "contribution", binding)
+        if chain != contribution.audit_mismatch_binding_chain_sha256:
+            raise AuditMismatchReportError(
+                "published availability binding chain differs from its reconciliation"
+            )
     by_divergence = {binding.divergence_id: binding for binding in ordered}
     if len(by_divergence) != len(ordered):
         raise AuditMismatchReportError("published availability bindings repeat one divergence")
@@ -2852,6 +2883,10 @@ def build_audit_mismatch_lineage_report(
         reported_latest_by_sequence.setdefault(transition.latest_ingest_seq, []).append(item)
 
     def bind_classification(envelope: RawEventEnvelope) -> None:
+        if envelope.received_monotonic.epoch_id != collector_run_id.value:
+            raise AuditMismatchReportError(
+                "audit mismatch raw evidence changes the run monotonic epoch"
+            )
         replay_stage = replay_stage_by_sequence.get(envelope.ingest_seq)
         if replay_stage is not None:
             if (
@@ -2929,15 +2964,6 @@ def build_audit_mismatch_lineage_report(
             raise AuditMismatchReportError(
                 "mismatch observation does not identify an audit classification control"
             )
-        source = _source(envelope)
-        expected = item.observation.classification_source
-        if expected is not None and source != expected:
-            raise AuditMismatchReportError("classification raw identity disagrees with artifact")
-        transition = item.observation.reported_top_transition
-        if transition is not None and transition.connection_id != envelope.connection_id:
-            raise AuditMismatchReportError(
-                "reported-top transition and audit classification connections disagree"
-            )
         control = _canonical_control(
             envelope.payload_bytes,
             context="audit classification control",
@@ -2953,10 +2979,24 @@ def build_audit_mismatch_lineage_report(
             AUDIT_CLASSIFICATION_V2_SCHEMA,
         }:
             raise AuditMismatchReportError("audit classification control schema is invalid")
+        request_id = _text(
+            control.get("request_id"),
+            field="classification request ID",
+            maximum=128,
+        )
+        source = _source(envelope)
+        expected = item.observation.classification_source
+        if expected is not None and source != expected:
+            raise AuditMismatchReportError("classification raw identity disagrees with artifact")
+        transition = item.observation.reported_top_transition
+        if transition is not None and transition.connection_id != envelope.connection_id:
+            raise AuditMismatchReportError(
+                "reported-top transition and audit classification connections disagree"
+            )
         item.classification_source = source
         item.classification_connection = envelope.connection_id.value
         item.classification_subscription_id = envelope.subscription_id
-        item.request_id = _text(control.get("request_id"), field="classification request ID")
+        item.request_id = request_id
         item.response_ingest_seq = _integer(
             control.get("response_ingest_seq"),
             field="classification response ingest sequence",
@@ -2966,20 +3006,95 @@ def build_audit_mismatch_lineage_report(
             field="classification monotonic time",
         )
         classification_received_monotonic_ns = envelope.received_monotonic.nanoseconds
-        if classification_monotonic_ns != classification_received_monotonic_ns:
-            raise AuditMismatchReportError(
-                "audit classification timestamp differs from raw receive evidence"
-            )
         hard_expiry_monotonic_ns = _integer(
             control.get("hard_expiry_monotonic_ns"),
             field="audit hard expiry",
         )
+        schema = cast(str, control.get("schema"))
+        prepare_metadata_keys = {
+            "classification_prepare_durable_monotonic_ns",
+            "classification_prepare_ingest_id",
+            "classification_prepare_payload_sha256",
+            "classification_prepare_processed_monotonic_ns",
+        }
+        has_prepare_attestation = bool(
+            prepare_metadata_keys.intersection(envelope.transport_metadata)
+        )
+        if schema == AUDIT_CLASSIFICATION_V1_SCHEMA:
+            if has_prepare_attestation:
+                raise AuditMismatchReportError(
+                    "legacy audit classification cannot attest a preparation"
+                )
+            if classification_monotonic_ns != classification_received_monotonic_ns:
+                raise AuditMismatchReportError(
+                    "audit classification timestamp differs from raw receive evidence"
+                )
+        elif not has_prepare_attestation:
+            if classification_monotonic_ns != classification_received_monotonic_ns:
+                raise AuditMismatchReportError(
+                    "audit classification timestamp differs from raw receive evidence"
+                )
+        else:
+            metadata = envelope.transport_metadata
+            expected_metadata_keys = {
+                "classification_prepare_durable_monotonic_ns",
+                "classification_prepare_ingest_id",
+                "classification_prepare_payload_sha256",
+                "classification_prepare_processed_monotonic_ns",
+                "request_id",
+            }
+            if set(metadata) != expected_metadata_keys:
+                raise AuditMismatchReportError(
+                    "audit classification attestation metadata is not exact"
+                )
+            prepare_ingest_id = _text(
+                metadata.get("classification_prepare_ingest_id"),
+                field="classification preparation ingest ID",
+                maximum=128,
+            )
+            prepare_payload_sha256 = _text(
+                metadata.get("classification_prepare_payload_sha256"),
+                field="classification preparation payload hash",
+                maximum=64,
+            )
+            if not is_sha256_hex(prepare_payload_sha256):
+                raise AuditMismatchReportError("classification preparation payload hash is invalid")
+            durable_monotonic_ns = _integer(
+                metadata.get("classification_prepare_durable_monotonic_ns"),
+                field="classification preparation durability time",
+            )
+            processed_monotonic_ns = _integer(
+                metadata.get("classification_prepare_processed_monotonic_ns"),
+                field="classification preparation processing time",
+            )
+            if (
+                metadata.get("request_id") != request_id
+                or not durable_monotonic_ns
+                <= processed_monotonic_ns
+                == classification_monotonic_ns
+                <= classification_received_monotonic_ns
+                or durable_monotonic_ns >= hard_expiry_monotonic_ns
+                or processed_monotonic_ns >= hard_expiry_monotonic_ns
+            ):
+                raise AuditMismatchReportError(
+                    "audit classification PREPARE/ATTEST evidence does not reconcile"
+                )
+            item.classification_attestation = _ClassificationAttestation(
+                expected_prepare_source=RawSourceRef(
+                    ingest_id=IngestId(prepare_ingest_id),
+                    payload_sha256=prepare_payload_sha256,
+                ),
+                durable_monotonic_ns=durable_monotonic_ns,
+                processed_monotonic_ns=processed_monotonic_ns,
+            )
         if classification_monotonic_ns >= hard_expiry_monotonic_ns:
             raise AuditMismatchReportError(
                 "a MISMATCH classification reached or exceeded its hard expiry"
             )
+        item.classification_schema = schema
         item.classification_monotonic_ns = classification_monotonic_ns
         item.classification_received_monotonic_ns = classification_received_monotonic_ns
+        item.classification_hard_expiry_monotonic_ns = hard_expiry_monotonic_ns
 
     first_pass = _scan_pass(
         envelope_factory,
@@ -2987,7 +3102,16 @@ def build_audit_mismatch_lineage_report(
         limits=selected_limits,
         visit=bind_classification,
     )
-    if any(item.classification_source is None for item in resolved):
+    if any(
+        item.classification_source is None
+        or item.classification_schema is None
+        or item.request_id is None
+        or item.response_ingest_seq is None
+        or item.classification_monotonic_ns is None
+        or item.classification_received_monotonic_ns is None
+        or item.classification_hard_expiry_monotonic_ns is None
+        for item in resolved
+    ):
         raise AuditMismatchReportError("one or more classification controls are absent")
     if seen_replay_stage_sequences != set(replay_stage_by_sequence):
         raise AuditMismatchReportError("one or more replay recovery raw sources are absent")
@@ -3010,6 +3134,90 @@ def build_audit_mismatch_lineage_report(
 
     def bind_start_and_response(envelope: RawEventEnvelope) -> None:
         nonlocal retained_rest_levels
+        if envelope.channel == CONTROL_REST_AUDIT_CLASSIFY_PREPARE:
+            metadata_request = envelope.transport_metadata.get("request_id")
+            if not isinstance(metadata_request, str):
+                return
+            prepared_item = request_ids.get(metadata_request)
+            if prepared_item is None:
+                return
+            attestation = prepared_item.classification_attestation
+            if attestation is None:
+                raise AuditMismatchReportError(
+                    "direct audit classification has an unexpected preparation"
+                )
+            if prepared_item.classification_prepare_source is not None:
+                raise AuditMismatchReportError(
+                    "audit classification request has multiple preparations"
+                )
+            control = _canonical_control(
+                envelope.payload_bytes,
+                context="audit classification preparation control",
+            )
+            if (
+                set(control)
+                != {
+                    "hard_expiry_monotonic_ns",
+                    "request_id",
+                    "response_ingest_seq",
+                    "schema",
+                }
+                or control.get("schema") != AUDIT_CLASSIFICATION_PREPARE_SCHEMA
+            ):
+                raise AuditMismatchReportError(
+                    "audit classification preparation control schema is invalid"
+                )
+            request_id = _text(
+                control.get("request_id"),
+                field="classification preparation request ID",
+                maximum=128,
+            )
+            if request_id != metadata_request or envelope.transport_metadata != {
+                "request_id": request_id
+            }:
+                raise AuditMismatchReportError(
+                    "audit classification preparation metadata is not exact"
+                )
+            response_ingest_seq = _integer(
+                control.get("response_ingest_seq"),
+                field="classification preparation response ingest sequence",
+            )
+            hard_expiry_monotonic_ns = _integer(
+                control.get("hard_expiry_monotonic_ns"),
+                field="classification preparation hard expiry",
+            )
+            actual_source = _source(envelope)
+            classification_ingest_seq = prepared_item.observation.classification_ingest_seq
+            classification_monotonic_ns = cast(int, prepared_item.classification_monotonic_ns)
+            classification_received_monotonic_ns = cast(
+                int, prepared_item.classification_received_monotonic_ns
+            )
+            if (
+                actual_source != attestation.expected_prepare_source
+                or response_ingest_seq != prepared_item.response_ingest_seq
+                or hard_expiry_monotonic_ns != prepared_item.classification_hard_expiry_monotonic_ns
+                or envelope.connection_id.value != prepared_item.classification_connection
+                or envelope.received_monotonic.epoch_id != collector_run_id.value
+                or not response_ingest_seq < envelope.ingest_seq < classification_ingest_seq
+                or not envelope.received_monotonic.nanoseconds
+                <= attestation.durable_monotonic_ns
+                <= attestation.processed_monotonic_ns
+                == classification_monotonic_ns
+                <= classification_received_monotonic_ns
+                or attestation.durable_monotonic_ns >= hard_expiry_monotonic_ns
+                or attestation.processed_monotonic_ns >= hard_expiry_monotonic_ns
+            ):
+                raise AuditMismatchReportError(
+                    "audit classification PREPARE/ATTEST evidence does not reconcile"
+                )
+            prepared_item.classification_prepare_source = actual_source
+            prepared_item.classification_prepare_received_monotonic_ns = (
+                envelope.received_monotonic.nanoseconds
+            )
+            prepared_item.classification_prepare_durable_monotonic_ns = (
+                attestation.durable_monotonic_ns
+            )
+            return
         response_item = response_sequences.get(envelope.ingest_seq)
         if response_item is not None:
             if envelope.channel != REST_BOOK_AUDIT:
@@ -3158,6 +3366,54 @@ def build_audit_mismatch_lineage_report(
         start_item.request_started_monotonic_ns = _integer(
             control.get("request_started_monotonic_ns"), field="request start time"
         )
+        if start_item.request_started_monotonic_ns != envelope.received_monotonic.nanoseconds:
+            raise AuditMismatchReportError(
+                "audit start timestamp differs from raw receive evidence"
+            )
+        if start_item.classification_attestation is not None:
+            metadata = envelope.transport_metadata
+            expected_metadata_keys = {
+                "audit_attempt",
+                "classification_protocol",
+                "hard_expiry_monotonic_ns",
+                "request_id",
+                "response_deadline_monotonic_ns",
+                "run_deadline_monotonic_ns",
+            }
+            if set(metadata) != expected_metadata_keys:
+                raise AuditMismatchReportError("prepare/attest audit start metadata is not exact")
+            hard_expiry_ns = _integer(
+                metadata.get("hard_expiry_monotonic_ns"),
+                field="audit start hard expiry",
+            )
+            response_deadline_ns = _integer(
+                metadata.get("response_deadline_monotonic_ns"),
+                field="audit start response deadline",
+            )
+            run_deadline_ns = _integer(
+                metadata.get("run_deadline_monotonic_ns"),
+                field="audit start run deadline",
+            )
+            if (
+                schema != AUDIT_START_V2_SCHEMA
+                or metadata.get("classification_protocol")
+                != AUDIT_CLASSIFICATION_PREPARE_ATTEST_PROTOCOL
+                or metadata.get("request_id") != metadata_request
+                or _integer(metadata.get("audit_attempt"), field="audit start attempt") != attempt
+                or hard_expiry_ns != start_item.classification_hard_expiry_monotonic_ns
+                or response_deadline_ns != min(hard_expiry_ns, run_deadline_ns)
+                or start_item.request_started_monotonic_ns >= hard_expiry_ns
+                or start_item.request_started_monotonic_ns >= response_deadline_ns
+                or start_item.request_started_monotonic_ns >= run_deadline_ns
+            ):
+                raise AuditMismatchReportError(
+                    "prepare/attest audit start authority does not reconcile"
+                )
+            start_item.response_deadline_monotonic_ns = response_deadline_ns
+        elif envelope.transport_metadata.get("classification_protocol") is not None:
+            raise AuditMismatchReportError(
+                "audit start selects prepare/attest without retained preparation evidence"
+            )
         start_item.starting_admission_ordinal = _integer(
             control.get("starting_admission_ordinal"), field="starting admission ordinal"
         )
@@ -3188,6 +3444,13 @@ def build_audit_mismatch_lineage_report(
     )
     _require_equal_passes(first_pass, second_pass)
     for item in resolved:
+        if (
+            item.classification_attestation is not None
+            and item.classification_prepare_source is None
+        ):
+            raise AuditMismatchReportError(
+                "current audit classification lacks its durable preparation"
+            )
         if (
             item.start_ingest_seq is None
             or item.start_source is None
@@ -3235,9 +3498,24 @@ def build_audit_mismatch_lineage_report(
         if not (
             item.request_started_monotonic_ns
             <= item.response_received_monotonic_ns
+            <= item.classification_monotonic_ns
             <= item.classification_received_monotonic_ns
         ):
             raise AuditMismatchReportError("audit raw monotonic chronology is invalid")
+        if (
+            item.classification_prepare_received_monotonic_ns is not None
+            and item.response_received_monotonic_ns
+            > item.classification_prepare_received_monotonic_ns
+        ):
+            raise AuditMismatchReportError(
+                "audit response receipt follows its classification preparation"
+            )
+        if item.response_deadline_monotonic_ns is not None and (
+            item.response_received_monotonic_ns >= item.response_deadline_monotonic_ns
+        ):
+            raise AuditMismatchReportError(
+                "audit response receipt reached or exceeded its response deadline"
+            )
         item.start_socket_generation = connection_generations.get(
             ConnectionId(cast(str, item.classification_connection))
         )

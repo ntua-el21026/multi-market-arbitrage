@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import replace
 
 import pytest
@@ -30,10 +31,13 @@ from multi_market_arbitrage.observability.availability import (
     PublishedAvailabilityEvidenceReconciliation,
 )
 from multi_market_arbitrage.pipeline.audit import (
+    AUDIT_CLASSIFICATION_PREPARE_ATTEST_PROTOCOL,
+    AUDIT_CLASSIFICATION_V2_SCHEMA,
     AUDIT_START_V1_SCHEMA,
     AUDIT_START_V2_SCHEMA,
     AuditBookIdentity,
     AuditClassificationCommand,
+    AuditClassificationPrepareCommand,
     AuditDivergencePending,
     AuditDivergenceResolution,
     AuditMismatchCause,
@@ -48,6 +52,7 @@ from multi_market_arbitrage.pipeline.audit import (
 )
 from multi_market_arbitrage.pipeline.channels import (
     CONTROL_REST_AUDIT_CLASSIFY,
+    CONTROL_REST_AUDIT_CLASSIFY_PREPARE,
     CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
     CONTROL_REST_AUDIT_START,
     REST_BOOK,
@@ -264,6 +269,31 @@ def _start(
     )
 
 
+def _prepare_attest_start(
+    sequence: int,
+    *,
+    hard_expiry_monotonic_ns: int = 100_000,
+    run_deadline_monotonic_ns: int = 200_000,
+) -> RawEventEnvelope:
+    start = _start(sequence)
+    return _envelope(
+        sequence,
+        CONTROL_REST_AUDIT_START,
+        start.payload_bytes,
+        metadata={
+            "audit_attempt": 1,
+            "classification_protocol": AUDIT_CLASSIFICATION_PREPARE_ATTEST_PROTOCOL,
+            "hard_expiry_monotonic_ns": hard_expiry_monotonic_ns,
+            "request_id": _REQUEST,
+            "response_deadline_monotonic_ns": min(
+                hard_expiry_monotonic_ns,
+                run_deadline_monotonic_ns,
+            ),
+            "run_deadline_monotonic_ns": run_deadline_monotonic_ns,
+        },
+    )
+
+
 def _rest_response(
     sequence: int,
     *,
@@ -322,6 +352,46 @@ def _classification(
             hard_expiry_monotonic_ns=hard_expiry_monotonic_ns,
         ).to_payload(),
     )
+
+
+def _prepared_classification(
+    *,
+    prepare_sequence: int,
+    classification_sequence: int,
+    response_sequence: int,
+    durable_monotonic_ns: int,
+    processed_monotonic_ns: int,
+    hard_expiry_monotonic_ns: int = 100_000,
+) -> tuple[RawEventEnvelope, RawEventEnvelope]:
+    prepare = _envelope(
+        prepare_sequence,
+        CONTROL_REST_AUDIT_CLASSIFY_PREPARE,
+        AuditClassificationPrepareCommand(
+            request_id=_REQUEST,
+            response_ingest_seq=response_sequence,
+            hard_expiry_monotonic_ns=hard_expiry_monotonic_ns,
+        ).to_payload(),
+        metadata={"request_id": _REQUEST},
+    )
+    classification = _envelope(
+        classification_sequence,
+        CONTROL_REST_AUDIT_CLASSIFY,
+        AuditClassificationCommand(
+            request_id=_REQUEST,
+            response_ingest_seq=response_sequence,
+            classification_monotonic_ns=processed_monotonic_ns,
+            hard_expiry_monotonic_ns=hard_expiry_monotonic_ns,
+            schema=AUDIT_CLASSIFICATION_V2_SCHEMA,
+        ).to_payload(),
+        metadata={
+            "classification_prepare_durable_monotonic_ns": durable_monotonic_ns,
+            "classification_prepare_ingest_id": prepare.ingest_id.value,
+            "classification_prepare_payload_sha256": prepare.payload_sha256,
+            "classification_prepare_processed_monotonic_ns": processed_monotonic_ns,
+            "request_id": _REQUEST,
+        },
+    )
+    return prepare, classification
 
 
 def _rest_resnapshot(sequence: int) -> RawEventEnvelope:
@@ -677,6 +747,40 @@ def test_published_bindings_must_exactly_cover_two_replay_restorations(case: str
 
     with pytest.raises(AuditMismatchReportError):
         _reconciled_published_binding_map(reconciliation, supplied, expected)
+
+
+def test_v2_reconciliation_marker_requires_exact_replay_binding_equality() -> None:
+    binding = _synthetic_published_binding("v2")
+    reconciliation = PublishedAvailabilityEvidenceReconciliation(
+        interval_reconciliation=None,
+        contribution_reconciliation=None,
+        reconciled=True,
+        discrepancies=(),
+    )
+
+    assert _reconciled_published_binding_map(
+        reconciliation,
+        (binding,),
+        (binding,),
+    ) == {binding.divergence_id: binding}
+
+    with pytest.raises(AuditMismatchReportError, match="differ from replay"):
+        _reconciled_published_binding_map(
+            reconciliation,
+            (replace(binding, market_id="tampered"),),
+            (binding,),
+        )
+
+    inconsistent = replace(
+        reconciliation,
+        discrepancies=("SYNTHETIC_UNRESOLVED_DISCREPANCY",),
+    )
+    with pytest.raises(AuditMismatchReportError, match="not successfully reconciled"):
+        _reconciled_published_binding_map(
+            inconsistent,
+            (binding,),
+            (binding,),
+        )
 
 
 def _processed(
@@ -1864,6 +1968,233 @@ def test_classification_control_time_must_equal_raw_receive_time() -> None:
         match="classification timestamp differs from raw receive evidence",
     ):
         _build(envelopes)
+
+
+def test_audit_start_time_must_equal_raw_receive_time() -> None:
+    original = _start(1)
+    payload = json.loads(original.payload_bytes)
+    payload["request_started_monotonic_ns"] = original.received_monotonic.nanoseconds + 1
+    tampered = _envelope(
+        1,
+        CONTROL_REST_AUDIT_START,
+        canonical_json_bytes(payload),
+        metadata={"request_id": _REQUEST},
+    )
+    envelopes = (_prefix()[0], tampered, *_prefix()[2:])
+
+    with pytest.raises(
+        AuditMismatchReportError,
+        match="audit start timestamp differs from raw receive evidence",
+    ):
+        _build(envelopes)
+
+
+def test_current_prepare_attest_timing_binds_decision_before_final_receive() -> None:
+    prepare, classification = _prepared_classification(
+        prepare_sequence=3,
+        classification_sequence=4,
+        response_sequence=2,
+        durable_monotonic_ns=1_350,
+        processed_monotonic_ns=1_380,
+    )
+    envelopes = (
+        _prefix()[0],
+        _prepare_attest_start(1),
+        _rest_response(2),
+        prepare,
+        classification,
+        _ws_book(
+            5,
+            bid_quantity="12",
+            venue_hash="prepared-replacement",
+            timestamp="1003",
+            admission_ordinal=21,
+        ),
+    )
+
+    result = _build(envelopes, classification_sequence=4).results[0]
+
+    assert result.classification_monotonic_ns == 1_380
+    assert result.classification_received_monotonic_ns == 1_400
+    assert result.classification_monotonic_ns < result.classification_received_monotonic_ns
+
+
+def test_current_prepare_attest_allows_final_receive_after_decision_deadline() -> None:
+    prepare, classification = _prepared_classification(
+        prepare_sequence=3,
+        classification_sequence=4,
+        response_sequence=2,
+        durable_monotonic_ns=1_350,
+        processed_monotonic_ns=1_380,
+        hard_expiry_monotonic_ns=1_390,
+    )
+    envelopes = (
+        _prefix()[0],
+        _prepare_attest_start(1, hard_expiry_monotonic_ns=1_390),
+        _rest_response(2),
+        prepare,
+        classification,
+        _ws_book(
+            5,
+            bid_quantity="12",
+            venue_hash="prepared-replacement-after-deadline",
+            timestamp="1003",
+            admission_ordinal=21,
+        ),
+    )
+
+    result = _build(envelopes, classification_sequence=4).results[0]
+
+    assert result.classification_monotonic_ns == 1_380
+    assert result.classification_received_monotonic_ns == 1_400
+    assert result.classification_monotonic_ns < 1_390 < result.classification_received_monotonic_ns
+
+
+def test_unmatched_prepare_history_does_not_consume_target_retention() -> None:
+    foreign_preparations = tuple(
+        _envelope(
+            sequence,
+            CONTROL_REST_AUDIT_CLASSIFY_PREPARE,
+            AuditClassificationPrepareCommand(
+                request_id=f"foreign-request-{sequence}",
+                response_ingest_seq=2,
+                hard_expiry_monotonic_ns=100_000,
+            ).to_payload(),
+            metadata={"request_id": f"foreign-request-{sequence}"},
+        )
+        for sequence in range(3, 131)
+    )
+    prepare, classification = _prepared_classification(
+        prepare_sequence=131,
+        classification_sequence=132,
+        response_sequence=2,
+        durable_monotonic_ns=14_150,
+        processed_monotonic_ns=14_180,
+    )
+    envelopes = (
+        _prefix()[0],
+        _prepare_attest_start(1),
+        _rest_response(2),
+        *foreign_preparations,
+        prepare,
+        classification,
+        _ws_book(
+            133,
+            bid_quantity="12",
+            venue_hash="prepared-replacement-after-unmatched-history",
+            timestamp="1003",
+            admission_ordinal=21,
+        ),
+    )
+    limits = replace(AuditMismatchReportLimits(), maximum_observations=1)
+
+    report = _build(
+        envelopes,
+        limits=limits,
+        classification_sequence=132,
+    )
+
+    assert report.observation_count == 1
+    assert report.results[0].classification_ingest_seq == 132
+
+
+@pytest.mark.parametrize("response_deadline_monotonic_ns", [1_150, 1_200])
+def test_current_prepare_attest_response_must_precede_deadline(
+    response_deadline_monotonic_ns: int,
+) -> None:
+    prepare, classification = _prepared_classification(
+        prepare_sequence=3,
+        classification_sequence=4,
+        response_sequence=2,
+        durable_monotonic_ns=1_350,
+        processed_monotonic_ns=1_380,
+    )
+    envelopes = (
+        _prefix()[0],
+        _prepare_attest_start(
+            1,
+            run_deadline_monotonic_ns=response_deadline_monotonic_ns,
+        ),
+        _rest_response(2),
+        prepare,
+        classification,
+    )
+
+    with pytest.raises(
+        AuditMismatchReportError,
+        match="response receipt reached or exceeded its response deadline",
+    ):
+        _build(envelopes, classification_sequence=4)
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "durability_before_prepare",
+        "processed_mismatch",
+        "prepare_source",
+        "missing_prepare",
+    ],
+)
+def test_current_prepare_attest_timing_fails_closed(tamper: str) -> None:
+    prepare, classification = _prepared_classification(
+        prepare_sequence=3,
+        classification_sequence=4,
+        response_sequence=2,
+        durable_monotonic_ns=1_350,
+        processed_monotonic_ns=1_380,
+    )
+    metadata = dict(classification.transport_metadata)
+    envelopes: tuple[RawEventEnvelope, ...]
+    if tamper == "durability_before_prepare":
+        metadata["classification_prepare_durable_monotonic_ns"] = 1_250
+    elif tamper == "processed_mismatch":
+        metadata["classification_prepare_processed_monotonic_ns"] = 1_379
+    elif tamper == "prepare_source":
+        metadata["classification_prepare_payload_sha256"] = "f" * 64
+    else:
+        envelopes = (
+            _prefix()[0],
+            _prepare_attest_start(1),
+            _rest_response(2),
+            _ws_book(
+                3,
+                bid_quantity="10",
+                venue_hash="missing-preparation-placeholder",
+                timestamp="1001",
+                admission_ordinal=11,
+            ),
+            classification,
+        )
+        with pytest.raises(AuditMismatchReportError, match="lacks its durable preparation"):
+            _build(envelopes, classification_sequence=4)
+        return
+    tampered = RawEventEnvelope.capture(
+        collector_run_id=classification.collector_run_id,
+        ingest_seq=classification.ingest_seq,
+        ingest_id=classification.ingest_id,
+        venue_id=classification.venue_id,
+        connection_id=classification.connection_id,
+        subscription_id=classification.subscription_id,
+        channel=classification.channel,
+        transport_type=classification.transport_type,
+        subscription_semantics_hash=classification.subscription_semantics_hash,
+        received_wall_time=classification.received_wall_time,
+        received_monotonic=classification.received_monotonic,
+        payload_bytes=classification.payload_bytes,
+        payload_encoding=classification.payload_encoding,
+        transport_metadata=metadata,
+    )
+    envelopes = (
+        _prefix()[0],
+        _prepare_attest_start(1),
+        _rest_response(2),
+        prepare,
+        tampered,
+    )
+
+    with pytest.raises(AuditMismatchReportError, match="PREPARE/ATTEST"):
+        _build(envelopes, classification_sequence=4)
 
 
 def test_mismatch_classification_must_precede_hard_expiry() -> None:
