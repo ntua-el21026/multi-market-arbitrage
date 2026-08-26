@@ -16,6 +16,187 @@ _AUDIT_AVAILABILITY_CHAIN_NAMESPACE: Final = b"mma-audit-availability-authority-
 _AUDIT_AVAILABILITY_CONTRIBUTION_CHAIN_NAMESPACE: Final = (
     b"mma-audit-availability-contribution-identity-v1\0"
 )
+_PUBLIC_READ_FAULT_AVAILABILITY_CHAIN_NAMESPACE: Final = (
+    b"mma-public-read-fault-availability-projection-v1\0"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PublicReadFaultAvailabilityOpenIdentity:
+    """Common processor/runtime/writer identity for one blocking fault open."""
+
+    fault_lifecycle_id: str
+    stable_causal_key: str
+    request_id: str
+    instrument_id: str
+    market_id: str
+    reason_code: str
+    source_evidence_ids: tuple[str, ...]
+    affected_scopes: tuple[str, ...]
+    started_at_utc_ns: int
+    started_monotonic_ns: int
+
+    def __post_init__(self) -> None:
+        if not is_sha256_hex(self.fault_lifecycle_id):
+            raise ValueError("public-read fault lifecycle ID must be SHA-256 hex")
+        for label, value in (
+            ("stable causal key", self.stable_causal_key),
+            ("request ID", self.request_id),
+            ("instrument ID", self.instrument_id),
+            ("market ID", self.market_id),
+            ("reason code", self.reason_code),
+        ):
+            if not value or len(value) > 4096:
+                raise ValueError(f"public-read fault {label} must be non-empty and bounded")
+        for label, values in (
+            ("source evidence", self.source_evidence_ids),
+            ("affected scopes", self.affected_scopes),
+        ):
+            if not values or len(set(values)) != len(values):
+                raise ValueError(f"public-read fault {label} must be non-empty and unique")
+            if any(not value or len(value) > 4096 for value in values):
+                raise ValueError(f"public-read fault {label} must be bounded")
+        if min(self.started_at_utc_ns, self.started_monotonic_ns) < 0:
+            raise ValueError("public-read fault open chronology cannot be negative")
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "affected_scopes": self.affected_scopes,
+            "fault_lifecycle_id": self.fault_lifecycle_id,
+            "instrument_id": self.instrument_id,
+            "market_id": self.market_id,
+            "reason_code": self.reason_code,
+            "request_id": self.request_id,
+            "source_evidence_ids": self.source_evidence_ids,
+            "stable_causal_key": self.stable_causal_key,
+            "started_at_utc_ns": self.started_at_utc_ns,
+            "started_monotonic_ns": self.started_monotonic_ns,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PublicReadFaultAvailabilityCompletionIdentity:
+    """Common exact identity for one blocking fault contribution completion."""
+
+    fault_lifecycle_id: str
+    stable_causal_key: str
+    ended_at_utc_ns: int
+    ended_monotonic_ns: int
+    closure_reason_code: str
+    closure_source_evidence_ids: tuple[str, ...]
+    open_at_shutdown: bool
+
+    def __post_init__(self) -> None:
+        if not is_sha256_hex(self.fault_lifecycle_id):
+            raise ValueError("public-read fault lifecycle ID must be SHA-256 hex")
+        if not self.stable_causal_key or len(self.stable_causal_key) > 4096:
+            raise ValueError("public-read fault stable causal key must be non-empty and bounded")
+        if not self.closure_reason_code or len(self.closure_reason_code) > 4096:
+            raise ValueError("public-read fault closure reason must be non-empty and bounded")
+        if len(set(self.closure_source_evidence_ids)) != len(
+            self.closure_source_evidence_ids
+        ) or any(not value or len(value) > 4096 for value in self.closure_source_evidence_ids):
+            raise ValueError("public-read fault closure sources must be unique and bounded")
+        if min(self.ended_at_utc_ns, self.ended_monotonic_ns) < 0:
+            raise ValueError("public-read fault completion chronology cannot be negative")
+        if type(self.open_at_shutdown) is not bool:
+            raise ValueError("public-read fault terminal-open authority must be an exact boolean")
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "closure_reason_code": self.closure_reason_code,
+            "closure_source_evidence_ids": self.closure_source_evidence_ids,
+            "ended_at_utc_ns": self.ended_at_utc_ns,
+            "ended_monotonic_ns": self.ended_monotonic_ns,
+            "fault_lifecycle_id": self.fault_lifecycle_id,
+            "open_at_shutdown": self.open_at_shutdown,
+            "stable_causal_key": self.stable_causal_key,
+        }
+
+
+def public_read_fault_availability_chain_seed(phase: str) -> str:
+    """Return the domain-separated empty open or completion accumulator.
+
+    The ``chain`` name is retained for checkpoint-field compatibility.  The
+    value is an order-independent 256-bit multiset accumulator so independent
+    evidence owners do not need to retain or reconstruct event order.
+    """
+
+    if phase not in {"open", "completion"}:
+        raise ValueError("public-read fault availability phase is unsupported")
+    digest = hashlib.sha256()
+    digest.update(_PUBLIC_READ_FAULT_AVAILABILITY_CHAIN_NAMESPACE)
+    digest.update(phase.encode("ascii"))
+    return digest.hexdigest()
+
+
+def public_read_fault_availability_chain_extend(
+    previous_sha256: str,
+    phase: str,
+    identity: PublicReadFaultAvailabilityOpenIdentity
+    | PublicReadFaultAvailabilityCompletionIdentity,
+) -> str:
+    """Add one exact identity to the order-independent projection accumulator.
+
+    Each canonical identity is first hashed with the projection namespace and
+    phase, then added modulo 2**256.  The paired projection count makes an
+    omitted or duplicated identity observable without retaining the identity
+    stream; unlike XOR, adding the same leaf twice does not cancel it.
+    """
+
+    if not is_sha256_hex(previous_sha256):
+        raise ValueError("public-read fault prior accumulator must be 256-bit hex")
+    if phase not in {"open", "completion"}:
+        raise ValueError("public-read fault availability phase is unsupported")
+    if (phase == "open") != isinstance(identity, PublicReadFaultAvailabilityOpenIdentity):
+        raise ValueError("public-read fault identity contradicts its projection phase")
+    payload = canonical_json_bytes(identity.to_record())
+    identity_digest = hashlib.sha256()
+    identity_digest.update(_PUBLIC_READ_FAULT_AVAILABILITY_CHAIN_NAMESPACE)
+    identity_digest.update(b"identity\0")
+    identity_digest.update(phase.encode("ascii"))
+    identity_digest.update(len(payload).to_bytes(8, "big"))
+    identity_digest.update(payload)
+    accumulator = (int(previous_sha256, 16) + int.from_bytes(identity_digest.digest(), "big")) % (
+        1 << 256
+    )
+    return f"{accumulator:064x}"
+
+
+@dataclass(frozen=True, slots=True)
+class PublicReadFaultAvailabilityProjectionSnapshot:
+    """Exact counted blocking-fault multiset projection for one evidence owner.
+
+    The ``*_chain_sha256`` field names are retained for serialized checkpoint
+    compatibility; their values are order-independent SHA-256-leaf
+    accumulators rather than order-sensitive hash chains.
+    """
+
+    opened: int
+    completed: int
+    open_chain_sha256: str
+    completion_chain_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.opened < 0 or self.completed < 0 or self.completed > self.opened:
+            raise ValueError("public-read fault projection counters are inconsistent")
+        if not is_sha256_hex(self.open_chain_sha256) or not is_sha256_hex(
+            self.completion_chain_sha256
+        ):
+            raise ValueError("public-read fault projection accumulator must be 256-bit hex")
+
+
+def empty_public_read_fault_availability_projection() -> (
+    PublicReadFaultAvailabilityProjectionSnapshot
+):
+    """Construct the canonical empty blocking-fault availability projection."""
+
+    return PublicReadFaultAvailabilityProjectionSnapshot(
+        opened=0,
+        completed=0,
+        open_chain_sha256=public_read_fault_availability_chain_seed("open"),
+        completion_chain_sha256=public_read_fault_availability_chain_seed("completion"),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,10 +416,16 @@ __all__ = [
     "AuditAvailabilityAuthoritySnapshot",
     "AuditAvailabilityBinding",
     "AuditAvailabilityContributionChainSnapshot",
+    "PublicReadFaultAvailabilityCompletionIdentity",
+    "PublicReadFaultAvailabilityOpenIdentity",
+    "PublicReadFaultAvailabilityProjectionSnapshot",
     "audit_availability_chain_extend",
     "audit_availability_chain_seed",
     "audit_availability_contribution_chain_extend",
     "audit_availability_contribution_chain_seed",
     "empty_audit_availability_authority_snapshot",
     "empty_audit_availability_contribution_snapshot",
+    "empty_public_read_fault_availability_projection",
+    "public_read_fault_availability_chain_extend",
+    "public_read_fault_availability_chain_seed",
 ]

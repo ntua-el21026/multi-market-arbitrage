@@ -295,30 +295,33 @@ class PolymarketReferenceBuilder:
         times: BitemporalFields,
     ) -> PrecisionRule:
         tick_values = [gamma.tick_size, clob.tick_size]
-        minimum_values = [gamma.minimum_order_size, clob.minimum_order_size]
+        # Gamma documents `orderMinSize` as a USDC notional, while both CLOB
+        # market info and REST books document their minimum as a share quantity.
+        # Keep those dimensions separate: Gamma remains an independent tick
+        # cross-check but cannot participate in share-minimum reconciliation.
+        minimum_values = [clob.minimum_order_size]
         sources = ["gamma:market", "clob:clob-market-info"]
         if rest_book is not None:
             tick_values.append(rest_book.tick_size)
             minimum_values.append(rest_book.minimum_order_size)
             sources.append("clob:rest-book")
         reason: str | None = None
-        if any(value is None for value in tick_values + minimum_values):
+        if any(value is None for value in tick_values):
             reason = "tick size or minimum order quantity is missing from a required source"
         else:
             ticks = tuple(value for value in tick_values if value is not None)
-            minimums = tuple(value for value in minimum_values if value is not None)
             if len(set(ticks)) != 1:
                 reason = "cross-source tick sizes disagree"
-            elif len(set(minimums)) != 1:
+            elif len(set(minimum_values)) != 1:
                 reason = "cross-source minimum order quantities disagree"
         status = ReferenceStatus.VERIFIED if reason is None else ReferenceStatus.INDETERMINATE
         tick = tick_values[0] if status is ReferenceStatus.VERIFIED else None
         minimum = minimum_values[0] if status is ReferenceStatus.VERIFIED else None
         version_id = PrecisionRuleVersionId.from_components(
-            "PolymarketPrecisionRule-v2",
+            "PolymarketPrecisionRule-v3",
             market_id,
             *("?" if value is None else value.to_canonical_string() for value in tick_values),
-            *("?" if value is None else value.to_canonical_string() for value in minimum_values),
+            *(value.to_canonical_string() for value in minimum_values),
             status.value,
             reason or "",
             *sources,

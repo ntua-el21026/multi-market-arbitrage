@@ -22,12 +22,17 @@ from multi_market_arbitrage.availability_authority import (
     AuditAvailabilityAuthoritySnapshot,
     AuditAvailabilityBinding,
     AuditAvailabilityContributionChainSnapshot,
+    PublicReadFaultAvailabilityCompletionIdentity,
+    PublicReadFaultAvailabilityProjectionSnapshot,
     audit_availability_chain_extend,
     audit_availability_chain_seed,
     audit_availability_contribution_chain_extend,
     audit_availability_contribution_chain_seed,
     empty_audit_availability_authority_snapshot,
     empty_audit_availability_contribution_snapshot,
+    empty_public_read_fault_availability_projection,
+    public_read_fault_availability_chain_extend,
+    public_read_fault_availability_chain_seed,
 )
 from multi_market_arbitrage.core.config import Phase1Config
 from multi_market_arbitrage.core.health import BookHealth
@@ -77,13 +82,23 @@ from multi_market_arbitrage.observability.availability import (
 )
 from multi_market_arbitrage.reference import POLYMARKET_VENUE_ID
 from multi_market_arbitrage.research import AnalyticalRuntimeSnapshot
-from multi_market_arbitrage.venues.polymarket import PublicReadMetricsSnapshot
+from multi_market_arbitrage.venues.polymarket import (
+    PolymarketEndpointClass,
+    PolymarketHttpFailureCategory,
+    PublicReadMetricsSnapshot,
+)
 
 from .audit import (
+    AUDIT_START_V1_SCHEMA,
     AUDIT_START_V2_SCHEMA,
     AuditDivergencePending,
     AuditDivergenceResolution,
+    AuditFailureReason,
+    AuditFaultAffectedScope,
+    AuditFaultFailureEvidenceKind,
     AuditFaultLifecycleRecord,
+    AuditFaultOrigin,
+    AuditFaultResolution,
     AuditFaultStatus,
     AuditMismatchCause,
     AuditMismatchDiagnostic,
@@ -264,7 +279,7 @@ AUDIT_MISMATCH_REPRESENTATIVE_TELEMETRY_ROW_FIELDS = (
     "response_ingest_id",
     "response_payload_sha256",
 )
-AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_SCHEMA = "mma-audit-fault-lifecycle-representative-table-v1"
+AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_SCHEMA = "mma-audit-fault-lifecycle-representative-table-v2"
 AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_ROW_FIELDS = (
     "lifecycle_record_sha256",
     "fault_id",
@@ -288,6 +303,19 @@ AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_ROW_FIELDS = (
     "resolution_source_ingest_id",
     "resolution_source_payload_sha256",
     "resolved_monotonic_ns",
+)
+AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_CODEBOOKS = (
+    ("audit_start_schema", (AUDIT_START_V1_SCHEMA, AUDIT_START_V2_SCHEMA)),
+    (
+        "failure_evidence_kind",
+        tuple(value.value for value in AuditFaultFailureEvidenceKind),
+    ),
+    ("status", tuple(value.value for value in AuditFaultStatus)),
+    ("reason", tuple(value.value for value in AuditFailureReason)),
+    ("origin", tuple(value.value for value in AuditFaultOrigin)),
+    ("endpoint_class", tuple(value.value for value in PolymarketEndpointClass)),
+    ("category", tuple(value.value for value in PolymarketHttpFailureCategory)),
+    ("resolution", tuple(value.value for value in AuditFaultResolution)),
 )
 PUBLIC_READ_ENDPOINT_TELEMETRY_SCHEMA = "mma-public-read-endpoint-telemetry-table-v1"
 PUBLIC_READ_ENDPOINT_TELEMETRY_STATUS_CLASSES = ("1xx", "2xx", "3xx", "4xx", "5xx")
@@ -372,6 +400,9 @@ class ObservationRuntimeHealthSnapshot:
         default_factory=empty_audit_availability_contribution_snapshot
     )
     resync_reason_counts: tuple[tuple[ProcessorRecoveryReason, int], ...] = ()
+    public_read_fault_availability_projection: PublicReadFaultAvailabilityProjectionSnapshot = (
+        field(default_factory=empty_public_read_fault_availability_projection)
+    )
 
     def __post_init__(self) -> None:
         counts = (
@@ -480,6 +511,30 @@ class AvailabilityInterruption:
                 raise ValueError("audit mismatch interruption lacks its exact direct binding")
             if self.affected_instruments != (self.instrument_id,):
                 raise ValueError("audit mismatch interruption must bind exactly one instrument")
+        elif self.cause is AvailabilityCause.PUBLIC_READ_FAULT:
+            if (
+                self.causal_family not in (None, AvailabilityCausalFamily.PUBLIC_READ_FAULT)
+                or self.request_id is None
+                or self.fault_lifecycle_id is None
+                or self.instrument_id is None
+                or self.market_id is None
+                or not is_sha256_hex(self.fault_lifecycle_id)
+                or self.affected_instruments != (self.instrument_id,)
+                or self.divergence_id is not None
+                or any(
+                    value is not None
+                    for value in (
+                        self.audit_start_source,
+                        self.audit_response_source,
+                        self.audit_classification_source,
+                        self.authoritative_resolution_source,
+                        self.replacement_release_source,
+                        self.replacement_recovery,
+                        self.recovery_id,
+                    )
+                )
+            ):
+                raise ValueError("public-read fault interruption lacks its exact direct binding")
         elif any(value is not None for value in audit_provenance):
             raise ValueError("non-audit interruption cannot carry an audit mismatch binding")
         if self.replacement_recovery is not None and (
@@ -700,6 +755,14 @@ class ObservationRuntimeHealth:
         self._audit_availability_release_chain = audit_availability_chain_seed("release")
         self._audit_availability_contributions_emitted = 0
         self._audit_availability_contribution_chain = audit_availability_contribution_chain_seed()
+        self._public_read_fault_availability_opened = 0
+        self._public_read_fault_availability_completed = 0
+        self._public_read_fault_availability_open_chain = public_read_fault_availability_chain_seed(
+            "open"
+        )
+        self._public_read_fault_availability_completion_chain = (
+            public_read_fault_availability_chain_seed("completion")
+        )
         self._reconnects = 0
         self._resyncs = 0
         self._resync_reason_counts = dict.fromkeys(ProcessorRecoveryReason, 0)
@@ -822,9 +885,39 @@ class ObservationRuntimeHealth:
         now_utc: UtcTimestamp | None = None,
         interruption: AvailabilityInterruption | None = None,
     ) -> None:
-        """Open or update exactly one unresolved ADR-0056 causal lifecycle."""
+        """Record a capture interruption and its unresolved causal lifecycle."""
 
         self._socket_connected = False
+        self._mark_unavailable(
+            now_ns=now_ns,
+            now_utc=now_utc,
+            interruption=interruption,
+        )
+
+    def mark_scope_unavailable(
+        self,
+        *,
+        now_ns: int,
+        now_utc: UtcTimestamp,
+        interruption: AvailabilityInterruption,
+    ) -> None:
+        """Record dependent-scope unavailability without claiming a socket gap."""
+
+        self._mark_unavailable(
+            now_ns=now_ns,
+            now_utc=now_utc,
+            interruption=interruption,
+        )
+
+    def _mark_unavailable(
+        self,
+        *,
+        now_ns: int,
+        now_utc: UtcTimestamp | None,
+        interruption: AvailabilityInterruption | None,
+    ) -> None:
+        """Open or update exactly one unresolved ADR-0056 causal lifecycle."""
+
         opened = self._open_unavailable
         if interruption is None:
             if opened is not None:
@@ -971,6 +1064,114 @@ class ObservationRuntimeHealth:
             self._unavailable_intervals += 1
         self._open_unavailable = candidate_interval
 
+    @staticmethod
+    def _audit_fault_availability_scopes(
+        record: AuditFaultLifecycleRecord,
+    ) -> tuple[AvailabilityScope, ...]:
+        mapping = {
+            AuditFaultAffectedScope.AUDIT_ELIGIBILITY: AvailabilityScope.AUDIT_ELIGIBILITY,
+            AuditFaultAffectedScope.SCANNER_RESEARCH_ELIGIBILITY: (
+                AvailabilityScope.SCANNER_RESEARCH_ELIGIBILITY
+            ),
+        }
+        try:
+            return tuple(mapping[scope] for scope in record.affected_scopes)
+        except KeyError as error:  # pragma: no cover - finite enum is exhaustively mapped
+            raise ValueError("audit fault has no availability-scope mapping") from error
+
+    @staticmethod
+    def _audit_fault_source_evidence(
+        record: AuditFaultLifecycleRecord,
+    ) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                (
+                    f"audit-fault:{record.fault_id}",
+                    f"audit-request:{record.request_id}",
+                    "raw-source:"
+                    f"{record.audit_start_source.ingest_id.value}:"
+                    f"{record.audit_start_source.payload_sha256}",
+                    "raw-source:"
+                    f"{record.failure_source.ingest_id.value}:"
+                    f"{record.failure_source.payload_sha256}",
+                )
+            )
+        )
+
+    def open_audit_fault_contributor(self, record: AuditFaultLifecycleRecord) -> None:
+        """Project one streamed blocking audit-fault lifecycle into availability."""
+
+        if record.status is AuditFaultStatus.RESOLVED:
+            raise ValueError("resolved audit fault cannot open an availability contributor")
+        if not record.blocks_current_scope:
+            return
+        identity = record.public_read_fault_availability_open_identity()
+        already_active = identity.stable_causal_key in self._active_availability_contributors
+        self.mark_scope_unavailable(
+            now_ns=record.observed_monotonic_ns,
+            now_utc=record.observed_at,
+            interruption=AvailabilityInterruption(
+                cause=AvailabilityCause.PUBLIC_READ_FAULT,
+                reason_code=record.reason.value,
+                source_evidence_ids=self._audit_fault_source_evidence(record),
+                affected_instruments=(record.instrument_id,),
+                affected_scopes=self._audit_fault_availability_scopes(record),
+                recovery_action=(
+                    AvailabilityRecoveryAction.RESNAPSHOT
+                    if record.status is AuditFaultStatus.CURRENT
+                    else AvailabilityRecoveryAction.OPERATOR_RESTART
+                ),
+                causal_family=AvailabilityCausalFamily.PUBLIC_READ_FAULT,
+                fault_lifecycle_id=record.fault_id,
+                request_id=record.request_id,
+                instrument_id=record.instrument_id,
+                market_id=record.market_id.value,
+            ),
+        )
+        if already_active:
+            return
+        writer = self._availability_writer
+        if writer is not None:
+            record_open = getattr(writer, "record_public_read_fault_open", None)
+            if not callable(record_open) or not bool(record_open(identity)):
+                self._availability_ledger_healthy = False
+        self._public_read_fault_availability_open_chain = (
+            public_read_fault_availability_chain_extend(
+                self._public_read_fault_availability_open_chain,
+                "open",
+                identity,
+            )
+        )
+        self._public_read_fault_availability_opened += 1
+
+    def resolve_audit_fault_contributor(self, record: AuditFaultLifecycleRecord) -> None:
+        """Complete exactly the contributor named by streamed resolution authority."""
+
+        if (
+            record.status is not AuditFaultStatus.RESOLVED
+            or record.resolution is None
+            or record.resolution_source is None
+            or record.resolved_at is None
+            or record.resolved_monotonic_ns is None
+        ):
+            raise ValueError("audit fault resolution authority is incomplete")
+        self.close_contributor(
+            stable_causal_key=availability_stable_causal_key(
+                causal_family=AvailabilityCausalFamily.PUBLIC_READ_FAULT,
+                causal_lifecycle_id=f"fault:{record.fault_id}",
+            ),
+            ended_at=record.resolved_at,
+            ended_monotonic_ns=record.resolved_monotonic_ns,
+            recovery_outcome=AvailabilityRecoveryOutcome.RESTORED,
+            research_eligibility_restored=True,
+            closure_reason_code=f"AUDIT_FAULT_{record.resolution.value}",
+            closure_source_evidence_ids=(
+                "raw-source:"
+                f"{record.resolution_source.ingest_id.value}:"
+                f"{record.resolution_source.payload_sha256}",
+            ),
+        )
+
     def _open_audit_availability_authority(
         self,
         interruption: AvailabilityInterruption,
@@ -1018,6 +1219,7 @@ class ObservationRuntimeHealth:
         if cause is AvailabilityCause.TARGET_LIFECYCLE:
             return AvailabilityCausalFamily.TARGET_LIFECYCLE
         if cause in {
+            AvailabilityCause.PUBLIC_READ_FAULT,
             AvailabilityCause.CANONICAL_STATE_INVALIDATION,
             AvailabilityCause.SCHEMA_PROTOCOL_ERROR,
             AvailabilityCause.PROTOCOL_SCHEMA_INVARIANT,
@@ -1734,6 +1936,7 @@ class ObservationRuntimeHealth:
     ) -> bool:
         if contributor.causal_family in {
             AvailabilityCausalFamily.AUDIT_DIVERGENCE,
+            AvailabilityCausalFamily.PUBLIC_READ_FAULT,
             AvailabilityCausalFamily.TARGET_LIFECYCLE,
         }:
             return False
@@ -1896,6 +2099,30 @@ class ObservationRuntimeHealth:
             raise RuntimeError("availability contributor changed during closure")
         self._active_availability_contributors.pop(stable_causal_key)
         self._completed_availability_contributors += 1
+        if (
+            contributor.causal_family is AvailabilityCausalFamily.PUBLIC_READ_FAULT
+            and contributor.interruption.cause is AvailabilityCause.PUBLIC_READ_FAULT
+        ):
+            fault_lifecycle_id = contributor.interruption.fault_lifecycle_id
+            if fault_lifecycle_id is None:
+                self._availability_ledger_healthy = False
+                raise RuntimeError("public-read fault contributor lacks lifecycle identity")
+            self._public_read_fault_availability_completion_chain = (
+                public_read_fault_availability_chain_extend(
+                    self._public_read_fault_availability_completion_chain,
+                    "completion",
+                    PublicReadFaultAvailabilityCompletionIdentity(
+                        fault_lifecycle_id=fault_lifecycle_id,
+                        stable_causal_key=stable_causal_key,
+                        ended_at_utc_ns=ended_at.nanoseconds_since_epoch,
+                        ended_monotonic_ns=ended_monotonic_ns,
+                        closure_reason_code=closure_reason_code,
+                        closure_source_evidence_ids=closure_source_evidence_ids,
+                        open_at_shutdown=open_at_shutdown,
+                    ),
+                )
+            )
+            self._public_read_fault_availability_completed += 1
         completion_record: dict[str, object]
         if record is None:
             completion_record = {
@@ -2351,6 +2578,14 @@ class ObservationRuntimeHealth:
             resync_reason_counts=tuple(
                 (reason, self._resync_reason_counts[reason])
                 for reason in sorted(ProcessorRecoveryReason, key=lambda item: item.value)
+            ),
+            public_read_fault_availability_projection=(
+                PublicReadFaultAvailabilityProjectionSnapshot(
+                    opened=self._public_read_fault_availability_opened,
+                    completed=self._public_read_fault_availability_completed,
+                    open_chain_sha256=self._public_read_fault_availability_open_chain,
+                    completion_chain_sha256=(self._public_read_fault_availability_completion_chain),
+                )
             ),
         )
 
@@ -3098,30 +3333,58 @@ def _audit_stage_timing_telemetry(metrics: InMemoryMetrics) -> dict[str, object]
 def _audit_fault_lifecycle_representative_telemetry(
     records: tuple[AuditFaultLifecycleRecord, ...],
 ) -> dict[str, object]:
-    """Encode bounded lifecycle representatives as digests plus durable raw joins."""
+    """Encode bounded lifecycle representatives as digests plus durable raw joins.
+
+    Fixed schema/enum strings are represented by their stable v2 codebook
+    indices.  Their full text is already implied by the table schema; avoiding
+    it in every row preserves the same evidence while keeping the six-hour
+    periodic checkpoint projection within its immutable byte bound.
+    """
+
+    def code(field_name: str, value: str | None) -> int | None:
+        if value is None:
+            return None
+        for candidate_name, values in AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_CODEBOOKS:
+            if candidate_name == field_name:
+                try:
+                    return values.index(value)
+                except ValueError as error:  # pragma: no cover - typed record enums are closed
+                    raise ValueError(
+                        "audit fault representative value is outside its schema codebook"
+                    ) from error
+        raise ValueError("audit fault representative field has no schema codebook")
 
     return {
         "rows": tuple(
             (
                 canonical_sha256(record),
                 record.fault_id,
-                record.audit_start_schema,
-                record.failure_evidence_kind.value,
+                code("audit_start_schema", record.audit_start_schema),
+                code("failure_evidence_kind", record.failure_evidence_kind.value),
                 record.failure_schema,
                 record.blocks_current_scope,
-                record.status.value,
-                record.reason.value,
-                record.origin.value,
+                code("status", record.status.value),
+                code("reason", record.reason.value),
+                code("origin", record.origin.value),
                 record.instrument_id.value,
                 record.market_id.value,
-                None if record.endpoint_class is None else record.endpoint_class.value,
-                None if record.category is None else record.category.value,
+                code(
+                    "endpoint_class",
+                    None if record.endpoint_class is None else record.endpoint_class.value,
+                ),
+                code(
+                    "category",
+                    None if record.category is None else record.category.value,
+                ),
                 record.observed_monotonic_ns,
                 record.audit_start_source.ingest_id.value,
                 record.audit_start_source.payload_sha256,
                 record.failure_source.ingest_id.value,
                 record.failure_source.payload_sha256,
-                None if record.resolution is None else record.resolution.value,
+                code(
+                    "resolution",
+                    None if record.resolution is None else record.resolution.value,
+                ),
                 (
                     None
                     if record.resolution_source is None
@@ -3519,6 +3782,32 @@ def audit_availability_authority_reconciled(
     )
 
 
+def public_read_fault_availability_projection_reconciled(
+    processor: ProcessorOperationalSnapshot,
+    runtime: ObservationRuntimeHealthSnapshot,
+    writer: AvailabilityEvidenceRuntimeSnapshot,
+) -> bool:
+    """Compare exact blocking-fault projection identities across all live owners."""
+
+    processor_projection = processor.public_read_fault_availability_projection
+    runtime_projection = runtime.public_read_fault_availability_projection
+    accepted_projection = writer.public_read_fault_projection_accepted
+    written_projection = writer.public_read_fault_projection_written
+    return (
+        processor_projection == runtime_projection == accepted_projection
+        and written_projection.opened == accepted_projection.opened
+        and written_projection.open_chain_sha256 == accepted_projection.open_chain_sha256
+        and written_projection.completed <= accepted_projection.completed
+        and written_projection.completion_chain_sha256
+        == writer.public_read_fault_completion_expected_written_chain_sha256
+        and (
+            written_projection.completed < accepted_projection.completed
+            or written_projection.completion_chain_sha256
+            == accepted_projection.completion_chain_sha256
+        )
+    )
+
+
 def build_observation_health_checkpoint(
     *,
     config: Phase1Config,
@@ -3730,9 +4019,17 @@ def build_observation_health_checkpoint(
             for item in audit_http_endpoint_snapshots
         )
     )
+    public_read_fault_availability_reconciled = (
+        public_read_fault_availability_projection_reconciled(
+            processor_snapshot,
+            runtime,
+            availability_writer,
+        )
+    )
     audit_fault_evidence_reconciled = (
         processor_snapshot.audit_fault_lifecycle_reconciled
         and audit_http_endpoint_evidence_reconciled
+        and public_read_fault_availability_reconciled
         and processor_snapshot.audit_faults_observed
         == (
             processor_snapshot.audit_faults_current
@@ -3840,6 +4137,7 @@ def build_observation_health_checkpoint(
         and availability_writer.rejected == 0
         and runtime.availability_open_at_shutdown_intervals == 0
         and audit_availability_reconciled
+        and public_read_fault_availability_reconciled
     )
     audit_http_by_endpoint = {
         snapshot.endpoint_class: snapshot for snapshot in audit_http_endpoint_snapshots
@@ -4112,6 +4410,27 @@ def build_observation_health_checkpoint(
             },
             "failed": processor_snapshot.rest_audit_failed,
             "fault_lifecycles": {
+                **(
+                    {
+                        "availability_projection": {
+                            "completed": (
+                                processor_snapshot.public_read_fault_availability_projection.completed
+                            ),
+                            "completion_digest": (
+                                processor_snapshot.public_read_fault_availability_projection.completion_chain_sha256
+                            ),
+                            "evidence_reconciled": (public_read_fault_availability_reconciled),
+                            "open_digest": (
+                                processor_snapshot.public_read_fault_availability_projection.open_chain_sha256
+                            ),
+                            "opened": (
+                                processor_snapshot.public_read_fault_availability_projection.opened
+                            ),
+                        }
+                    }
+                    if terminal
+                    else {}
+                ),
                 "current": processor_snapshot.audit_faults_current,
                 "current_representative_capacity": (
                     processor_snapshot.audit_fault_current_representative_capacity
@@ -4445,6 +4764,7 @@ def build_observation_health_checkpoint(
 __all__ = [
     "ANALYTICAL_FRAGMENT_RETENTION_TELEMETRY_ROW_FIELDS",
     "ANALYTICAL_FRAGMENT_RETENTION_TELEMETRY_SCHEMA",
+    "AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_CODEBOOKS",
     "AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_ROW_FIELDS",
     "AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_SCHEMA",
     "AUDIT_HTTP_ENDPOINT_TELEMETRY_ROW_FIELDS",
@@ -4476,5 +4796,6 @@ __all__ = [
     "capture_process_resources",
     "capture_terminal_process_resources",
     "evaluate_required_book_health",
+    "public_read_fault_availability_projection_reconciled",
     "required_instrument_ids_for_target",
 ]

@@ -7,13 +7,17 @@ import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast
 
 import httpx
 import pytest
 
+from multi_market_arbitrage.availability_authority import (
+    PublicReadFaultAvailabilityProjectionSnapshot,
+    empty_public_read_fault_availability_projection,
+)
 from multi_market_arbitrage.core.config import load_phase1_config
 from multi_market_arbitrage.core.ids import CollectorRunId, ConnectionId, SubscriptionId, WriterId
 from multi_market_arbitrage.core.time import UtcTimestamp
@@ -29,6 +33,7 @@ from multi_market_arbitrage.observability import (
     AvailabilityCause,
     AvailabilityScope,
     InMemoryMetrics,
+    SupervisedAvailabilityIntervalWriter,
 )
 from multi_market_arbitrage.pipeline import (
     CLOB_MARKET_PREFIX,
@@ -71,7 +76,10 @@ from multi_market_arbitrage.replay import replay_journal
 from multi_market_arbitrage.state import InvalidationReason
 from multi_market_arbitrage.venues.polymarket import (
     PolymarketEndpointClass,
+    PolymarketHttpFailureCategory,
     PolymarketPublicClient,
+    PolymarketRetryAfterDisposition,
+    PolymarketRetryBlockedReason,
     PolymarketWebSocketFailureCategory,
     PolymarketWebSocketTransportError,
     PublicReadEvidence,
@@ -162,13 +170,14 @@ def _protocol_invalid_yes_price_change() -> bytes:
 
 def _yes_reported_top_transition(
     *,
+    asset_id: str = "token-yes",
     best_ask: str = "0.56",
     spread: str = "0.11",
 ) -> bytes:
     return json.dumps(
         {
             "event_type": "best_bid_ask",
-            "asset_id": "token-yes",
+            "asset_id": asset_id,
             "market": "0xcondition",
             "best_bid": "0.45",
             "best_ask": best_ask,
@@ -228,6 +237,205 @@ async def _initialize_books(capture: observe_module._RawCaptureBoundary) -> None
             semantics_hash=hashlib.sha256(channel.encode()).hexdigest(),
         )
         assert result.success
+
+
+@pytest.mark.asyncio
+async def test_recoverable_public_read_fault_crosses_production_boundary_and_reconciles(
+    tmp_path: Path,
+) -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("recoverable-public-read-fault-boundary")
+    raw_writer = RawJournalWriter(
+        JournalWriterConfig(
+            root=tmp_path / "raw",
+            collector_run_id=run_id,
+            venue_id=POLYMARKET_VENUE_ID,
+            stream="polymarket-public",
+            writer_id=WriterId("recoverable-public-read-fault-boundary-writer"),
+            writer_software_version="test",
+            git_commit="fixture",
+        )
+    )
+    availability_writer = SupervisedAvailabilityIntervalWriter(
+        root=tmp_path / "availability",
+        collector_run_id=run_id,
+        queue_capacity=4,
+        contribution_queue_capacity=4,
+        maximum_intervals=4,
+        maximum_contributions=4,
+        maximum_file_bytes=64 * 1024,
+        maximum_contribution_file_bytes=64 * 1024,
+    )
+    processor = CanonicalProcessor(config)
+    metrics = InMemoryMetrics()
+    connection_id = ConnectionId("recoverable-public-read-fault-boundary-connection")
+    subscription_id = SubscriptionId("recoverable-public-read-fault-boundary-subscription")
+    ingress = BoundedRawIngress(
+        max_items=config.system.queue_capacity,
+        max_bytes=config.polymarket.maximum_ingress_queue_bytes,
+        connection_id=connection_id,
+    )
+    runtime_health = ObservationRuntimeHealth(
+        collector_run_id=run_id,
+        availability_writer=availability_writer,
+    )
+    runtime_health.begin_generation(connection_id, ingress)
+    runtime_health.mark_connected(
+        now_ns=time.monotonic_ns(),
+        now_utc=UtcTimestamp.now(),
+    )
+    capture = observe_module._RawCaptureBoundary(  # pyright: ignore[reportPrivateUsage]
+        collector_run_id=run_id,
+        writer=raw_writer,
+        processor=processor,
+        metrics=metrics,
+        runtime_health=runtime_health,
+    )
+    service = PolymarketObservationService(
+        config,
+        workspace_root=tmp_path,
+        code_commit="fixture",
+        metrics=metrics,
+    )
+
+    await raw_writer.start()
+    await availability_writer.start()
+    availability_summary = None
+    try:
+        await _initialize_books(capture)
+        instrument_id = processor.audit_book_identity("token-yes").instrument_id
+        hard_expiry_ns = capture.book_freshness_receive_ns_by_instrument[instrument_id] + int(
+            config.scanner.maximum_book_age_seconds * 1_000_000_000
+        )
+        failed_start, failed_start_result = await service._stage_audit_start(  # pyright: ignore[reportPrivateUsage]
+            capture=capture,
+            ingress=ingress,
+            native_asset_id="token-yes",
+            attempt=config.polymarket.public_reads.maximum_attempts,
+            connection_id=connection_id,
+            subscription_id=subscription_id,
+            trigger_reason=AuditTriggerReason.PERIODIC,
+            hard_expiry_monotonic_ns=hard_expiry_ns,
+            run_deadline_monotonic_ns=hard_expiry_ns,
+        )
+        assert failed_start_result.success
+        failure_result = await service._preserve_audit_failure(  # pyright: ignore[reportPrivateUsage]
+            capture=capture,
+            failure=AuditHttpFailureHandoff(
+                request_id=failed_start.request_id,
+                connection_id=connection_id,
+                reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+                error_type="PolymarketHttpTransportError:TIMEOUT",
+                endpoint_class=PolymarketEndpointClass.CLOB_BOOK,
+                category=PolymarketHttpFailureCategory.TIMEOUT,
+                retryable=True,
+                attempt=config.polymarket.public_reads.maximum_attempts,
+                retry_after_disposition=PolymarketRetryAfterDisposition.ABSENT,
+                retry_exhausted=True,
+                retry_blocked_reason=PolymarketRetryBlockedReason.ATTEMPTS_EXHAUSTED,
+            ),
+            subscription_id=subscription_id,
+        )
+        assert failure_result.success
+        assert len(failure_result.audit_faults_opened) == 1
+        during_fault = runtime_health.snapshot(now_ns=time.monotonic_ns())
+        assert during_fault.socket_connected is True
+        assert during_fault.active_availability_contributors == 1
+        assert (
+            processor.operational_snapshot().public_read_fault_availability_projection
+            == during_fault.public_read_fault_availability_projection
+            == availability_writer.runtime_snapshot.public_read_fault_projection_accepted
+        )
+
+        recovery_start, recovery_start_result = await service._stage_audit_start(  # pyright: ignore[reportPrivateUsage]
+            capture=capture,
+            ingress=ingress,
+            native_asset_id="token-yes",
+            attempt=1,
+            connection_id=connection_id,
+            subscription_id=subscription_id,
+            trigger_reason=AuditTriggerReason.RESYNC_VERIFICATION,
+            hard_expiry_monotonic_ns=hard_expiry_ns,
+            run_deadline_monotonic_ns=hard_expiry_ns,
+        )
+        assert recovery_start_result.success
+        response_ns = time.monotonic_ns()
+        recovery_result = await service._preserve_audit_response(  # pyright: ignore[reportPrivateUsage]
+            capture=capture,
+            response=AuditHttpResponseHandoff(
+                request_id=recovery_start.request_id,
+                connection_id=connection_id,
+                payload_bytes=_fixture("polymarket_rest_book_yes.json"),
+                received_wall_time=UtcTimestamp.now(),
+                received_monotonic_ns=response_ns,
+                response_boundary_watermark=WebSocketAdmissionWatermark(
+                    connection_id=connection_id,
+                    ordinal=0,
+                ),
+            ),
+            start=recovery_start,
+            barrier_ordinal=0,
+            subscription_id=subscription_id,
+            hard_expiry_monotonic_ns=hard_expiry_ns,
+        )
+        assert recovery_result.success
+        assert len(recovery_result.audit_faults_resolved) == 1
+        terminal_runtime = runtime_health.snapshot(now_ns=time.monotonic_ns())
+        terminal_processor = processor.summary()
+        assert terminal_runtime.socket_connected is True
+        assert terminal_runtime.active_availability_contributors == 0
+        assert (
+            terminal_processor.public_read_fault_availability_projection
+            == terminal_runtime.public_read_fault_availability_projection
+        )
+        assert terminal_runtime.public_read_fault_availability_projection.opened == 1
+        assert terminal_runtime.public_read_fault_availability_projection.completed == 1
+        availability_summary = await availability_writer.close(
+            completed=True,
+            terminal_active_causal_keys=(),
+        )
+        await raw_writer.close()
+    except BaseException:
+        with suppress(Exception):
+            await availability_writer.close(completed=False)
+        with suppress(Exception):
+            await raw_writer.close(completed=False)
+        raise
+
+    assert availability_summary is not None
+    terminal_runtime = runtime_health.snapshot(now_ns=time.monotonic_ns())
+    terminal_processor = processor.summary()
+    assert (
+        availability_summary.public_read_fault_projection_accepted
+        == availability_summary.public_read_fault_projection_written
+        == terminal_runtime.public_read_fault_availability_projection
+    )
+    assert observe_module._availability_evidence_reconciled(  # pyright: ignore[reportPrivateUsage]
+        availability_summary,
+        terminal_runtime,
+        terminal_processor,
+    )
+    exact_projection = terminal_runtime.public_read_fault_availability_projection
+    disagreeing_projections = (
+        empty_public_read_fault_availability_projection(),
+        PublicReadFaultAvailabilityProjectionSnapshot(
+            opened=2,
+            completed=2,
+            open_chain_sha256="f" * 64,
+            completion_chain_sha256="e" * 64,
+        ),
+        replace(exact_projection, open_chain_sha256="d" * 64),
+    )
+    for disagreeing_projection in disagreeing_projections:
+        disagreeing_summary = replace(
+            availability_summary,
+            public_read_fault_projection_accepted=disagreeing_projection,
+        )
+        assert not observe_module._availability_evidence_reconciled(  # pyright: ignore[reportPrivateUsage]
+            disagreeing_summary,
+            terminal_runtime,
+            terminal_processor,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -678,6 +886,10 @@ async def test_prepare_attest_classification_deadline_is_transactional_and_repla
         max_bytes=config.polymarket.maximum_ingress_queue_bytes,
         connection_id=connection_id,
     )
+    runtime_health = ObservationRuntimeHealth()
+    runtime_health.begin_generation(connection_id, ingress)
+    runtime_health.mark_connected(now_ns=time.monotonic_ns())
+    capture.runtime_health = runtime_health
     delay_used = False
     prepare_results: list[ProcessedEnvelope] = []
     prepare_state_pairs: list[tuple[object, object]] = []
@@ -829,6 +1041,11 @@ async def test_prepare_attest_classification_deadline_is_transactional_and_repla
     assert lifecycle.origin is AuditFaultOrigin.INTERNAL
     assert lifecycle.status is AuditFaultStatus.PERMANENT
     assert lifecycle.reason is AuditFailureReason.BOOK_FRESHNESS_EXPIRED
+    assert runtime_health.snapshot(now_ns=time.monotonic_ns()).socket_connected is True
+    assert len(runtime_health.active_availability_contributors) == 1
+    fault_contributor = runtime_health.active_availability_contributors[0]
+    assert fault_contributor.causal_lifecycle_id == f"fault:{lifecycle.fault_id}"
+    assert fault_contributor.cause is AvailabilityCause.PUBLIC_READ_FAULT
 
     records = JournalReader(tmp_path / "raw", run_id).read_all()
     assert sum(record.channel == CONTROL_REST_AUDIT_CLASSIFY_PREPARE for record in records) == 1
@@ -4576,10 +4793,11 @@ async def test_exact_run_deadline_starts_zero_audits(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("expiry_at_run_cutoff", "expected_exit"),
+    ("expiry_at_run_cutoff", "expected_exit", "transition_count"),
     [
-        pytest.param(False, "RESYNC_REQUIRED", id="idle-before-run-cutoff"),
-        pytest.param(True, "DEADLINE", id="exact-run-cutoff-tie"),
+        pytest.param(False, "RESYNC_REQUIRED", 1, id="idle-before-run-cutoff"),
+        pytest.param(False, "RESYNC_REQUIRED", 2, id="simultaneous-idle-expiries"),
+        pytest.param(True, "DEADLINE", 1, id="exact-run-cutoff-tie"),
     ],
 )
 async def test_idle_reported_top_transition_expires_through_durable_supervisor_control(
@@ -4587,6 +4805,7 @@ async def test_idle_reported_top_transition_expires_through_durable_supervisor_c
     monkeypatch: pytest.MonkeyPatch,
     expiry_at_run_cutoff: bool,
     expected_exit: str,
+    transition_count: int,
 ) -> None:
     """An idle socket cannot leave transition eligibility pending past its bound."""
 
@@ -4609,6 +4828,17 @@ async def test_idle_reported_top_transition_expires_through_durable_supervisor_c
     )
     processor = CanonicalProcessor(config)
     metrics = InMemoryMetrics()
+    availability_writer = SupervisedAvailabilityIntervalWriter(
+        root=tmp_path / "health",
+        collector_run_id=run_id,
+        queue_capacity=4,
+        maximum_intervals=4,
+        maximum_file_bytes=64 * 1024,
+    )
+    runtime_health = ObservationRuntimeHealth(
+        collector_run_id=run_id,
+        availability_writer=availability_writer,
+    )
     capture = observe_module._RawCaptureBoundary(  # pyright: ignore[reportPrivateUsage]
         collector_run_id=run_id,
         writer=writer,
@@ -4639,18 +4869,20 @@ async def test_idle_reported_top_transition_expires_through_durable_supervisor_c
             ready: asyncio.Event,
         ) -> None:
             ready.set()
-            admit(
-                ReceivedWebSocketMessage(
-                    payload_bytes=_yes_reported_top_transition(),
-                    received_wall_time=UtcTimestamp.now(),
-                    received_monotonic_ns=(
-                        time.monotonic_ns()
-                        if transition_received_monotonic_ns is None
-                        else transition_received_monotonic_ns
-                    ),
-                    message_type="TEXT",
-                )
+            shared_received_monotonic_ns = (
+                time.monotonic_ns()
+                if transition_received_monotonic_ns is None
+                else transition_received_monotonic_ns
             )
+            for asset_id in selected.clob_token_ids[:transition_count]:
+                admit(
+                    ReceivedWebSocketMessage(
+                        payload_bytes=_yes_reported_top_transition(asset_id=asset_id),
+                        received_wall_time=UtcTimestamp.now(),
+                        received_monotonic_ns=shared_received_monotonic_ns,
+                        message_type="TEXT",
+                    )
+                )
             await asyncio.Event().wait()
 
     class _ForbiddenAuditClient:
@@ -4666,6 +4898,7 @@ async def test_idle_reported_top_transition_expires_through_durable_supervisor_c
 
     monkeypatch.setattr(observe_module, "PolymarketMarketWebSocket", _IdleTransitionSocket)
     await writer.start()
+    await availability_writer.start()
     await _initialize_books(capture)
     run_duration_seconds = 0.15 if expiry_at_run_cutoff else 1.0
     deadline_ns = time.monotonic_ns() + int(run_duration_seconds * 1_000_000_000)
@@ -4682,9 +4915,21 @@ async def test_idle_reported_top_transition_expires_through_durable_supervisor_c
         connection_id=ConnectionId("reported-top-idle-supervisor-expiry-socket"),
         subscription_id=SubscriptionId("reported-top-idle-supervisor-expiry-subscription"),
         unavailable_started_ns=None,
-        runtime_health=ObservationRuntimeHealth(),
+        runtime_health=runtime_health,
     )
     await writer.close()
+    generation_end = generation.interruption_started_at or generation.capture_cutoff
+    if generation_end is None:
+        generation_end = observe_module._CaptureCutoffMoment(  # pyright: ignore[reportPrivateUsage]
+            wall_time=UtcTimestamp.now(),
+            monotonic_ns=time.monotonic_ns(),
+        )
+    runtime_health.finish_generation(
+        continuity_interrupted=not expiry_at_run_cutoff,
+        now_ns=generation_end.monotonic_ns,
+        now_utc=generation_end.wall_time,
+        interruption=generation.interruption,
+    )
 
     assert generation.reason.value == expected_exit
     if expiry_at_run_cutoff:
@@ -4694,25 +4939,86 @@ async def test_idle_reported_top_transition_expires_through_durable_supervisor_c
         assert generation.interruption.cause.value == "REPORTED_TOP_TRANSITION_FAILURE"
     live = processor.summary()
     assert live.pending_reported_top_transitions == 0
-    assert live.reported_top_transitions_expired == 1
-    outcome = live.reported_top_transition_outcomes[-1]
-    assert outcome.status is ReportedTopTransitionStatus.EXPIRED
-    assert outcome.reason is ReportedTopTransitionReason.TIME_BOUND_EXPIRED
-    assert outcome.duration_ns >= 50_000_000
-    assert outcome.duration_is_lower_bound is False
-    assert outcome.close_source is not None
-    assert outcome.close_source.channel == CONTROL_REPORTED_TOP_TRANSITION_EXPIRED
+    assert live.reported_top_transitions_expired == transition_count
+    outcomes = live.reported_top_transition_outcomes[-transition_count:]
+    assert all(outcome.status is ReportedTopTransitionStatus.EXPIRED for outcome in outcomes)
+    assert all(
+        outcome.reason is ReportedTopTransitionReason.TIME_BOUND_EXPIRED for outcome in outcomes
+    )
+    assert all(outcome.duration_ns >= 50_000_000 for outcome in outcomes)
+    assert all(outcome.duration_is_lower_bound is False for outcome in outcomes)
+    assert all(
+        outcome.close_source is not None
+        and outcome.close_source.channel == CONTROL_REPORTED_TOP_TRANSITION_EXPIRED
+        for outcome in outcomes
+    )
     if not expiry_at_run_cutoff:
         assert generation.interruption_started_at is not None
-        assert generation.interruption_started_at.monotonic_ns == outcome.ended_monotonic_ns
-        assert generation.interruption_started_at.wall_time == outcome.ended_at
+        assert all(
+            generation.interruption_started_at.monotonic_ns == outcome.ended_monotonic_ns
+            for outcome in outcomes
+        )
+        assert all(
+            generation.interruption_started_at.wall_time == outcome.ended_at for outcome in outcomes
+        )
+        assert len(runtime_health.active_availability_contributors) == transition_count
+        assert (
+            len(
+                {
+                    contributor.stable_causal_key
+                    for contributor in runtime_health.active_availability_contributors
+                }
+            )
+            == transition_count
+        )
+        replacement_connection = ConnectionId("reported-top-idle-supervisor-replacement")
+        runtime_health.begin_generation(
+            replacement_connection,
+            BoundedRawIngress(
+                max_items=config.system.queue_capacity,
+                max_bytes=config.polymarket.maximum_ingress_queue_bytes,
+                connection_id=replacement_connection,
+            ),
+        )
+        runtime_health.mark_connected(now_ns=time.monotonic_ns(), now_utc=UtcTimestamp.now())
+    availability_summary = await availability_writer.close(
+        completed=True,
+        terminal_active_causal_keys=(),
+    )
+    if not expiry_at_run_cutoff:
+        assert availability_summary.contribution_path is not None
+        contributions = tuple(
+            json.loads(line)
+            for line in availability_summary.contribution_path.read_text(
+                encoding="utf-8"
+            ).splitlines()
+        )
+        assert len(contributions) == transition_count
+        assert (
+            len({contribution["reported_top_transition_id"] for contribution in contributions})
+            == transition_count
+        )
+        assert all(len(contribution["affected_instruments"]) == 1 for contribution in contributions)
+        assert all(
+            set(contribution["affected_scopes"])
+            == {
+                AvailabilityScope.WEBSOCKET_CAPTURE.value,
+                AvailabilityScope.CANONICAL_BOOKS.value,
+                AvailabilityScope.AUDIT_ELIGIBILITY.value,
+                AvailabilityScope.SCANNER_RESEARCH_ELIGIBILITY.value,
+            }
+            for contribution in contributions
+        )
     records = JournalReader(tmp_path / "raw", run_id).read_all()
     expiry_records = tuple(
         record for record in records if record.channel == CONTROL_REPORTED_TOP_TRANSITION_EXPIRED
     )
-    assert len(expiry_records) == 1
-    assert expiry_records[0].ingest_seq == outcome.close_source.ingest_seq
-    assert expiry_records[0].ingest_id == outcome.close_source.raw_source.ingest_id
+    assert len(expiry_records) == transition_count
+    for record, outcome in zip(expiry_records, outcomes, strict=True):
+        close_source = outcome.close_source
+        assert close_source is not None
+        assert record.ingest_seq == close_source.ingest_seq
+        assert record.ingest_id == close_source.raw_source.ingest_id
     replayed = replay_journal(tmp_path / "raw", run_id, config).processor
     assert replayed.reported_top_transition_outcomes == live.reported_top_transition_outcomes
     assert replayed.reported_top_transition_chain_sha256 == (

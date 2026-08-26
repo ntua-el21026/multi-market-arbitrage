@@ -88,7 +88,32 @@ def test_cross_source_tick_or_minimum_mismatch_is_indeterminate() -> None:
     assert bundle.precision.reason == "cross-source tick sizes disagree"
 
 
-def test_cross_source_minimum_order_size_mismatch_is_indeterminate() -> None:
+def test_gamma_order_notional_does_not_change_share_minimum_authority() -> None:
+    gamma, clob, rest = _sources()
+    baseline = PolymarketReferenceBuilder().build(
+        gamma=gamma,
+        clob=clob,
+        rest_book=rest,
+        observed_at=UtcTimestamp(1),
+    )
+    differing_gamma_notional = replace(
+        gamma,
+        minimum_order_notional=ExactDecimal.parse("999"),
+    )
+    changed = PolymarketReferenceBuilder().build(
+        gamma=differing_gamma_notional,
+        clob=clob,
+        rest_book=rest,
+        observed_at=UtcTimestamp(1),
+    )
+
+    assert baseline.precision.status is ReferenceStatus.VERIFIED
+    assert changed.precision.status is ReferenceStatus.VERIFIED
+    assert changed.precision.minimum_order_size == Quantity.parse("5")
+    assert changed.precision.version_id == baseline.precision.version_id
+
+
+def test_clob_info_and_rest_minimum_order_size_mismatch_is_indeterminate() -> None:
     gamma, clob, rest = _sources()
     mismatched = replace(rest, minimum_order_size=Quantity.parse("6"))
     bundle = PolymarketReferenceBuilder().build(

@@ -9,6 +9,10 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Final, Protocol, cast
 
+from multi_market_arbitrage.availability_authority import (
+    PublicReadFaultAvailabilityCompletionIdentity,
+    PublicReadFaultAvailabilityOpenIdentity,
+)
 from multi_market_arbitrage.core.exact import ExactDecimal, Price, Quantity
 from multi_market_arbitrage.core.ids import (
     ConnectionId,
@@ -1265,6 +1269,68 @@ class AuditFaultLifecycleRecord:
             "status": self.status.value,
             "status_code": self.status_code,
         }
+
+    def public_read_fault_availability_open_identity(
+        self,
+    ) -> PublicReadFaultAvailabilityOpenIdentity:
+        """Normalize the exact blocking-fault identity shared by evidence owners."""
+
+        if self.status is AuditFaultStatus.RESOLVED or not self.blocks_current_scope:
+            raise ValueError("only an unresolved blocking fault can project an availability open")
+        return PublicReadFaultAvailabilityOpenIdentity(
+            fault_lifecycle_id=self.fault_id,
+            stable_causal_key=availability_stable_causal_key(
+                causal_family=AvailabilityCausalFamily.PUBLIC_READ_FAULT,
+                causal_lifecycle_id=f"fault:{self.fault_id}",
+            ),
+            request_id=self.request_id,
+            instrument_id=self.instrument_id.value,
+            market_id=self.market_id.value,
+            reason_code=self.reason.value,
+            source_evidence_ids=(
+                f"audit-fault:{self.fault_id}",
+                f"audit-request:{self.request_id}",
+                "raw-source:"
+                f"{self.audit_start_source.ingest_id.value}:"
+                f"{self.audit_start_source.payload_sha256}",
+                "raw-source:"
+                f"{self.failure_source.ingest_id.value}:"
+                f"{self.failure_source.payload_sha256}",
+            ),
+            affected_scopes=tuple(scope.value for scope in self.affected_scopes),
+            started_at_utc_ns=self.observed_at.nanoseconds_since_epoch,
+            started_monotonic_ns=self.observed_monotonic_ns,
+        )
+
+    def public_read_fault_availability_completion_identity(
+        self,
+    ) -> PublicReadFaultAvailabilityCompletionIdentity:
+        """Normalize exact resolution authority shared with completed evidence."""
+
+        if (
+            self.status is not AuditFaultStatus.RESOLVED
+            or self.resolution is None
+            or self.resolution_source is None
+            or self.resolved_at is None
+            or self.resolved_monotonic_ns is None
+        ):
+            raise ValueError("only an exactly resolved fault can project availability completion")
+        return PublicReadFaultAvailabilityCompletionIdentity(
+            fault_lifecycle_id=self.fault_id,
+            stable_causal_key=availability_stable_causal_key(
+                causal_family=AvailabilityCausalFamily.PUBLIC_READ_FAULT,
+                causal_lifecycle_id=f"fault:{self.fault_id}",
+            ),
+            ended_at_utc_ns=self.resolved_at.nanoseconds_since_epoch,
+            ended_monotonic_ns=self.resolved_monotonic_ns,
+            closure_reason_code=f"AUDIT_FAULT_{self.resolution.value}",
+            closure_source_evidence_ids=(
+                "raw-source:"
+                f"{self.resolution_source.ingest_id.value}:"
+                f"{self.resolution_source.payload_sha256}",
+            ),
+            open_at_shutdown=False,
+        )
 
 
 def audit_fault_origin(command: AuditFailureCommand) -> AuditFaultOrigin:

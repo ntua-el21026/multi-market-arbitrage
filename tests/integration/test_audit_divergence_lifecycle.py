@@ -811,6 +811,7 @@ async def test_off_socket_cancellation_durably_terminalizes_replacement_recovery
         writer: RawJournalWriter,
         processor: CanonicalProcessor,
         metrics: InMemoryMetrics,
+        runtime_health: ObservationRuntimeHealth | None = None,
     ) -> None:
         original_capture_init(
             capture,
@@ -818,6 +819,7 @@ async def test_off_socket_cancellation_durably_terminalizes_replacement_recovery
             writer=writer,
             processor=processor,
             metrics=metrics,
+            runtime_health=runtime_health,
         )
         retained_captures.append(capture)
 
@@ -1271,9 +1273,11 @@ async def test_observed_divergence_resnapshot_replacement_generation_restores_cu
     assert interval["research_eligibility_restored"] is True
     assert interval["open_at_shutdown"] is False
     assert interval["socket_generation"] == 1
-    assert interval["affected_scopes"] == sorted(
-        scope.value for scope in AvailabilityScope if scope is not AvailabilityScope.TARGET
-    )
+    assert interval["affected_scopes"] == [
+        AvailabilityScope.AUDIT_ELIGIBILITY.value,
+        AvailabilityScope.CANONICAL_BOOKS.value,
+        AvailabilityScope.SCANNER_RESEARCH_ELIGIBILITY.value,
+    ]
     assert interval["ended_monotonic_ns"] >= interval["started_monotonic_ns"]
     assert interval["ended_monotonic_ns"] >= replacement_processing_completed_ns[-1]
 

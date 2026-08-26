@@ -15,11 +15,15 @@ from multi_market_arbitrage.availability_authority import (
     AuditAvailabilityAuthoritySnapshot,
     AuditAvailabilityBinding,
     AuditAvailabilityContributionChainSnapshot,
+    PublicReadFaultAvailabilityProjectionSnapshot,
     audit_availability_chain_extend,
     audit_availability_chain_seed,
     audit_availability_contribution_chain_extend,
     audit_availability_contribution_chain_seed,
     empty_audit_availability_contribution_snapshot,
+    empty_public_read_fault_availability_projection,
+    public_read_fault_availability_chain_extend,
+    public_read_fault_availability_chain_seed,
 )
 from multi_market_arbitrage.core.config import Phase1Config, load_phase1_config
 from multi_market_arbitrage.core.exact import ExactDecimal, Price, Quantity
@@ -37,6 +41,7 @@ from multi_market_arbitrage.core.time import MonotonicTimestamp, UtcTimestamp
 from multi_market_arbitrage.ingestion import RawEventEnvelope
 from multi_market_arbitrage.journal import JournalMetricsSnapshot
 from multi_market_arbitrage.observability import (
+    AvailabilityCausalFamily,
     AvailabilityCause,
     AvailabilityEvidenceRuntimeSnapshot,
     AvailabilityIntervalContribution,
@@ -50,15 +55,19 @@ from multi_market_arbitrage.observability import (
     InMemoryMetrics,
     SupervisedAvailabilityIntervalWriter,
     normalize_git_commit,
+    reconcile_published_availability_evidence,
 )
 from multi_market_arbitrage.pipeline.audit import (
+    AUDIT_FAILURE_V1_SCHEMA,
     AUDIT_FAILURE_V2_SCHEMA,
     AUDIT_START_V2_SCHEMA,
     AuditBookIdentity,
     AuditFailureReason,
+    AuditFaultAffectedScope,
     AuditFaultFailureEvidenceKind,
     AuditFaultLifecycleRecord,
     AuditFaultOrigin,
+    AuditFaultResolution,
     AuditFaultStatus,
     AuditMismatchCause,
     AuditMismatchDiagnostic,
@@ -91,6 +100,7 @@ from multi_market_arbitrage.pipeline.health import (
     audit_availability_authority_reconciled,
     build_observation_health_checkpoint,
     capture_terminal_process_resources,
+    public_read_fault_availability_projection_reconciled,
 )
 from multi_market_arbitrage.pipeline.ingress import BoundedRawIngress
 from multi_market_arbitrage.pipeline.processor import (
@@ -969,6 +979,20 @@ def test_checkpoint_current_external_fault_is_nonsticky_until_terminal_and_recov
     assert (
         cast(dict[str, object], periodic.audit["fault_lifecycles"])["evidence_reconciled"] is True
     )
+    assert "availability_projection" not in cast(
+        dict[str, object], periodic.audit["fault_lifecycles"]
+    )
+    terminal_projection = cast(
+        dict[str, object],
+        cast(dict[str, object], terminal.audit["fault_lifecycles"])["availability_projection"],
+    )
+    assert terminal_projection == {
+        "completed": 0,
+        "completion_digest": public_read_fault_availability_chain_seed("completion"),
+        "evidence_reconciled": True,
+        "open_digest": public_read_fault_availability_chain_seed("open"),
+        "opened": 0,
+    }
     assert {
         HealthDecisionReason.AUDIT_FAILED,
         HealthDecisionReason.HTTP_FINAL_FAILURE,
@@ -2684,6 +2708,535 @@ def test_non_audit_interruption_rejects_recovery_only_audit_provenance() -> None
         replace(interruption, authoritative_resolution_source=source)
     with pytest.raises(ValueError, match="non-audit interruption"):
         replace(interruption, replacement_release_source=source)
+
+
+def test_public_read_fault_interruption_accepts_only_its_direct_identity_subset() -> None:
+    fault = _current_http_audit_fault(
+        instrument_id=InstrumentId("public-read-fault-direct-binding"),
+        market_id=MarketId("public-read-fault-direct-binding-market"),
+        native_asset_id="public-read-fault-direct-binding-asset",
+        label="public-read-fault-direct-binding",
+    )
+    interruption = AvailabilityInterruption(
+        cause=AvailabilityCause.PUBLIC_READ_FAULT,
+        reason_code=fault.reason.value,
+        source_evidence_ids=(f"audit-fault:{fault.fault_id}",),
+        affected_instruments=(fault.instrument_id,),
+        affected_scopes=(AvailabilityScope.AUDIT_ELIGIBILITY,),
+        recovery_action=AvailabilityRecoveryAction.RESNAPSHOT,
+        request_id=fault.request_id,
+        instrument_id=fault.instrument_id,
+        market_id=fault.market_id.value,
+        causal_family=AvailabilityCausalFamily.PUBLIC_READ_FAULT,
+        fault_lifecycle_id=fault.fault_id,
+    )
+
+    assert interruption.request_id == fault.request_id
+    with pytest.raises(ValueError, match="public-read fault interruption"):
+        replace(interruption, divergence_id="a" * 64)
+    with pytest.raises(ValueError, match="public-read fault interruption"):
+        replace(interruption, audit_start_source=fault.audit_start_source)
+    with pytest.raises(ValueError, match="public-read fault interruption"):
+        replace(interruption, recovery_id="mismatch-only-recovery")
+
+
+def test_public_read_fault_projection_accumulator_is_order_independent_and_counted() -> None:
+    faults = tuple(
+        _current_http_audit_fault(
+            instrument_id=InstrumentId(f"public-read-accumulator-instrument-{index}"),
+            market_id=MarketId(f"public-read-accumulator-market-{index}"),
+            native_asset_id=f"public-read-accumulator-asset-{index}",
+            label=f"public-read-accumulator-{index}",
+        )
+        for index in range(2)
+    )
+    first, second = tuple(fault.public_read_fault_availability_open_identity() for fault in faults)
+    seed = public_read_fault_availability_chain_seed("open")
+    first_then_second = public_read_fault_availability_chain_extend(
+        public_read_fault_availability_chain_extend(seed, "open", first),
+        "open",
+        second,
+    )
+    second_then_first = public_read_fault_availability_chain_extend(
+        public_read_fault_availability_chain_extend(seed, "open", second),
+        "open",
+        first,
+    )
+    first_twice = public_read_fault_availability_chain_extend(
+        public_read_fault_availability_chain_extend(seed, "open", first),
+        "open",
+        first,
+    )
+
+    assert first_then_second == second_then_first
+    assert first_twice not in {
+        seed,
+        public_read_fault_availability_chain_extend(seed, "open", first),
+        first_then_second,
+    }
+    assert PublicReadFaultAvailabilityProjectionSnapshot(
+        opened=2,
+        completed=0,
+        open_chain_sha256=first_twice,
+        completion_chain_sha256=public_read_fault_availability_chain_seed("completion"),
+    ) != PublicReadFaultAvailabilityProjectionSnapshot(
+        opened=1,
+        completed=0,
+        open_chain_sha256=public_read_fault_availability_chain_extend(seed, "open", first),
+        completion_chain_sha256=public_read_fault_availability_chain_seed("completion"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_public_read_fault_contributor_preserves_socket_and_closes_only_on_resolution(
+    tmp_path: Path,
+) -> None:
+    run_id = CollectorRunId("availability-public-read-fault")
+    writer = SupervisedAvailabilityIntervalWriter(
+        root=tmp_path,
+        collector_run_id=run_id,
+        queue_capacity=2,
+        maximum_intervals=4,
+        maximum_file_bytes=64 * 1024,
+    )
+    await writer.start()
+    runtime = ObservationRuntimeHealth(
+        collector_run_id=run_id,
+        availability_writer=writer,
+    )
+    connection_id = ConnectionId("availability-public-read-fault-connection")
+    runtime.begin_generation(connection_id, _ingress(connection_id))
+    runtime.mark_connected(
+        now_ns=10,
+        now_utc=UtcTimestamp(1_800_000_000_000_000_010),
+    )
+    instrument_id = InstrumentId("availability-public-read-fault-instrument")
+    fault = _current_http_audit_fault(
+        instrument_id=instrument_id,
+        market_id=MarketId("availability-public-read-fault-market"),
+        native_asset_id="availability-public-read-fault-asset",
+        label="availability-public-read-fault",
+    )
+
+    runtime.open_audit_fault_contributor(fault)
+    runtime.open_audit_fault_contributor(fault)
+
+    during_fault = runtime.snapshot(now_ns=25)
+    assert during_fault.socket_connected is True
+    assert during_fault.active_availability_contributors == 1
+    active_fault = runtime.active_availability_contributors[0]
+    assert active_fault.observation_count == 2
+    assert active_fault.causal_family.value == "PUBLIC_READ_FAULT"
+    assert active_fault.causal_lifecycle_id == f"fault:{fault.fault_id}"
+    assert active_fault.cause is AvailabilityCause.PUBLIC_READ_FAULT
+
+    overlapping_fault = _current_http_audit_fault(
+        instrument_id=instrument_id,
+        market_id=MarketId("availability-public-read-fault-market"),
+        native_asset_id="availability-public-read-fault-asset",
+        label="availability-public-read-fault-overlap",
+    )
+    runtime.open_audit_fault_contributor(overlapping_fault)
+    assert runtime.snapshot(now_ns=25).active_availability_contributors == 2
+
+    # A connected generation is not authoritative resolution for this cause.
+    runtime.mark_connected(
+        now_ns=30,
+        now_utc=UtcTimestamp(1_800_000_000_000_000_030),
+    )
+    assert runtime.snapshot(now_ns=30).active_availability_contributors == 2
+
+    resolution_source = RawSourceRef(
+        ingest_id=IngestId("availability-public-read-fault-resolution"),
+        payload_sha256=hashlib.sha256(b"availability-public-read-fault-resolution").hexdigest(),
+    )
+    resolved = replace(
+        fault,
+        status=AuditFaultStatus.RESOLVED,
+        blocks_current_scope=False,
+        resolution=AuditFaultResolution.LATER_FENCED_MATCH,
+        resolution_source=resolution_source,
+        resolved_at=UtcTimestamp(1_800_000_000_000_000_040),
+        resolved_monotonic_ns=40,
+    )
+    runtime.resolve_audit_fault_contributor(resolved)
+
+    after_first_resolution = runtime.snapshot(now_ns=40)
+    assert after_first_resolution.socket_connected is True
+    assert after_first_resolution.active_availability_contributors == 1
+    assert after_first_resolution.current_unavailable_started_monotonic_ns == 20
+
+    second_resolution_source = RawSourceRef(
+        ingest_id=IngestId("availability-public-read-fault-overlap-resolution"),
+        payload_sha256=hashlib.sha256(
+            b"availability-public-read-fault-overlap-resolution"
+        ).hexdigest(),
+    )
+    resolved_overlap = replace(
+        overlapping_fault,
+        status=AuditFaultStatus.RESOLVED,
+        blocks_current_scope=False,
+        resolution=AuditFaultResolution.LATER_FENCED_MATCH,
+        resolution_source=second_resolution_source,
+        resolved_at=UtcTimestamp(1_800_000_000_000_000_050),
+        resolved_monotonic_ns=50,
+    )
+    runtime.resolve_audit_fault_contributor(resolved_overlap)
+
+    after_resolution = runtime.snapshot(now_ns=50)
+    assert after_resolution.socket_connected is True
+    assert after_resolution.active_availability_contributors == 0
+    assert after_resolution.current_unavailable_started_monotonic_ns is None
+    assert after_resolution.public_read_fault_availability_projection.opened == 2
+    assert after_resolution.public_read_fault_availability_projection.completed == 2
+    summary = await writer.close(completed=True, terminal_active_causal_keys=())
+    assert summary.contribution_path is not None
+    assert (
+        summary.public_read_fault_projection_accepted
+        == summary.public_read_fault_projection_written
+        == after_resolution.public_read_fault_availability_projection
+    )
+    assert (
+        summary.public_read_fault_completion_expected_written_chain_sha256
+        == after_resolution.public_read_fault_availability_projection.completion_chain_sha256
+    )
+    assert reconcile_published_availability_evidence(
+        summary,
+        expected_audit_contributions=empty_audit_availability_contribution_snapshot(),
+        expected_public_read_fault_projection=(
+            after_resolution.public_read_fault_availability_projection
+        ),
+    ).reconciled
+    contributions = tuple(
+        json.loads(line)
+        for line in summary.contribution_path.read_text(encoding="utf-8").splitlines()
+    )
+    assert len(contributions) == 2
+    contribution = contributions[0]
+    assert contribution["cause_type"] == AvailabilityCause.PUBLIC_READ_FAULT.value
+    assert contribution["fault_lifecycle_id"] == fault.fault_id
+    assert contribution["observation_count"] == 2
+    assert contribution["affected_scopes"] == [
+        AuditFaultAffectedScope.AUDIT_ELIGIBILITY.value,
+        AuditFaultAffectedScope.SCANNER_RESEARCH_ELIGIBILITY.value,
+    ]
+    assert contribution["closure_reason_code"] == ("AUDIT_FAULT_LATER_FENCED_MATCH")
+    assert contributions[1]["fault_lifecycle_id"] == overlapping_fault.fault_id
+    assert contributions[1]["observation_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_public_read_fault_projection_reconciles_reverse_key_same_start_order(
+    tmp_path: Path,
+) -> None:
+    run_id = CollectorRunId("availability-public-read-fault-reverse-key")
+    writer = SupervisedAvailabilityIntervalWriter(
+        root=tmp_path,
+        collector_run_id=run_id,
+        queue_capacity=2,
+        maximum_intervals=4,
+        maximum_file_bytes=64 * 1024,
+    )
+    await writer.start()
+    runtime = ObservationRuntimeHealth(
+        collector_run_id=run_id,
+        availability_writer=writer,
+    )
+    connection_id = ConnectionId("availability-public-read-fault-reverse-key-connection")
+    runtime.begin_generation(connection_id, _ingress(connection_id))
+    runtime.mark_connected(
+        now_ns=10,
+        now_utc=UtcTimestamp(1_800_000_000_000_000_010),
+    )
+    faults = tuple(
+        _current_http_audit_fault(
+            instrument_id=InstrumentId(f"reverse-key-instrument-{index}"),
+            market_id=MarketId(f"reverse-key-market-{index}"),
+            native_asset_id=f"reverse-key-asset-{index}",
+            label=f"reverse-key-{index}",
+        )
+        for index in range(2)
+    )
+    reverse_key_faults = tuple(
+        sorted(
+            faults,
+            key=lambda fault: (
+                fault.public_read_fault_availability_open_identity().stable_causal_key
+            ),
+            reverse=True,
+        )
+    )
+    opening_identities = tuple(
+        fault.public_read_fault_availability_open_identity() for fault in reverse_key_faults
+    )
+    assert opening_identities[0].started_monotonic_ns == opening_identities[1].started_monotonic_ns
+    assert opening_identities[0].stable_causal_key > opening_identities[1].stable_causal_key
+    for fault in reverse_key_faults:
+        runtime.open_audit_fault_contributor(fault)
+
+    for index, fault in enumerate(reverse_key_faults):
+        resolution_source = RawSourceRef(
+            ingest_id=IngestId(f"reverse-key-resolution-{index}"),
+            payload_sha256=hashlib.sha256(f"reverse-key-resolution-{index}".encode()).hexdigest(),
+        )
+        runtime.resolve_audit_fault_contributor(
+            replace(
+                fault,
+                status=AuditFaultStatus.RESOLVED,
+                blocks_current_scope=False,
+                resolution=AuditFaultResolution.LATER_FENCED_MATCH,
+                resolution_source=resolution_source,
+                resolved_at=UtcTimestamp(1_800_000_000_000_000_040 + index),
+                resolved_monotonic_ns=40 + index,
+            )
+        )
+
+    terminal = runtime.snapshot(now_ns=50)
+    summary = await writer.close(completed=True, terminal_active_causal_keys=())
+    assert terminal.socket_connected is True
+    assert terminal.public_read_fault_availability_projection.opened == 2
+    assert terminal.public_read_fault_availability_projection.completed == 2
+    assert (
+        summary.public_read_fault_projection_accepted
+        == summary.public_read_fault_projection_written
+        == terminal.public_read_fault_availability_projection
+    )
+    reconciliation = reconcile_published_availability_evidence(
+        summary,
+        expected_audit_contributions=empty_audit_availability_contribution_snapshot(),
+        expected_public_read_fault_projection=(terminal.public_read_fault_availability_projection),
+    )
+    assert reconciliation.reconciled
+    assert summary.contribution_path is not None
+    contributions = tuple(
+        json.loads(line)
+        for line in summary.contribution_path.read_text(encoding="utf-8").splitlines()
+    )
+    assert tuple(item["stable_causal_key"] for item in contributions) == tuple(
+        identity.stable_causal_key for identity in opening_identities
+    )
+
+
+@pytest.mark.parametrize("mutation", ["omitted", "duplicated", "substituted"])
+def test_public_read_fault_projection_identity_disagreement_fails_terminal_health(
+    mutation: str,
+) -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    updated_at = UtcTimestamp(1_800_000_000_000_000_000)
+    base_processor, target = _healthy_target_processor(config, updated_at=updated_at)
+    scoped_base_processor = cast(_ScopedProcessorView, base_processor)
+    fault = _current_http_audit_fault(
+        instrument_id=InstrumentId.from_native(POLYMARKET_VENUE_ID, target.yes_token_id),
+        market_id=MarketId(target.condition_id),
+        native_asset_id=target.yes_token_id,
+        label=f"projection-{mutation}",
+    )
+    runtime = ObservationRuntimeHealth()
+    connection_id = ConnectionId(f"projection-{mutation}-connection")
+    runtime.begin_generation(connection_id, _ingress(connection_id))
+    runtime.mark_connected(now_ns=10, now_utc=updated_at)
+    runtime.open_audit_fault_contributor(fault)
+    resolution_source = RawSourceRef(
+        ingest_id=IngestId(f"projection-{mutation}-resolution"),
+        payload_sha256=hashlib.sha256(f"projection-{mutation}-resolution".encode()).hexdigest(),
+    )
+    resolved = replace(
+        fault,
+        status=AuditFaultStatus.RESOLVED,
+        blocks_current_scope=False,
+        resolution=AuditFaultResolution.LATER_FENCED_MATCH,
+        resolution_source=resolution_source,
+        resolved_at=UtcTimestamp(updated_at.nanoseconds_since_epoch + 40),
+        resolved_monotonic_ns=40,
+    )
+    runtime.resolve_audit_fault_contributor(resolved)
+    runtime_snapshot = runtime.snapshot(now_ns=50)
+    expected = runtime_snapshot.public_read_fault_availability_projection
+    projected_processor = _ScopedProcessorView(
+        scoped_base_processor.canonical_processor,
+        scoped_base_processor.snapshots(),
+        operational_snapshot_transform=lambda snapshot: replace(
+            snapshot,
+            public_read_fault_availability_projection=expected,
+        ),
+    )
+
+    open_identity = fault.public_read_fault_availability_open_identity()
+    completion_identity = resolved.public_read_fault_availability_completion_identity()
+    if mutation == "omitted":
+        observed = empty_public_read_fault_availability_projection()
+    elif mutation == "duplicated":
+        open_chain = public_read_fault_availability_chain_seed("open")
+        completion_chain = public_read_fault_availability_chain_seed("completion")
+        for _ in range(2):
+            open_chain = public_read_fault_availability_chain_extend(
+                open_chain,
+                "open",
+                open_identity,
+            )
+            completion_chain = public_read_fault_availability_chain_extend(
+                completion_chain,
+                "completion",
+                completion_identity,
+            )
+        observed = PublicReadFaultAvailabilityProjectionSnapshot(
+            opened=2,
+            completed=2,
+            open_chain_sha256=open_chain,
+            completion_chain_sha256=completion_chain,
+        )
+    else:
+        observed = PublicReadFaultAvailabilityProjectionSnapshot(
+            opened=1,
+            completed=1,
+            open_chain_sha256=public_read_fault_availability_chain_extend(
+                public_read_fault_availability_chain_seed("open"),
+                "open",
+                replace(open_identity, request_id=f"{open_identity.request_id}-substituted"),
+            ),
+            completion_chain_sha256=expected.completion_chain_sha256,
+        )
+    exact_writer = AvailabilityEvidenceRuntimeSnapshot(
+        healthy=True,
+        queue_depth=0,
+        queue_high_water=0,
+        accepted=runtime_snapshot.availability_records_emitted,
+        written=runtime_snapshot.availability_records_emitted,
+        rejected=0,
+        file_bytes=0,
+        unavailable_duration_nanoseconds=runtime_snapshot.unavailable_total_nanoseconds,
+        longest_interval_nanoseconds=runtime_snapshot.longest_unavailable_nanoseconds,
+        open_at_shutdown_intervals=0,
+        failure_type=None,
+        contributions_accepted=runtime_snapshot.availability_contributions_emitted,
+        contributions_written=runtime_snapshot.availability_contributions_emitted,
+        public_read_fault_projection_accepted=expected,
+        public_read_fault_projection_written=expected,
+        public_read_fault_completion_expected_written_chain_sha256=(
+            expected.completion_chain_sha256
+        ),
+    )
+    processor_snapshot = projected_processor.operational_snapshot()
+    assert public_read_fault_availability_projection_reconciled(
+        processor_snapshot,
+        runtime_snapshot,
+        exact_writer,
+    )
+
+    disagreeing_writer = replace(
+        exact_writer,
+        public_read_fault_projection_accepted=observed,
+        public_read_fault_projection_written=observed,
+        public_read_fault_completion_expected_written_chain_sha256=(
+            observed.completion_chain_sha256
+        ),
+    )
+    assert not public_read_fault_availability_projection_reconciled(
+        processor_snapshot,
+        runtime_snapshot,
+        disagreeing_writer,
+    )
+    checkpoint = _checkpoint(
+        config=config,
+        target=target,
+        processor=cast(CanonicalProcessor, projected_processor),
+        book_last_valid_receive_monotonic_ns=_target_receive_times(target, 50),
+        emitted_at=updated_at,
+        monotonic_now_ns=50,
+        runtime_snapshot=runtime_snapshot,
+        availability_writer=disagreeing_writer,
+        terminal=True,
+    )
+    assert HealthDecisionReason.AVAILABILITY_RECONCILIATION_FAILED in checkpoint.reason_codes
+    # ADR-0055 scopes this fault to audit/research eligibility; capture remains
+    # connected while the projection discrepancy still fails the Gate.
+    assert checkpoint.capture_healthy is True
+    assert checkpoint.gate1_eligible_so_far is False
+    compact_projection = cast(
+        dict[str, object],
+        cast(dict[str, object], checkpoint.audit["fault_lifecycles"])["availability_projection"],
+    )
+    assert compact_projection == {
+        "completed": expected.completed,
+        "completion_digest": expected.completion_chain_sha256,
+        "evidence_reconciled": False,
+        "open_digest": expected.open_chain_sha256,
+        "opened": expected.opened,
+    }
+
+
+@pytest.mark.asyncio
+async def test_permanent_public_read_fault_terminalizes_while_legacy_nonblocking_fault_does_not(
+    tmp_path: Path,
+) -> None:
+    run_id = CollectorRunId("availability-permanent-public-read-fault")
+    writer = SupervisedAvailabilityIntervalWriter(
+        root=tmp_path,
+        collector_run_id=run_id,
+        queue_capacity=2,
+        maximum_intervals=4,
+        maximum_file_bytes=64 * 1024,
+    )
+    await writer.start()
+    runtime = ObservationRuntimeHealth(
+        collector_run_id=run_id,
+        availability_writer=writer,
+    )
+    connection_id = ConnectionId("availability-permanent-public-read-fault-connection")
+    runtime.begin_generation(connection_id, _ingress(connection_id))
+    runtime.mark_connected(
+        now_ns=10,
+        now_utc=UtcTimestamp(1_800_000_000_000_000_010),
+    )
+    fault = _current_http_audit_fault(
+        instrument_id=InstrumentId("availability-permanent-public-read-fault-instrument"),
+        market_id=MarketId("availability-permanent-public-read-fault-market"),
+        native_asset_id="availability-permanent-public-read-fault-asset",
+        label="availability-permanent-public-read-fault",
+    )
+    legacy_nonblocking = replace(
+        fault,
+        origin=AuditFaultOrigin.INDETERMINATE,
+        status=AuditFaultStatus.PERMANENT,
+        failure_schema=AUDIT_FAILURE_V1_SCHEMA,
+        blocks_current_scope=False,
+        error_type=AuditFailureReason.HTTP_REQUEST_FAILED.value,
+        endpoint_class=None,
+        category=None,
+        retryable=None,
+        attempt=None,
+        retry_after_disposition=None,
+        retry_exhausted=None,
+        retry_blocked_reason=None,
+    )
+    runtime.open_audit_fault_contributor(legacy_nonblocking)
+    assert runtime.snapshot(now_ns=20).active_availability_contributors == 0
+
+    permanent = replace(
+        fault,
+        status=AuditFaultStatus.PERMANENT,
+    )
+    runtime.open_audit_fault_contributor(permanent)
+    terminal_keys = tuple(
+        contributor.stable_causal_key for contributor in runtime.active_availability_contributors
+    )
+    interval = runtime.finalize_open_interval(
+        cutoff_at=UtcTimestamp(1_800_000_000_000_000_100),
+        cutoff_monotonic_ns=100,
+    )
+    summary = await writer.close(
+        completed=True,
+        terminal_active_causal_keys=terminal_keys,
+    )
+
+    assert interval is not None
+    assert interval.open_at_shutdown is True
+    assert interval.research_eligibility_restored is False
+    assert summary.contribution_path is not None
+    contribution = json.loads(summary.contribution_path.read_text(encoding="utf-8"))
+    assert contribution["fault_lifecycle_id"] == permanent.fault_id
+    assert contribution["open_at_shutdown"] is True
+    assert contribution["closure_reason_code"] == "TERMINAL_CAPTURE_CUTOFF"
 
 
 @pytest.mark.asyncio

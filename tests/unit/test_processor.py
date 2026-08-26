@@ -2004,6 +2004,8 @@ def test_classification_schema_is_exact_implicit_fault_authority(
     lifecycle = processor.summary().audit_fault_lifecycle_records[0]
 
     assert failed.success
+    assert failed.audit_faults_opened == (lifecycle,)
+    assert failed.audit_faults_resolved == ()
     assert failed.audit_outcomes[0].reason is AuditFailureReason.BOOK_FRESHNESS_EXPIRED
     assert (
         lifecycle.failure_evidence_kind
@@ -4122,6 +4124,10 @@ def test_rest_audit_failure_blocks_eligibility_without_forcing_socket_resync() -
     )
 
     assert recovered.audit_outcomes[0].outcome is AuditOutcome.MATCH
+    assert recovered.audit_faults_opened == ()
+    assert recovered.audit_faults_resolved == (
+        explicit.summary().audit_fault_lifecycle_records[-1],
+    )
     assert explicit.summary().audit_ineligible_books == 0
     assert explicit.summary().audit_faults_current == 0
     assert explicit.summary().audit_faults_resolved == 1
@@ -4530,6 +4536,8 @@ def test_only_proven_transient_audit_faults_clear_on_match_or_resnapshot(
     first_lifecycle = failed_summary.audit_fault_lifecycle_records[0]
 
     assert failed.success
+    assert failed.audit_faults_opened == (first_lifecycle,)
+    assert failed.audit_faults_resolved == ()
     assert first_lifecycle.origin is expected_origin
     assert first_lifecycle.status is (
         AuditFaultStatus.CURRENT if expected_resolved else AuditFaultStatus.PERMANENT
@@ -4565,6 +4573,10 @@ def test_only_proven_transient_audit_faults_clear_on_match_or_resnapshot(
     after_match = processor.summary()
 
     assert recovered.audit_outcomes[0].outcome is AuditOutcome.MATCH
+    assert recovered.audit_faults_opened == ()
+    assert recovered.audit_faults_resolved == (
+        (after_match.audit_fault_lifecycle_records[-1],) if expected_resolved else ()
+    )
     assert after_match.audit_faults_current == 0
     assert after_match.audit_faults_resolved == int(expected_resolved)
     assert after_match.audit_faults_permanent == int(not expected_resolved)
@@ -5648,8 +5660,13 @@ def test_terminal_hash_is_independent_of_nonempty_audit_fault_retention_capacity
         ).to_payload(),
         connection_id=start.connection_id,
     )
-    assert lean.process_replayed(failure).success
-    assert retained.process_replayed(failure).success
+    lean_failure = lean.process_replayed(failure)
+    retained_failure = retained.process_replayed(failure)
+    assert lean_failure.success
+    assert retained_failure.success
+    assert lean_failure.audit_faults_opened == retained_failure.audit_faults_opened
+    assert len(lean_failure.audit_faults_opened) == 1
+    assert lean_failure.audit_faults_resolved == retained_failure.audit_faults_resolved == ()
 
     lean_current = lean.summary()
     retained_current = retained.summary()
@@ -5668,6 +5685,14 @@ def test_terminal_hash_is_independent_of_nonempty_audit_fault_retention_capacity
     assert lean_current.audit_fault_lifecycle_chain_sha256 == (
         retained_current.audit_fault_lifecycle_chain_sha256
     )
+    assert (
+        lean_current.public_read_fault_availability_projection
+        == retained_current.public_read_fault_availability_projection
+        == lean.operational_snapshot().public_read_fault_availability_projection
+        == retained.operational_snapshot().public_read_fault_availability_projection
+    )
+    assert lean_current.public_read_fault_availability_projection.opened == 1
+    assert lean_current.public_read_fault_availability_projection.completed == 0
     assert lean_current.terminal_hash == retained_current.terminal_hash
 
     recovery_start, recovery_intent = _audit_start(
@@ -5685,8 +5710,13 @@ def test_terminal_hash_is_independent_of_nonempty_audit_fault_retention_capacity
         _fixture("polymarket_rest_book_yes.json"),
         boundary=0,
     )
-    assert lean.process_replayed(recovery).success
-    assert retained.process_replayed(recovery).success
+    lean_recovery = lean.process_replayed(recovery)
+    retained_recovery = retained.process_replayed(recovery)
+    assert lean_recovery.success
+    assert retained_recovery.success
+    assert lean_recovery.audit_faults_opened == retained_recovery.audit_faults_opened == ()
+    assert lean_recovery.audit_faults_resolved == retained_recovery.audit_faults_resolved
+    assert len(lean_recovery.audit_faults_resolved) == 1
 
     lean_resolved = lean.summary()
     retained_resolved = retained.summary()
@@ -5706,6 +5736,14 @@ def test_terminal_hash_is_independent_of_nonempty_audit_fault_retention_capacity
     assert lean_resolved.audit_fault_lifecycle_chain_sha256 == (
         retained_resolved.audit_fault_lifecycle_chain_sha256
     )
+    assert (
+        lean_resolved.public_read_fault_availability_projection
+        == retained_resolved.public_read_fault_availability_projection
+        == lean.operational_snapshot().public_read_fault_availability_projection
+        == retained.operational_snapshot().public_read_fault_availability_projection
+    )
+    assert lean_resolved.public_read_fault_availability_projection.opened == 1
+    assert lean_resolved.public_read_fault_availability_projection.completed == 1
     assert lean_resolved.terminal_hash == retained_resolved.terminal_hash
 
 

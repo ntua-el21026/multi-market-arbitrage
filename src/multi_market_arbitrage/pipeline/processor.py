@@ -9,15 +9,19 @@ import time
 from collections import deque
 from collections.abc import Callable
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Final, Protocol, cast
 
 from multi_market_arbitrage.availability_authority import (
     AuditAvailabilityAuthoritySnapshot,
     AuditAvailabilityBinding,
+    PublicReadFaultAvailabilityProjectionSnapshot,
     audit_availability_chain_extend,
     audit_availability_chain_seed,
+    empty_public_read_fault_availability_projection,
+    public_read_fault_availability_chain_extend,
+    public_read_fault_availability_chain_seed,
 )
 from multi_market_arbitrage.core.config import Phase1Config
 from multi_market_arbitrage.core.errors import ProgrammingInvariantViolation
@@ -436,6 +440,8 @@ class ProcessedEnvelope:
     audit_divergences_opened: tuple[AuditDivergencePending, ...] = ()
     audit_divergences_resolved: tuple[AuditDivergenceResolution, ...] = ()
     audit_divergences_eligibility_restored: tuple[AuditDivergenceEligibilityRestoration, ...] = ()
+    audit_faults_opened: tuple[AuditFaultLifecycleRecord, ...] = ()
+    audit_faults_resolved: tuple[AuditFaultLifecycleRecord, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1192,6 +1198,9 @@ class ProcessorOperationalSnapshot:
     audit_barrier_lag_frames_max: int | None
     audit_race_budget_exhaustions: int
     retention: tuple[ProcessorRetentionSnapshot, ...]
+    public_read_fault_availability_projection: PublicReadFaultAvailabilityProjectionSnapshot = (
+        field(default_factory=empty_public_read_fault_availability_projection)
+    )
 
     def retention_for(self, domain: ProcessorRetentionDomain) -> ProcessorRetentionSnapshot:
         for item in self.retention:
@@ -1300,6 +1309,9 @@ class ProcessorSummary:
     audit_fault_lifecycle_records: tuple[AuditFaultLifecycleRecord, ...]
     reported_top_transitions: tuple[ReportedTopTransition, ...]
     reported_top_transition_outcomes: tuple[ReportedTopTransitionOutcome, ...]
+    public_read_fault_availability_projection: PublicReadFaultAvailabilityProjectionSnapshot = (
+        field(default_factory=empty_public_read_fault_availability_projection)
+    )
 
 
 class AnalyticalOutputSink(Protocol):
@@ -1449,6 +1461,8 @@ class CanonicalProcessor:
         self._active_audit_divergences_eligibility_restored: (
             list[AuditDivergenceEligibilityRestoration] | None
         ) = None
+        self._active_audit_faults_opened: list[AuditFaultLifecycleRecord] | None = None
+        self._active_audit_faults_resolved: list[AuditFaultLifecycleRecord] | None = None
         self._active_canonical_event: CanonicalEvent | None = None
         self._last_accepted_l2_monotonic: dict[InstrumentId, MonotonicTimestamp] = {}
         self._raw_input_chain = _chain_seed("raw-input")
@@ -1506,6 +1520,14 @@ class CanonicalProcessor:
         self._audit_faults_observed = 0
         self._audit_faults_resolved = 0
         self._audit_faults_permanent = 0
+        self._public_read_fault_availability_opened = 0
+        self._public_read_fault_availability_completed = 0
+        self._public_read_fault_availability_open_chain = public_read_fault_availability_chain_seed(
+            "open"
+        )
+        self._public_read_fault_availability_completion_chain = (
+            public_read_fault_availability_chain_seed("completion")
+        )
         self._audit_http_faults_observed = 0
         self._audit_http_faults_resolved = 0
         self._audit_http_faults_permanent = 0
@@ -2431,6 +2453,8 @@ class CanonicalProcessor:
             or self._active_audit_divergences_opened is not None
             or self._active_audit_divergences_resolved is not None
             or self._active_audit_divergences_eligibility_restored is not None
+            or self._active_audit_faults_opened is not None
+            or self._active_audit_faults_resolved is not None
             or self._active_canonical_event is not None
         ):
             raise ProgrammingInvariantViolation(
@@ -2459,6 +2483,8 @@ class CanonicalProcessor:
         current_audit_divergences_eligibility_restored: list[
             AuditDivergenceEligibilityRestoration
         ] = []
+        current_audit_faults_opened: list[AuditFaultLifecycleRecord] = []
+        current_audit_faults_resolved: list[AuditFaultLifecycleRecord] = []
         self._active_refresh_requests = current_refresh_requests
         self._active_dirty_markets = current_dirty_markets
         self._active_freshness_updates = current_freshness_updates
@@ -2473,6 +2499,8 @@ class CanonicalProcessor:
         self._active_audit_divergences_eligibility_restored = (
             current_audit_divergences_eligibility_restored
         )
+        self._active_audit_faults_opened = current_audit_faults_opened
+        self._active_audit_faults_resolved = current_audit_faults_resolved
         try:
             try:
                 self._route(envelope)
@@ -2582,6 +2610,8 @@ class CanonicalProcessor:
                     audit_divergences_eligibility_restored=tuple(
                         current_audit_divergences_eligibility_restored
                     ),
+                    audit_faults_opened=tuple(current_audit_faults_opened),
+                    audit_faults_resolved=tuple(current_audit_faults_resolved),
                 )
             else:
                 scan_triggers = self._flush_dirty_scans(
@@ -2658,6 +2688,8 @@ class CanonicalProcessor:
                     audit_divergences_eligibility_restored=tuple(
                         current_audit_divergences_eligibility_restored
                     ),
+                    audit_faults_opened=tuple(current_audit_faults_opened),
+                    audit_faults_resolved=tuple(current_audit_faults_resolved),
                 )
         finally:
             self._active_refresh_requests = None
@@ -2672,6 +2704,8 @@ class CanonicalProcessor:
             self._active_audit_divergences_opened = None
             self._active_audit_divergences_resolved = None
             self._active_audit_divergences_eligibility_restored = None
+            self._active_audit_faults_opened = None
+            self._active_audit_faults_resolved = None
             self._active_canonical_event = None
         return processed
 
@@ -4344,7 +4378,22 @@ class CanonicalProcessor:
                 self._audit_fault_scope_block_count_by_instrument.get(record.instrument_id, 0) + 1
             )
             self._mark_audit_ineligible(record.instrument_id, nonfault=False)
+            self._public_read_fault_availability_open_chain = (
+                public_read_fault_availability_chain_extend(
+                    self._public_read_fault_availability_open_chain,
+                    "open",
+                    record.public_read_fault_availability_open_identity(),
+                )
+            )
+            self._public_read_fault_availability_opened += 1
         self._audit_fault_lifecycle_records.append(record)
+        active_opened = self._active_audit_faults_opened
+        if active_opened is None:
+            raise ProgrammingInvariantViolation(
+                "audit fault was opened outside envelope processing",
+                component="canonical-processor",
+            )
+        active_opened.append(record)
         self._latest_audit_fault_by_status[status] = record
         self._audit_fault_lifecycle_chain = _chain_extend(
             self._audit_fault_lifecycle_chain,
@@ -4401,6 +4450,22 @@ class CanonicalProcessor:
                     self._audit_http_retry_endpoint_current[endpoint_class] -= 1
                     self._audit_http_retry_endpoint_resolved[endpoint_class] += 1
             self._audit_fault_lifecycle_records.append(resolved)
+            if record.blocks_current_scope:
+                self._public_read_fault_availability_completion_chain = (
+                    public_read_fault_availability_chain_extend(
+                        self._public_read_fault_availability_completion_chain,
+                        "completion",
+                        resolved.public_read_fault_availability_completion_identity(),
+                    )
+                )
+                self._public_read_fault_availability_completed += 1
+            active_resolved = self._active_audit_faults_resolved
+            if active_resolved is None:
+                raise ProgrammingInvariantViolation(
+                    "audit fault was resolved outside envelope processing",
+                    component="canonical-processor",
+                )
+            active_resolved.append(resolved)
             self._latest_audit_fault_by_status[AuditFaultStatus.RESOLVED] = resolved
             self._audit_fault_lifecycle_chain = _chain_extend(
                 self._audit_fault_lifecycle_chain,
@@ -8216,6 +8281,14 @@ class CanonicalProcessor:
             audit_barrier_lag_frames_max=self._audit_barrier_lag_frames_max,
             audit_race_budget_exhaustions=self._audit_race_budget_exhaustions,
             retention=retention,
+            public_read_fault_availability_projection=(
+                PublicReadFaultAvailabilityProjectionSnapshot(
+                    opened=self._public_read_fault_availability_opened,
+                    completed=self._public_read_fault_availability_completed,
+                    open_chain_sha256=self._public_read_fault_availability_open_chain,
+                    completion_chain_sha256=(self._public_read_fault_availability_completion_chain),
+                )
+            ),
         )
 
     def summary(self) -> ProcessorSummary:
@@ -8716,6 +8789,14 @@ class CanonicalProcessor:
             audit_fault_lifecycle_records=audit_fault_lifecycle_records,
             reported_top_transitions=reported_top_transitions,
             reported_top_transition_outcomes=reported_top_transition_outcomes,
+            public_read_fault_availability_projection=(
+                PublicReadFaultAvailabilityProjectionSnapshot(
+                    opened=self._public_read_fault_availability_opened,
+                    completed=self._public_read_fault_availability_completed,
+                    open_chain_sha256=self._public_read_fault_availability_open_chain,
+                    completion_chain_sha256=(self._public_read_fault_availability_completion_chain),
+                )
+            ),
         )
 
 

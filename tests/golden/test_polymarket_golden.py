@@ -15,7 +15,7 @@ from multi_market_arbitrage.venues.polymarket.schemas import (
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
-EXPECTED_FINAL_STATE_SHA256 = "223f95b0faca3af68f5b900d90b81215ea363b0281b3e019c2056188249069fe"
+EXPECTED_FINAL_STATE_SHA256 = "06bf42f88f0f95237187939776d45a91bcba274c294f02a6ae96e93dee73737c"
 
 
 def _raw(name: str) -> bytes:

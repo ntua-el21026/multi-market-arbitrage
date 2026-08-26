@@ -99,8 +99,10 @@ def test_gamma_keyset_and_legacy_shapes_preserve_long_number_lexeme() -> None:
     assert keyset.keyset is True
     assert keyset.next_cursor == "next"
     assert keyset.markets[0].tick_size == expected
+    assert keyset.markets[0].minimum_order_notional == ExactDecimal.parse("5")
     assert legacy.keyset is False
     assert legacy.markets[0].tick_size == expected
+    assert legacy.markets[0].minimum_order_notional == ExactDecimal.parse("5")
 
 
 def test_gamma_index_arrays_must_have_identical_lengths() -> None:

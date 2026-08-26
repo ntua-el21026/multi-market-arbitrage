@@ -180,13 +180,6 @@ def _quantity(value: object, path: str) -> Quantity:
         raise PolymarketSchemaError(path, f"invalid non-negative quantity: {error}") from error
 
 
-def _optional_quantity(obj: Mapping[str, object], key: str, path: str) -> Quantity | None:
-    value = obj.get(key)
-    if value is None:
-        return None
-    return _quantity(value, f"{path}.{key}")
-
-
 def _integer(value: object, path: str) -> int:
     if not isinstance(value, (JsonNumber, str)):
         raise PolymarketSchemaError(path, "expected integer")
@@ -289,7 +282,7 @@ class GammaMarket:
     clob_token_ids: tuple[str, ...]
     outcome_prices: tuple[ExactDecimal, ...]
     tick_size: ExactDecimal | None
-    minimum_order_size: Quantity | None
+    minimum_order_notional: ExactDecimal | None
     fees_enabled: bool | None
     fee_schedule: FeeScheduleSchema | None
     active: bool | None
@@ -335,6 +328,13 @@ def _gamma_market(value: object, path: str) -> GammaMarket:
             "outcomes and outcomePrices must have identical lengths for index alignment",
         )
 
+    minimum_order_notional = _optional_decimal(obj, "orderMinSize", path)
+    if minimum_order_notional is not None and minimum_order_notional < ExactDecimal.zero():
+        raise PolymarketSchemaError(
+            f"{path}.orderMinSize",
+            "minimum order notional must be non-negative",
+        )
+
     schedule_value = obj.get("feeSchedule")
     event_id: str | None = None
     events = obj.get("events")
@@ -361,7 +361,7 @@ def _gamma_market(value: object, path: str) -> GammaMarket:
         clob_token_ids=token_ids,
         outcome_prices=prices,
         tick_size=_optional_decimal(obj, "orderPriceMinTickSize", path),
-        minimum_order_size=_optional_quantity(obj, "orderMinSize", path),
+        minimum_order_notional=minimum_order_notional,
         fees_enabled=_optional_boolean(obj, "feesEnabled", path),
         fee_schedule=_fee_schedule(schedule_value, f"{path}.feeSchedule")
         if schedule_value is not None

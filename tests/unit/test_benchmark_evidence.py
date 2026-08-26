@@ -16,6 +16,7 @@ from multi_market_arbitrage.pipeline import (
 from multi_market_arbitrage.pipeline.health import (
     AUDIT_DIVERGENCE_PENDING_REPRESENTATIVE_SCHEMA,
     AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVE_SCHEMA,
+    AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_CODEBOOKS,
     MAXIMUM_AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVES,
     PROCESSOR_HISTORY_CHAIN_TELEMETRY_FIELDS,
     PROCESSOR_RETENTION_TELEMETRY_SCHEMA,
@@ -229,10 +230,14 @@ def test_audit_divergence_benchmark_covers_changed_paths_and_capacity() -> None:
         )
         // capacity["periodic_checkpoint_count"]
     )
-    assert maximum_periodic_checkpoint_bytes_acceptance == 30_077
+    assert maximum_periodic_checkpoint_bytes_acceptance == 30_078
     assert (
         capacity["maximum_periodic_checkpoint_bytes"]
         <= maximum_periodic_checkpoint_bytes_acceptance
+    )
+    assert (
+        maximum_periodic_checkpoint_bytes_acceptance - capacity["maximum_periodic_checkpoint_bytes"]
+        >= 512
     )
     assert capacity["remaining_file_bytes"] >= minimum_six_hour_file_headroom_bytes
     assert capacity["unknown_host_source_field_count"] == 9
@@ -283,6 +288,13 @@ def test_audit_divergence_benchmark_covers_changed_paths_and_capacity() -> None:
     assert capacity_shape["audit_fault_current_count"] == 4_096
     assert capacity_shape["audit_fault_current_representative_count"] == 2
     assert capacity_shape["audit_fault_current_representatives_truncated"] is True
+    # These eight finite schema/enum columns were formerly repeated as long
+    # strings in every bounded representative.  V2 dictionary codes preserve
+    # every value while recovering deterministic periodic-file headroom.
+    assert capacity_shape["audit_fault_representative_dictionary_coded_field_count"] == len(
+        AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_CODEBOOKS
+    )
+    assert capacity_shape["audit_fault_representative_dictionary_coding_exact"] is True
     assert capacity_shape["audit_fault_status_representative_count"] == 3
     assert capacity_shape["audit_fault_status_set_complete"] is True
     assert capacity_shape["audit_fault_lifecycle_retention_capacity"] == 64

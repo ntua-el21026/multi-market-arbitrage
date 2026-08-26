@@ -13,7 +13,7 @@ import io
 import json
 import os
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, cast
@@ -24,10 +24,16 @@ if TYPE_CHECKING:
 from multi_market_arbitrage.availability_authority import (
     AuditAvailabilityBinding,
     AuditAvailabilityContributionChainSnapshot,
+    PublicReadFaultAvailabilityCompletionIdentity,
+    PublicReadFaultAvailabilityOpenIdentity,
+    PublicReadFaultAvailabilityProjectionSnapshot,
     audit_availability_chain_extend,
     audit_availability_chain_seed,
     audit_availability_contribution_chain_extend,
     audit_availability_contribution_chain_seed,
+    empty_public_read_fault_availability_projection,
+    public_read_fault_availability_chain_extend,
+    public_read_fault_availability_chain_seed,
 )
 from multi_market_arbitrage.core.ids import CollectorRunId, IngestId, is_sha256_hex
 from multi_market_arbitrage.core.provenance import RawSourceRef
@@ -77,6 +83,7 @@ class AvailabilityCause(StrEnum):
     """Stable initiating-cause taxonomy required by the Gate-1 contract."""
 
     AUDIT_MISMATCH_RECOVERY = "AUDIT_MISMATCH_RECOVERY"
+    PUBLIC_READ_FAULT = "PUBLIC_READ_FAULT"
     REPORTED_TOP_TRANSITION_FAILURE = "REPORTED_TOP_TRANSITION_FAILURE"
     FRESHNESS_EXPIRY = "FRESHNESS_EXPIRY"
     REFERENCE_REFRESH = "REFERENCE_REFRESH"
@@ -1156,6 +1163,28 @@ class AvailabilityIntervalContributionV2:
                 )
             ):
                 raise ValueError("restored audit v2 contribution lacks recovery evidence")
+        elif self.cause is AvailabilityCause.PUBLIC_READ_FAULT:
+            if (
+                self.causal_family is not AvailabilityCausalFamily.PUBLIC_READ_FAULT
+                or self.request_id is None
+                or self.fault_lifecycle_id is None
+                or self.instrument_id is None
+                or self.market_id is None
+                or not is_sha256_hex(self.fault_lifecycle_id)
+                or self.affected_instruments != (self.instrument_id,)
+                or self.divergence_id is not None
+                or any(
+                    value is not None
+                    for value in (
+                        self.audit_start_source,
+                        self.audit_response_source,
+                        self.audit_classification_source,
+                        self.authoritative_resolution_source,
+                        self.replacement_release_source,
+                    )
+                )
+            ):
+                raise ValueError("public-read fault contribution lacks its exact direct binding")
         elif any(value is not None for value in audit_provenance):
             raise ValueError("non-audit v2 contribution cannot carry audit provenance")
         recovery = self.replacement_recovery
@@ -1288,6 +1317,58 @@ class AvailabilityIntervalContributionV2:
             audit_classification_source=self.audit_classification_source,
             authoritative_resolution_source=self.authoritative_resolution_source,
             replacement_release_source=self.replacement_release_source,
+        )
+
+    def public_read_fault_availability_open_identity(
+        self,
+    ) -> PublicReadFaultAvailabilityOpenIdentity | None:
+        """Project the exact opening identity from one completed fault contribution."""
+
+        if (
+            self.causal_family is not AvailabilityCausalFamily.PUBLIC_READ_FAULT
+            or self.cause is not AvailabilityCause.PUBLIC_READ_FAULT
+        ):
+            return None
+        if (
+            self.fault_lifecycle_id is None
+            or self.request_id is None
+            or self.instrument_id is None
+            or self.market_id is None
+        ):
+            raise ValueError("public-read fault contribution identity is incomplete")
+        return PublicReadFaultAvailabilityOpenIdentity(
+            fault_lifecycle_id=self.fault_lifecycle_id,
+            stable_causal_key=self.stable_causal_key,
+            request_id=self.request_id,
+            instrument_id=self.instrument_id,
+            market_id=self.market_id,
+            reason_code=self.reason_code,
+            source_evidence_ids=self.source_evidence_ids,
+            affected_scopes=tuple(scope.value for scope in self.affected_scopes),
+            started_at_utc_ns=self.started_at.nanoseconds_since_epoch,
+            started_monotonic_ns=self.started_monotonic.nanoseconds,
+        )
+
+    def public_read_fault_availability_completion_identity(
+        self,
+    ) -> PublicReadFaultAvailabilityCompletionIdentity | None:
+        """Project the exact completion identity from one persisted contribution."""
+
+        if (
+            self.causal_family is not AvailabilityCausalFamily.PUBLIC_READ_FAULT
+            or self.cause is not AvailabilityCause.PUBLIC_READ_FAULT
+        ):
+            return None
+        if self.fault_lifecycle_id is None:
+            raise ValueError("public-read fault contribution identity is incomplete")
+        return PublicReadFaultAvailabilityCompletionIdentity(
+            fault_lifecycle_id=self.fault_lifecycle_id,
+            stable_causal_key=self.stable_causal_key,
+            ended_at_utc_ns=self.ended_at.nanoseconds_since_epoch,
+            ended_monotonic_ns=self.ended_monotonic.nanoseconds,
+            closure_reason_code=self.closure_reason_code,
+            closure_source_evidence_ids=self.closure_source_evidence_ids,
+            open_at_shutdown=self.open_at_shutdown,
         )
 
 
@@ -1481,6 +1562,15 @@ class AvailabilityEvidenceRuntimeSnapshot:
     contribution_chain_accepted_sha256: str = EMPTY_AVAILABILITY_CONTRIBUTION_V2_CHAIN_SHA256
     contribution_chain_written_sha256: str = EMPTY_AVAILABILITY_CONTRIBUTION_V2_CHAIN_SHA256
     last_contribution_completion_sequence: int = 0
+    public_read_fault_projection_accepted: PublicReadFaultAvailabilityProjectionSnapshot = field(
+        default_factory=empty_public_read_fault_availability_projection
+    )
+    public_read_fault_projection_written: PublicReadFaultAvailabilityProjectionSnapshot = field(
+        default_factory=empty_public_read_fault_availability_projection
+    )
+    public_read_fault_completion_expected_written_chain_sha256: str = (
+        public_read_fault_availability_chain_seed("completion")
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1525,6 +1615,15 @@ class AvailabilityEvidenceSummary:
     terminal_active_causal_keys_sha256: str = EMPTY_TERMINAL_ACTIVE_CAUSAL_KEYS_SHA256
     publication_phase: AvailabilityEvidencePublicationPhase = (
         AvailabilityEvidencePublicationPhase.PARTIAL
+    )
+    public_read_fault_projection_accepted: PublicReadFaultAvailabilityProjectionSnapshot = field(
+        default_factory=empty_public_read_fault_availability_projection
+    )
+    public_read_fault_projection_written: PublicReadFaultAvailabilityProjectionSnapshot = field(
+        default_factory=empty_public_read_fault_availability_projection
+    )
+    public_read_fault_completion_expected_written_chain_sha256: str = (
+        public_read_fault_availability_chain_seed("completion")
     )
 
 
@@ -2193,6 +2292,7 @@ def _reconcile_published_availability_v2_evidence(
     evidence: AvailabilityEvidenceSummary,
     *,
     expected_audit_contributions: AuditAvailabilityContributionChainSnapshot,
+    expected_public_read_fault_projection: PublicReadFaultAvailabilityProjectionSnapshot,
 ) -> PublishedAvailabilityEvidenceReconciliation:
     """Strictly bind both v2 streams, their manifest, and semantic reconciliation."""
 
@@ -2386,6 +2486,44 @@ def _reconcile_published_availability_v2_evidence(
             discrepancies.append("AUDIT_CONTRIBUTION_COUNT")
         if audit_chain != expected_audit_contributions.chain_sha256:
             discrepancies.append("AUDIT_CONTRIBUTION_CHAIN")
+        public_read_fault_contributions = tuple(
+            contribution
+            for contribution in contributions
+            if contribution.cause is AvailabilityCause.PUBLIC_READ_FAULT
+        )
+        public_read_fault_open_chain = public_read_fault_availability_chain_seed("open")
+        for contribution in public_read_fault_contributions:
+            identity = contribution.public_read_fault_availability_open_identity()
+            if identity is None:  # pragma: no cover - filtered by exact causal family
+                raise ValueError("public-read fault contribution lacks opening identity")
+            public_read_fault_open_chain = public_read_fault_availability_chain_extend(
+                public_read_fault_open_chain,
+                "open",
+                identity,
+            )
+        public_read_fault_completion_chain = public_read_fault_availability_chain_seed("completion")
+        for contribution in public_read_fault_contributions:
+            identity = contribution.public_read_fault_availability_completion_identity()
+            if identity is None:  # pragma: no cover - filtered by exact causal family
+                raise ValueError("public-read fault contribution lacks completion identity")
+            public_read_fault_completion_chain = public_read_fault_availability_chain_extend(
+                public_read_fault_completion_chain,
+                "completion",
+                identity,
+            )
+        public_read_fault_projection = PublicReadFaultAvailabilityProjectionSnapshot(
+            opened=len(public_read_fault_contributions),
+            completed=len(public_read_fault_contributions),
+            open_chain_sha256=public_read_fault_open_chain,
+            completion_chain_sha256=public_read_fault_completion_chain,
+        )
+        if (
+            evidence.public_read_fault_projection_accepted != public_read_fault_projection
+            or evidence.public_read_fault_projection_written != public_read_fault_projection
+        ):
+            discrepancies.append("PUBLIC_READ_FAULT_CONTRIBUTION_SUMMARY")
+        if public_read_fault_projection != expected_public_read_fault_projection:
+            discrepancies.append("PUBLIC_READ_FAULT_CONTRIBUTION_PROJECTION")
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
         discrepancies.append(f"PUBLISHED_LEDGER_INVALID:{type(error).__name__}")
     return PublishedAvailabilityEvidenceReconciliation(
@@ -2400,13 +2538,22 @@ def reconcile_published_availability_evidence(
     evidence: AvailabilityEvidenceSummary,
     *,
     expected_audit_contributions: AuditAvailabilityContributionChainSnapshot,
+    expected_public_read_fault_projection: (
+        PublicReadFaultAvailabilityProjectionSnapshot | None
+    ) = None,
 ) -> PublishedAvailabilityEvidenceReconciliation:
     """Reload and reconcile bounded published evidence without trusting writer counters."""
 
+    public_read_fault_projection = (
+        empty_public_read_fault_availability_projection()
+        if expected_public_read_fault_projection is None
+        else expected_public_read_fault_projection
+    )
     if evidence.schema_version == AVAILABILITY_EVIDENCE_SUMMARY_V2_VERSION:
         return _reconcile_published_availability_v2_evidence(
             evidence,
             expected_audit_contributions=expected_audit_contributions,
+            expected_public_read_fault_projection=public_read_fault_projection,
         )
     if evidence.schema_version != AVAILABILITY_EVIDENCE_SUMMARY_VERSION:
         return PublishedAvailabilityEvidenceReconciliation(
@@ -2419,6 +2566,11 @@ def reconcile_published_availability_evidence(
     discrepancies: list[str] = []
     interval_result: AvailabilityLedgerReconciliation | None = None
     contribution_result: AvailabilityContributionReconciliation | None = None
+    if public_read_fault_projection != empty_public_read_fault_availability_projection():
+        # Historical v1 contributions cannot encode the exact ADR-0055/0056
+        # public-fault identity.  Compatibility remains readable but can never
+        # satisfy a non-empty current-source projection.
+        discrepancies.append("PUBLIC_READ_FAULT_CONTRIBUTION_PROJECTION")
     try:
         if (
             not evidence.gate1_evidence_eligible
@@ -2507,11 +2659,22 @@ class _AvailabilityContributionWrite:
     expected_audit_chain_sha256: str
     expected_v2_count: int
     expected_v2_chain_sha256: str
+    expected_public_read_fault_completed: int
+    expected_public_read_fault_completion_chain_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
 class _AuditContributionWrittenPrefix:
     """Atomically published actual/expected authority for the written prefix."""
+
+    count: int
+    actual_chain_sha256: str
+    expected_chain_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PublicReadFaultCompletionWrittenPrefix:
+    """Atomically published actual/expected fault completion write prefix."""
 
     count: int
     actual_chain_sha256: str
@@ -2665,6 +2828,23 @@ class SupervisedAvailabilityIntervalWriter:
             count=0,
             actual_chain_sha256=EMPTY_AUDIT_CONTRIBUTION_CHAIN_SHA256,
             expected_chain_sha256=EMPTY_AUDIT_CONTRIBUTION_CHAIN_SHA256,
+        )
+        self._public_read_fault_open_identities: dict[
+            str, PublicReadFaultAvailabilityOpenIdentity
+        ] = {}
+        self._public_read_fault_opened = 0
+        self._public_read_fault_open_chain = public_read_fault_availability_chain_seed("open")
+        self._public_read_fault_completed_accepted = 0
+        self._public_read_fault_completion_accepted_chain = (
+            public_read_fault_availability_chain_seed("completion")
+        )
+        empty_public_read_fault_completion_chain = public_read_fault_availability_chain_seed(
+            "completion"
+        )
+        self._public_read_fault_completion_written_prefix = _PublicReadFaultCompletionWrittenPrefix(
+            count=0,
+            actual_chain_sha256=empty_public_read_fault_completion_chain,
+            expected_chain_sha256=empty_public_read_fault_completion_chain,
         )
         self._unavailable_duration_nanoseconds = 0
         self._longest_interval_nanoseconds = 0
@@ -2862,6 +3042,12 @@ class SupervisedAvailabilityIntervalWriter:
                     expected_audit_chain_sha256=expected_audit_chain,
                     expected_v2_count=0,
                     expected_v2_chain_sha256=(EMPTY_AVAILABILITY_CONTRIBUTION_V2_CHAIN_SHA256),
+                    expected_public_read_fault_completed=(
+                        self._public_read_fault_completed_accepted
+                    ),
+                    expected_public_read_fault_completion_chain_sha256=(
+                        self._public_read_fault_completion_accepted_chain
+                    ),
                 )
             )
         self._interval_queue.put_nowait(
@@ -2900,6 +3086,33 @@ class SupervisedAvailabilityIntervalWriter:
         except BaseException as error:
             self._reject_contribution(error)
             raise
+
+    def record_public_read_fault_open(
+        self,
+        identity: PublicReadFaultAvailabilityOpenIdentity,
+    ) -> bool:
+        """Record exact opening authority before its contribution can complete."""
+
+        if self._closed or not self._healthy or not self._contribution_healthy:
+            return False
+        fault_id = identity.fault_lifecycle_id
+        if (
+            fault_id in self._public_read_fault_open_identities
+            or len(self._public_read_fault_open_identities) >= MAXIMUM_CONTRIBUTIONS_PER_INTERVAL
+        ):
+            self._degrade(
+                RuntimeError("public-read fault opening projection is duplicate or saturated"),
+                stream="contribution",
+            )
+            return False
+        self._public_read_fault_open_chain = public_read_fault_availability_chain_extend(
+            self._public_read_fault_open_chain,
+            "open",
+            identity,
+        )
+        self._public_read_fault_opened += 1
+        self._public_read_fault_open_identities[fault_id] = identity
+        return True
 
     def _enqueue_contribution_v2_nowait(
         self,
@@ -2942,6 +3155,33 @@ class SupervisedAvailabilityIntervalWriter:
                 expected_audit_chain,
                 contribution.to_record(),
             )
+        expected_public_read_fault_completed = self._public_read_fault_completed_accepted
+        expected_public_read_fault_completion_chain = (
+            self._public_read_fault_completion_accepted_chain
+        )
+        public_read_fault_open = contribution.public_read_fault_availability_open_identity()
+        public_read_fault_completion = (
+            contribution.public_read_fault_availability_completion_identity()
+        )
+        if public_read_fault_open is not None:
+            if (
+                public_read_fault_completion is None
+                or self._public_read_fault_open_identities.get(
+                    public_read_fault_open.fault_lifecycle_id
+                )
+                != public_read_fault_open
+            ):
+                return self._reject_contribution(
+                    RuntimeError("public-read fault contribution opening identity diverged")
+                )
+            expected_public_read_fault_completed += 1
+            expected_public_read_fault_completion_chain = (
+                public_read_fault_availability_chain_extend(
+                    expected_public_read_fault_completion_chain,
+                    "completion",
+                    public_read_fault_completion,
+                )
+            )
         self._contribution_queue.put_nowait(
             _AvailabilityContributionWrite(
                 contribution=contribution,
@@ -2950,6 +3190,10 @@ class SupervisedAvailabilityIntervalWriter:
                 expected_audit_chain_sha256=expected_audit_chain,
                 expected_v2_count=expected_sequence,
                 expected_v2_chain_sha256=expected_v2_chain,
+                expected_public_read_fault_completed=(expected_public_read_fault_completed),
+                expected_public_read_fault_completion_chain_sha256=(
+                    expected_public_read_fault_completion_chain
+                ),
             )
         )
         self._contributions_accepted += 1
@@ -2957,6 +3201,12 @@ class SupervisedAvailabilityIntervalWriter:
         self._accepted_contribution_ids.add(contribution.contribution_id)
         self._audit_contributions_accepted = expected_audit_count
         self._audit_contribution_accepted_chain = expected_audit_chain
+        self._public_read_fault_completed_accepted = expected_public_read_fault_completed
+        self._public_read_fault_completion_accepted_chain = (
+            expected_public_read_fault_completion_chain
+        )
+        if public_read_fault_open is not None:
+            self._public_read_fault_open_identities.pop(public_read_fault_open.fault_lifecycle_id)
         self._v2_contribution_accepted_chain = expected_v2_chain
         self._last_accepted_completion_sequence = contribution.completion_sequence
         interval_id = contribution.interval_id
@@ -3145,6 +3395,31 @@ class SupervisedAvailabilityIntervalWriter:
             actual_chain_sha256=actual_chain,
             expected_chain_sha256=command.expected_audit_chain_sha256,
         )
+        public_read_fault_written_prefix = self._public_read_fault_completion_written_prefix
+        public_read_fault_count = public_read_fault_written_prefix.count
+        public_read_fault_chain = public_read_fault_written_prefix.actual_chain_sha256
+        public_read_fault_completion = (
+            contribution.public_read_fault_availability_completion_identity()
+            if isinstance(contribution, AvailabilityIntervalContributionV2)
+            else None
+        )
+        if public_read_fault_completion is not None:
+            public_read_fault_count += 1
+            public_read_fault_chain = public_read_fault_availability_chain_extend(
+                public_read_fault_chain,
+                "completion",
+                public_read_fault_completion,
+            )
+        if (
+            public_read_fault_count != command.expected_public_read_fault_completed
+            or public_read_fault_chain != command.expected_public_read_fault_completion_chain_sha256
+        ):
+            raise RuntimeError("availability public-read fault write prefix diverged")
+        self._public_read_fault_completion_written_prefix = _PublicReadFaultCompletionWrittenPrefix(
+            count=public_read_fault_count,
+            actual_chain_sha256=public_read_fault_chain,
+            expected_chain_sha256=(command.expected_public_read_fault_completion_chain_sha256),
+        )
         if isinstance(contribution, AvailabilityIntervalContributionV2):
             actual_v2_chain = availability_contribution_v2_chain_extend(
                 self._v2_contribution_written_chain,
@@ -3297,6 +3572,19 @@ class SupervisedAvailabilityIntervalWriter:
     @property
     def runtime_snapshot(self) -> AvailabilityEvidenceRuntimeSnapshot:
         audit_written_prefix = self._audit_contribution_written_prefix
+        public_read_fault_written_prefix = self._public_read_fault_completion_written_prefix
+        public_read_fault_accepted = PublicReadFaultAvailabilityProjectionSnapshot(
+            opened=self._public_read_fault_opened,
+            completed=self._public_read_fault_completed_accepted,
+            open_chain_sha256=self._public_read_fault_open_chain,
+            completion_chain_sha256=self._public_read_fault_completion_accepted_chain,
+        )
+        public_read_fault_written = PublicReadFaultAvailabilityProjectionSnapshot(
+            opened=self._public_read_fault_opened,
+            completed=public_read_fault_written_prefix.count,
+            open_chain_sha256=self._public_read_fault_open_chain,
+            completion_chain_sha256=public_read_fault_written_prefix.actual_chain_sha256,
+        )
         return AvailabilityEvidenceRuntimeSnapshot(
             healthy=self._healthy and not self._closed,
             queue_depth=self._interval_queue.qsize(),
@@ -3326,6 +3614,11 @@ class SupervisedAvailabilityIntervalWriter:
             contribution_chain_accepted_sha256=self._v2_contribution_accepted_chain,
             contribution_chain_written_sha256=self._v2_contribution_written_chain,
             last_contribution_completion_sequence=self._last_written_completion_sequence,
+            public_read_fault_projection_accepted=public_read_fault_accepted,
+            public_read_fault_projection_written=public_read_fault_written,
+            public_read_fault_completion_expected_written_chain_sha256=(
+                public_read_fault_written_prefix.expected_chain_sha256
+            ),
         )
 
     async def close(
@@ -3438,6 +3731,8 @@ class SupervisedAvailabilityIntervalWriter:
             self._degrade(RuntimeError("availability accepted and written counts differ"))
         if self._mode == "v2" and self._accepted_v2_interval_counts:
             self._degrade(RuntimeError("availability contributions lack finalized intervals"))
+        if self._mode == "v2" and self._public_read_fault_open_identities:
+            self._degrade(RuntimeError("public-read fault openings lack completed contributions"))
         content_sha256: str | None = None
         contribution_content_sha256: str | None = None
         completion_identity: str | None = None
@@ -3499,6 +3794,7 @@ class SupervisedAvailabilityIntervalWriter:
             else (self._completion_partial_path if self._completion_partial_path.exists() else None)
         )
         audit_written_prefix = self._audit_contribution_written_prefix
+        public_read_fault_written_prefix = self._public_read_fault_completion_written_prefix
         return AvailabilityEvidenceSummary(
             schema_version=(
                 AVAILABILITY_EVIDENCE_SUMMARY_V2_VERSION
@@ -3545,6 +3841,25 @@ class SupervisedAvailabilityIntervalWriter:
             terminal_active_causal_key_count=terminal_active_causal_key_count,
             terminal_active_causal_keys_sha256=terminal_active_causal_keys_sha256,
             publication_phase=self._publication_phase,
+            public_read_fault_projection_accepted=(
+                PublicReadFaultAvailabilityProjectionSnapshot(
+                    opened=self._public_read_fault_opened,
+                    completed=self._public_read_fault_completed_accepted,
+                    open_chain_sha256=self._public_read_fault_open_chain,
+                    completion_chain_sha256=(self._public_read_fault_completion_accepted_chain),
+                )
+            ),
+            public_read_fault_projection_written=(
+                PublicReadFaultAvailabilityProjectionSnapshot(
+                    opened=self._public_read_fault_opened,
+                    completed=public_read_fault_written_prefix.count,
+                    open_chain_sha256=self._public_read_fault_open_chain,
+                    completion_chain_sha256=(public_read_fault_written_prefix.actual_chain_sha256),
+                )
+            ),
+            public_read_fault_completion_expected_written_chain_sha256=(
+                public_read_fault_written_prefix.expected_chain_sha256
+            ),
         )
 
     def _build_v2_completion(

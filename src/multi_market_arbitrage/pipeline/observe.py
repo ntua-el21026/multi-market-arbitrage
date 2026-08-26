@@ -557,11 +557,13 @@ class _RawCaptureBoundary:
         writer: RawJournalWriter,
         processor: CanonicalProcessor,
         metrics: InMemoryMetrics,
+        runtime_health: ObservationRuntimeHealth | None = None,
     ) -> None:
         self.collector_run_id = collector_run_id
         self.writer = writer
         self.processor = processor
         self.metrics = metrics
+        self.runtime_health = runtime_health
         self._next_sequence = 0
         self._book_freshness_ns: dict[InstrumentId, int] = {}
         self._relevant_l2_receive_ns: dict[InstrumentId, int] = {}
@@ -632,6 +634,12 @@ class _RawCaptureBoundary:
                     scan_completed_monotonic_ns - scan_source_received_ns,
                 ),
             )
+        runtime_health = self.runtime_health
+        if runtime_health is not None:
+            for record in result.audit_faults_opened:
+                runtime_health.open_audit_fault_contributor(record)
+            for record in result.audit_faults_resolved:
+                runtime_health.resolve_audit_fault_contributor(record)
 
     def _record_durable_receipt(
         self,
@@ -989,6 +997,11 @@ def _failed_availability_summary(
         audit_contribution_expected_written_chain_sha256=(
             runtime.audit_contribution_expected_written_chain_sha256
         ),
+        public_read_fault_projection_accepted=(runtime.public_read_fault_projection_accepted),
+        public_read_fault_projection_written=(runtime.public_read_fault_projection_written),
+        public_read_fault_completion_expected_written_chain_sha256=(
+            runtime.public_read_fault_completion_expected_written_chain_sha256
+        ),
     )
 
 
@@ -1002,12 +1015,15 @@ def _availability_evidence_reconciled(
     processor_authority = processor.audit_availability_authority
     runtime_authority = runtime.audit_availability_authority
     emitted = runtime.audit_availability_contributions_emitted
+    processor_fault_projection = processor.public_read_fault_availability_projection
+    runtime_fault_projection = runtime.public_read_fault_availability_projection
     published = reconcile_published_availability_evidence(
         evidence,
         expected_audit_contributions=AuditAvailabilityContributionChainSnapshot(
             count=emitted.count,
             chain_sha256=emitted.chain_sha256,
         ),
+        expected_public_read_fault_projection=runtime_fault_projection,
     )
     return (
         evidence.gate1_evidence_eligible
@@ -1028,6 +1044,12 @@ def _availability_evidence_reconciled(
         and evidence.audit_contribution_accepted_chain_sha256 == emitted.chain_sha256
         and evidence.audit_contribution_written_chain_sha256 == emitted.chain_sha256
         and evidence.audit_contribution_expected_written_chain_sha256 == emitted.chain_sha256
+        and processor_fault_projection == runtime_fault_projection
+        and processor_fault_projection.opened == processor_fault_projection.completed
+        and evidence.public_read_fault_projection_accepted == runtime_fault_projection
+        and evidence.public_read_fault_projection_written == runtime_fault_projection
+        and evidence.public_read_fault_completion_expected_written_chain_sha256
+        == runtime_fault_projection.completion_chain_sha256
         and published.reconciled
         and evidence.contribution_path is not None
         and evidence.contribution_content_sha256 is not None
@@ -1456,6 +1478,7 @@ class PolymarketObservationService:
             writer=writer,
             processor=processor,
             metrics=self._metrics,
+            runtime_health=runtime_health,
         )
         run_completed = False
         analytical_summary: ResearchOutputSummary | None = None
@@ -4585,6 +4608,11 @@ class PolymarketObservationService:
                                 reason_code="REST_AUDIT_MISMATCH",
                                 source_evidence_ids=tuple(source_evidence_ids),
                                 affected_instruments=(start.starting_book.instrument_id,),
+                                affected_scopes=(
+                                    AvailabilityScope.AUDIT_ELIGIBILITY,
+                                    AvailabilityScope.CANONICAL_BOOKS,
+                                    AvailabilityScope.SCANNER_RESEARCH_ELIGIBILITY,
+                                ),
                                 recovery_action=AvailabilityRecoveryAction.RESNAPSHOT,
                                 request_id=divergence.request_id,
                                 divergence_id=divergence.divergence_id,
@@ -4840,32 +4868,43 @@ class PolymarketObservationService:
                             )
                             if expired:
                                 pending_exit = _GenerationExit.RESYNC_REQUIRED
-                                register_interruption(
-                                    AvailabilityInterruption(
-                                        cause=(AvailabilityCause.REPORTED_TOP_TRANSITION_FAILURE),
-                                        reason_code="TIME_BOUND_EXPIRED",
-                                        source_evidence_ids=tuple(
-                                            evidence_id
-                                            for transition, result in expired
-                                            for evidence_id in (
-                                                (
-                                                    "reported-top-transition:"
-                                                    f"{transition.transition_id}"
+                                for transition, result in expired:
+                                    source = result.source
+                                    register_interruption(
+                                        AvailabilityInterruption(
+                                            cause=(
+                                                AvailabilityCause.REPORTED_TOP_TRANSITION_FAILURE
+                                            ),
+                                            reason_code="TIME_BOUND_EXPIRED",
+                                            source_evidence_ids=(
+                                                "reported-top-transition:"
+                                                f"{transition.transition_id}",
+                                                f"expiry-control-ingest-seq:{result.ingest_seq}",
+                                                *(
+                                                    ()
+                                                    if source is None
+                                                    else (
+                                                        "raw-source:"
+                                                        f"{source.ingest_id.value}:"
+                                                        f"{source.payload_sha256}",
+                                                    )
                                                 ),
-                                                (f"expiry-control-ingest-seq:{result.ingest_seq}"),
-                                            )
+                                            ),
+                                            affected_instruments=(transition.instrument_id,),
+                                            affected_scopes=(
+                                                AvailabilityScope.WEBSOCKET_CAPTURE,
+                                                AvailabilityScope.CANONICAL_BOOKS,
+                                                AvailabilityScope.AUDIT_ELIGIBILITY,
+                                                AvailabilityScope.SCANNER_RESEARCH_ELIGIBILITY,
+                                            ),
+                                            recovery_action=(AvailabilityRecoveryAction.RESNAPSHOT),
+                                            reported_top_transition_id=(transition.transition_id),
                                         ),
-                                        affected_instruments=tuple(
-                                            transition.instrument_id
-                                            for transition, _result in expired
+                                        started_at=_CaptureCutoffMoment(
+                                            wall_time=decision_at,
+                                            monotonic_ns=decision_monotonic_ns,
                                         ),
-                                        recovery_action=(AvailabilityRecoveryAction.RESNAPSHOT),
-                                    ),
-                                    started_at=_CaptureCutoffMoment(
-                                        wall_time=decision_at,
-                                        monotonic_ns=decision_monotonic_ns,
-                                    ),
-                                )
+                                    )
                                 deviations.append(
                                     "reported-top transition time bound expired under "
                                     "idle supervision"

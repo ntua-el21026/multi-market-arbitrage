@@ -106,6 +106,7 @@ from multi_market_arbitrage.pipeline.health import (  # noqa: E402
     AUDIT_DIVERGENCE_PENDING_REPRESENTATIVE_SCHEMA,
     AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVE_ROW_FIELDS,
     AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVE_SCHEMA,
+    AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_CODEBOOKS,
     AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_ROW_FIELDS,
     AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_SCHEMA,
     AUDIT_HTTP_ENDPOINT_TELEMETRY_ROW_FIELDS,
@@ -2785,11 +2786,37 @@ def _capacity_evidence_shape(checkpoint: HealthCheckpoint) -> dict[str, int | st
         schema=AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_SCHEMA,
         row_fields=AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_ROW_FIELDS,
     )
+    fault_codebooks = dict(AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_CODEBOOKS)
+
+    def fault_code_rows_exact(rows: tuple[object, ...]) -> bool:
+        for value in rows:
+            row = _object_tuple(value)
+            if row is None:
+                return False
+            for field, values in AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_CODEBOOKS:
+                encoded = row[AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_ROW_FIELDS.index(field)]
+                if encoded is None and field in {"endpoint_class", "category", "resolution"}:
+                    continue
+                if (
+                    not isinstance(encoded, int)
+                    or isinstance(encoded, bool)
+                    or not 0 <= encoded < len(values)
+                ):
+                    return False
+        return True
+
+    fault_dictionary_coding_exact = fault_code_rows_exact(
+        current_fault_rows
+    ) and fault_code_rows_exact(terminal_fault_rows)
     fault_statuses: set[object] = set()
     for value in (*current_fault_rows, *terminal_fault_rows):
         row = _object_tuple(value)
         if row is not None:
-            fault_statuses.add(row[AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_ROW_FIELDS.index("status")])
+            status_code = row[AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_ROW_FIELDS.index("status")]
+            if isinstance(status_code, int) and not isinstance(status_code, bool):
+                statuses = fault_codebooks["status"]
+                if 0 <= status_code < len(statuses):
+                    fault_statuses.add(statuses[status_code])
     fragment_rows = _table_rows(
         checkpoint.analytical.get("fragment_retention"),
         schema=ANALYTICAL_FRAGMENT_RETENTION_TELEMETRY_SCHEMA,
@@ -2841,6 +2868,10 @@ def _capacity_evidence_shape(checkpoint: HealthCheckpoint) -> dict[str, int | st
             bool, fault_lifecycles["current_representatives_truncated"]
         ),
         "audit_fault_evidence_reconciled": cast(bool, fault_lifecycles["evidence_reconciled"]),
+        "audit_fault_representative_dictionary_coded_field_count": len(
+            AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_CODEBOOKS
+        ),
+        "audit_fault_representative_dictionary_coding_exact": (fault_dictionary_coding_exact),
         "audit_fault_lifecycle_representative_schema": (
             AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_SCHEMA
         ),
@@ -3249,6 +3280,9 @@ def run_benchmark(
         or capacity_shape["audit_fault_current_count"] != MAXIMUM_ACTIVE_AUDIT_FAULTS
         or not capacity_shape["audit_fault_current_representatives_truncated"]
         or not capacity_shape["audit_fault_evidence_reconciled"]
+        or capacity_shape["audit_fault_representative_dictionary_coded_field_count"]
+        != len(AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_CODEBOOKS)
+        or not capacity_shape["audit_fault_representative_dictionary_coding_exact"]
         or not capacity_shape["audit_fault_status_set_complete"]
         or capacity_shape["audit_fault_status_representative_count"] != len(AuditFaultStatus)
         or capacity_shape["audit_fault_lifecycle_retention_capacity"] != 64
