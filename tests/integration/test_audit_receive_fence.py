@@ -691,8 +691,12 @@ async def test_response_durable_before_expiry_but_classified_after_expiry_fails_
         update={
             "scanner": config.scanner.model_copy(
                 update={
-                    "maximum_book_age_seconds": 0.1,
-                    "maximum_interleg_skew_seconds": 0.05,
+                    # Keep a wide real-time margin for slower CI filesystems.
+                    # The response gate below still crosses the exact derived
+                    # expiry, so increasing the fixture scale does not weaken
+                    # the boundary assertion.
+                    "maximum_book_age_seconds": 2.0,
+                    "maximum_interleg_skew_seconds": 0.5,
                 }
             )
         }
@@ -2317,15 +2321,15 @@ async def test_quiet_race_retry_never_crosses_deadline_boundaries(
             "polymarket": config.polymarket.model_copy(
                 update={
                     "snapshot_audit_interval_seconds": 30.0,
-                    "snapshot_audit_freshness_guard_seconds": (0.15 if hard_expiry_case else 0.4),
+                    "snapshot_audit_freshness_guard_seconds": (1.5 if hard_expiry_case else 0.4),
                     "snapshot_audit_max_race_retries": 4,
-                    "snapshot_audit_race_retry_quiet_seconds": (0.10 if hard_expiry_case else 0.3),
+                    "snapshot_audit_race_retry_quiet_seconds": (1.5 if hard_expiry_case else 0.3),
                 }
             ),
             "scanner": config.scanner.model_copy(
                 update={
-                    "maximum_book_age_seconds": 0.20 if hard_expiry_case else 5.0,
-                    "maximum_interleg_skew_seconds": 0.01 if hard_expiry_case else 1.0,
+                    "maximum_book_age_seconds": 2.0 if hard_expiry_case else 5.0,
+                    "maximum_interleg_skew_seconds": 0.5 if hard_expiry_case else 1.0,
                 }
             ),
         }
@@ -2412,7 +2416,9 @@ async def test_quiet_race_retry_never_crosses_deadline_boundaries(
             await admitted.wait()
             # Classify safely before the selected boundary, but late enough
             # that the valid quiet interval cannot finish before it.
-            await asyncio.sleep(0.12 if hard_expiry_case else 0.30)
+            # The hard-expiry fixture uses a scaled wall-clock window so
+            # CI scheduling cannot consume its intended pre-expiry margin.
+            await asyncio.sleep(1.0 if hard_expiry_case else 0.30)
             return _public_read(
                 _fixture("polymarket_rest_book_yes.json"),
                 on_response_body_complete,
@@ -2448,7 +2454,7 @@ async def test_quiet_race_retry_never_crosses_deadline_boundaries(
     client = _OneRaceClient()
     await writer.start()
     await _initialize_books(capture)
-    run_seconds = 1.0 if hard_expiry_case else 0.5
+    run_seconds = 4.0 if hard_expiry_case else 0.5
     generation_task = asyncio.create_task(
         service._run_generation(  # pyright: ignore[reportPrivateUsage]
             client=cast(PolymarketPublicClient, client),
