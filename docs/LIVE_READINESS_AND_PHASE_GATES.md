@@ -42,7 +42,8 @@ external-attribution, fault-lifecycle, direct-contribution, typed-resync and
 classification-latency defects now governed by ADR-0055.
 The later contributor-capacity failure exposed completed history retained as
 active plus replacement capture without bounded exhaustion. ADR-0056 reconciles
-that governance; implementation remediation remains pending.
+that governance. Implementation and deterministic offline gates are complete;
+public preflight and Gate-1 rerun authorization remain pending.
 
 Before a rerun:
 
@@ -64,7 +65,7 @@ Before a rerun:
   stability observation.
 
 A fresh six-hour run and full independent post-run audit are mandatory.
-Neither has been run for the pending ADR-0056 implementation remediation.
+Neither has been run for the implemented ADR-0056 remediation.
 
 No later production phase may be promoted while G1 is failed.
 

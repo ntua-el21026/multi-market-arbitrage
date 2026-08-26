@@ -7,7 +7,7 @@ import json
 import shutil
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from types import TracebackType
 from typing import ClassVar, cast
@@ -16,33 +16,36 @@ import pytest
 
 from multi_market_arbitrage.core.config import load_phase1_config
 from multi_market_arbitrage.core.health import ComponentHealth
-from multi_market_arbitrage.core.ids import ConnectionId, SubscriptionId
+from multi_market_arbitrage.core.ids import CollectorRunId, ConnectionId, SubscriptionId
 from multi_market_arbitrage.core.time import MonotonicTimestamp, UtcTimestamp
-from multi_market_arbitrage.journal import JournalReader
+from multi_market_arbitrage.journal import JournalReader, RawJournalWriter
 from multi_market_arbitrage.observability import (
     AvailabilityCause,
-    AvailabilityIntervalContribution,
+    AvailabilityIntervalContributionV2,
     AvailabilityRecoveryAction,
     AvailabilityRecoveryOutcome,
     AvailabilityScope,
     HealthDecisionReason,
+    InMemoryMetrics,
     SupervisedAvailabilityIntervalWriter,
     health_decision_reasons_from_mask,
 )
-from multi_market_arbitrage.observability.availability import AvailabilityInterval
 from multi_market_arbitrage.pipeline import observe as observe_module
 from multi_market_arbitrage.pipeline.channels import (
     CLOB_MARKET_PREFIX,
+    CONTROL_REST_AUDIT_REPLACEMENT_RECOVERY,
     CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
+    CONTROL_REST_AUDIT_REPLACEMENT_RELEASE_V2,
     CONTROL_REST_AUDIT_START,
     GAMMA_MARKETS_KEYSET,
     REST_BOOK,
     REST_BOOK_AUDIT,
     WS_MARKET,
 )
+from multi_market_arbitrage.pipeline.health import ObservationRuntimeHealth
 from multi_market_arbitrage.pipeline.ingress import RawIngressItem
 from multi_market_arbitrage.pipeline.observe import PolymarketObservationService
-from multi_market_arbitrage.pipeline.processor import ProcessedEnvelope
+from multi_market_arbitrage.pipeline.processor import CanonicalProcessor, ProcessedEnvelope
 from multi_market_arbitrage.pipeline.targeting import (
     ObservationTargetMode,
     ResolvedPolymarketTarget,
@@ -495,6 +498,8 @@ def _configured_service(
     *,
     maximum_book_age_seconds: float | None = None,
     max_reconnect_attempts: int | None = None,
+    audit_replacement_retry_delay_seconds: float | None = None,
+    audit_replacement_hard_deadline_seconds: float | None = None,
 ) -> PolymarketObservationService:
     source_commit = _initialize_clean_source(tmp_path)
     config = load_phase1_config(Path("config/phase1.toml"))
@@ -517,6 +522,16 @@ def _configured_service(
                         config.polymarket.max_reconnect_attempts
                         if max_reconnect_attempts is None
                         else max_reconnect_attempts
+                    ),
+                    "audit_replacement_retry_delay_seconds": (
+                        config.polymarket.audit_replacement_retry_delay_seconds
+                        if audit_replacement_retry_delay_seconds is None
+                        else audit_replacement_retry_delay_seconds
+                    ),
+                    "audit_replacement_hard_deadline_seconds": (
+                        config.polymarket.audit_replacement_hard_deadline_seconds
+                        if audit_replacement_hard_deadline_seconds is None
+                        else audit_replacement_hard_deadline_seconds
                     ),
                 }
             ),
@@ -569,6 +584,365 @@ def _prepare_runtime(
         PolymarketObservationService,
         "_bootstrap_explicit",
         _bootstrap_fixture,
+    )
+
+
+@pytest.mark.asyncio
+async def test_resnapshot_wait_exhausts_replacement_hard_deadline_before_run_cutoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _configured_service(
+        tmp_path,
+        audit_replacement_retry_delay_seconds=0.05,
+        audit_replacement_hard_deadline_seconds=0.4,
+    )
+    _prepare_runtime(monkeypatch, fail_resnapshot=False)
+
+    class _DeadlineBoundResnapshotClient(_LifecyclePublicClient):
+        observed_deadline: ClassVar[float | None] = None
+        raised_monotonic_ns: ClassVar[int | None] = None
+
+        async def fetch_order_book_raw(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+        ) -> bytes:
+            if asset_id == "token-yes":
+                return await super().fetch_order_book_raw(asset_id, deadline=deadline)
+            assert asset_id == "token-no"
+            assert deadline is not None
+            self.first_generation_stopped_before_resnapshot = bool(
+                _LifecycleSocket.instances and _LifecycleSocket.instances[0].stopped
+            )
+            self.resnapshot_book_calls.append(asset_id)
+            type(self).observed_deadline = deadline
+            await asyncio.sleep(max(0.0, deadline - asyncio.get_running_loop().time()))
+            type(self).raised_monotonic_ns = time.monotonic_ns()
+            raise PolymarketHttpTransportError(
+                endpoint_class=PolymarketEndpointClass.CLOB_BOOK,
+                category=PolymarketHttpFailureCategory.DEADLINE_EXCEEDED,
+                retryable=False,
+                attempt=1,
+                detail="injected resnapshot read reached its supervised deadline",
+            )
+
+    monkeypatch.setattr(
+        observe_module,
+        "PolymarketPublicClient",
+        _DeadlineBoundResnapshotClient,
+    )
+
+    summary = await service.run(duration_seconds=2.0, gamma_market_id="101")
+
+    assert _DeadlineBoundResnapshotClient.observed_deadline is not None
+    assert _DeadlineBoundResnapshotClient.raised_monotonic_ns is not None
+    assert len(_LifecycleSocket.instances) == 1
+    assert _LifecycleSocket.instances[0].stopped
+    client = _DeadlineBoundResnapshotClient.latest
+    assert isinstance(client, _DeadlineBoundResnapshotClient)
+    assert client.resnapshot_book_calls == ["token-yes", "token-no"]
+    assert client.first_generation_stopped_before_resnapshot
+
+    processor = summary.processor
+    assert processor.audit_replacement_captures_pending == 1
+    capture_authority = processor.audit_replacement_capture_authority[0]
+    recovery = capture_authority.recovery_authority
+    assert recovery is not None
+    assert recovery.status.value == "HARD_DEADLINE_EXHAUSTED"
+    assert recovery.last_result.value == "HARD_DEADLINE_EXHAUSTED"
+    assert recovery.last_failure is not None
+    assert recovery.last_failure.value == "HARD_DEADLINE_REACHED"
+    assert recovery.attempt_count == 0
+    assert recovery.unresolved
+    assert recovery.hard_deadline.nanoseconds < recovery.run_deadline.nanoseconds
+    observed_deadline = _DeadlineBoundResnapshotClient.observed_deadline
+    raised_monotonic_ns = _DeadlineBoundResnapshotClient.raised_monotonic_ns
+    assert observed_deadline is not None
+    assert raised_monotonic_ns is not None
+    assert abs(int(observed_deadline * 1e9) - recovery.hard_deadline.nanoseconds) <= 2_000_000
+    assert (
+        recovery.hard_deadline.nanoseconds
+        <= raised_monotonic_ns
+        < recovery.run_deadline.nanoseconds
+    )
+
+    raw_records = JournalReader(summary.journal_root, summary.collector_run_id).read_all()
+    lifecycle_records = tuple(
+        (record, cast(dict[str, object], json.loads(record.payload_bytes)))
+        for record in raw_records
+        if record.channel == CONTROL_REST_AUDIT_REPLACEMENT_RECOVERY
+    )
+    assert tuple(payload["action"] for _record, payload in lifecycle_records) == ("DEADLINE",)
+    deadline_record, deadline_payload = lifecycle_records[0]
+    assert deadline_payload["decision_monotonic_ns"] == (
+        deadline_record.received_monotonic.nanoseconds
+    )
+    assert (
+        recovery.hard_deadline.nanoseconds
+        <= deadline_record.received_monotonic.nanoseconds
+        < recovery.run_deadline.nanoseconds
+    )
+    replay = replay_journal(
+        summary.journal_root,
+        summary.collector_run_id,
+        service._config,  # pyright: ignore[reportPrivateUsage]
+    )
+    assert replay.processor == processor
+    assert replay.processor.terminal_hash == processor.terminal_hash
+
+
+@pytest.mark.asyncio
+async def test_pre_ready_wait_exhausts_replacement_hard_deadline_without_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _configured_service(
+        tmp_path,
+        audit_replacement_retry_delay_seconds=0.05,
+        audit_replacement_hard_deadline_seconds=0.4,
+    )
+    _prepare_runtime(monkeypatch, fail_resnapshot=False)
+
+    class _NeverReadyReplacementSocket(_LifecycleSocket):
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            if self.generation == 1:
+                await super().pump_received(admit, ready=ready)
+                return
+            del admit, ready
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.stopped = True
+
+    monkeypatch.setattr(
+        observe_module,
+        "PolymarketMarketWebSocket",
+        _NeverReadyReplacementSocket,
+    )
+
+    summary = await service.run(duration_seconds=1.5, gamma_market_id="101")
+
+    assert len(_NeverReadyReplacementSocket.instances) == 2
+    assert all(socket.stopped for socket in _NeverReadyReplacementSocket.instances)
+    capture_authority = summary.processor.audit_replacement_capture_authority[0]
+    recovery = capture_authority.recovery_authority
+    assert recovery is not None
+    assert recovery.status.value == "HARD_DEADLINE_EXHAUSTED"
+    assert recovery.last_result.value == "HARD_DEADLINE_EXHAUSTED"
+    assert recovery.last_failure is not None
+    assert recovery.last_failure.value == "HARD_DEADLINE_REACHED"
+    assert recovery.attempt_count == 0
+    assert recovery.attempted_connection_ids == ()
+    assert recovery.unresolved
+    assert recovery.hard_deadline.nanoseconds < recovery.run_deadline.nanoseconds
+
+    raw_records = JournalReader(summary.journal_root, summary.collector_run_id).read_all()
+    lifecycle_records = tuple(
+        (record, cast(dict[str, object], json.loads(record.payload_bytes)))
+        for record in raw_records
+        if record.channel == CONTROL_REST_AUDIT_REPLACEMENT_RECOVERY
+    )
+    assert tuple(payload["action"] for _record, payload in lifecycle_records) == ("DEADLINE",)
+    deadline_record, deadline_payload = lifecycle_records[0]
+    assert deadline_payload["decision_monotonic_ns"] == (
+        deadline_record.received_monotonic.nanoseconds
+    )
+    assert (
+        recovery.hard_deadline.nanoseconds
+        <= deadline_record.received_monotonic.nanoseconds
+        < recovery.run_deadline.nanoseconds
+    )
+    replay = replay_journal(
+        summary.journal_root,
+        summary.collector_run_id,
+        service._config,  # pyright: ignore[reportPrivateUsage]
+    )
+    assert replay.processor == summary.processor
+    assert replay.processor.terminal_hash == summary.processor.terminal_hash
+
+
+@pytest.mark.asyncio
+async def test_off_socket_cancellation_durably_terminalizes_replacement_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _configured_service(
+        tmp_path,
+        audit_replacement_retry_delay_seconds=0.05,
+        audit_replacement_hard_deadline_seconds=0.4,
+    )
+    _prepare_runtime(monkeypatch, fail_resnapshot=False)
+    resnapshot_waiting = asyncio.Event()
+
+    class _CancellableResnapshotClient(_LifecyclePublicClient):
+        async def fetch_order_book_raw(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+        ) -> bytes:
+            if asset_id == "token-yes":
+                return await super().fetch_order_book_raw(asset_id, deadline=deadline)
+            assert asset_id == "token-no"
+            self.resnapshot_book_calls.append(asset_id)
+            resnapshot_waiting.set()
+            await asyncio.Event().wait()
+            raise AssertionError("cancelled resnapshot unexpectedly resumed")
+
+    monkeypatch.setattr(
+        observe_module,
+        "PolymarketPublicClient",
+        _CancellableResnapshotClient,
+    )
+    retained_captures: list[observe_module._RawCaptureBoundary] = []  # pyright: ignore[reportPrivateUsage]
+    original_capture_init = observe_module._RawCaptureBoundary.__init__  # pyright: ignore[reportPrivateUsage]
+
+    def retain_capture(
+        capture: observe_module._RawCaptureBoundary,  # pyright: ignore[reportPrivateUsage]
+        *,
+        collector_run_id: CollectorRunId,
+        writer: RawJournalWriter,
+        processor: CanonicalProcessor,
+        metrics: InMemoryMetrics,
+    ) -> None:
+        original_capture_init(
+            capture,
+            collector_run_id=collector_run_id,
+            writer=writer,
+            processor=processor,
+            metrics=metrics,
+        )
+        retained_captures.append(capture)
+
+    monkeypatch.setattr(
+        observe_module._RawCaptureBoundary,  # pyright: ignore[reportPrivateUsage]
+        "__init__",
+        retain_capture,
+    )
+
+    observation = asyncio.create_task(
+        service.run(duration_seconds=2.0, gamma_market_id="101"),
+        name="off-socket-replacement-cancellation",
+    )
+    await asyncio.wait_for(resnapshot_waiting.wait(), timeout=5.0)
+    observation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(observation, timeout=10.0)
+
+    assert len(retained_captures) == 1
+    capture = retained_captures[0]
+    recovery = capture.processor.audit_replacement_recovery_authorities[0]
+    assert recovery.status.value == "TERMINAL_UNRESOLVED"
+    assert recovery.last_result.value == "TERMINAL_UNRESOLVED"
+    assert recovery.last_failure is not None
+    assert recovery.last_failure.value == "TERMINAL_CUTOFF"
+    assert recovery.attempt_count == 0
+    raw_records = JournalReader(
+        capture.writer.config.root,
+        capture.collector_run_id,
+    ).read_all(include_partial=True)
+    lifecycle_payloads = tuple(
+        cast(dict[str, object], json.loads(record.payload_bytes))
+        for record in raw_records
+        if record.channel == CONTROL_REST_AUDIT_REPLACEMENT_RECOVERY
+    )
+    assert tuple(payload["action"] for payload in lifecycle_payloads) == ("TERMINAL_CUTOFF",)
+
+
+@pytest.mark.asyncio
+async def test_ready_boundary_preceding_recovery_timer_starts_attempt_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _configured_service(
+        tmp_path,
+        audit_replacement_retry_delay_seconds=0.05,
+        audit_replacement_hard_deadline_seconds=0.4,
+    )
+    _prepare_runtime(monkeypatch, fail_resnapshot=False)
+
+    class _ReadyBeforeDelayedTimerSocket(_LifecycleSocket):
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            if self.generation == 1:
+                await super().pump_received(admit, ready=ready)
+                return
+            ready.set()
+            for asset_id in ("token-yes", "token-no"):
+                admit(
+                    ReceivedWebSocketMessage(
+                        payload_bytes=_replacement_ws_book_payload(asset_id),
+                        received_wall_time=UtcTimestamp.now(),
+                        received_monotonic_ns=time.monotonic_ns(),
+                        message_type="TEXT",
+                    )
+                )
+            try:
+                # Both full snapshots were synchronously admitted before the
+                # hard boundary, but the timer owns release once the delayed
+                # coordinator drains them after that boundary.
+                time.sleep(0.5)  # noqa: ASYNC251 - force coordinator wakeup after the timer
+                await asyncio.Event().wait()
+            finally:
+                self.stopped = True
+
+    monkeypatch.setattr(
+        observe_module,
+        "PolymarketMarketWebSocket",
+        _ReadyBeforeDelayedTimerSocket,
+    )
+
+    summary = await service.run(duration_seconds=1.5, gamma_market_id="101")
+
+    capture_authority = summary.processor.audit_replacement_capture_authority[0]
+    recovery = capture_authority.recovery_authority
+    assert recovery is not None
+    assert recovery.status.value == "HARD_DEADLINE_EXHAUSTED"
+    assert recovery.last_failure is not None
+    assert recovery.last_failure.value == "HARD_DEADLINE_REACHED"
+    assert recovery.attempt_count == 1
+    assert len(recovery.attempted_connection_ids) == 1
+    assert len(recovery.captured_snapshot_sources) == 2
+    assert recovery.unresolved
+    raw_records = JournalReader(summary.journal_root, summary.collector_run_id).read_all()
+    lifecycle_records = tuple(
+        (record, cast(dict[str, object], json.loads(record.payload_bytes)))
+        for record in raw_records
+        if record.channel == CONTROL_REST_AUDIT_REPLACEMENT_RECOVERY
+    )
+    assert tuple(payload["action"] for _record, payload in lifecycle_records) == (
+        "ATTEMPT_START",
+        "DEADLINE",
+    )
+    assert all(
+        record.channel
+        not in {
+            CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
+            CONTROL_REST_AUDIT_REPLACEMENT_RELEASE_V2,
+        }
+        for record in raw_records
+    )
+    attempt_record, attempt_payload = lifecycle_records[0]
+    deadline_record, _deadline_payload = lifecycle_records[1]
+    assert attempt_payload["decision_monotonic_ns"] == (
+        attempt_record.received_monotonic.nanoseconds
+    )
+    assert (
+        attempt_record.received_monotonic.nanoseconds
+        < recovery.hard_deadline.nanoseconds
+        <= deadline_record.received_monotonic.nanoseconds
+        < recovery.run_deadline.nanoseconds
     )
 
 
@@ -897,9 +1271,9 @@ async def test_observed_divergence_resnapshot_replacement_generation_restores_cu
     assert interval["research_eligibility_restored"] is True
     assert interval["open_at_shutdown"] is False
     assert interval["socket_generation"] == 1
-    assert interval["affected_scopes"] == [
+    assert interval["affected_scopes"] == sorted(
         scope.value for scope in AvailabilityScope if scope is not AvailabilityScope.TARGET
-    ]
+    )
     assert interval["ended_monotonic_ns"] >= interval["started_monotonic_ns"]
     assert interval["ended_monotonic_ns"] >= replacement_processing_completed_ns[-1]
 
@@ -953,7 +1327,7 @@ async def test_observed_divergence_resnapshot_replacement_generation_restores_cu
     release_index = next(
         index
         for index, record in enumerate(raw_records)
-        if record.channel == CONTROL_REST_AUDIT_REPLACEMENT_RELEASE
+        if record.channel == CONTROL_REST_AUDIT_REPLACEMENT_RELEASE_V2
     )
     release_record = raw_records[release_index]
     release_payload = cast(dict[str, object], json.loads(release_record.payload_bytes))
@@ -1105,7 +1479,7 @@ async def test_sibling_reported_top_blocks_release_until_authoritative_reconcili
     release_indices = tuple(
         index
         for index, record in enumerate(raw_records)
-        if record.channel == CONTROL_REST_AUDIT_REPLACEMENT_RELEASE
+        if record.channel == CONTROL_REST_AUDIT_REPLACEMENT_RELEASE_V2
     )
     assert len(release_indices) == 1
     initial_sibling_index = max(
@@ -1192,7 +1566,14 @@ async def test_stale_first_replacement_snapshot_cannot_close_recovery_interval(
 
     summary = await service.run(duration_seconds=3.0, gamma_market_id="101")
 
-    assert processed_replacement_assets == ["token-yes", "token-no"]
+    # The idle recovery timer owns the first snapshot's freshness boundary.
+    # It closes and rotates the attempt before the deliberately stale sibling
+    # can be admitted; waiting for that sibling would make timer progress
+    # dependent on another WebSocket frame.
+    assert processed_replacement_assets == ["token-yes"]
+    client = _LifecyclePublicClient.latest
+    assert client is not None
+    assert client.resnapshot_book_calls == ["token-yes", "token-no"]
     processor = summary.processor
     assert processor.audit_divergences_observed == 1
     assert processor.audit_divergences_resolved_by_authoritative_resnapshot == 1
@@ -1214,27 +1595,45 @@ async def test_stale_first_replacement_snapshot_cannot_close_recovery_interval(
         if record.channel == WS_MARKET
         and cast(dict[str, object], json.loads(record.payload_bytes)).get("event_type") == "book"
     )
-    assert tuple(item[2].get("asset_id") for item in replacement_records) == (
-        "token-yes",
-        "token-no",
-    )
+    assert tuple(item[2].get("asset_id") for item in replacement_records) == ("token-yes",)
     yes_index, yes_record, _yes_payload = replacement_records[0]
-    no_index, no_record, _no_payload = replacement_records[1]
     authoritative_record = raw_records[authoritative_index]
-    assert authoritative_index < yes_index < no_index
+    lifecycle_records = tuple(
+        (index, record, cast(dict[str, object], json.loads(record.payload_bytes)))
+        for index, record in enumerate(raw_records)
+        if record.channel == CONTROL_REST_AUDIT_REPLACEMENT_RECOVERY
+    )
+    assert tuple(item[2]["action"] for item in lifecycle_records) == (
+        "ATTEMPT_START",
+        "DEADLINE",
+        "DEADLINE",
+    )
+    attempt_index = lifecycle_records[0][0]
+    freshness_deadline_index, freshness_deadline_record, _deadline_payload = lifecycle_records[1]
+    assert authoritative_index < attempt_index < yes_index < freshness_deadline_index
     assert (
         authoritative_record.received_monotonic.epoch_id
         == yes_record.received_monotonic.epoch_id
-        == no_record.received_monotonic.epoch_id
+        == freshness_deadline_record.received_monotonic.epoch_id
     )
     assert (
         authoritative_record.received_monotonic.nanoseconds
         <= yes_record.received_monotonic.nanoseconds
     )
     assert (
-        no_record.received_monotonic.nanoseconds - yes_record.received_monotonic.nanoseconds
+        freshness_deadline_record.received_monotonic.nanoseconds
+        - yes_record.received_monotonic.nanoseconds
         > int(maximum_book_age_seconds * 1_000_000_000)
     )
+    capture_authority = processor.audit_replacement_capture_authority[0]
+    recovery = capture_authority.recovery_authority
+    assert recovery is not None
+    assert recovery.status.value == "RUN_DEADLINE_EXHAUSTED"
+    assert recovery.last_result.value == "RUN_DEADLINE_EXHAUSTED"
+    assert recovery.last_failure is not None
+    assert recovery.last_failure.value == "RUN_DEADLINE_REACHED"
+    assert recovery.attempt_count == 1
+    assert recovery.unresolved
     assert not summary.health_decision.research_eligible
     assert not summary.health_decision.gate1_eligible_so_far
     assert HealthDecisionReason.AUDIT_REPLACEMENT_CAPTURE_PENDING in (
@@ -1352,7 +1751,14 @@ async def test_slow_canonical_return_cannot_scan_or_release_stale_replacement_ca
         summary.journal_root,
         summary.collector_run_id,
     ).read_all()
-    assert all(record.channel != CONTROL_REST_AUDIT_REPLACEMENT_RELEASE for record in raw_records)
+    assert all(
+        record.channel
+        not in {
+            CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
+            CONTROL_REST_AUDIT_REPLACEMENT_RELEASE_V2,
+        }
+        for record in raw_records
+    )
     assert summary.runtime_health.unavailable_intervals == 1
     assert summary.availability_evidence.open_at_shutdown_intervals == 1
     interval = json.loads(summary.availability_evidence.path.read_text(encoding="utf-8"))
@@ -1449,7 +1855,14 @@ async def test_ended_replacement_generation_cannot_release_after_canonical_retur
         summary.journal_root,
         summary.collector_run_id,
     ).read_all()
-    assert all(record.channel != CONTROL_REST_AUDIT_REPLACEMENT_RELEASE for record in raw_records)
+    assert all(
+        record.channel
+        not in {
+            CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
+            CONTROL_REST_AUDIT_REPLACEMENT_RELEASE_V2,
+        }
+        for record in raw_records
+    )
     assert summary.runtime_health.unavailable_intervals == 1
     assert summary.availability_evidence.open_at_shutdown_intervals == 1
     interval = json.loads(summary.availability_evidence.path.read_text(encoding="utf-8"))
@@ -1469,6 +1882,7 @@ async def test_generation_end_after_sampled_release_decision_does_not_retroactiv
     original_preserve_websocket = (
         observe_module._RawCaptureBoundary.preserve_websocket_batch  # pyright: ignore[reportPrivateUsage]
     )
+    replacement_scan_counts: list[int] = []
 
     async def signal_first_replacement(
         capture: observe_module._RawCaptureBoundary,  # pyright: ignore[reportPrivateUsage]
@@ -1486,9 +1900,12 @@ async def test_generation_end_after_sampled_release_decision_does_not_retroactiv
             subscription_id=subscription_id,
         )
         if len(_LifecycleSocket.instances) >= 2:
-            for item in items:
+            for item, result in zip(items, results, strict=True):
                 raw = cast(dict[str, object], json.loads(item.message.payload_bytes))
-                if raw.get("event_type") == "book" and raw.get("asset_id") == "token-yes":
+                if raw.get("event_type") != "book":
+                    continue
+                replacement_scan_counts.append(result.scan_count)
+                if raw.get("asset_id") == "token-yes":
                     first_processed = _LifecycleSocket.first_replacement_processed
                     assert first_processed is not None
                     first_processed.set()
@@ -1501,6 +1918,7 @@ async def test_generation_end_after_sampled_release_decision_does_not_retroactiv
     )
     original_preserve = observe_module._RawCaptureBoundary.preserve_then_process  # pyright: ignore[reportPrivateUsage]
     release_chronology: list[tuple[int, int]] = []
+    release_processor_states: list[tuple[int, int, int]] = []
 
     async def end_generation_during_release_durability(
         capture: observe_module._RawCaptureBoundary,  # pyright: ignore[reportPrivateUsage]
@@ -1515,9 +1933,11 @@ async def test_generation_end_after_sampled_release_decision_does_not_retroactiv
         received_wall_time: UtcTimestamp | None = None,
         received_monotonic_ns: int | None = None,
     ) -> ProcessedEnvelope:
-        if channel == CONTROL_REST_AUDIT_REPLACEMENT_RELEASE:
+        if channel == CONTROL_REST_AUDIT_REPLACEMENT_RELEASE_V2:
             release = cast(dict[str, object], json.loads(payload))
             decision_ns = cast(int, release["decision_monotonic_ns"])
+            assert capture.processor.audit_replacement_captures_pending == 1
+            assert capture.processor.audit_ineligible_instruments
             allow_replacement_end = _LifecycleSocket.allow_replacement_end
             replacement_ended = _LifecycleSocket.replacement_ended
             assert allow_replacement_end is not None
@@ -1527,7 +1947,13 @@ async def test_generation_end_after_sampled_release_decision_does_not_retroactiv
             ended_ns = _LifecycleSocket.replacement_ended_monotonic_ns
             assert ended_ns is not None
             release_chronology.append((decision_ns, ended_ns))
-        return await original_preserve(
+            # Hold the release before raw durability/canonical application.
+            # Complete replacement snapshots remain scan-ineligible throughout
+            # this delay even though the decision has already been sampled.
+            await asyncio.sleep(0.05)
+            assert capture.processor.audit_replacement_captures_pending == 1
+            assert capture.processor.audit_ineligible_instruments
+        result = await original_preserve(
             capture,
             channel=channel,
             payload=payload,
@@ -1539,11 +1965,67 @@ async def test_generation_end_after_sampled_release_decision_does_not_retroactiv
             received_wall_time=received_wall_time,
             received_monotonic_ns=received_monotonic_ns,
         )
+        if channel == CONTROL_REST_AUDIT_REPLACEMENT_RELEASE_V2:
+            release_processor_states.append(
+                (
+                    1,
+                    capture.processor.audit_replacement_captures_pending,
+                    result.scan_count,
+                )
+            )
+        return result
 
     monkeypatch.setattr(
         observe_module._RawCaptureBoundary,  # pyright: ignore[reportPrivateUsage]
         "preserve_then_process",
         end_generation_during_release_durability,
+    )
+
+    original_try_release = cast(
+        Callable[..., Awaitable[bool]],
+        PolymarketObservationService._try_release_audit_replacement_captures,  # pyright: ignore[reportPrivateUsage]
+    )
+    release_runtime_states: list[tuple[int, int, int, bool]] = []
+
+    async def observe_runtime_release_reconciliation(
+        release_service: PolymarketObservationService,
+        **kwargs: object,
+    ) -> bool:
+        release_capture = cast(
+            observe_module._RawCaptureBoundary,  # pyright: ignore[reportPrivateUsage]
+            kwargs["capture"],
+        )
+        runtime_health = cast(ObservationRuntimeHealth, kwargs["runtime_health"])
+        is_release = any(
+            authority.status.value == "CAPTURE_COMPLETE"
+            for authority in release_capture.processor.audit_replacement_recovery_authorities
+        )
+        before = runtime_health.snapshot() if is_release else None
+        if is_release:
+            contributors = runtime_health.active_availability_contributors
+            assert len(contributors) == 1
+            recovery = contributors[0].replacement_recovery
+            assert recovery is not None
+            assert recovery.status == "CAPTURE_COMPLETE"
+            assert recovery.last_result == "CAPTURE_SUCCEEDED"
+        deferred = await original_try_release(release_service, **kwargs)
+        if is_release:
+            assert before is not None
+            after = runtime_health.snapshot()
+            release_runtime_states.append(
+                (
+                    before.active_availability_contributors,
+                    after.active_availability_contributors,
+                    after.availability_contributions_emitted,
+                    after.availability_ledger_healthy,
+                )
+            )
+        return deferred
+
+    monkeypatch.setattr(
+        PolymarketObservationService,
+        "_try_release_audit_replacement_captures",
+        observe_runtime_release_reconciliation,
     )
 
     # The sampled-release fence intentionally ends generation two. Disabling
@@ -1552,13 +2034,17 @@ async def test_generation_end_after_sampled_release_decision_does_not_retroactiv
     summary = await service.run(duration_seconds=5.0, gamma_market_id="101")
 
     assert len(release_chronology) == 1
+    assert replacement_scan_counts == [0, 0]
+    assert release_processor_states == [(1, 0, 1)]
+    assert release_runtime_states == [(1, 0, 1, True)]
     decision_ns, ended_ns = release_chronology[0]
     assert decision_ns < ended_ns
     assert summary.processor.audit_replacement_captures_pending == 0
     assert summary.processor.audit_ineligible_books == 0
     raw_records = JournalReader(summary.journal_root, summary.collector_run_id).read_all()
     assert (
-        sum(record.channel == CONTROL_REST_AUDIT_REPLACEMENT_RELEASE for record in raw_records) == 1
+        sum(record.channel == CONTROL_REST_AUDIT_REPLACEMENT_RELEASE_V2 for record in raw_records)
+        == 1
     )
     intervals = tuple(
         cast(dict[str, object], json.loads(line))
@@ -1572,6 +2058,20 @@ async def test_generation_end_after_sampled_release_decision_does_not_retroactiv
     assert mismatch_interval["ended_monotonic_ns"] == decision_ns
     assert mismatch_interval["research_eligibility_restored"] is True
     assert mismatch_interval["open_at_shutdown"] is False
+    contribution_path = summary.availability_evidence.contribution_path
+    assert contribution_path is not None
+    contributions = tuple(
+        cast(dict[str, object], json.loads(line))
+        for line in contribution_path.read_text(encoding="utf-8").splitlines()
+    )
+    contribution = next(
+        item
+        for item in contributions
+        if cast(dict[str, object], item["replacement_recovery"])["status"] == "RELEASED"
+    )
+    recovery_record = cast(dict[str, object], contribution["replacement_recovery"])
+    assert recovery_record["status"] == "RELEASED"
+    assert recovery_record["last_result"] == "RELEASED"
 
     replay = replay_journal(
         summary.journal_root,
@@ -1592,20 +2092,18 @@ async def test_resnapshot_failure_keeps_divergence_terminally_unresolved(
     service = _configured_service(tmp_path)
     _prepare_runtime(monkeypatch, fail_resnapshot=True)
     if availability_writer_failure:
-        original_enqueue = SupervisedAvailabilityIntervalWriter.enqueue_nowait
+        original_enqueue = SupervisedAvailabilityIntervalWriter.enqueue_contribution_nowait
 
         def fail_availability_admission(
             writer: SupervisedAvailabilityIntervalWriter,
-            interval: AvailabilityInterval,
-            *,
-            contributions: tuple[AvailabilityIntervalContribution, ...] = (),
+            contribution: AvailabilityIntervalContributionV2,
         ) -> bool:
             writer.record_failure(OSError("injected availability writer failure while pending"))
-            return original_enqueue(writer, interval, contributions=contributions)
+            return original_enqueue(writer, contribution)
 
         monkeypatch.setattr(
             SupervisedAvailabilityIntervalWriter,
-            "enqueue_nowait",
+            "enqueue_contribution_nowait",
             fail_availability_admission,
         )
 
@@ -1680,3 +2178,216 @@ async def test_resnapshot_failure_keeps_divergence_terminally_unresolved(
         final_checkpoint
     )
     assert "AUDIT_DIVERGENCE_UNRESOLVED" in _record_decision_reasons(final_checkpoint, sticky=True)
+
+
+@pytest.mark.asyncio
+async def test_contribution_writer_failure_does_not_stop_raw_ws_durability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A derived-evidence failure cannot become a raw-capture stop signal."""
+
+    service = _configured_service(tmp_path)
+    _prepare_runtime(monkeypatch, fail_resnapshot=False)
+    writer_failed = asyncio.Event()
+    post_failure_processed = asyncio.Event()
+    failure_monotonic_ns: list[int] = []
+    failed_contributions: list[AvailabilityIntervalContributionV2] = []
+    post_failure_payloads = tuple(
+        _canonical_bytes(
+            {
+                **cast(
+                    dict[str, object],
+                    json.loads(_replacement_ws_book_payload(asset_id)),
+                ),
+                "hash": f"post-contribution-writer-failure-{asset_id}",
+                "timestamp": timestamp,
+            }
+        )
+        for asset_id, timestamp in (
+            ("token-yes", "1787198403001"),
+            ("token-no", "1787198403002"),
+        )
+    )
+    post_failure_hashes = {
+        cast(dict[str, object], json.loads(payload))["hash"] for payload in post_failure_payloads
+    }
+
+    class _RawContinuesAfterContributionWriterFailureSocket(_LifecycleSocket):
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            ready.set()
+            try:
+                if self.generation == 2:
+                    first_processed = type(self).first_replacement_processed
+                    if first_processed is None:
+                        raise RuntimeError("replacement-generation test fence is unavailable")
+                    admit(
+                        ReceivedWebSocketMessage(
+                            payload_bytes=_replacement_ws_book_payload("token-yes"),
+                            received_wall_time=UtcTimestamp.now(),
+                            received_monotonic_ns=time.monotonic_ns(),
+                            message_type="TEXT",
+                        )
+                    )
+                    await first_processed.wait()
+                    admit(
+                        ReceivedWebSocketMessage(
+                            payload_bytes=_replacement_ws_book_payload("token-no"),
+                            received_wall_time=UtcTimestamp.now(),
+                            received_monotonic_ns=time.monotonic_ns(),
+                            message_type="TEXT",
+                        )
+                    )
+                    # The replacement pair closes the mismatch contributor.
+                    # Only its failed writer admission releases this fence, so
+                    # both following frames are causally post-failure.
+                    await writer_failed.wait()
+                    for payload in post_failure_payloads:
+                        admit(
+                            ReceivedWebSocketMessage(
+                                payload_bytes=payload,
+                                received_wall_time=UtcTimestamp.now(),
+                                received_monotonic_ns=time.monotonic_ns(),
+                                message_type="TEXT",
+                            )
+                        )
+                    await post_failure_processed.wait()
+                await asyncio.Event().wait()
+            finally:
+                self.stopped = True
+
+    monkeypatch.setattr(
+        observe_module,
+        "PolymarketMarketWebSocket",
+        _RawContinuesAfterContributionWriterFailureSocket,
+    )
+
+    original_enqueue = SupervisedAvailabilityIntervalWriter.enqueue_contribution_nowait
+
+    def fail_mismatch_contribution_admission(
+        writer: SupervisedAvailabilityIntervalWriter,
+        contribution: AvailabilityIntervalContributionV2,
+    ) -> bool:
+        if (
+            not writer_failed.is_set()
+            and contribution.cause is AvailabilityCause.AUDIT_MISMATCH_RECOVERY
+        ):
+            failed_contributions.append(contribution)
+            writer.record_failure(OSError("injected mid-run contribution writer failure"))
+            failure_monotonic_ns.append(time.monotonic_ns())
+            writer_failed.set()
+        return original_enqueue(writer, contribution)
+
+    monkeypatch.setattr(
+        SupervisedAvailabilityIntervalWriter,
+        "enqueue_contribution_nowait",
+        fail_mismatch_contribution_admission,
+    )
+
+    original_preserve_websocket = (
+        observe_module._RawCaptureBoundary.preserve_websocket_batch  # pyright: ignore[reportPrivateUsage]
+    )
+    processed_post_failure_hashes: list[str] = []
+
+    async def observe_post_failure_durability(
+        capture: observe_module._RawCaptureBoundary,  # pyright: ignore[reportPrivateUsage]
+        items: tuple[RawIngressItem, ...],
+        *,
+        semantics_hash: str,
+        connection_id: ConnectionId,
+        subscription_id: SubscriptionId,
+    ) -> tuple[ProcessedEnvelope, ...]:
+        results = await original_preserve_websocket(
+            capture,
+            items,
+            semantics_hash=semantics_hash,
+            connection_id=connection_id,
+            subscription_id=subscription_id,
+        )
+        if len(_LifecycleSocket.instances) >= 2:
+            for item in items:
+                payload = cast(dict[str, object], json.loads(item.message.payload_bytes))
+                if payload.get("asset_id") == "token-yes" and payload.get("hash") == (
+                    "replacement-ws-token-yes"
+                ):
+                    first_processed = _LifecycleSocket.first_replacement_processed
+                    assert first_processed is not None
+                    first_processed.set()
+                payload_hash = payload.get("hash")
+                if isinstance(payload_hash, str) and payload_hash in post_failure_hashes:
+                    processed_post_failure_hashes.append(payload_hash)
+                    if len(processed_post_failure_hashes) == len(post_failure_payloads):
+                        post_failure_processed.set()
+        return results
+
+    monkeypatch.setattr(
+        observe_module._RawCaptureBoundary,  # pyright: ignore[reportPrivateUsage]
+        "preserve_websocket_batch",
+        observe_post_failure_durability,
+    )
+
+    summary = await service.run(duration_seconds=3.0, gamma_market_id="101")
+
+    assert writer_failed.is_set()
+    assert post_failure_processed.is_set()
+    assert len(failure_monotonic_ns) == 1
+    assert len(failed_contributions) == 1
+    assert failed_contributions[0].cause is AvailabilityCause.AUDIT_MISMATCH_RECOVERY
+    assert set(processed_post_failure_hashes) == post_failure_hashes
+
+    raw_records = JournalReader(summary.journal_root, summary.collector_run_id).read_all()
+    raw_post_failure_records = tuple(
+        record
+        for record in raw_records
+        if record.channel == WS_MARKET
+        and cast(dict[str, object], json.loads(record.payload_bytes)).get("hash")
+        in post_failure_hashes
+    )
+    assert len(raw_post_failure_records) == 2
+    assert all(
+        record.received_monotonic.nanoseconds > failure_monotonic_ns[0]
+        for record in raw_post_failure_records
+    )
+    release_index = next(
+        index
+        for index, record in enumerate(raw_records)
+        if record.channel == CONTROL_REST_AUDIT_REPLACEMENT_RELEASE_V2
+    )
+    post_failure_indices = tuple(raw_records.index(record) for record in raw_post_failure_records)
+    assert release_index < min(post_failure_indices)
+    assert summary.journal_metrics.writer_failures == 0
+    assert summary.journal_metrics.backpressure_failures == 0
+    assert summary.journal_metrics.received == summary.journal_metrics.durable == len(raw_records)
+
+    runtime = summary.runtime_health
+    assert not runtime.availability_ledger_healthy
+    assert runtime.completed_availability_contributors == 1
+    assert runtime.availability_contribution_persistence_failures == 1
+    assert runtime.availability_contributions_emitted == 0
+    assert runtime.availability_records_emitted == 0
+    assert summary.status is ComponentHealth.DEGRADED
+    assert not summary.availability_evidence.completed
+    assert not summary.availability_evidence.gate1_evidence_eligible
+    assert summary.availability_evidence.failure_type == "OSError"
+    assert summary.availability_evidence.contribution_failure_type == "OSError"
+    # Raw capture and the derived analytical path remain independently
+    # usable, but the unavailable contributor ledger cannot authorize Gate 1.
+    assert summary.health_decision.capture_healthy
+    assert summary.health_decision.research_eligible
+    assert not summary.health_decision.gate1_eligible_so_far
+    assert HealthDecisionReason.AVAILABILITY_EVIDENCE_UNHEALTHY in (
+        summary.health_decision.reason_codes
+    )
+
+    replay = replay_journal(
+        summary.journal_root,
+        summary.collector_run_id,
+        service._config,  # pyright: ignore[reportPrivateUsage]
+    )
+    assert replay.processor == summary.processor
+    assert replay.processor.terminal_hash == summary.processor.terminal_hash

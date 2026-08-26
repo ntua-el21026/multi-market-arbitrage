@@ -16,7 +16,8 @@ between immutable mismatch history and current unresolved state; ADR-0055
 separates internal correctness from externally unattributable cause and adds
 fault/contribution/resource evidence; ADR-0056 separates active contributor
 authority from completed history and bounds replacement recovery. None rewrites
-that failed result, and ADR-0056 implementation remediation remains pending.
+that failed result. ADR-0056 implementation and offline validation are complete;
+independent authorization for a new public preflight remains pending.
 
 A fresh six-hour run is mandatory after ADR-0053 through ADR-0056 and
 `GATE_1_REMEDIATION_SPEC.md` are implemented and independently approved through
@@ -182,7 +183,7 @@ processing, the observer independently rechecks all required book receive
 timestamps as present, nonfuture and within the same maximum-age bound and
 verifies every required canonical book is healthy. A complete v2 capture remains
 pending/ineligible and every replacement snapshot emits zero scans. Only a
-self-contained bounded `mma.control.rest-audit-replacement-release.v1`, durably
+self-contained bounded `mma.control.rest-audit-replacement-release.v2`, durably
 journaled at that paired decision wall/monotonic boundary and successfully
 processed through the canonical route, may clear state and permit the recovery
 scan. It commits the exact capture preimage/digest, original/replacement
@@ -371,10 +372,12 @@ contributions. Historical v1 interval/contribution evidence remains unchanged,
 is not reinterpreted as ADR-0056 conformance, and never receives synthesized
 fields or contributions.
 
-Both the post-ADR-0056 interval record carrying contributor count/digest and the
-post-ADR-0056 contribution record use explicitly newer schemas selected during
-implementation. Existing interval-v1 and contribution-v1 evidence cannot supply
-or imply those fields.
+The post-ADR-0056 interval record uses `gate1-availability-interval-v2`; the
+contribution record uses `gate1-availability-interval-contribution-v2`; final
+publication binds `gate1-availability-evidence-summary-v2`,
+`gate1-availability-evidence-completion-v2` and
+`gate1-availability-evidence-reconciliation-v2`. Existing interval-v1 and
+contribution-v1 evidence cannot supply or imply those fields.
 
 Under ADR-0056, the interval ID is assigned when the interval opens and every
 causal contributor references that stable ID. Active authority contains only
@@ -386,7 +389,8 @@ active contributors. A resolved contributor freezes one immutable completed
 record, is handed independently to bounded durable derived-evidence persistence,
 and leaves active authority even when another contributor keeps the interval
 open. Active-contributor capacity and cumulative completed count/file/byte
-capacity are separate hard bounds.
+capacity are separate hard bounds: 64 active contributors; 8,192 interval
+records/64 MiB; 65,536 contribution records/256 MiB; and 64 KiB per record.
 
 The global interval is the union of time with a nonempty active-contributor set,
 not the sum of contributor durations. It closes only when the set becomes empty
@@ -397,9 +401,10 @@ remaining contributor receives explicit open-at-shutdown evidence at the paired
 cutoff, eligibility stays blocked, and unresolved state is Gate-sticky.
 
 Replacement capture uses one stable recovery/contributor identity across
-permitted connection generations. Its configured phase contract bounds attempts,
-first/latest times, next retry, hard recovery and run deadlines, required/
-captured instruments, last typed failure, and its deterministic evidence chain.
+permitted connection generations. Its configured phase contract permits nine
+attempts, a five-second retry delay and a 120-second hard deadline bounded by the
+run deadline, and retains first/latest times, required/captured instruments,
+last typed failure, and its deterministic evidence chain.
 Attempt or deadline exhaustion remains unresolved/open with exact evidence,
 typed fail-closed degradation, and no scanner/research restoration; it cannot
 remain indefinitely pending.

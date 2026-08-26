@@ -27,9 +27,12 @@ _FORBIDDEN_IMPORT_ROOTS = {
 }
 _FORBIDDEN_CAPABILITY_NAME = re.compile(
     r"(?i)^(?:"
-    r"(?:get|fetch|list|load|open|close|create|place|submit|send|amend|replace|cancel)_"
-    r"(?:orders?|balances?|positions?|credentials?|api_keys?|private_keys?|user_streams?)"
-    r"|(?:credentials?|signer|wallet|private_stream|authenticated_stream)"
+    r"(?:get|fetch|list|load|open|close|create|place|submit|send|amend|replace|cancel|"
+    r"deposit|withdraw|transfer|fund)_"
+    r"(?:orders?|accounts?|balances?|positions?|credentials?|api_keys?|private_keys?|user_streams?|"
+    r"funds?|assets?|tokens?|deposits?|withdrawals?|transfers?|funding)"
+    r"|(?:credentials?|signer|wallet|private_stream|authenticated_stream|deposit|deposits|"
+    r"withdraw|withdrawal|withdrawals|transfer|transfers|funding)"
     r")$"
 )
 _PUBLIC_HTTP_METHODS = {
@@ -172,6 +175,9 @@ def test_locked_project_dependencies_and_config_have_no_live_secret_surface() ->
         "auth",
         "balance",
         "credential",
+        "deposit",
+        "deposits",
+        "funding",
         "live",
         "order",
         "position",
@@ -179,7 +185,12 @@ def test_locked_project_dependencies_and_config_have_no_live_secret_surface() ->
         "private_stream",
         "secret",
         "signer",
+        "transfer",
+        "transfers",
         "wallet",
+        "withdraw",
+        "withdrawal",
+        "withdrawals",
     }
     observed_keys = {key.casefold() for key, _value in _mapping_items(config)}
     assert observed_keys.isdisjoint(forbidden_config_keys)
@@ -212,12 +223,17 @@ def test_cli_surface_contains_no_execution_or_account_command() -> None:
             "account",
             "balance",
             "cancel",
+            "deposit",
             "execute",
+            "funding",
             "live",
             "order",
             "position",
             "sign",
             "trade",
+            "transfer",
+            "withdraw",
+            "withdrawal",
         }
         & command_literals
     )
@@ -227,3 +243,16 @@ def test_negative_capability_test_itself_is_source_backed() -> None:
     assert inspect.getsourcefile(PolymarketPublicClient) == str(
         PRODUCTION_PACKAGE / "venues" / "polymarket" / "client.py"
     )
+
+
+def test_forbidden_capability_detector_covers_funding_and_asset_movement_paths() -> None:
+    for name in (
+        "deposit",
+        "deposit_asset",
+        "withdraw_funds",
+        "withdrawal",
+        "transfer_tokens",
+        "fund_account",
+        "funding",
+    ):
+        assert _FORBIDDEN_CAPABILITY_NAME.fullmatch(name), name

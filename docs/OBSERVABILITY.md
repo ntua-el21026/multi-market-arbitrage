@@ -324,8 +324,8 @@ must not extend the claimed observation duration.
 
 The observer writes a versioned logical availability-interval stream. The
 interval ID is assigned at open, before any contributor can reference it. The
-target record below is carried only by an explicitly newer post-ADR-0056 interval
-schema. Existing `gate1-availability-interval-v1` records are immutable, do not
+record below is carried by `gate1-availability-interval-v2`. Existing
+`gate1-availability-interval-v1` records are immutable, do not
 acquire `contributor_count` or `contributor_digest`, and cannot be used to infer
 those fields. Each completed or terminal-cutoff target record includes:
 
@@ -400,7 +400,7 @@ book receive timestamp is present, nonfuture and no older than
 `scanner.maximum_book_age`, and that every required canonical book is healthy.
 Complete v2 capture remains pending/ineligible and all of its replacement
 snapshots have emitted zero scans at this point. The coordinator next preserves
-`mma.control.rest-audit-replacement-release.v1` at that same boundary and waits
+`mma.control.rest-audit-replacement-release.v2` at that same boundary and waits
 for successful canonical processing. Only that accepted durable control may
 clear replacement-capture pending, clear audit ineligibility, produce the
 recovery scan, and close the mismatch contributor at exactly the control
@@ -423,8 +423,11 @@ instrument; intermediate controls retain the group blocker and emit zero scans,
 and only the final accepted control can close the mismatch contributor and scan.
 It closes the global interval only when no other contributor remains active.
 
-Phase implementation/configuration defines separate hard bounds for active
-contributors and cumulative interval/contributor records, artifacts and bytes.
+Phase implementation/configuration independently bounds unresolved active
+contributors, interval and completed-contributor queue/record/file capacity, and
+per-record size. Exact current values remain in `config/phase1.toml`,
+`PHASE_1_IMPLEMENTATION.md` and the Gate-1 specifications rather than becoming
+global observability constants.
 Derived-evidence admission is non-blocking and bounded. A supervised single
 owner per logical stream serializes, appends and durably persists outside the
 capture path, then atomically publishes a final artifact only after clean
@@ -453,9 +456,9 @@ enqueue-through-`fsync` latency, and observed JSONL byte growth per interval.
 ### 9.1 Availability interval contributions
 
 ADR-0055 producers retain the historical
-`gate1-availability-interval-contribution-v1` contract. ADR-0056 producers use an
-explicitly newer homogeneous contribution schema; they do not assign new fields
-or semantics to contribution-v1. Each active entry has one deterministic causal
+`gate1-availability-interval-contribution-v1` contract. ADR-0056 producers use
+`gate1-availability-interval-contribution-v2`; they do not assign new fields or
+semantics to contribution-v1. Each active entry has one deterministic causal
 key: audit request/divergence, public-read fault lifecycle, transport
 interruption, reported-top transition, reference recovery, resource/writer
 fault, or target lifecycle. Every entry references the stable global interval ID
@@ -489,9 +492,12 @@ completed contributor still active, count/digest mismatch, union-duration
 mismatch or sequence/hash-chain mismatch. Failure or saturation blocks automatic
 Gate eligibility without blocking raw capture. Existing
 `gate1-availability-interval-v1` and
-`gate1-availability-interval-contribution-v1` files remain immutable; both the
-post-ADR-0056 interval and contribution streams require explicitly newer schemas
-whose exact versions are selected during implementation. Readers report direct
+`gate1-availability-interval-contribution-v1` files remain immutable. Current
+publication uses `gate1-availability-interval-v2`,
+`gate1-availability-interval-contribution-v2`,
+`gate1-availability-evidence-summary-v2`,
+`gate1-availability-evidence-completion-v2` and
+`gate1-availability-evidence-reconciliation-v2`. Readers report direct
 coverage, stable causal key, active/completed classification, observation count/
 digest, independent completion/publication order, interval contributor count/
 digest, replacement attempt count/bound, first/latest/next-retry times, hard/run
@@ -603,7 +609,9 @@ required canonical-book health checks must pass first.
 The recovery record also carries one stable recovery identity, bounded attempt
 count, first/latest attempt times, next retry deadline, hard recovery deadline,
 the enclosing run deadline, required/captured instrument state, last typed
-failure and a deterministic evidence chain. A permitted new connection
+failure and a deterministic evidence chain. Strict finite attempt, retry-delay
+and hard-recovery bounds are Phase-1 configuration/specification values, all
+subordinate to the run deadline. A permitted new connection
 generation updates this same recovery and causal contributor. Attempt or
 deadline exhaustion records typed unresolved evidence, keeps contributor,
 interval and eligibility state open, and transitions to fail-closed degraded or
@@ -612,7 +620,7 @@ indefinitely pending. Numeric limits are phase configuration/specification
 values justified by measurement.
 
 The coordinator then durably journals
-`mma.control.rest-audit-replacement-release.v1` at that exact sampled paired
+`mma.control.rest-audit-replacement-release.v2` at that exact sampled paired
 UTC/monotonic decision boundary. Its bounded self-contained payload carries the
 full canonical capture preimage and SHA-256: divergence/market identity,
 original/replacement connection, complete required-instrument set, and every

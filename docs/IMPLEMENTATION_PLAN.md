@@ -14,7 +14,7 @@ Every stage ends with tests, reproducible evidence and an explicit gate. Code pr
 | F1 — Canonical core | Implemented |
 | F2 — Immutable raw journal | Implemented |
 | F3 — Canonical analytical storage | Implemented; incremental long-run report path present |
-| P1 — Polymarket read-only vertical slice | Implemented baseline; ADR-0053/0054/0055 candidate preserved; ADR-0056 implementation remediation pending |
+| P1 — Polymarket read-only vertical slice | Implemented baseline; ADR-0053/0054/0055 candidate preserved; ADR-0056 implementation and offline gates complete |
 | P2 — Ordinary-binary complete-set scanner | Implemented |
 | P3 — Deterministic replay/rebuild | Implemented and passed first-soak review |
 | P4 — First six-hour Polymarket soak | Executed; `GATE 1: FAIL` |
@@ -30,9 +30,11 @@ fault-lifecycle, interval-contribution, typed-resync and local classification-
 latency defects. The later pre-soak stability attempt exposed that completed
 contributor history was retained in active authority until the shared interval
 closed and that replacement capture lacked bounded exhaustion. ADR-0056 now
-governs those corrections. Documentation is reconciled; implementation, final
-offline gates, a new exact-SHA 60-second smoke and 5,400–7,200 second post-fix
-stability evidence remain pending. No six-hour rerun was performed.
+governs those corrections. Implementation, deterministic retained-corpus
+regression, strict capacity evidence and final offline quality gates are
+complete. Independent public-preflight authorization, a new exact-SHA 60-second
+smoke and 5,400–7,200 second post-fix stability evidence remain pending. No
+six-hour rerun was performed.
 
 ## 2. Completed foundation
 
@@ -208,9 +210,9 @@ ADR-0055 and ADR-0056.
   replacement retry/exhaustion, chronology, operational/terminal latency,
   memory attribution/plateau, queues, tails and storage.
 
-The post-fix final-SHA smoke and stability runs are pending until ADR-0056
-implementation and offline gates are frozen. Older public runs are forensic
-inputs, not acceptance of this candidate.
+ADR-0056 implementation and offline gates are complete. The post-fix final-SHA
+smoke and stability runs remain pending separate independent authorization.
+Older public runs are forensic inputs, not acceptance of this candidate.
 
 ### R8 — Fresh six-hour soak
 

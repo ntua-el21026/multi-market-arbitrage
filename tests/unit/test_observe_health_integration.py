@@ -472,8 +472,16 @@ async def test_processing_failure_opens_at_owner_detection_boundary(
             assert native_asset_id == "token-yes"
             return type("BookIdentity", (), {"instrument_id": instrument_id})()
 
+        def audit_replacement_attempt_start_commands(self, **kwargs: object) -> tuple[()]:
+            del kwargs
+            return ()
+
+        def audit_replacement_next_action_deadline_ns(self, **kwargs: object) -> None:
+            del kwargs
+
     class _FailingCapture:
         def __init__(self) -> None:
+            self.collector_run_id = CollectorRunId("processing-causal-boundary-run")
             self.processor = _Processor()
             self.book_freshness_receive_ns_by_instrument = {instrument_id: time.monotonic_ns()}
             self.relevant_l2_receive_ns_by_instrument = {instrument_id: time.monotonic_ns()}

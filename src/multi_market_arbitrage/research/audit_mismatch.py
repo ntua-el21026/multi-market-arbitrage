@@ -64,6 +64,7 @@ from multi_market_arbitrage.pipeline.audit import (
 from multi_market_arbitrage.pipeline.channels import (
     CONTROL_REST_AUDIT_CLASSIFY,
     CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
+    CONTROL_REST_AUDIT_REPLACEMENT_RELEASE_V2,
     CONTROL_REST_AUDIT_START,
     REST_BOOK,
     REST_BOOK_AUDIT,
@@ -2862,12 +2863,15 @@ def build_audit_mismatch_lineage_report(
                 raise AuditMismatchReportError(
                     "replay recovery stage differs from the report raw journal"
                 )
-            expected_channel = (
-                REST_BOOK
+            expected_channels = (
+                {REST_BOOK}
                 if replay_stage.event_type == "authoritative_rest_resnapshot"
-                else CONTROL_REST_AUDIT_REPLACEMENT_RELEASE
+                else {
+                    CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
+                    CONTROL_REST_AUDIT_REPLACEMENT_RELEASE_V2,
+                }
             )
-            if envelope.channel != expected_channel:
+            if envelope.channel not in expected_channels:
                 raise AuditMismatchReportError("replay recovery stage has the wrong raw channel")
             seen_replay_stage_sequences.add(envelope.ingest_seq)
         if envelope.channel == WS_MARKET and envelope.connection_id not in connection_generations:

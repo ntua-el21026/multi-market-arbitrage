@@ -207,12 +207,34 @@ def test_audit_divergence_benchmark_covers_changed_paths_and_capacity() -> None:
     assert identity["workload_version"] == WORKLOAD_VERSION == "adr-0054-production-paths-v2"
 
     capacity = cast(dict[str, int | bool], result["capacity_projection"])
+    bounds = cast(dict[str, object], result["bounds"])
+    maximum_periodic_checkpoint_bytes_acceptance = cast(
+        int,
+        bounds["maximum_periodic_checkpoint_bytes_acceptance"],
+    )
+    minimum_six_hour_file_headroom_bytes = cast(
+        int,
+        bounds["minimum_six_hour_file_headroom_bytes"],
+    )
     assert capacity["checkpoint_count"] == SIX_HOUR_CHECKPOINT_COUNT == 2_161
     assert capacity["maximum_records"] == HEALTH_EVIDENCE_MAXIMUM_RECORDS == 8_192
     assert capacity["maximum_file_bytes"] == HEALTH_EVIDENCE_MAXIMUM_BYTES == 67_108_864
     assert capacity["projected_file_bytes"] <= HEALTH_EVIDENCE_MAXIMUM_BYTES
-    assert capacity["maximum_periodic_checkpoint_bytes"] <= 30_000
-    assert capacity["remaining_file_bytes"] >= 2 * 1024 * 1024
+    assert (
+        maximum_periodic_checkpoint_bytes_acceptance
+        == (
+            capacity["maximum_file_bytes"]
+            - minimum_six_hour_file_headroom_bytes
+            - capacity["maximum_terminal_checkpoint_bytes"]
+        )
+        // capacity["periodic_checkpoint_count"]
+    )
+    assert maximum_periodic_checkpoint_bytes_acceptance == 30_077
+    assert (
+        capacity["maximum_periodic_checkpoint_bytes"]
+        <= maximum_periodic_checkpoint_bytes_acceptance
+    )
+    assert capacity["remaining_file_bytes"] >= minimum_six_hour_file_headroom_bytes
     assert capacity["unknown_host_source_field_count"] == 9
     assert capacity["unknown_host_periodic_delta_bytes"] == 71
     assert capacity["unknown_host_terminal_delta_bytes"] == 71

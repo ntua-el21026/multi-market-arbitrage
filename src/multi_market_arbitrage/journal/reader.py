@@ -477,6 +477,34 @@ class JournalReader:
             raise JournalCorruptionError("multiple completion heads exist for one run stream")
         return tuple(heads)
 
+    def uncompleted_sealed_prefix_git_commit(self) -> str | None:
+        """Return unanimous sealed-prefix provenance without implying completion.
+
+        This is a narrow replay compatibility selector for an explicitly
+        interrupted run whose durable prefix consists only of sealed segments.
+        A completion head remains the sole clean-run authority.  Any active
+        partial, absent sealed inventory, mixed stream, or mixed writer
+        provenance leaves the source unbound and therefore on strict current
+        semantics.
+        """
+
+        if self.completion_heads() or self._partial_inventory():
+            return None
+        segments = self._sealed_inventory()
+        provenance = {
+            (
+                segment.manifest.stream,
+                segment.manifest.venue_id,
+                segment.manifest.writer_id,
+                segment.manifest.writer_software_version,
+                segment.manifest.git_commit,
+            )
+            for segment in segments
+        }
+        if len(provenance) != 1:
+            return None
+        return next(iter(provenance))[-1]
+
     @staticmethod
     def _validate_completion_inventory(
         head: RunCompletionHead, segments: tuple[_SealedInventoryItem, ...]

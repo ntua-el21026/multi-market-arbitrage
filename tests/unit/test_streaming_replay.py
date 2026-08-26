@@ -72,6 +72,7 @@ async def _write_completed(
     count: int = 7,
     max_events_per_segment: int = 2,
     ingest_prefix: str = "ingest",
+    git_commit: str = "streaming-replay-test",
 ) -> tuple[RawEventEnvelope, ...]:
     envelopes = tuple(
         _envelope(run, sequence, ingest_prefix=ingest_prefix) for sequence in range(count)
@@ -84,7 +85,7 @@ async def _write_completed(
             stream=stream,
             writer_id=WriterId(f"writer-{stream}"),
             writer_software_version="test",
-            git_commit="streaming-replay-test",
+            git_commit=git_commit,
             max_events_per_segment=max_events_per_segment,
             zstd_level=3,
         )
@@ -254,6 +255,7 @@ async def test_streaming_interrupted_prefix_requires_explicit_opt_in(tmp_path: P
         tuple(JournalReader(tmp_path, run).iter_verified())
 
     assert tuple(JournalReader(tmp_path, run).iter_verified(include_partial=True)) == (expected,)
+    assert JournalReader(tmp_path, run).uncompleted_sealed_prefix_git_commit() is None
     assert (
         replay_journal(
             tmp_path,
@@ -263,6 +265,37 @@ async def test_streaming_interrupted_prefix_requires_explicit_opt_in(tmp_path: P
         ).raw_record_count
         == 1
     )
+
+
+@pytest.mark.asyncio
+async def test_uncompleted_sealed_prefix_uses_unanimous_manifest_source(tmp_path: Path) -> None:
+    run = CollectorRunId("sealed-interrupted-source-authority")
+    source_commit = "6dc5dc43bbb673a35ff960bb7d84fed062aefda4"
+    expected = await _write_completed(
+        tmp_path,
+        run,
+        count=3,
+        git_commit=source_commit,
+    )
+    completion = completion_path_for_run(tmp_path, run, "polymarket-public")
+    await asyncio.to_thread(completion.unlink)
+
+    reader = JournalReader(tmp_path, run)
+    assert reader.uncompleted_sealed_prefix_git_commit() == source_commit
+    config = load_phase1_config(Path("config/phase1.toml"))
+    replay = replay_journal(
+        tmp_path,
+        run,
+        config,
+        include_partial=True,
+    )
+    direct = CanonicalProcessor(
+        config,
+        source_journal_git_commit=source_commit,
+    )
+    assert all(direct.process_replayed(envelope).success for envelope in expected)
+
+    assert replay.processor == direct.summary()
 
 
 @pytest.mark.asyncio

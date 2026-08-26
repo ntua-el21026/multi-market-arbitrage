@@ -153,6 +153,12 @@ it from active authority without waiting for the shared interval to close.
 Active-contributor capacity and cumulative completed count/artifact/byte
 capacity are independently bounded.
 
+The active map and each interval/contribution queue, record count, file size and
+per-record size are independently bounded by strict phase configuration and hard
+implementation maxima. Exact current Phase-1 values belong to
+`config/phase1.toml`, `PHASE_1_IMPLEMENTATION.md` and the Gate-1 specifications;
+they are not foundational concurrency constants.
+
 Interval and contribution persistence are independent logical streams. They may
 be owned by one composite derived-evidence task or by separately supervised
 bounded tasks, but each stream has exactly one mutable owner. Producer admission
@@ -168,6 +174,9 @@ deadlines, required/captured instruments, last typed failure and deterministic
 evidence chain. Exhaustion transitions to typed unresolved fail-closed behavior;
 it cannot schedule indefinitely or create another contributor for the same
 causal lifecycle.
+
+The finite attempt, retry-delay and hard-recovery limits are strict Phase-1
+configuration/specification values, always subordinate to the run deadline.
 
 ### Scanner tasks
 Consume immutable validated snapshots/events; they do not mutate canonical market state.

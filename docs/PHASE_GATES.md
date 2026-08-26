@@ -10,10 +10,10 @@ G1 — Polymarket Observation: FAIL
 
 The first six-hour soak is retained as failure evidence. ADR-0053 through
 ADR-0056 and `GATE_1_REMEDIATION_SPEC.md` govern the correction and mandatory
-rerun. ADR-0056 reconciles contributor/replacement-recovery governance, but its
-implementation remediation and offline gates remain pending. Only afterward may
-a new exact-SHA 60-second smoke and 5,400–7,200 second post-fix stability
-observation run; no replacement six-hour soak has been run.
+rerun. ADR-0056 contributor/replacement-recovery implementation and deterministic
+offline gates are complete. Independent public-preflight authorization remains
+required before a new exact-SHA 60-second smoke and 5,400–7,200 second post-fix
+stability observation; no replacement six-hour soak has been run.
 
 | Gate | Name | Current status | Real orders allowed? |
 |---|---|---|---:|

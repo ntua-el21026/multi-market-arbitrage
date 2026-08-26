@@ -8,6 +8,7 @@ import sys
 import time
 from collections import deque
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Final, Protocol, cast
@@ -118,7 +119,10 @@ from .audit import (
     AUDIT_EXPIRY_SCHEMA,
     AUDIT_FAILURE_V1_SCHEMA,
     AUDIT_FAILURE_V2_SCHEMA,
-    AUDIT_REPLACEMENT_RELEASE_SCHEMA,
+    AUDIT_FAULT_LIFECYCLE_SCHEMA,
+    AUDIT_FAULT_LIFECYCLE_V2_SCHEMA,
+    AUDIT_REPLACEMENT_RELEASE_V1_SCHEMA,
+    AUDIT_REPLACEMENT_RELEASE_V2_SCHEMA,
     AUDIT_START_V1_SCHEMA,
     AUDIT_START_V2_SCHEMA,
     AuditBookIdentity,
@@ -158,7 +162,9 @@ from .channels import (
     CONTROL_REST_AUDIT_CLASSIFY_PREPARE,
     CONTROL_REST_AUDIT_EXPIRED,
     CONTROL_REST_AUDIT_FAILED,
+    CONTROL_REST_AUDIT_REPLACEMENT_RECOVERY,
     CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
+    CONTROL_REST_AUDIT_REPLACEMENT_RELEASE_V2,
     CONTROL_REST_AUDIT_START,
     GAMMA_EVENT_PREFIX,
     GAMMA_MARKET_PREFIX,
@@ -168,6 +174,17 @@ from .channels import (
     REST_BOOK_AUDIT,
     WS_MARKET,
     channel_native_id,
+)
+from .replacement_recovery import (
+    REPLACEMENT_RECOVERY_LIFECYCLE_SCHEMA,
+    ReplacementRecoveryAuthority,
+    ReplacementRecoveryBounds,
+    ReplacementRecoveryFailure,
+    ReplacementRecoveryLifecycleAction,
+    ReplacementRecoveryLifecycleCommand,
+    ReplacementRecoveryStatus,
+    ReplacementRecoveryTransitionError,
+    ReplacementSnapshotCandidate,
 )
 from .transitions import (
     REPORTED_TOP_TRANSITION_EXPIRY_SCHEMA,
@@ -214,6 +231,18 @@ _HISTORICAL_DIRECT_DEFERRED_AUDIT_SOURCE_COMMITS = frozenset(
         "a382b93220011428703fe02483f7034f59c1f045",
         "ff7054ac2167026ce1ed14111b7e144cfd4fd865",
         "ee240c51184cccfc6e425906097758b5ca019a95",
+    }
+)
+_HISTORICAL_UNSUPERVISED_REPLACEMENT_CAPTURE_SOURCE_COMMITS = frozenset(
+    {
+        # Immutable retained producers that predate the ADR-0056 recovery
+        # lifecycle and v2 release controls.  Their v2 audit-start records use
+        # the bounded snapshot capture plus v1 release protocol, so replay must
+        # not synthesize a recovery authority that was never journaled.
+        "a382b93220011428703fe02483f7034f59c1f045",
+        "ff7054ac2167026ce1ed14111b7e144cfd4fd865",
+        "ee240c51184cccfc6e425906097758b5ca019a95",
+        "6dc5dc43bbb673a35ff960bb7d84fed062aefda4",
     }
 )
 
@@ -434,6 +463,7 @@ class AuditDivergenceEligibilityRestoration:
     restored_ingest_seq: int
     restored_at: UtcTimestamp
     restored_monotonic: MonotonicTimestamp
+    replacement_recovery_authority: ReplacementRecoveryAuthority | None = None
 
     def __post_init__(self) -> None:
         if self.audit_start_schema != AUDIT_START_V2_SCHEMA:
@@ -453,6 +483,17 @@ class AuditDivergenceEligibilityRestoration:
         ):
             raise ValueError(
                 "eligibility-restoration event differs from its availability authority"
+            )
+        recovery = self.replacement_recovery_authority
+        if recovery is not None and (
+            recovery.divergence_id != self.divergence_id
+            or recovery.status is not ReplacementRecoveryStatus.RELEASED
+            or recovery.release_source != self.replacement_release_source
+            or recovery.release_ingest_seq != self.restored_ingest_seq
+            or recovery.release_monotonic != self.restored_monotonic
+        ):
+            raise ValueError(
+                "eligibility-restoration event differs from replacement-recovery authority"
             )
 
 
@@ -474,8 +515,73 @@ class _PostSnapshotBaseline:
 class _AuditFaultRecordingContext:
     """Exact v2 failure metadata active for one outcome-recording call."""
 
-    command: AuditFailureCommand
+    command: AuditFailureCommand | None
     original_reason: AuditFailureReason
+    failure_evidence_kind: AuditFaultFailureEvidenceKind | None = None
+    failure_schema: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedAuditState:
+    """Exact scoped canonical authority frozen by an inert PREPARE."""
+
+    processed_watermark: WebSocketAdmissionWatermark
+    book: AuditBookIdentity
+    owner_snapshot: ImmutableOrderBookSnapshot
+    reported_top_transition: ReportedTopTransition | None
+    audit_ineligible: bool
+    audit_ineligible_nonfault: bool
+    audit_faults: tuple[AuditFaultLifecycleRecord, ...]
+    replacement_capture: ProcessorAuditReplacementCaptureSnapshot | None
+    pending_divergence: AuditDivergencePending | None
+    transition_resync: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedAuditPlan:
+    """Pure decision and bounded effects computed against ``_PreparedAuditState``."""
+
+    outcome: AuditOutcome
+    reason: AuditFailureReason | None
+    response_boundary_ordinal: int | None
+    barrier_processed_ordinal: int | None
+    barrier_book: AuditBookIdentity | None
+    normalized_rest: NormalizedRestBook | None
+    mismatch_diagnostic: AuditMismatchDiagnostic | None
+    owner_after: CanonicalL2BookOwner | None
+    owner_after_snapshot: ImmutableOrderBookSnapshot | None
+    book_mutation: BookMutation | None
+    mark_audit_ineligible: bool
+    audit_ineligible_nonfault: bool
+    mark_market_dirty: bool
+    increment_invalidation: bool
+    transition_resync: bool
+    resolve_current_faults: bool
+    clear_audit_ineligible: bool
+    open_divergence: bool
+
+    def to_record(self) -> dict[str, object]:
+        """Return the exact serializable plan projection used by terminal hashes."""
+
+        return {
+            "audit_ineligible_nonfault": self.audit_ineligible_nonfault,
+            "barrier_book": self.barrier_book,
+            "barrier_processed_ordinal": self.barrier_processed_ordinal,
+            "book_mutation": self.book_mutation,
+            "clear_audit_ineligible": self.clear_audit_ineligible,
+            "increment_invalidation": self.increment_invalidation,
+            "mark_audit_ineligible": self.mark_audit_ineligible,
+            "mark_market_dirty": self.mark_market_dirty,
+            "mismatch_diagnostic": self.mismatch_diagnostic,
+            "normalized_rest": self.normalized_rest,
+            "open_divergence": self.open_divergence,
+            "outcome": self.outcome,
+            "owner_after_snapshot": self.owner_after_snapshot,
+            "reason": self.reason,
+            "resolve_current_faults": self.resolve_current_faults,
+            "response_boundary_ordinal": self.response_boundary_ordinal,
+            "transition_resync": self.transition_resync,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -484,13 +590,8 @@ class _PreparedAuditClassification:
 
     command: AuditClassificationPrepareCommand
     envelope: RawEventEnvelope
-    processed_watermark: WebSocketAdmissionWatermark
-    book: AuditBookIdentity
-    owner_health: BookHealth
-    reported_top_transition: ReportedTopTransition | None
-    audit_ineligible_nonfault: bool
-    audit_fault_current_count: int
-    audit_fault_scope_block_count: int
+    state: _PreparedAuditState
+    plan: _PreparedAuditPlan
 
 
 @dataclass(frozen=True, slots=True)
@@ -534,6 +635,7 @@ class ProcessorAuditReplacementCaptureSnapshot:
     availability_binding: AuditAvailabilityBinding | None
     replacement_connection_id: ConnectionId | None
     captured_snapshot_sources: tuple[ProcessorAuditReplacementSnapshotSource, ...]
+    recovery_authority: ReplacementRecoveryAuthority | None = None
 
     def __post_init__(self) -> None:
         if not is_sha256_hex(self.divergence_id):
@@ -548,6 +650,7 @@ class ProcessorAuditReplacementCaptureSnapshot:
             raise ValueError("audit replacement authority key must be in its required scope")
         if self.audit_start_schema == AUDIT_START_V2_SCHEMA:
             binding = self.availability_binding
+            recovery = self.recovery_authority
             if (
                 binding is None
                 or binding.divergence_id != self.divergence_id
@@ -555,9 +658,20 @@ class ProcessorAuditReplacementCaptureSnapshot:
                 or binding.market_id != self.market_id.value
                 or binding.authoritative_resolution_source != self.resolution_source
                 or binding.replacement_release_source is not None
+                or (
+                    recovery is not None
+                    and (
+                        recovery.divergence_id != self.divergence_id
+                        or recovery.resolution_source != self.resolution_source
+                        or recovery.resolution_ingest_seq != self.resolution_ingest_seq
+                        or recovery.resolution_monotonic != self.resolution_monotonic
+                        or recovery.original_connection_id != self.original_connection_id
+                        or recovery.required_instrument_ids != self.required_instrument_ids
+                    )
+                )
             ):
                 raise ValueError("v2 replacement capture availability binding is inconsistent")
-        elif self.availability_binding is not None:
+        elif self.availability_binding is not None or self.recovery_authority is not None:
             raise ValueError("legacy replacement capture cannot invent availability authority")
         if (
             tuple(sorted(set(self.required_instrument_ids), key=lambda item: item.value))
@@ -626,6 +740,7 @@ class _AuditReplacementCapture:
     # so the durable v1/v2 capture/history identity preimage remains stable.
     # This does not promise equality with a historical pre-v3 terminal hash.
     availability_binding: AuditAvailabilityBinding | None
+    recovery_authority: ReplacementRecoveryAuthority | None = None
     replacement_connection_id: ConnectionId | None = None
     captured_snapshot_sources: tuple[_AuditReplacementSnapshotSource, ...] = ()
 
@@ -633,6 +748,7 @@ class _AuditReplacementCapture:
         if self.audit_start_schema not in {AUDIT_START_V1_SCHEMA, AUDIT_START_V2_SCHEMA}:
             raise ValueError("audit replacement capture start schema is unsupported")
         if self.audit_start_schema == AUDIT_START_V2_SCHEMA:
+            recovery = self.recovery_authority
             if (
                 self.availability_binding is None
                 or self.availability_binding.divergence_id != self.divergence_id
@@ -640,9 +756,27 @@ class _AuditReplacementCapture:
                 or self.availability_binding.authoritative_resolution_source
                 != self.resolution_source
                 or self.availability_binding.replacement_release_source is not None
+                or (
+                    recovery is not None
+                    and (
+                        recovery.divergence_id != self.divergence_id
+                        or recovery.resolution_source != self.resolution_source
+                        or recovery.resolution_ingest_seq != self.resolution_ingest_seq
+                        or recovery.resolution_monotonic != self.resolution_monotonic
+                        or recovery.original_connection_id != self.original_connection_id
+                        or recovery.required_instrument_ids != self.required_instrument_ids
+                        or recovery.excluded_connection_ids
+                        != tuple(
+                            sorted(
+                                self.pre_open_connection_ids,
+                                key=lambda item: item.value,
+                            )
+                        )
+                    )
+                )
             ):
                 raise ValueError("v2 replacement capture availability binding is inconsistent")
-        elif self.availability_binding is not None:
+        elif self.availability_binding is not None or self.recovery_authority is not None:
             raise ValueError("legacy replacement capture cannot invent availability authority")
         if self.resolution_ingest_seq < 0:
             raise ValueError("audit replacement capture resolution sequence cannot be negative")
@@ -674,6 +808,26 @@ class _AuditReplacementCapture:
             for source in self.captured_snapshot_sources
         ):
             raise ValueError("replacement snapshot sources span socket connections")
+        recovery = self.recovery_authority
+        if recovery is not None:
+            expected_sources = tuple(
+                _AuditReplacementSnapshotSource(
+                    instrument_id=source.instrument_id,
+                    connection_id=source.connection_id,
+                    admission_ordinal=source.admission_ordinal,
+                    ingest_seq=source.ingest_seq,
+                    received_monotonic=source.received_monotonic,
+                    raw_source=source.raw_source,
+                )
+                for source in recovery.captured_snapshot_sources
+            )
+            if (
+                self.replacement_connection_id != recovery.current_connection_id
+                or self.captured_snapshot_sources != expected_sources
+            ):
+                raise ValueError(
+                    "replacement capture projection differs from its recovery authority"
+                )
 
     def observe_snapshot(
         self,
@@ -686,6 +840,11 @@ class _AuditReplacementCapture:
         received_monotonic: MonotonicTimestamp,
         raw_source: RawSourceRef,
     ) -> _AuditReplacementCapture:
+        if self.recovery_authority is not None:
+            raise ProgrammingInvariantViolation(
+                "v2 replacement snapshots require bounded recovery authority",
+                component="canonical-processor",
+            )
         if maximum_age_ns < 0:
             raise ValueError("replacement snapshot maximum age cannot be negative")
         if connection_id == self.original_connection_id:
@@ -723,9 +882,41 @@ class _AuditReplacementCapture:
 
     @property
     def complete(self) -> bool:
-        return (
+        sources_complete = (
             tuple(source.instrument_id for source in self.captured_snapshot_sources)
             == self.required_instrument_ids
+        )
+        recovery = self.recovery_authority
+        if recovery is None:
+            return sources_complete
+        return sources_complete and recovery.status is ReplacementRecoveryStatus.CAPTURE_COMPLETE
+
+    def with_recovery_authority(
+        self,
+        authority: ReplacementRecoveryAuthority,
+    ) -> _AuditReplacementCapture:
+        """Project one immutable v2 authority into the legacy-compatible view."""
+
+        if self.audit_start_schema != AUDIT_START_V2_SCHEMA:
+            raise ProgrammingInvariantViolation(
+                "legacy replacement capture cannot adopt v2 recovery authority",
+                component="canonical-processor",
+            )
+        return replace(
+            self,
+            recovery_authority=authority,
+            replacement_connection_id=authority.current_connection_id,
+            captured_snapshot_sources=tuple(
+                _AuditReplacementSnapshotSource(
+                    instrument_id=source.instrument_id,
+                    connection_id=source.connection_id,
+                    admission_ordinal=source.admission_ordinal,
+                    ingest_seq=source.ingest_seq,
+                    received_monotonic=source.received_monotonic,
+                    raw_source=source.raw_source,
+                )
+                for source in authority.captured_snapshot_sources
+            ),
         )
 
     def authority_snapshot(
@@ -759,6 +950,7 @@ class _AuditReplacementCapture:
                 )
                 for source in self.captured_snapshot_sources
             ),
+            recovery_authority=self.recovery_authority,
         )
 
     def to_record(self) -> dict[str, object]:
@@ -777,6 +969,9 @@ class _AuditReplacementCapture:
             record["resolution_ingest_seq"] = self.resolution_ingest_seq
             record["resolution_monotonic"] = self.resolution_monotonic
             record["resolution_source"] = self.resolution_source
+            recovery = self.recovery_authority
+            if recovery is not None:
+                record["recovery_authority"] = recovery.to_record()
         return record
 
 
@@ -1161,6 +1356,9 @@ class CanonicalProcessor:
         self._allow_historical_direct_deferred_audit = (
             source_journal_git_commit in _HISTORICAL_DIRECT_DEFERRED_AUDIT_SOURCE_COMMITS
         )
+        self._allow_historical_unsupervised_replacement_capture = (
+            source_journal_git_commit in _HISTORICAL_UNSUPERVISED_REPLACEMENT_CAPTURE_SOURCE_COMMITS
+        )
         self._gamma_by_condition: dict[str, GammaMarket] = {}
         self._gamma_by_id: dict[str, GammaMarket] = {}
         self._events_by_id: dict[str, GammaEvent] = {}
@@ -1425,8 +1623,10 @@ class CanonicalProcessor:
         *,
         maximum_age_ns: int,
     ) -> bool:
+        recovery = capture.recovery_authority
         return (
             capture.complete
+            and (recovery is None or recovery.status is ReplacementRecoveryStatus.CAPTURE_COMPLETE)
             and capture.resolution_monotonic.epoch_id == decision_monotonic.epoch_id
             and decision_monotonic.nanoseconds >= capture.resolution_monotonic.nanoseconds
             and all(
@@ -1441,6 +1641,231 @@ class CanonicalProcessor:
                 for source in capture.captured_snapshot_sources
             )
         )
+
+    @staticmethod
+    def _replacement_recovery_deadline_transition(
+        authority: ReplacementRecoveryAuthority,
+        *,
+        at: MonotonicTimestamp,
+    ) -> ReplacementRecoveryAuthority:
+        """Apply an reached hard/run deadline with deterministic precedence."""
+
+        if authority.terminal:
+            return authority
+        if at.epoch_id != authority.resolution_monotonic.epoch_id:
+            return authority
+        hard_reached = at.nanoseconds >= authority.hard_deadline.nanoseconds
+        run_reached = at.nanoseconds >= authority.run_deadline.nanoseconds
+        if run_reached and (
+            not hard_reached
+            or authority.run_deadline.nanoseconds <= authority.hard_deadline.nanoseconds
+        ):
+            return authority.exhaust_run_deadline(at=at)
+        if hard_reached:
+            return authority.exhaust_hard_deadline(at=at)
+        return authority
+
+    def _parse_replacement_recovery_lifecycle(
+        self,
+        payload: bytes,
+    ) -> ReplacementRecoveryLifecycleCommand:
+        control = self._control_object(
+            payload,
+            schema=REPLACEMENT_RECOVERY_LIFECYCLE_SCHEMA,
+            expected_keys=frozenset(
+                {
+                    "action",
+                    "connection_id",
+                    "decision_monotonic_ns",
+                    "divergence_id",
+                    "failure",
+                    "monotonic_epoch_id",
+                    "prior_authority_sha256",
+                    "recovery_id",
+                    "schema",
+                }
+            ),
+        )
+        raw_connection = control["connection_id"]
+        raw_failure = control["failure"]
+        try:
+            connection_id = (
+                None
+                if raw_connection is None
+                else ConnectionId(self._control_text(control, "connection_id", maximum=256))
+            )
+            failure = (
+                None
+                if raw_failure is None
+                else ReplacementRecoveryFailure(self._control_text(control, "failure", maximum=64))
+            )
+            command = ReplacementRecoveryLifecycleCommand(
+                action=ReplacementRecoveryLifecycleAction(
+                    self._control_text(control, "action", maximum=64)
+                ),
+                recovery_id=self._control_text(control, "recovery_id", maximum=64),
+                divergence_id=self._control_text(control, "divergence_id", maximum=64),
+                prior_authority_sha256=self._control_text(
+                    control,
+                    "prior_authority_sha256",
+                    maximum=64,
+                ),
+                monotonic_epoch_id=self._control_text(
+                    control,
+                    "monotonic_epoch_id",
+                    maximum=256,
+                ),
+                decision_monotonic_ns=self._control_integer(
+                    control,
+                    "decision_monotonic_ns",
+                ),
+                connection_id=connection_id,
+                failure=failure,
+            )
+        except ValueError as error:
+            raise NormalizationError(
+                "replacement recovery lifecycle evidence is invalid"
+            ) from error
+        if payload != command.to_payload():
+            raise NormalizationError(
+                "replacement recovery lifecycle evidence must use canonical encoding"
+            )
+        return command
+
+    def _apply_replacement_recovery_lifecycle(self, envelope: RawEventEnvelope) -> None:
+        command = self._parse_replacement_recovery_lifecycle(envelope.payload_bytes)
+        decision_monotonic = command.decision_monotonic
+        if envelope.received_monotonic != decision_monotonic:
+            raise NormalizationError(
+                "replacement recovery lifecycle differs from its receive boundary"
+            )
+        matches = tuple(
+            (instrument_id, capture)
+            for instrument_id, capture in sorted(
+                self._audit_replacement_captures.items(),
+                key=lambda item: item[0].value,
+            )
+            if capture.recovery_authority is not None
+            and capture.recovery_authority.recovery_id == command.recovery_id
+        )
+        if len(matches) != 1:
+            raise NormalizationError(
+                "replacement recovery lifecycle identifies no unique pending authority"
+            )
+        instrument_id, capture = matches[0]
+        authority = capture.recovery_authority
+        if authority is None:  # pragma: no cover - narrowed above
+            raise ProgrammingInvariantViolation(
+                "replacement recovery lifecycle lost its authority",
+                component="canonical-processor",
+            )
+        if (
+            command.divergence_id != authority.divergence_id
+            or command.prior_authority_sha256 != canonical_sha256(authority.to_record())
+        ):
+            raise NormalizationError(
+                "replacement recovery lifecycle differs from prior authority identity"
+            )
+        if decision_monotonic.epoch_id != authority.resolution_monotonic.epoch_id:
+            raise NormalizationError("replacement recovery lifecycle changes monotonic epoch")
+
+        action = command.action
+        if action is ReplacementRecoveryLifecycleAction.ATTEMPT_START:
+            connection_id = command.connection_id
+            if connection_id is None or envelope.connection_id != connection_id:
+                raise NormalizationError(
+                    "replacement attempt start differs from its socket generation"
+                )
+            try:
+                updated = authority.start_attempt(
+                    connection_id=connection_id,
+                    started_monotonic=decision_monotonic,
+                )
+            except ReplacementRecoveryTransitionError as error:
+                raise NormalizationError("replacement attempt start was rejected") from error
+        elif action is ReplacementRecoveryLifecycleAction.ATTEMPT_ABANDON_RETRY:
+            connection_id = command.connection_id
+            failure = command.failure
+            if (
+                connection_id is None
+                or failure is None
+                or envelope.connection_id != connection_id
+                or authority.current_connection_id != connection_id
+            ):
+                raise NormalizationError(
+                    "replacement attempt abandonment differs from current authority"
+                )
+            try:
+                updated = authority.abandon_attempt(
+                    failure=failure,
+                    abandoned_monotonic=decision_monotonic,
+                    source=self._active_raw_source(),
+                )
+                if not updated.terminal:
+                    updated = updated.schedule_retry(decided_monotonic=decision_monotonic)
+            except ReplacementRecoveryTransitionError as error:
+                raise NormalizationError("replacement attempt abandonment was rejected") from error
+        elif action is ReplacementRecoveryLifecycleAction.DEADLINE:
+            updated = self._replacement_recovery_deadline_transition(
+                authority,
+                at=decision_monotonic,
+            )
+            if updated == authority:
+                if (
+                    authority.status
+                    not in {
+                        ReplacementRecoveryStatus.ATTEMPT_ACTIVE,
+                        ReplacementRecoveryStatus.CAPTURE_COMPLETE,
+                    }
+                    or decision_monotonic.nanoseconds < authority.next_action_deadline.nanoseconds
+                ):
+                    raise NormalizationError("replacement recovery deadline has not been reached")
+                try:
+                    updated = authority.abandon_attempt(
+                        failure=ReplacementRecoveryFailure.FRESHNESS_EXPIRED,
+                        abandoned_monotonic=decision_monotonic,
+                        source=self._active_raw_source(),
+                    )
+                    if not updated.terminal:
+                        updated = updated.schedule_retry(decided_monotonic=decision_monotonic)
+                except ReplacementRecoveryTransitionError as error:
+                    raise NormalizationError(
+                        "replacement recovery attempt deadline was rejected"
+                    ) from error
+        elif action is ReplacementRecoveryLifecycleAction.RELEASE_NOT_PROJECTED:
+            connection_id = command.connection_id
+            if (
+                connection_id is None
+                or envelope.connection_id != connection_id
+                or authority.current_connection_id != connection_id
+            ):
+                raise NormalizationError(
+                    "replacement release projection differs from its connection"
+                )
+            if self._audit_replacement_release_group_ready_at(
+                self._audit_replacement_release_group(capture),
+                connection_id=connection_id,
+                decision_monotonic=decision_monotonic,
+            ):
+                raise NormalizationError(
+                    "replacement release was projectable at the recorded boundary"
+                )
+            try:
+                updated = authority.record_release_not_projected(
+                    decided_monotonic=decision_monotonic
+                )
+            except ReplacementRecoveryTransitionError as error:
+                raise NormalizationError(
+                    "replacement release non-projection verdict was rejected"
+                ) from error
+        else:
+            try:
+                updated = authority.terminalize(cutoff_monotonic=decision_monotonic)
+            except ReplacementRecoveryTransitionError as error:
+                raise NormalizationError(
+                    "replacement recovery terminal cutoff was rejected"
+                ) from error
+        self._audit_replacement_captures[instrument_id] = capture.with_recovery_authority(updated)
 
     @staticmethod
     def _audit_replacement_release_command(
@@ -1462,6 +1887,11 @@ class CanonicalProcessor:
             capture_record=capture.to_record(),
             monotonic_epoch_id=decision_monotonic.epoch_id,
             decision_monotonic_ns=decision_monotonic.nanoseconds,
+            schema=(
+                AUDIT_REPLACEMENT_RELEASE_V1_SCHEMA
+                if capture.recovery_authority is None
+                else AUDIT_REPLACEMENT_RELEASE_V2_SCHEMA
+            ),
         )
 
     def _audit_replacement_release_group(
@@ -1637,6 +2067,207 @@ class CanonicalProcessor:
             )
         return tuple(commands)
 
+    def audit_replacement_release_not_projected_commands(
+        self,
+        *,
+        connection_id: ConnectionId,
+        decision_monotonic: MonotonicTimestamp,
+    ) -> tuple[ReplacementRecoveryLifecycleCommand, ...]:
+        """Project one durable typed verdict for each blocked complete capture."""
+
+        commands: list[ReplacementRecoveryLifecycleCommand] = []
+        visited_markets: set[MarketId] = set()
+        for instrument_id in sorted(
+            self._audit_replacement_captures,
+            key=lambda item: item.value,
+        ):
+            capture = self._audit_replacement_captures[instrument_id]
+            if capture.market_id in visited_markets:
+                continue
+            visited_markets.add(capture.market_id)
+            group = self._audit_replacement_release_group(capture)
+            if self._audit_replacement_release_group_ready_at(
+                group,
+                connection_id=connection_id,
+                decision_monotonic=decision_monotonic,
+            ):
+                continue
+            for _group_instrument_id, group_capture in group:
+                authority = group_capture.recovery_authority
+                if (
+                    authority is None
+                    or authority.status is not ReplacementRecoveryStatus.CAPTURE_COMPLETE
+                    or authority.current_connection_id != connection_id
+                    or authority.last_failure
+                    is ReplacementRecoveryFailure.RELEASE_CONTROL_NOT_PROJECTED
+                ):
+                    continue
+                commands.append(
+                    ReplacementRecoveryLifecycleCommand.create(
+                        authority=authority,
+                        action=(ReplacementRecoveryLifecycleAction.RELEASE_NOT_PROJECTED),
+                        decision_monotonic=decision_monotonic,
+                        connection_id=connection_id,
+                    )
+                )
+        return tuple(commands)
+
+    @property
+    def audit_replacement_recovery_authorities(
+        self,
+    ) -> tuple[ReplacementRecoveryAuthority, ...]:
+        """Return the bounded current supervisor authorities in stable order."""
+
+        return tuple(
+            authority
+            for instrument_id in sorted(
+                self._audit_replacement_captures,
+                key=lambda item: item.value,
+            )
+            if (authority := self._audit_replacement_captures[instrument_id].recovery_authority)
+            is not None
+        )
+
+    def audit_replacement_attempt_start_commands(
+        self,
+        *,
+        connection_id: ConnectionId,
+        decision_monotonic: MonotonicTimestamp,
+    ) -> tuple[ReplacementRecoveryLifecycleCommand, ...]:
+        """Project attempts that may start on this newly ready socket generation."""
+
+        commands: list[ReplacementRecoveryLifecycleCommand] = []
+        for authority in self.audit_replacement_recovery_authorities:
+            if authority.terminal or authority.status not in {
+                ReplacementRecoveryStatus.READY,
+                ReplacementRecoveryStatus.RETRY_SCHEDULED,
+            }:
+                continue
+            if decision_monotonic.epoch_id != authority.resolution_monotonic.epoch_id:
+                continue
+            if decision_monotonic.nanoseconds >= min(
+                authority.hard_deadline.nanoseconds,
+                authority.run_deadline.nanoseconds,
+            ):
+                # Deadline equality is owned by the durable DEADLINE action;
+                # do not encode exhaustion as a rejected ATTEMPT_START.
+                continue
+            if (
+                authority.next_retry_monotonic is not None
+                and decision_monotonic.nanoseconds < authority.next_retry_monotonic.nanoseconds
+            ):
+                continue
+            if connection_id in {
+                authority.original_connection_id,
+                *authority.excluded_connection_ids,
+                *authority.attempted_connection_ids,
+            }:
+                continue
+            commands.append(
+                ReplacementRecoveryLifecycleCommand.create(
+                    authority=authority,
+                    action=ReplacementRecoveryLifecycleAction.ATTEMPT_START,
+                    decision_monotonic=decision_monotonic,
+                    connection_id=connection_id,
+                )
+            )
+        return tuple(commands)
+
+    def audit_replacement_attempt_abandon_commands(
+        self,
+        *,
+        connection_id: ConnectionId,
+        decision_monotonic: MonotonicTimestamp,
+        failure: ReplacementRecoveryFailure,
+    ) -> tuple[ReplacementRecoveryLifecycleCommand, ...]:
+        """Project explicit attempt closure before its socket generation ends."""
+
+        return tuple(
+            ReplacementRecoveryLifecycleCommand.create(
+                authority=authority,
+                action=ReplacementRecoveryLifecycleAction.ATTEMPT_ABANDON_RETRY,
+                decision_monotonic=decision_monotonic,
+                connection_id=connection_id,
+                failure=failure,
+            )
+            for authority in self.audit_replacement_recovery_authorities
+            if not authority.terminal
+            and authority.status
+            in {
+                ReplacementRecoveryStatus.ATTEMPT_ACTIVE,
+                ReplacementRecoveryStatus.CAPTURE_COMPLETE,
+            }
+            and authority.current_connection_id == connection_id
+            and authority.resolution_monotonic.epoch_id == decision_monotonic.epoch_id
+        )
+
+    def audit_replacement_deadline_commands(
+        self,
+        *,
+        decision_monotonic: MonotonicTimestamp,
+    ) -> tuple[ReplacementRecoveryLifecycleCommand, ...]:
+        """Project only supervisor deadlines reached at the exact decision boundary."""
+
+        commands: list[ReplacementRecoveryLifecycleCommand] = []
+        for authority in self.audit_replacement_recovery_authorities:
+            if (
+                authority.terminal
+                or authority.resolution_monotonic.epoch_id != decision_monotonic.epoch_id
+            ):
+                continue
+            hard_or_run_due = decision_monotonic.nanoseconds >= min(
+                authority.hard_deadline.nanoseconds,
+                authority.run_deadline.nanoseconds,
+            )
+            attempt_due = (
+                authority.status
+                in {
+                    ReplacementRecoveryStatus.ATTEMPT_ACTIVE,
+                    ReplacementRecoveryStatus.CAPTURE_COMPLETE,
+                }
+                and decision_monotonic.nanoseconds >= authority.next_action_deadline.nanoseconds
+            )
+            if not hard_or_run_due and not attempt_due:
+                continue
+            commands.append(
+                ReplacementRecoveryLifecycleCommand.create(
+                    authority=authority,
+                    action=ReplacementRecoveryLifecycleAction.DEADLINE,
+                    decision_monotonic=decision_monotonic,
+                )
+            )
+        return tuple(commands)
+
+    def audit_replacement_terminal_commands(
+        self,
+        *,
+        decision_monotonic: MonotonicTimestamp,
+    ) -> tuple[ReplacementRecoveryLifecycleCommand, ...]:
+        """Project explicit open-at-cutoff terminal evidence for unresolved recovery."""
+
+        return tuple(
+            ReplacementRecoveryLifecycleCommand.create(
+                authority=authority,
+                action=ReplacementRecoveryLifecycleAction.TERMINAL_CUTOFF,
+                decision_monotonic=decision_monotonic,
+            )
+            for authority in self.audit_replacement_recovery_authorities
+            if not authority.terminal
+            and authority.resolution_monotonic.epoch_id == decision_monotonic.epoch_id
+        )
+
+    def audit_replacement_next_action_deadline_ns(self, *, epoch_id: str) -> int | None:
+        """Return the earliest bounded retry/deadline action in this monotonic epoch."""
+
+        return min(
+            (
+                authority.next_action_deadline.nanoseconds
+                for authority in self.audit_replacement_recovery_authorities
+                if not authority.terminal and authority.resolution_monotonic.epoch_id == epoch_id
+            ),
+            default=None,
+        )
+
     @property
     def audit_replacement_captures_pending(self) -> int:
         """Resolved baselines still awaiting replacement full-snapshot coverage."""
@@ -1745,19 +2376,46 @@ class CanonicalProcessor:
             CONTROL_REST_AUDIT_FAILED,
         }:
             return False
+        return bool(self._attributable_prepare_attest_request_ids(envelope))
+
+    def _attributable_prepare_attest_request_ids(
+        self,
+        envelope: RawEventEnvelope,
+    ) -> tuple[str, ...]:
+        """Return every current request unambiguously named by raw payload or metadata."""
+
         candidate_request_ids: set[str] = set()
         metadata_request_id = envelope.transport_metadata.get("request_id")
         if isinstance(metadata_request_id, str):
             candidate_request_ids.add(metadata_request_id)
         try:
             decoded = decode_json_exact(envelope.payload_bytes)
-        except ValueError:
+        except ValueError, PolymarketSchemaError:
             decoded = None
         if isinstance(decoded, dict):
             payload_request_id = cast(dict[object, object], decoded).get("request_id")
             if isinstance(payload_request_id, str):
                 candidate_request_ids.add(payload_request_id)
-        return bool(candidate_request_ids.intersection(self._prepare_attest_rest_audit_requests))
+        return tuple(
+            sorted(candidate_request_ids.intersection(self._prepare_attest_rest_audit_requests))
+        )
+
+    @staticmethod
+    def _observed_audit_classification_schema(
+        envelope: RawEventEnvelope,
+    ) -> str | None:
+        """Retain bounded raw schema provenance without granting it authority."""
+
+        try:
+            decoded = decode_json_exact(envelope.payload_bytes)
+        except ValueError, PolymarketSchemaError:
+            return None
+        if not isinstance(decoded, dict):
+            return None
+        raw_schema = cast(dict[object, object], decoded).get("schema")
+        if not isinstance(raw_schema, str) or not raw_schema or len(raw_schema) > 256:
+            return None
+        return raw_schema
 
     def _process_preserved(self, envelope: RawEventEnvelope) -> ProcessedEnvelope:
         if (
@@ -1849,7 +2507,11 @@ class CanonicalProcessor:
                 # to block every scan and research consumer.
                 affected = (
                     ()
-                    if envelope.channel == CONTROL_REST_AUDIT_REPLACEMENT_RELEASE
+                    if envelope.channel
+                    in {
+                        CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
+                        CONTROL_REST_AUDIT_REPLACEMENT_RELEASE_V2,
+                    }
                     or self._rejected_prepare_attest_control_is_inert(envelope)
                     or (
                         isinstance(error, _AuditFaultCapacityError)
@@ -2173,6 +2835,15 @@ class CanonicalProcessor:
         owner = self._owners.get(mutation.instrument_id)
         if mutation.freshness_changed and owner is not None:
             if owner.health is BookHealth.HEALTHY:
+                previous_freshness = self._last_accepted_l2_monotonic.get(mutation.instrument_id)
+                if previous_freshness is not None and (
+                    previous_freshness.epoch_id == received_monotonic.epoch_id
+                    and received_monotonic.nanoseconds < previous_freshness.nanoseconds
+                ):
+                    raise ProgrammingInvariantViolation(
+                        "accepted L2 freshness cannot regress within one monotonic epoch",
+                        component="canonical-processor",
+                    )
                 self._last_accepted_l2_monotonic[mutation.instrument_id] = received_monotonic
                 update = BookFreshnessUpdate(
                     market_id=mutation.market_id,
@@ -2789,7 +3460,13 @@ class CanonicalProcessor:
         if channel == CONTROL_REST_AUDIT_CLASSIFY:
             self._classify_staged_rest_audit_response(envelope)
             return
-        if channel == CONTROL_REST_AUDIT_REPLACEMENT_RELEASE:
+        if channel == CONTROL_REST_AUDIT_REPLACEMENT_RECOVERY:
+            self._apply_replacement_recovery_lifecycle(envelope)
+            return
+        if channel in {
+            CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
+            CONTROL_REST_AUDIT_REPLACEMENT_RELEASE_V2,
+        }:
             self._release_audit_replacement_capture_from_control(envelope)
             return
         if channel == CONTROL_REPORTED_TOP_TRANSITION_EXPIRED:
@@ -2813,6 +3490,11 @@ class CanonicalProcessor:
             # request so two pending audits cannot half-commit at the bound.
             self._assert_audit_fault_capacity_available(required_slots=len(pending_request_ids))
             for request_id in pending_request_ids:
+                staged_response = self._pending_rest_audit_responses.get(request_id)
+                missing_prepare_attest_completion = (
+                    request_id in self._prepare_attest_rest_audit_requests
+                    and staged_response is not None
+                )
                 start = self._pending_rest_audits.pop(request_id)
                 start_source = self._pending_rest_audit_start_sources.pop(request_id, None)
                 if start_source is None:
@@ -2828,9 +3510,22 @@ class CanonicalProcessor:
                 self._record_audit_outcome(
                     self._failed_audit_outcome(
                         start,
-                        reason=AuditFailureReason.SOCKET_GENERATION_CHANGED,
+                        reason=(
+                            AuditFailureReason.BOOK_FRESHNESS_EXPIRED
+                            if missing_prepare_attest_completion
+                            else AuditFailureReason.SOCKET_GENERATION_CHANGED
+                        ),
                         start_source=start_source,
                         classification_source=self._active_raw_source(),
+                        response=(staged_response if missing_prepare_attest_completion else None),
+                        response_boundary_ordinal=(
+                            None
+                            if not missing_prepare_attest_completion
+                            else self._audit_response_metadata(
+                                cast(RawEventEnvelope, staged_response)
+                            )[1]
+                        ),
+                        mark_market_dirty=not missing_prepare_attest_completion,
                     )
                 )
             self.invalidate_all(invalidation_reason)
@@ -3416,6 +4111,10 @@ class CanonicalProcessor:
                 evidence,
                 command=None if fault_context is None else fault_context.command,
                 original_reason=None if fault_context is None else fault_context.original_reason,
+                failure_evidence_kind=(
+                    None if fault_context is None else fault_context.failure_evidence_kind
+                ),
+                failure_schema=None if fault_context is None else fault_context.failure_schema,
             )
         if evidence.reason is AuditFailureReason.RACE_RETRY_EXHAUSTED:
             self._audit_race_budget_exhaustions += 1
@@ -3464,6 +4163,8 @@ class CanonicalProcessor:
         *,
         command: AuditFailureCommand | None,
         original_reason: AuditFailureReason | None,
+        failure_evidence_kind: AuditFaultFailureEvidenceKind | None = None,
+        failure_schema: str | None = None,
     ) -> None:
         reason = evidence.reason
         if evidence.outcome is not AuditOutcome.FAILED or reason is None:
@@ -3479,8 +4180,23 @@ class CanonicalProcessor:
                 "current audit failure lacks exact durable control identities",
                 component="canonical-processor",
             )
-        if command is None:
-            failure_schema: str | None = None
+        if failure_evidence_kind is not None:
+            if (
+                failure_evidence_kind
+                is not AuditFaultFailureEvidenceKind.AUDIT_ATTESTATION_VALIDATION_FAILURE
+                or command is not None
+            ):
+                raise ProgrammingInvariantViolation(
+                    "audit fault recording override is not a current attestation failure",
+                    component="canonical-processor",
+                )
+            command = AuditFailureCommand(
+                request_id=evidence.request_id,
+                reason=reason,
+                error_type=reason.value,
+            )
+        elif command is None:
+            failure_schema = None
             if envelope.channel == CONTROL_REST_AUDIT_CLASSIFY:
                 decoded = decode_json_exact(envelope.payload_bytes)
                 if not isinstance(decoded, dict):
@@ -3532,6 +4248,12 @@ class CanonicalProcessor:
             audit_start_schema=evidence.audit_start_schema,
             failure_schema=failure_schema,
         )
+        lifecycle_schema = (
+            AUDIT_FAULT_LIFECYCLE_V2_SCHEMA
+            if failure_evidence_kind
+            is AuditFaultFailureEvidenceKind.AUDIT_ATTESTATION_VALIDATION_FAILURE
+            else AUDIT_FAULT_LIFECYCLE_SCHEMA
+        )
         fault_id = canonical_sha256(
             {
                 "audit_start_schema": evidence.audit_start_schema,
@@ -3543,7 +4265,11 @@ class CanonicalProcessor:
                 "original_reason": effective_original_reason,
                 "reason": reason,
                 "request_id": evidence.request_id,
-                "schema": "mma-rest-audit-fault-id-v1",
+                "schema": (
+                    "mma-rest-audit-fault-id-v2"
+                    if lifecycle_schema == AUDIT_FAULT_LIFECYCLE_V2_SCHEMA
+                    else "mma-rest-audit-fault-id-v1"
+                ),
             }
         )
         record = AuditFaultLifecycleRecord(
@@ -3576,6 +4302,7 @@ class CanonicalProcessor:
             retry_after_disposition=command.retry_after_disposition,
             retry_exhausted=command.retry_exhausted,
             retry_blocked_reason=command.retry_blocked_reason,
+            schema=lifecycle_schema,
         )
         if fault_id in self._current_audit_faults or fault_id in self._permanent_audit_faults:
             raise ProgrammingInvariantViolation(
@@ -3964,6 +4691,53 @@ class CanonicalProcessor:
                 key=lambda item: item.value,
             )
         )
+        recovery_authority: ReplacementRecoveryAuthority | None = None
+        if (
+            pending.audit_outcome.audit_start_schema == AUDIT_START_V2_SCHEMA
+            and self._rest_audit_protocol_mode is _RestAuditProtocolMode.DEFERRED_BOUND
+            and not self._allow_historical_unsupervised_replacement_capture
+        ):
+            run_deadline_epoch_id = self._rest_audit_run_deadline_epoch_id
+            run_deadline_ns = self._rest_audit_run_deadline_ns
+            if (
+                run_deadline_epoch_id is None
+                or run_deadline_ns is None
+                or run_deadline_epoch_id != envelope.received_monotonic.epoch_id
+            ):
+                raise ProgrammingInvariantViolation(
+                    "v2 replacement recovery lacks its exact run deadline",
+                    component="canonical-processor",
+                )
+            hard_duration_ns = int(
+                self._config.polymarket.audit_replacement_hard_deadline_seconds * 1_000_000_000
+            )
+            recovery_authority = ReplacementRecoveryAuthority.start(
+                divergence_id=pending.divergence_id,
+                resolution_source=authoritative_source,
+                resolution_ingest_seq=envelope.ingest_seq,
+                resolution_monotonic=envelope.received_monotonic,
+                original_connection_id=pending.audit_outcome.connection_id,
+                excluded_connection_ids=tuple(
+                    sorted(pre_open_connection_ids, key=lambda item: item.value)
+                ),
+                required_instrument_ids=required_instrument_ids,
+                bounds=ReplacementRecoveryBounds(
+                    maximum_attempts=(self._config.polymarket.audit_replacement_maximum_attempts),
+                    retry_delay_ns=int(
+                        self._config.polymarket.audit_replacement_retry_delay_seconds
+                        * 1_000_000_000
+                    ),
+                    maximum_snapshot_age_ns=self._scanner.config.maximum_book_age_ns,
+                ),
+                hard_deadline=MonotonicTimestamp(
+                    envelope.received_monotonic.epoch_id,
+                    envelope.received_monotonic.nanoseconds + hard_duration_ns,
+                ),
+                run_deadline=MonotonicTimestamp(
+                    run_deadline_epoch_id,
+                    run_deadline_ns,
+                ),
+            )
         self._audit_replacement_captures[rest.instrument_id] = _AuditReplacementCapture(
             divergence_id=pending.divergence_id,
             market_id=rest.market_id,
@@ -3987,6 +4761,7 @@ class CanonicalProcessor:
                 else pending.audit_outcome.mismatch_diagnostic.cause
             ),
             availability_binding=resolved_availability_binding,
+            recovery_authority=recovery_authority,
         )
 
     def _failed_audit_outcome(
@@ -4190,7 +4965,7 @@ class CanonicalProcessor:
         self,
         envelope: RawEventEnvelope,
     ) -> None:
-        """Stage an inert first phase; never compare, mutate, restore, or scan."""
+        """Freeze one pure decision/effect plan without changing canonical state."""
 
         command = self._parse_audit_classification_prepare(envelope)
         if command.request_id not in self._prepare_attest_rest_audit_requests:
@@ -4222,26 +4997,283 @@ class CanonicalProcessor:
         start = self._pending_rest_audits.get(command.request_id)
         if start is None:
             raise NormalizationError("audit classification preparation has no pending start")
-        instrument_id = start.starting_book.instrument_id
-        owner = self._owners[instrument_id]
+        state = self._capture_prepared_audit_state(start)
+        plan = self._prepare_rest_audit_plan(
+            start=start,
+            response=response,
+            state=state,
+        )
         self._pending_rest_audit_classification_preparations[command.request_id] = (
             _PreparedAuditClassification(
                 command=command,
                 envelope=envelope,
-                processed_watermark=self.processed_websocket_watermark(start.connection_id),
-                book=self.audit_book_identity(start.native_asset_id),
-                owner_health=owner.health,
-                reported_top_transition=self._reported_top_transitions.get(instrument_id),
-                audit_ineligible_nonfault=(
-                    instrument_id in self._audit_ineligible_nonfault_instruments
-                ),
-                audit_fault_current_count=self._audit_fault_current_count_by_instrument.get(
-                    instrument_id, 0
-                ),
-                audit_fault_scope_block_count=(
-                    self._audit_fault_scope_block_count_by_instrument.get(instrument_id, 0)
-                ),
+                state=state,
+                plan=plan,
             )
+        )
+
+    def _capture_prepared_audit_state(self, start: AuditStartEvidence) -> _PreparedAuditState:
+        """Capture every scoped value that can change classification or its effects."""
+
+        instrument_id = start.starting_book.instrument_id
+        owner = self._owners[instrument_id]
+        fault_records = tuple(
+            record
+            for _fault_id, record in sorted(
+                {**self._current_audit_faults, **self._permanent_audit_faults}.items()
+            )
+            if record.instrument_id == instrument_id
+        )
+        replacement = self._audit_replacement_captures.get(instrument_id)
+        return _PreparedAuditState(
+            processed_watermark=self.processed_websocket_watermark(start.connection_id),
+            book=self.audit_book_identity(start.native_asset_id),
+            owner_snapshot=owner.snapshot(),
+            reported_top_transition=self._reported_top_transitions.get(instrument_id),
+            audit_ineligible=instrument_id in self._audit_ineligible_instruments,
+            audit_ineligible_nonfault=(
+                instrument_id in self._audit_ineligible_nonfault_instruments
+            ),
+            audit_faults=fault_records,
+            replacement_capture=(
+                None
+                if replacement is None
+                else replacement.authority_snapshot(instrument_id=instrument_id)
+            ),
+            pending_divergence=self._pending_audit_divergences.get(instrument_id),
+            transition_resync=instrument_id in self._transition_resync_instruments,
+        )
+
+    @staticmethod
+    def _prepared_failure_plan(
+        *,
+        reason: AuditFailureReason,
+        boundary: int,
+        processed: int,
+        barrier_book: AuditBookIdentity,
+        normalized_rest: NormalizedRestBook | None = None,
+        mark_audit_ineligible: bool = True,
+        mark_market_dirty: bool = True,
+    ) -> _PreparedAuditPlan:
+        return _PreparedAuditPlan(
+            outcome=AuditOutcome.FAILED,
+            reason=reason,
+            response_boundary_ordinal=boundary,
+            barrier_processed_ordinal=processed,
+            barrier_book=barrier_book,
+            normalized_rest=normalized_rest,
+            mismatch_diagnostic=None,
+            owner_after=None,
+            owner_after_snapshot=None,
+            book_mutation=None,
+            mark_audit_ineligible=mark_audit_ineligible,
+            audit_ineligible_nonfault=False,
+            mark_market_dirty=mark_market_dirty,
+            increment_invalidation=False,
+            transition_resync=False,
+            resolve_current_faults=False,
+            clear_audit_ineligible=False,
+            open_divergence=False,
+        )
+
+    def _prepare_rest_audit_plan(
+        self,
+        *,
+        start: AuditStartEvidence,
+        response: RawEventEnvelope,
+        state: _PreparedAuditState,
+    ) -> _PreparedAuditPlan:
+        """Compute classification and effects once, against only PREPARE-frozen inputs."""
+
+        request_id, boundary, barrier_ordinal, attempt = self._audit_response_metadata(response)
+        if request_id != start.request_id:
+            raise ProgrammingInvariantViolation(
+                "staged audit response changed its pending request identity",
+                component="canonical-processor",
+            )
+        processed = state.processed_watermark.ordinal
+        barrier_book = state.book
+        if response.connection_id != start.connection_id or attempt != start.attempt:
+            return self._prepared_failure_plan(
+                reason=AuditFailureReason.SOCKET_GENERATION_CHANGED,
+                boundary=boundary,
+                processed=processed,
+                barrier_book=barrier_book,
+            )
+        if response.received_monotonic.nanoseconds < start.request_started_monotonic_ns:
+            return self._prepared_failure_plan(
+                reason=AuditFailureReason.RESPONSE_INVALID,
+                boundary=boundary,
+                processed=processed,
+                barrier_book=barrier_book,
+            )
+        if (
+            boundary != barrier_ordinal
+            or processed != boundary
+            or boundary < start.starting_admission_watermark.ordinal
+        ):
+            return self._prepared_failure_plan(
+                reason=AuditFailureReason.WATERMARK_AMBIGUOUS,
+                boundary=boundary,
+                processed=processed,
+                barrier_book=barrier_book,
+            )
+        try:
+            native = parse_rest_book(response.payload_bytes)
+            if native.asset_id != start.native_asset_id:
+                raise NormalizationError("REST audit response identifies another asset")
+            market_id = self._market_id_for_condition(native.condition_id)
+            bundle = self._registry.as_known_at(market_id, response.received_wall_time)
+            if bundle is None:
+                raise NormalizationError(
+                    "REST book audit arrived before matching as-known reference data"
+                )
+            context = self._normalization_context(response, bundle)
+            rest = self._normalizer.normalize_rest_book(native, context)
+        except BookStateError, NormalizationError, PolymarketSchemaError:
+            return self._prepared_failure_plan(
+                reason=AuditFailureReason.RESPONSE_INVALID,
+                boundary=boundary,
+                processed=processed,
+                barrier_book=barrier_book,
+            )
+
+        if barrier_book != start.starting_book:
+            return _PreparedAuditPlan(
+                outcome=AuditOutcome.RACED,
+                reason=None,
+                response_boundary_ordinal=boundary,
+                barrier_processed_ordinal=processed,
+                barrier_book=barrier_book,
+                normalized_rest=rest,
+                mismatch_diagnostic=None,
+                owner_after=None,
+                owner_after_snapshot=None,
+                book_mutation=None,
+                mark_audit_ineligible=True,
+                audit_ineligible_nonfault=True,
+                mark_market_dirty=False,
+                increment_invalidation=False,
+                transition_resync=False,
+                resolve_current_faults=False,
+                clear_audit_ineligible=False,
+                open_divergence=False,
+            )
+
+        instrument_id = start.starting_book.instrument_id
+        if state.reported_top_transition is not None:
+            return self._prepared_failure_plan(
+                reason=AuditFailureReason.LOCAL_STATE_NOT_COMPARABLE,
+                boundary=boundary,
+                processed=processed,
+                barrier_book=barrier_book,
+                normalized_rest=rest,
+                mark_audit_ineligible=False,
+            )
+        owner_after = deepcopy(self._owners[instrument_id])
+        try:
+            audit_result = owner_after.audit_rest_snapshot(
+                rest,
+                checked_at=response.received_wall_time,
+            )
+        except BookStateError, RawSourceInvariantError:
+            return self._prepared_failure_plan(
+                reason=AuditFailureReason.LOCAL_STATE_NOT_COMPARABLE,
+                boundary=boundary,
+                processed=processed,
+                barrier_book=barrier_book,
+                normalized_rest=rest,
+            )
+        if audit_result.status is RestAuditStatus.NOT_COMPARABLE:
+            return self._prepared_failure_plan(
+                reason=AuditFailureReason.LOCAL_STATE_NOT_COMPARABLE,
+                boundary=boundary,
+                processed=processed,
+                barrier_book=barrier_book,
+                normalized_rest=rest,
+            )
+
+        outcome = (
+            AuditOutcome.MATCH
+            if audit_result.status is RestAuditStatus.MATCH
+            else AuditOutcome.MISMATCH
+        )
+        mismatch_diagnostic: AuditMismatchDiagnostic | None = None
+        if outcome is AuditOutcome.MISMATCH:
+            comparison = compare_audit_exact_depth(
+                local_bids=state.owner_snapshot.bids,
+                local_asks=state.owner_snapshot.asks,
+                rest_bids=rest.bids,
+                rest_asks=rest.asks,
+            )
+            cause = (
+                AuditMismatchCause.TRUE_EXACT_DEPTH_DIVERGENCE
+                if comparison.difference_count
+                else AuditMismatchCause.UNKNOWN
+            )
+            local_provenance = (
+                state.owner_snapshot.state_source_provenance
+                or state.owner_snapshot.last_source_provenance
+            )
+            response_source = RawSourceRef(
+                ingest_id=response.ingest_id,
+                payload_sha256=response.payload_sha256,
+            )
+            try:
+                mismatch_diagnostic = build_audit_mismatch_diagnostic(
+                    cause=cause,
+                    local_book=barrier_book,
+                    local_bids=state.owner_snapshot.bids,
+                    local_asks=state.owner_snapshot.asks,
+                    local_raw_sources=(
+                        () if local_provenance is None else local_provenance.raw_source_refs
+                    ),
+                    rest_instrument_id=rest.instrument_id,
+                    rest_market_id=rest.market_id,
+                    rest_bids=rest.bids,
+                    rest_asks=rest.asks,
+                    rest_tick_size=rest.tick_size,
+                    rest_minimum_order_size=rest.minimum_order_size,
+                    rest_neg_risk=rest.neg_risk,
+                    rest_raw_sources=rest.provenance.raw_source_refs,
+                    response_source=response_source,
+                )
+            except ValueError as error:
+                raise ProgrammingInvariantViolation(
+                    "bounded REST mismatch diagnostic could not be prepared",
+                    component="canonical-processor",
+                ) from error
+
+        permanent_blocker = any(
+            record.status is AuditFaultStatus.PERMANENT and record.blocks_current_scope
+            for record in state.audit_faults
+        )
+        return _PreparedAuditPlan(
+            outcome=outcome,
+            reason=None,
+            response_boundary_ordinal=boundary,
+            barrier_processed_ordinal=processed,
+            barrier_book=barrier_book,
+            normalized_rest=rest,
+            mismatch_diagnostic=mismatch_diagnostic,
+            owner_after=owner_after,
+            owner_after_snapshot=owner_after.snapshot(),
+            book_mutation=audit_result.mutation,
+            mark_audit_ineligible=outcome is AuditOutcome.MISMATCH,
+            audit_ineligible_nonfault=outcome is AuditOutcome.MISMATCH,
+            mark_market_dirty=False,
+            increment_invalidation=(
+                outcome is AuditOutcome.MISMATCH
+                and state.owner_snapshot.health is not BookHealth.INVALID
+            ),
+            transition_resync=outcome is AuditOutcome.MISMATCH,
+            resolve_current_faults=outcome is AuditOutcome.MATCH,
+            clear_audit_ineligible=(
+                outcome is AuditOutcome.MATCH
+                and state.replacement_capture is None
+                and not permanent_blocker
+            ),
+            open_divergence=outcome is AuditOutcome.MISMATCH,
         )
 
     def _parse_audit_classification(self, envelope: RawEventEnvelope) -> AuditClassificationCommand:
@@ -4288,11 +5320,26 @@ class CanonicalProcessor:
             raise NormalizationError("audit classification decision is invalid") from error
         if envelope.payload_bytes != command.to_payload():
             raise NormalizationError("audit classification decision must use canonical encoding")
-        if command.classification_monotonic_ns != envelope.received_monotonic.nanoseconds:
-            raise NormalizationError("audit classification timestamp differs from raw evidence")
         return command
 
     def _classify_staged_rest_audit_response(self, envelope: RawEventEnvelope) -> None:
+        """Consume a final control or turn any attributable invalid attestation into failure."""
+
+        attributable = self._attributable_prepare_attest_request_ids(envelope)
+        try:
+            self._classify_staged_rest_audit_response_exact(envelope)
+        except _AuditFaultCapacityError:
+            raise
+        except NormalizationError, PolymarketSchemaError:
+            if not attributable:
+                raise
+            self._fail_prepare_attest_requests(
+                envelope=envelope,
+                request_ids=attributable,
+                validation_disposition="ATTESTATION_INVALID",
+            )
+
+    def _classify_staged_rest_audit_response_exact(self, envelope: RawEventEnvelope) -> None:
         command = self._parse_audit_classification(envelope)
         response = self._pending_rest_audit_responses.get(command.request_id)
         if response is None:
@@ -4324,8 +5371,6 @@ class CanonicalProcessor:
             raise NormalizationError(
                 "prepare/attest audit classification requires current-schema authority"
             )
-        deadline_failure_dominates = False
-        attestation_binding: dict[str, object] | None = None
         if prepared is not None:
             metadata = envelope.transport_metadata
             if set(metadata) != {
@@ -4364,6 +5409,9 @@ class CanonicalProcessor:
                 hard_expiry_monotonic_ns=command.hard_expiry_monotonic_ns,
             ):
                 raise NormalizationError("audit classification attestation changes preparation")
+            # Reserve before consuming the frozen transaction.  This also keeps
+            # the transaction inert at the global fault bound.
+            self._assert_audit_fault_capacity_available()
             start = self._pending_rest_audits.get(command.request_id)
             if start is None:
                 raise NormalizationError("audit classification attestation has no pending start")
@@ -4372,34 +5420,34 @@ class CanonicalProcessor:
                 <= prepared.envelope.received_monotonic.nanoseconds
                 <= durable_ns
                 <= processed_ns
+                <= envelope.received_monotonic.nanoseconds
                 and durable_ns < hard_expiry_ns
                 and processed_ns < hard_expiry_ns
             )
-            final_state_reconciled = self._prepared_audit_final_state_reconciles(
-                start=start,
-                prepared=prepared,
-            )
-            if not timing_reconciled or not final_state_reconciled:
-                coordinator_failure = AuditFailureReason.BOOK_FRESHNESS_EXPIRED
-                deadline_failure_dominates = True
-            else:
-                coordinator_failure = None
+            if not timing_reconciled:
+                self._fail_prepare_attest_requests(
+                    envelope=envelope,
+                    request_ids=(command.request_id,),
+                    validation_disposition="PREPARATION_TIMING_EXPIRED",
+                )
+                return
+            if self._capture_prepared_audit_state(start) != prepared.state:
+                self._fail_prepare_attest_requests(
+                    envelope=envelope,
+                    request_ids=(command.request_id,),
+                    validation_disposition="PREPARED_STATE_UNRECONCILED",
+                )
+                return
+            promotes_current_freshness = envelope.received_monotonic.nanoseconds < hard_expiry_ns
             attestation_binding = {
                 "classification_protocol": AUDIT_CLASSIFICATION_PREPARE_ATTEST_PROTOCOL,
                 "classification_source": RawSourceRef(
                     ingest_id=envelope.ingest_id,
                     payload_sha256=envelope.payload_sha256,
                 ),
-                "final_state_reconciled": final_state_reconciled,
-                "prepared_state": {
-                    "audit_fault_current_count": prepared.audit_fault_current_count,
-                    "audit_fault_scope_block_count": (prepared.audit_fault_scope_block_count),
-                    "audit_ineligible_nonfault": prepared.audit_ineligible_nonfault,
-                    "book": prepared.book,
-                    "owner_health": prepared.owner_health,
-                    "processed_watermark": prepared.processed_watermark,
-                    "reported_top_transition": prepared.reported_top_transition,
-                },
+                "final_state_reconciled": True,
+                "prepared_plan": prepared.plan.to_record(),
+                "prepared_state": prepared.state,
                 "preparation_command": prepared.command,
                 "preparation_durable_monotonic_ns": durable_ns,
                 "preparation_processed_monotonic_ns": processed_ns,
@@ -4411,51 +5459,366 @@ class CanonicalProcessor:
                 "request_id": command.request_id,
                 "schema": "mma-rest-audit-classification-attestation-binding-v1",
                 "timing_reconciled": timing_reconciled,
+                "promotes_current_freshness": promotes_current_freshness,
             }
-        else:
-            coordinator_failure = (
-                AuditFailureReason.BOOK_FRESHNESS_EXPIRED
-                if command.classification_monotonic_ns >= command.hard_expiry_monotonic_ns
-                else None
+            # The frozen response is the economic observation boundary.  The
+            # inert PREPARE/final controls can be processed after already
+            # admitted WebSocket frames whose raw receive times are earlier;
+            # using attestation wall time here would make later FIFO processing
+            # regress opportunity-lifecycle chronology.
+            self._active_scan_observed_at = response.received_wall_time
+            self._commit_prepared_rest_audit_classification(
+                envelope=envelope,
+                start=start,
+                response=response,
+                prepared=prepared,
+                promote_current_freshness=promotes_current_freshness,
             )
+            self._audit_classification_attestation_chain = _chain_extend(
+                self._audit_classification_attestation_chain,
+                "rest-audit-classification-attestation",
+                attestation_binding,
+            )
+            return
+
+        if command.classification_monotonic_ns != envelope.received_monotonic.nanoseconds:
+            raise NormalizationError(
+                "historical audit classification timestamp differs from raw evidence"
+            )
+        coordinator_failure = (
+            AuditFailureReason.BOOK_FRESHNESS_EXPIRED
+            if command.classification_monotonic_ns >= command.hard_expiry_monotonic_ns
+            else None
+        )
         self._active_scan_observed_at = response.received_wall_time
         self._complete_rest_audit_response(
             response,
             coordinator_failure=coordinator_failure,
             coordinator_decision_supplied=True,
             classification_control=envelope,
-            deadline_failure_dominates=deadline_failure_dominates,
+            deadline_failure_dominates=False,
         )
-        if attestation_binding is not None:
+
+    @staticmethod
+    def _prepared_audit_outcome_evidence(
+        *,
+        start: AuditStartEvidence,
+        start_source: RawSourceRef,
+        response: RawEventEnvelope,
+        plan: _PreparedAuditPlan,
+        classification_source: RawSourceRef,
+        forced_expiry: bool = False,
+    ) -> AuditOutcomeEvidence:
+        response_is_chronological = (
+            response.received_monotonic.nanoseconds >= start.request_started_monotonic_ns
+        )
+        return AuditOutcomeEvidence(
+            request_id=start.request_id,
+            connection_id=start.connection_id,
+            native_asset_id=start.native_asset_id,
+            attempt=start.attempt,
+            request_started_monotonic_ns=start.request_started_monotonic_ns,
+            starting_admission_ordinal=start.starting_admission_watermark.ordinal,
+            starting_processed_ordinal=start.starting_processed_watermark.ordinal,
+            starting_book=start.starting_book,
+            outcome=AuditOutcome.FAILED if forced_expiry else plan.outcome,
+            reason=(AuditFailureReason.BOOK_FRESHNESS_EXPIRED if forced_expiry else plan.reason),
+            response_ingest_id=response.ingest_id if response_is_chronological else None,
+            raw_response_sha256=response.payload_sha256 if response_is_chronological else None,
+            response_received_wall_time=(
+                response.received_wall_time if response_is_chronological else None
+            ),
+            response_received_monotonic_ns=(
+                response.received_monotonic.nanoseconds if response_is_chronological else None
+            ),
+            response_boundary_ordinal=(
+                plan.response_boundary_ordinal if response_is_chronological else None
+            ),
+            barrier_processed_ordinal=(
+                plan.barrier_processed_ordinal if response_is_chronological else None
+            ),
+            barrier_book=plan.barrier_book if response_is_chronological else None,
+            requires_resync=False if forced_expiry else plan.outcome is AuditOutcome.MISMATCH,
+            mismatch_diagnostic=None if forced_expiry else plan.mismatch_diagnostic,
+            audit_start_schema=start.schema,
+            trigger_reason=start.trigger_reason,
+            audit_start_source=start_source,
+            classification_source=classification_source,
+        )
+
+    def _commit_prepared_rest_audit_classification(
+        self,
+        *,
+        envelope: RawEventEnvelope,
+        start: AuditStartEvidence,
+        response: RawEventEnvelope,
+        prepared: _PreparedAuditClassification,
+        promote_current_freshness: bool,
+    ) -> None:
+        """Commit only the PREPARE-frozen plan; no classification input is reread."""
+
+        request_id = start.request_id
+        self._assert_audit_fault_capacity_available()
+        consumed_start = self._pending_rest_audits.pop(request_id, None)
+        start_source = self._pending_rest_audit_start_sources.pop(request_id, None)
+        consumed_prepared = self._pending_rest_audit_classification_preparations.pop(
+            request_id,
+            None,
+        )
+        if consumed_start != start or start_source is None or consumed_prepared is not prepared:
+            raise ProgrammingInvariantViolation(
+                "prepared audit transaction changed during final commit",
+                component="canonical-processor",
+            )
+        self._pending_rest_audit_hard_expiries.pop(request_id, None)
+        self._pending_rest_audit_response_deadlines.pop(request_id, None)
+        self._pending_rest_audit_responses.pop(request_id, None)
+        self._prepare_attest_rest_audit_requests.discard(request_id)
+
+        plan = prepared.plan
+        classification_source = RawSourceRef(
+            ingest_id=envelope.ingest_id,
+            payload_sha256=envelope.payload_sha256,
+        )
+        evidence = self._prepared_audit_outcome_evidence(
+            start=start,
+            start_source=start_source,
+            response=response,
+            plan=plan,
+            classification_source=classification_source,
+        )
+        instrument_id = start.starting_book.instrument_id
+        owner = self._owners[instrument_id]
+
+        if plan.outcome is AuditOutcome.MATCH:
+            if promote_current_freshness:
+                if plan.owner_after is None or plan.book_mutation is None:
+                    raise ProgrammingInvariantViolation(
+                        "prepared MATCH lacks its frozen owner mutation",
+                        component="canonical-processor",
+                    )
+                self._owners[instrument_id] = plan.owner_after
+                owner = plan.owner_after
+                self._record_book_mutation(
+                    plan.book_mutation,
+                    reason=ScanTriggerReason.REST_AUDIT,
+                    freshness_received_monotonic=response.received_monotonic,
+                )
+            self._record_audit_outcome(evidence)
+            if promote_current_freshness and plan.resolve_current_faults:
+                self._resolve_current_audit_faults(
+                    instrument_id=instrument_id,
+                    resolution=AuditFaultResolution.LATER_FENCED_MATCH,
+                    resolution_source=classification_source,
+                    resolved_at=envelope.received_wall_time,
+                    resolved_monotonic_ns=envelope.received_monotonic.nanoseconds,
+                )
+            if promote_current_freshness and plan.clear_audit_ineligible:
+                self._clear_audit_ineligible(instrument_id)
+            return
+
+        if plan.outcome is AuditOutcome.MISMATCH:
+            if (
+                plan.owner_after is None
+                or plan.book_mutation is None
+                or plan.normalized_rest is None
+            ):
+                raise ProgrammingInvariantViolation(
+                    "prepared MISMATCH lacks its frozen mutation inputs",
+                    component="canonical-processor",
+                )
+            self._owners[instrument_id] = plan.owner_after
+            owner = plan.owner_after
+            self._record_book_mutation(
+                plan.book_mutation,
+                reason=ScanTriggerReason.REST_AUDIT,
+                freshness_received_monotonic=response.received_monotonic,
+            )
+            if plan.increment_invalidation:
+                self._invalidations += 1
+            if plan.mark_audit_ineligible:
+                self._mark_audit_ineligible(
+                    instrument_id,
+                    nonfault=plan.audit_ineligible_nonfault,
+                )
+            if plan.transition_resync:
+                self._transition_resync_instruments.add(instrument_id)
+            self._record_audit_outcome(evidence)
+            if plan.open_divergence:
+                self._open_audit_divergence(
+                    outcome=evidence,
+                    market_id=plan.normalized_rest.market_id,
+                    start_source=start_source,
+                    classification_control=envelope,
+                )
+            return
+
+        if plan.mark_audit_ineligible:
+            self._mark_audit_ineligible(
+                instrument_id,
+                nonfault=plan.audit_ineligible_nonfault,
+            )
+        if plan.mark_market_dirty:
+            self._mark_market_dirty(owner.market_id, ScanTriggerReason.REST_AUDIT)
+        self._record_audit_outcome(evidence)
+
+    def _fail_prepare_attest_requests(
+        self,
+        *,
+        envelope: RawEventEnvelope,
+        request_ids: tuple[str, ...],
+        validation_disposition: str,
+    ) -> None:
+        """Consume attributable invalid/missing authority as permanent internal failure."""
+
+        pending_ids = tuple(
+            request_id
+            for request_id in sorted(set(request_ids))
+            if request_id in self._prepare_attest_rest_audit_requests
+            and request_id in self._pending_rest_audits
+        )
+        if not pending_ids:
+            raise NormalizationError("audit attestation references no pending current request")
+        self._assert_audit_fault_capacity_available(required_slots=len(pending_ids))
+        classification_source = RawSourceRef(
+            ingest_id=envelope.ingest_id,
+            payload_sha256=envelope.payload_sha256,
+        )
+        observed_classification_schema = self._observed_audit_classification_schema(envelope)
+        for request_id in pending_ids:
+            start = self._pending_rest_audits.pop(request_id)
+            start_source = self._pending_rest_audit_start_sources.pop(request_id, None)
+            response = self._pending_rest_audit_responses.pop(request_id, None)
+            prepared = self._pending_rest_audit_classification_preparations.pop(
+                request_id,
+                None,
+            )
+            self._pending_rest_audit_hard_expiries.pop(request_id, None)
+            self._pending_rest_audit_response_deadlines.pop(request_id, None)
+            self._prepare_attest_rest_audit_requests.discard(request_id)
+            if start_source is None:
+                raise ProgrammingInvariantViolation(
+                    "failed attestation lost its audit-start source",
+                    component="canonical-processor",
+                )
+
+            if response is None:
+                evidence = AuditOutcomeEvidence(
+                    request_id=start.request_id,
+                    connection_id=start.connection_id,
+                    native_asset_id=start.native_asset_id,
+                    attempt=start.attempt,
+                    request_started_monotonic_ns=start.request_started_monotonic_ns,
+                    starting_admission_ordinal=start.starting_admission_watermark.ordinal,
+                    starting_processed_ordinal=start.starting_processed_watermark.ordinal,
+                    starting_book=start.starting_book,
+                    outcome=AuditOutcome.FAILED,
+                    reason=AuditFailureReason.BOOK_FRESHNESS_EXPIRED,
+                    response_ingest_id=None,
+                    raw_response_sha256=None,
+                    response_received_wall_time=None,
+                    response_received_monotonic_ns=None,
+                    response_boundary_ordinal=None,
+                    barrier_processed_ordinal=None,
+                    barrier_book=None,
+                    requires_resync=False,
+                    audit_start_schema=start.schema,
+                    trigger_reason=start.trigger_reason,
+                    audit_start_source=start_source,
+                    classification_source=classification_source,
+                )
+            elif prepared is None:
+                _, boundary, _, _ = self._audit_response_metadata(response)
+                response_is_chronological = (
+                    response.received_monotonic.nanoseconds >= start.request_started_monotonic_ns
+                )
+                evidence = AuditOutcomeEvidence(
+                    request_id=start.request_id,
+                    connection_id=start.connection_id,
+                    native_asset_id=start.native_asset_id,
+                    attempt=start.attempt,
+                    request_started_monotonic_ns=start.request_started_monotonic_ns,
+                    starting_admission_ordinal=start.starting_admission_watermark.ordinal,
+                    starting_processed_ordinal=start.starting_processed_watermark.ordinal,
+                    starting_book=start.starting_book,
+                    outcome=AuditOutcome.FAILED,
+                    reason=AuditFailureReason.BOOK_FRESHNESS_EXPIRED,
+                    response_ingest_id=(response.ingest_id if response_is_chronological else None),
+                    raw_response_sha256=(
+                        response.payload_sha256 if response_is_chronological else None
+                    ),
+                    response_received_wall_time=(
+                        response.received_wall_time if response_is_chronological else None
+                    ),
+                    response_received_monotonic_ns=(
+                        response.received_monotonic.nanoseconds
+                        if response_is_chronological
+                        else None
+                    ),
+                    response_boundary_ordinal=(boundary if response_is_chronological else None),
+                    barrier_processed_ordinal=None,
+                    barrier_book=None,
+                    requires_resync=False,
+                    audit_start_schema=start.schema,
+                    trigger_reason=start.trigger_reason,
+                    audit_start_source=start_source,
+                    classification_source=classification_source,
+                )
+            else:
+                evidence = self._prepared_audit_outcome_evidence(
+                    start=start,
+                    start_source=start_source,
+                    response=response,
+                    plan=prepared.plan,
+                    classification_source=classification_source,
+                    forced_expiry=True,
+                )
+
+            if self._active_audit_fault_recording_context is not None:
+                raise ProgrammingInvariantViolation(
+                    "audit attestation failure context cannot be nested",
+                    component="canonical-processor",
+                )
+            self._active_audit_fault_recording_context = _AuditFaultRecordingContext(
+                command=None,
+                original_reason=AuditFailureReason.BOOK_FRESHNESS_EXPIRED,
+                failure_evidence_kind=(
+                    AuditFaultFailureEvidenceKind.AUDIT_ATTESTATION_VALIDATION_FAILURE
+                ),
+                failure_schema=observed_classification_schema,
+            )
+            try:
+                self._record_audit_outcome(evidence)
+            finally:
+                self._active_audit_fault_recording_context = None
+
             self._audit_classification_attestation_chain = _chain_extend(
                 self._audit_classification_attestation_chain,
                 "rest-audit-classification-attestation",
-                attestation_binding,
+                {
+                    "audit_start_schema": start.schema,
+                    "classification_protocol": AUDIT_CLASSIFICATION_PREPARE_ATTEST_PROTOCOL,
+                    "classification_source": classification_source,
+                    "expected_classification_schema": AUDIT_CLASSIFICATION_V2_SCHEMA,
+                    "final_state_reconciled": False,
+                    "observed_classification_schema": observed_classification_schema,
+                    "prepared_plan": None if prepared is None else prepared.plan.to_record(),
+                    "prepared_state": None if prepared is None else prepared.state,
+                    "preparation_command": None if prepared is None else prepared.command,
+                    "preparation_source": (
+                        None
+                        if prepared is None
+                        else RawSourceRef(
+                            ingest_id=prepared.envelope.ingest_id,
+                            payload_sha256=prepared.envelope.payload_sha256,
+                        )
+                    ),
+                    "request_id": request_id,
+                    "schema": "mma-rest-audit-classification-attestation-binding-v1",
+                    "timing_reconciled": False,
+                    "validation_disposition": validation_disposition,
+                },
             )
-
-    def _prepared_audit_final_state_reconciles(
-        self,
-        *,
-        start: AuditStartEvidence,
-        prepared: _PreparedAuditClassification,
-    ) -> bool:
-        """Check prepare-to-attestation stability without producing any side effect."""
-
-        instrument_id = start.starting_book.instrument_id
-        owner = self._owners[start.starting_book.instrument_id]
-        return (
-            self.processed_websocket_watermark(start.connection_id) == prepared.processed_watermark
-            and self.audit_book_identity(start.native_asset_id) == prepared.book
-            and owner.health is prepared.owner_health
-            and self._reported_top_transitions.get(instrument_id)
-            == prepared.reported_top_transition
-            and (instrument_id in self._audit_ineligible_nonfault_instruments)
-            is prepared.audit_ineligible_nonfault
-            and self._audit_fault_current_count_by_instrument.get(instrument_id, 0)
-            == prepared.audit_fault_current_count
-            and self._audit_fault_scope_block_count_by_instrument.get(instrument_id, 0)
-            == prepared.audit_fault_scope_block_count
-        )
 
     def _audit_response_coordinator_failure(
         self,
@@ -4877,35 +6240,13 @@ class CanonicalProcessor:
 
         if not self._audit_replacement_captures:
             return
-        envelope, admission_ordinal = self._active_websocket_evidence()
-        v2_candidates = tuple(
-            capture
-            for capture in self._audit_replacement_captures.values()
-            if capture.audit_start_schema == AUDIT_START_V2_SCHEMA
-            and instrument_id in capture.required_instrument_ids
-            and envelope.connection_id != capture.original_connection_id
+        envelope, legacy_admission_ordinal = self._active_websocket_evidence()
+        explicit_ordinal = envelope.transport_metadata.get("websocket_admission_ordinal")
+        v2_admission_ordinal = (
+            None
+            if isinstance(explicit_ordinal, bool) or not isinstance(explicit_ordinal, int)
+            else explicit_ordinal
         )
-        if v2_candidates:
-            explicit_ordinal = envelope.transport_metadata.get("websocket_admission_ordinal")
-            if (
-                isinstance(explicit_ordinal, bool)
-                or not isinstance(explicit_ordinal, int)
-                or explicit_ordinal <= 0
-            ):
-                raise NormalizationError(
-                    "v2 audit replacement snapshot requires an explicit admission ordinal"
-                )
-            admission_ordinal = explicit_ordinal
-            if any(
-                envelope.ingest_seq <= capture.resolution_ingest_seq
-                or envelope.received_monotonic.epoch_id != capture.resolution_monotonic.epoch_id
-                or envelope.received_monotonic.nanoseconds
-                < capture.resolution_monotonic.nanoseconds
-                for capture in v2_candidates
-            ):
-                raise NormalizationError(
-                    "v2 audit replacement snapshot predates authoritative resolution"
-                )
         raw_source = RawSourceRef(
             ingest_id=envelope.ingest_id,
             payload_sha256=envelope.payload_sha256,
@@ -4914,8 +6255,40 @@ class CanonicalProcessor:
             sorted(self._audit_replacement_captures, key=lambda item: item.value)
         ):
             pending = self._audit_replacement_captures[divergence_instrument_id]
+            if instrument_id not in pending.required_instrument_ids:
+                continue
+            if pending.recovery_authority is not None:
+                authority = pending.recovery_authority
+                if (
+                    authority.terminal
+                    or authority.status is not ReplacementRecoveryStatus.ATTEMPT_ACTIVE
+                ):
+                    continue
+                candidate = ReplacementSnapshotCandidate(
+                    connection_id=envelope.connection_id,
+                    instrument_ids=(instrument_id,),
+                    admission_ordinal=v2_admission_ordinal,
+                    ingest_seq=envelope.ingest_seq,
+                    received_monotonic=envelope.received_monotonic,
+                    raw_source=raw_source,
+                )
+                authority = authority.observe_snapshot(
+                    candidate=candidate,
+                    observed_monotonic=envelope.received_monotonic,
+                )
+                if (
+                    authority.status is ReplacementRecoveryStatus.ATTEMPT_ACTIVE
+                    and authority.coverage_complete
+                ):
+                    authority = authority.succeed_attempt(
+                        decided_monotonic=envelope.received_monotonic,
+                    )
+                self._audit_replacement_captures[divergence_instrument_id] = (
+                    pending.with_recovery_authority(authority)
+                )
+                continue
             advanced = pending.observe_snapshot(
-                admission_ordinal=admission_ordinal,
+                admission_ordinal=legacy_admission_ordinal,
                 connection_id=envelope.connection_id,
                 ingest_seq=envelope.ingest_seq,
                 instrument_id=instrument_id,
@@ -4942,18 +6315,80 @@ class CanonicalProcessor:
                     release_control_source=None,
                 )
 
+    def _record_cross_epoch_replacement_snapshots(
+        self,
+        envelope: RawEventEnvelope,
+        snapshot_instruments: set[InstrumentId],
+    ) -> bool:
+        """Type cross-epoch candidates without mutating canonical book freshness."""
+
+        recorded = False
+        raw_source = RawSourceRef(
+            ingest_id=envelope.ingest_id,
+            payload_sha256=envelope.payload_sha256,
+        )
+        raw_ordinal = envelope.transport_metadata.get("websocket_admission_ordinal")
+        admission_ordinal = (
+            None
+            if isinstance(raw_ordinal, bool) or not isinstance(raw_ordinal, int)
+            else raw_ordinal
+        )
+        for divergence_instrument_id in sorted(
+            self._audit_replacement_captures,
+            key=lambda item: item.value,
+        ):
+            capture = self._audit_replacement_captures[divergence_instrument_id]
+            authority = capture.recovery_authority
+            if (
+                authority is None
+                or authority.terminal
+                or authority.status is not ReplacementRecoveryStatus.ATTEMPT_ACTIVE
+                or envelope.received_monotonic.epoch_id == authority.resolution_monotonic.epoch_id
+            ):
+                continue
+            relevant = tuple(
+                sorted(
+                    snapshot_instruments.intersection(authority.required_instrument_ids),
+                    key=lambda item: item.value,
+                )
+            )
+            if not relevant:
+                continue
+            candidate = ReplacementSnapshotCandidate(
+                connection_id=envelope.connection_id,
+                instrument_ids=relevant,
+                admission_ordinal=admission_ordinal,
+                ingest_seq=envelope.ingest_seq,
+                received_monotonic=envelope.received_monotonic,
+                raw_source=raw_source,
+            )
+            updated = authority.observe_snapshot(
+                candidate=candidate,
+                observed_monotonic=envelope.received_monotonic,
+            )
+            self._audit_replacement_captures[divergence_instrument_id] = (
+                capture.with_recovery_authority(updated)
+            )
+            recorded = True
+        return recorded
+
     def _validate_v2_audit_replacement_snapshot_envelope(
         self,
         envelope: RawEventEnvelope,
         snapshot_instruments: set[InstrumentId],
     ) -> None:
-        candidates = tuple(
+        legacy_candidates = tuple(
             capture
             for capture in self._audit_replacement_captures.values()
             if capture.audit_start_schema == AUDIT_START_V2_SCHEMA
+            and capture.recovery_authority is None
             and snapshot_instruments.intersection(capture.required_instrument_ids)
         )
-        if not candidates:
+        if not legacy_candidates:
+            # Current candidates retain candidate-specific failures inside the
+            # recovery authority after canonical snapshot processing.  A Gate
+            # evidence rejection must not discard otherwise valid raw/canonical
+            # market data.
             return
         admission_ordinal = envelope.transport_metadata.get("websocket_admission_ordinal")
         if (
@@ -4967,7 +6402,7 @@ class CanonicalProcessor:
         if any(
             envelope.connection_id == capture.original_connection_id
             or envelope.connection_id in capture.pre_open_connection_ids
-            for capture in candidates
+            for capture in legacy_candidates
         ):
             raise _AuditReplacementSnapshotEvidenceError(
                 "v2 audit replacement snapshot requires a new post-resolution connection"
@@ -4976,7 +6411,7 @@ class CanonicalProcessor:
             envelope.ingest_seq <= capture.resolution_ingest_seq
             or envelope.received_monotonic.epoch_id != capture.resolution_monotonic.epoch_id
             or envelope.received_monotonic.nanoseconds < capture.resolution_monotonic.nanoseconds
-            for capture in candidates
+            for capture in legacy_candidates
         ):
             raise _AuditReplacementSnapshotEvidenceError(
                 "v2 audit replacement snapshot predates authoritative resolution"
@@ -4991,6 +6426,7 @@ class CanonicalProcessor:
         restored_at: UtcTimestamp,
         restored_monotonic: MonotonicTimestamp,
         release_control_source: RawSourceRef | None,
+        released_recovery_authority: ReplacementRecoveryAuthority | None = None,
     ) -> None:
         if self._audit_replacement_captures.get(instrument_id) != capture:
             raise ProgrammingInvariantViolation(
@@ -5011,7 +6447,19 @@ class CanonicalProcessor:
                     component="canonical-processor",
                 )
             released_binding = binding.with_replacement_release(release_control_source)
-        elif release_control_source is not None:
+            if capture.recovery_authority is not None and (
+                released_recovery_authority is None
+                or released_recovery_authority.divergence_id != capture.divergence_id
+                or released_recovery_authority.status is not ReplacementRecoveryStatus.RELEASED
+                or released_recovery_authority.release_source != release_control_source
+                or released_recovery_authority.release_ingest_seq != restored_ingest_seq
+                or released_recovery_authority.release_monotonic != restored_monotonic
+            ):
+                raise ProgrammingInvariantViolation(
+                    "v2 audit replacement release lacks reconciled recovery authority",
+                    component="canonical-processor",
+                )
+        elif release_control_source is not None or released_recovery_authority is not None:
             raise ProgrammingInvariantViolation(
                 "legacy audit availability cannot invent a release source",
                 component="canonical-processor",
@@ -5045,6 +6493,7 @@ class CanonicalProcessor:
                 restored_ingest_seq=restored_ingest_seq,
                 restored_at=restored_at,
                 restored_monotonic=restored_monotonic,
+                replacement_recovery_authority=released_recovery_authority,
             )
             active_restorations = self._active_audit_divergences_eligibility_restored
             if active_restorations is not None:
@@ -5059,6 +6508,8 @@ class CanonicalProcessor:
         }
         if release_control_source is not None:
             history_record["release_control_source"] = release_control_source
+            if released_recovery_authority is not None:
+                history_record["replacement_recovery_authority"] = released_recovery_authority
         self._audit_divergence_history_chain = _chain_extend(
             self._audit_divergence_history_chain,
             "rest-audit-divergence-eligibility-restored",
@@ -5073,9 +6524,26 @@ class CanonicalProcessor:
         self,
         envelope: RawEventEnvelope,
     ) -> None:
+        decoded = decode_json_exact(envelope.payload_bytes)
+        if not isinstance(decoded, dict):
+            raise NormalizationError("audit replacement release must be an object")
+        release_record = cast(dict[str, object], decoded)
+        if envelope.channel == CONTROL_REST_AUDIT_REPLACEMENT_RELEASE:
+            schema = AUDIT_REPLACEMENT_RELEASE_V1_SCHEMA
+        elif envelope.channel == CONTROL_REST_AUDIT_REPLACEMENT_RELEASE_V2:
+            schema = AUDIT_REPLACEMENT_RELEASE_V2_SCHEMA
+        else:  # pragma: no cover - the channel router owns this invariant
+            raise ProgrammingInvariantViolation(
+                "audit replacement release parser received an unsupported channel",
+                component="canonical-processor",
+            )
+        if release_record.get("schema") != schema:
+            raise NormalizationError(
+                "audit replacement release schema differs from its versioned channel"
+            )
         control = self._control_object(
             envelope.payload_bytes,
-            schema=AUDIT_REPLACEMENT_RELEASE_SCHEMA,
+            schema=schema,
             expected_keys=frozenset(
                 {
                     "capture_state_sha256",
@@ -5127,6 +6595,7 @@ class CanonicalProcessor:
                     control,
                     "decision_monotonic_ns",
                 ),
+                schema=schema,
             )
         except ValueError as error:
             raise NormalizationError("audit replacement release evidence is invalid") from error
@@ -5141,6 +6610,26 @@ class CanonicalProcessor:
             raise NormalizationError(
                 "historical audit replacement capture cannot use a release control"
             )
+
+        def reject_release(message: str) -> None:
+            authority = capture.recovery_authority
+            if authority is not None and not authority.terminal:
+                try:
+                    rejected = authority.reject_release(
+                        rejection_source=RawSourceRef(
+                            ingest_id=envelope.ingest_id,
+                            payload_sha256=envelope.payload_sha256,
+                        ),
+                        rejected_monotonic=envelope.received_monotonic,
+                    )
+                except ReplacementRecoveryTransitionError:
+                    pass
+                else:
+                    self._audit_replacement_captures[command.instrument_id] = (
+                        capture.with_recovery_authority(rejected)
+                    )
+            raise NormalizationError(message)
+
         decision_monotonic = MonotonicTimestamp(
             command.monotonic_epoch_id,
             command.decision_monotonic_ns,
@@ -5151,44 +6640,69 @@ class CanonicalProcessor:
             decision_monotonic,
         )
         if command != expected:
-            raise NormalizationError(
-                "audit replacement release differs from current capture evidence"
-            )
+            reject_release("audit replacement release differs from current capture evidence")
         if (
             envelope.connection_id != command.replacement_connection_id
             or envelope.received_monotonic != decision_monotonic
             or envelope.ingest_seq
             <= max(source.ingest_seq for source in capture.captured_snapshot_sources)
         ):
-            raise NormalizationError(
-                "audit replacement release differs from its durable receive boundary"
-            )
+            reject_release("audit replacement release differs from its durable receive boundary")
         if not self._audit_replacement_capture_fresh_at(
             capture,
             decision_monotonic,
             maximum_age_ns=self._scanner.config.maximum_book_age_ns,
         ):
-            raise NormalizationError(
-                "audit replacement release capture is incomplete or freshness-invalid"
-            )
+            reject_release("audit replacement release capture is incomplete or freshness-invalid")
         if not self._audit_replacement_release_group_ready_at(
             self._audit_replacement_release_group(capture),
             connection_id=command.replacement_connection_id,
             decision_monotonic=decision_monotonic,
         ):
-            raise NormalizationError(
-                "audit replacement release scope has another eligibility blocker"
-            )
+            reject_release("audit replacement release scope has another eligibility blocker")
+        release_source = RawSourceRef(
+            ingest_id=envelope.ingest_id,
+            payload_sha256=envelope.payload_sha256,
+        )
+        recovery_authority = capture.recovery_authority
+        released_recovery_authority: ReplacementRecoveryAuthority | None = None
+        if recovery_authority is not None:
+            try:
+                released_recovery_authority = recovery_authority.release(
+                    release_source=release_source,
+                    release_ingest_seq=envelope.ingest_seq,
+                    release_monotonic=envelope.received_monotonic,
+                )
+            except ReplacementRecoveryTransitionError as error:
+                try:
+                    rejected = recovery_authority.reject_release(
+                        rejection_source=release_source,
+                        rejected_monotonic=envelope.received_monotonic,
+                    )
+                except ReplacementRecoveryTransitionError:
+                    pass
+                else:
+                    self._audit_replacement_captures[command.instrument_id] = (
+                        capture.with_recovery_authority(rejected)
+                    )
+                raise NormalizationError(
+                    "audit replacement release violates bounded recovery authority"
+                ) from error
+            if released_recovery_authority.status is not ReplacementRecoveryStatus.RELEASED:
+                self._audit_replacement_captures[command.instrument_id] = (
+                    capture.with_recovery_authority(released_recovery_authority)
+                )
+                raise NormalizationError(
+                    "audit replacement release reached a terminal unresolved boundary"
+                )
         self._finalize_audit_replacement_capture(
             command.instrument_id,
             capture,
             restored_ingest_seq=envelope.ingest_seq,
             restored_at=envelope.received_wall_time,
             restored_monotonic=envelope.received_monotonic,
-            release_control_source=RawSourceRef(
-                ingest_id=envelope.ingest_id,
-                payload_sha256=envelope.payload_sha256,
-            ),
+            release_control_source=release_source,
+            released_recovery_authority=released_recovery_authority,
         )
 
     def _validate_gamma_identity(self, market: GammaMarket) -> None:
@@ -5764,6 +7278,11 @@ class CanonicalProcessor:
             for event in events
             if isinstance(event.payload, OrderBookSnapshotEvent)
         }
+        if self._record_cross_epoch_replacement_snapshots(
+            envelope,
+            snapshot_instruments,
+        ):
+            return
         self._validate_v2_audit_replacement_snapshot_envelope(
             envelope,
             snapshot_instruments,
@@ -6877,17 +8396,8 @@ class CanonicalProcessor:
                     else {
                         "command": preparation.command,
                         "envelope": preparation.envelope.to_record(),
-                        "prepared_state": {
-                            "audit_fault_current_count": (preparation.audit_fault_current_count),
-                            "audit_fault_scope_block_count": (
-                                preparation.audit_fault_scope_block_count
-                            ),
-                            "audit_ineligible_nonfault": (preparation.audit_ineligible_nonfault),
-                            "book": preparation.book,
-                            "owner_health": preparation.owner_health,
-                            "processed_watermark": preparation.processed_watermark,
-                            "reported_top_transition": (preparation.reported_top_transition),
-                        },
+                        "prepared_plan": preparation.plan.to_record(),
+                        "prepared_state": preparation.state,
                     }
                 ),
                 "classification_protocol": (
@@ -6936,6 +8446,9 @@ class CanonicalProcessor:
                 "schema": _TERMINAL_HASH_SCHEMA,
                 "config_hash": self._config.config_hash.value,
                 "v1_audit_generation_rebase_enabled": (self._allow_v1_audit_generation_rebase),
+                "historical_unsupervised_replacement_capture_enabled": (
+                    self._allow_historical_unsupervised_replacement_capture
+                ),
                 "counters": {
                     "candidates": self._candidate_count,
                     "canonical_events": self._canonical_events,

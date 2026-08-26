@@ -13,13 +13,13 @@ unavailable.
 
 Gate 1 remains `FAIL` because the first six-hour soak is historical failure
 evidence and no replacement six-hour soak was run. The preserved candidate
-`6dc5dc43bbb673a35ff960bb7d84fed062aefda4` implements the ADR-0055 baseline but
-does not implement ADR-0056 unresolved-only contributor ownership, independent
-completed-contributor persistence, cross-stream interval reconciliation or
-bounded replacement-recovery exhaustion. ADR-0056 reconciles governance only;
-implementation remediation and final offline gates remain pending. A new exact-
-SHA 60-second smoke and 5,400- to 7,200-second post-saturation stability
-observation are required only after that implementation is complete and frozen.
+`6dc5dc43bbb673a35ff960bb7d84fed062aefda4` remains the immutable ADR-0055
+baseline. Its successor implements ADR-0056 unresolved-only contributor
+ownership, independent completed-contributor persistence, cross-stream interval
+reconciliation and bounded replacement-recovery exhaustion. Deterministic
+offline gates pass; a new exact-SHA 60-second smoke and 5,400- to 7,200-second
+post-saturation stability observation still require separate public-preflight
+authorization.
 
 ## Toolchain
 
@@ -118,8 +118,11 @@ date make the external venue evidence reviewable rather than an architectural
 constant. `[health]` independently bounds checkpoint and availability-ledger
 queue capacity, record count, file size, cadence, and minimum free-disk
 headroom. The committed checkpoint cadence is ten seconds. Availability
-evidence has a separate 64-command queue, 8,192-interval count bound, and
-64 MiB file bound. Reported-top uncertainty is independently capped at eight
+interval evidence has a 64-command queue, 8,192-record count bound and 64 MiB
+file bound. Completed-contributor evidence has an independent 1,024-command
+queue, 65,536-record count bound and 256 MiB file bound; either stream rejects a
+record above 64 KiB. Active causal concurrency remains independently capped at
+64. Reported-top uncertainty is independently capped at eight
 accepted frames and two monotonic seconds by `[polymarket]`; configuration
 rejects a time bound longer than the five-second maximum book age. A bounded
 live calibration rejected the initial five-second checkpoint choice because its
@@ -140,11 +143,13 @@ quiet boundary. At most four retries (five real attempts) are allowed; the run
 deadline, current leg hard expiry, or socket-generation exit always suppresses
 later work, and exhaustion remains a durable fail-closed outcome.
 
-ADR-0056 replacement-capture attempt, retry and hard-recovery limits are not yet
-present in this candidate configuration. Implementation remediation must add
-explicit measured limits for attempts, next-retry timing and hard recovery
-duration, bounded by the absolute run deadline. Those numeric values belong in
-Phase-1 configuration/specification and tests, not foundational architecture.
+ADR-0056 replacement capture uses at most nine attempts, a fixed five-second
+retry delay and a 120-second hard recovery deadline, always bounded by the
+absolute run deadline. The attempt count is the initial post-resolution
+generation plus the eight configured reconnect attempts; the deadline is the
+75 seconds of configured reconnect sleeps plus nine five-second capture
+windows. Configuration validation also retains absolute state-machine maxima of
+64 attempts, 60 seconds per retry and 300 seconds hard duration.
 
 Retained failed-run and corrected-stability cadence evidence supports keeping
 the 30-second periodic cap and four-second guard. A 15-second periodic cap did
@@ -530,20 +535,20 @@ Incrementals, reported BBO, socket readiness, partial market coverage, or the
 first binary leg cannot restore eligibility.
 
 The preserved candidate has no ADR-0056 attempt/deadline authority around this
-capture. The required remediation must retain one stable recovery identity and
-causal contributor across permitted connection generations, with bounded
-attempts, first/latest attempt times, next retry, hard recovery and run
-deadlines, required/captured instruments, last typed failure and deterministic
-attempt chain. Exhaustion must retain unresolved/open evidence, keep eligibility
-blocked and transition to typed fail-closed degraded or terminal behavior; it
-must not remain indefinitely pending or create duplicate contributors.
+capture. The successor retains one stable recovery identity and causal
+contributor across permitted connection generations, with bounded attempts,
+first/latest attempt times, next retry, hard recovery and run deadlines,
+required/captured instruments, last typed failure and deterministic attempt
+chain. Exhaustion retains unresolved/open evidence, keeps eligibility blocked
+and transitions to typed fail-closed degraded or terminal behavior; it cannot
+remain indefinitely pending or create duplicate contributors.
 
 Replacement-capture pending continues to block audit starts, scanner, and
 research. For current v2 audit state it clears only after complete full-snapshot
 coverage from the one new connection; an independent post-processing observer
 check proves every required book receive timestamp is present, nonfuture and
 within `scanner.maximum_book_age` of one sampled decision time; and the
-coordinator durably applies `mma.control.rest-audit-replacement-release.v1` at
+coordinator durably applies `mma.control.rest-audit-replacement-release.v2` at
 that exact paired wall/monotonic boundary. Complete v2 snapshot coverage is
 still pending/ineligible and every replacement snapshot, including the
 completing one, emits zero scans before that control. The control embeds the
@@ -1011,13 +1016,13 @@ cutoff.
 
 ### Separate availability ledger
 
-This subsection records the preserved candidate topology. ADR-0056 does not
-require that topology, and the contributor-ownership behavior below is
-explicitly pending remediation.
+This subsection records the current successor topology. Historical v1 artifacts
+from the preserved candidate remain immutable and readable only under their
+recorded contract.
 
 Availability intervals are not mixed into checkpoint JSONL. A second bounded,
-single-owner writer publishes
-`gate1-availability-interval-v1` records to the run-scoped
+single-owner composite writer publishes
+`gate1-availability-interval-v2` records to the run-scoped
 `availability-intervals.jsonl.partial`/`.jsonl` pair. Each record binds the
 connection/socket generation, paired UTC and run-epoch monotonic start/end,
 exact monotonic duration, typed initiating cause and reason, bounded source and
@@ -1085,13 +1090,13 @@ cadence/overhead.
 
 ### Separate availability-contribution ledger
 
-The preserved candidate publishes bounded
-`gate1-availability-interval-contribution-v1` records through the same
-single-owner availability evidence bundle and retains completed contributions in
-active authority until the global interval closes. That behavior does not
-conform to ADR-0056 and must not be treated as the target contract.
+The current producer publishes bounded
+`gate1-availability-interval-contribution-v2` records through the same
+single-owner availability evidence bundle. The preserved candidate's
+`gate1-availability-interval-contribution-v1` artifacts remain historical and
+are never promoted to the successor contract.
 
-The remediation assigns the global interval ID at open and keeps only unresolved
+The implementation assigns the global interval ID at open and keeps only unresolved
 deterministic causal keys active. Repeated symptoms update one bounded count and
 evidence digest. A resolved contributor independently freezes one immutable
 completed record, hands it to bounded durable derived-evidence persistence and
@@ -1100,16 +1105,20 @@ capacity and cumulative completed count/file/byte capacity are separate hard
 bounds. The global interval remains the union of nonempty-active-set time, not a
 sum, and closes only when that set becomes empty or at terminal cutoff.
 
-The implementation may retain a composite owner with independently admitted
-logical streams or use separately supervised bounded owners. Each logical stream
-has one mutable owner, non-blocking admission, explicit partials, durable writes,
-atomic clean completion and exact cross-stream interval/contribution count,
-digest, union, sequence and hash reconciliation. Missing, duplicate, orphan,
-source-mismatched, saturated, failed or partial-as-complete evidence blocks
-automatic Gate eligibility without changing raw capture.
+One composite owner exposes independently bounded interval and contribution
+logical streams. Each stream has one mutable owner, non-blocking admission,
+explicit partials, durable writes, atomic clean completion and exact cross-stream
+interval/contribution count, digest, union, sequence and hash reconciliation.
+Missing, duplicate, orphan, source-mismatched, saturated, failed or partial-as-
+complete evidence blocks automatic Gate eligibility without changing raw
+capture.
 
-ADR-0056 requires explicitly newer interval and contribution producer schemas
-rather than assigning new semantics to interval-v1 or contribution-v1.
+ADR-0056 uses `gate1-availability-interval-v2` and
+`gate1-availability-interval-contribution-v2`, with
+`gate1-availability-evidence-summary-v2`,
+`gate1-availability-evidence-completion-v2` and
+`gate1-availability-evidence-reconciliation-v2` publication identities, rather
+than assigning new semantics to interval-v1 or contribution-v1.
 Historical interval/contribution evidence remains immutable; interval-v1 lacks
 the new contributor count/digest, and absent causal keys, observation counts,
 independent completion, retry/deadline or reconciliation fields are reported
@@ -1268,6 +1277,6 @@ Current protocol conclusions:
   Gate 1.
 - The new final-SHA 60-second smoke and 5,400–7,200 second post-saturation
   stability evidence remain required before independent pre-soak review; older
-  public runs do not validate the pending ADR-0056 implementation remediation.
+  public runs do not validate the current ADR-0056 implementation.
 - Long-duration data-quality soak evidence remains an independent Gate 1
   operator activity.

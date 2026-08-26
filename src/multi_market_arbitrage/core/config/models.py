@@ -252,6 +252,18 @@ class PolymarketConfig(_StrictFrozenModel):
     reported_top_transition_max_seconds: PositiveFiniteFloat = 2.0
     public_reads: PublicReadConfig
     snapshot_audit_max_race_retries: Annotated[int, Field(strict=True, ge=0, le=16)] = 4
+    audit_replacement_maximum_attempts: Annotated[
+        int,
+        Field(strict=True, ge=1, le=64),
+    ]
+    audit_replacement_retry_delay_seconds: Annotated[
+        float,
+        Field(strict=True, gt=0, le=60.0, allow_inf_nan=False),
+    ]
+    audit_replacement_hard_deadline_seconds: Annotated[
+        float,
+        Field(strict=True, gt=0, le=300.0, allow_inf_nan=False),
+    ]
 
     @model_validator(mode="after")
     def _reported_top_transition_bounds(self) -> Self:
@@ -273,6 +285,11 @@ class PolymarketConfig(_StrictFrozenModel):
     def _reconnect_bounds(self) -> Self:
         if self.reconnect_initial_seconds > self.reconnect_max_seconds:
             raise ValueError("reconnect_initial_seconds cannot exceed reconnect_max_seconds")
+        if (
+            self.audit_replacement_retry_delay_seconds
+            >= self.audit_replacement_hard_deadline_seconds
+        ):
+            raise ValueError("audit replacement retry delay must be below its hard deadline")
         return self
 
     @model_validator(mode="after")
@@ -342,6 +359,10 @@ class HealthConfig(_StrictFrozenModel):
     availability_queue_capacity: PositiveStrictInt = 64
     maximum_availability_intervals: PositiveStrictInt = 8_192
     maximum_availability_file_bytes: PositiveStrictInt = 64 * 1024 * 1024
+    availability_contribution_queue_capacity: PositiveStrictInt
+    maximum_availability_contributions: PositiveStrictInt
+    maximum_availability_contribution_file_bytes: PositiveStrictInt
+    maximum_availability_record_bytes: PositiveStrictInt
     minimum_free_disk_bytes: PositiveStrictInt = 1024 * 1024 * 1024
 
     @model_validator(mode="after")
@@ -354,6 +375,27 @@ class HealthConfig(_StrictFrozenModel):
             raise ValueError("health evidence file cannot exceed 256 MiB")
         if self.maximum_availability_file_bytes > 256 * 1024 * 1024:
             raise ValueError("availability evidence file cannot exceed 256 MiB")
+        if self.availability_contribution_queue_capacity > 65_536:
+            raise ValueError("availability contribution queue capacity cannot exceed 65536")
+        if self.maximum_availability_contributions > 2_000_000:
+            raise ValueError("availability contribution count cannot exceed 2000000")
+        if self.maximum_availability_contribution_file_bytes > 256 * 1024 * 1024:
+            raise ValueError("availability contribution evidence file cannot exceed 256 MiB")
+        if self.maximum_availability_record_bytes > 1024 * 1024:
+            raise ValueError("availability evidence record cannot exceed 1 MiB")
+        if self.availability_contribution_queue_capacity > self.maximum_availability_contributions:
+            raise ValueError(
+                "availability contribution queue capacity cannot exceed its record bound"
+            )
+        if self.maximum_availability_contributions < self.maximum_availability_intervals:
+            raise ValueError(
+                "availability contribution record bound cannot be below its interval bound"
+            )
+        if self.maximum_availability_record_bytes > min(
+            self.maximum_availability_file_bytes,
+            self.maximum_availability_contribution_file_bytes,
+        ):
+            raise ValueError("availability record bound cannot exceed either evidence file bound")
         return self
 
 
@@ -401,6 +443,16 @@ class Phase1Config(_StrictFrozenModel):
             > self.scanner.maximum_book_age_seconds
         ):
             raise ValueError("reported-top transition duration cannot exceed maximum book age")
+        if (
+            self.polymarket.audit_replacement_retry_delay_seconds
+            > self.scanner.maximum_book_age_seconds
+        ):
+            raise ValueError("audit replacement retry delay cannot exceed maximum book age")
+        if (
+            self.polymarket.audit_replacement_hard_deadline_seconds
+            > self.system.maximum_observation_duration_seconds
+        ):
+            raise ValueError("audit replacement hard deadline cannot exceed the run deadline")
         return self
 
     @classmethod

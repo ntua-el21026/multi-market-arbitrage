@@ -209,10 +209,16 @@ def replay_journal(
     _validate_replay_config(config)
     reader = JournalReader(journal_root, collector_run_id)
     heads = reader.completion_heads()
-    # An uncompleted/ambiguous journal has no positive historical compatibility
-    # authority.  The non-commit sentinel therefore selects the current strict
-    # protocol rather than silently treating omission as legacy evidence.
-    source_journal_git_commit = heads[0].git_commit if len(heads) == 1 else "UNBOUND_REPLAY_SOURCE"
+    # A clean completion head is the primary source authority.  An explicitly
+    # interrupted, sealed-only prefix may use unanimous per-segment provenance
+    # without being promoted to a completed run.  Active partials or ambiguous
+    # provenance remain unbound and therefore select strict current semantics.
+    sealed_prefix_commit = (
+        reader.uncompleted_sealed_prefix_git_commit() if include_partial and not heads else None
+    )
+    source_journal_git_commit = (
+        heads[0].git_commit if len(heads) == 1 else sealed_prefix_commit or "UNBOUND_REPLAY_SOURCE"
+    )
     return _run_replay(
         journal_root=journal_root,
         collector_run_id=collector_run_id,

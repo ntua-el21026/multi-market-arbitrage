@@ -13,8 +13,16 @@ sys.path.insert(0, str(REPOSITORY))
 from benchmarks.gate1_pre_soak_capacity import (  # noqa: E402
     _RUN_ID,  # pyright: ignore[reportPrivateUsage]
     DEFAULT_AUDIT_OUTCOMES,
+    DEFAULT_AVAILABILITY_WRITER_CONTRIBUTIONS,
+    DEFAULT_OVERLAPPING_CONTRIBUTOR_GROUPS,
     DEFAULT_SATURATION_THRESHOLD,
     DEFAULT_SCAN_EVENTS,
+    DEFAULT_SEQUENTIAL_CONTRIBUTOR_LIFECYCLES,
+    GATE1_MINIMUM_AUDIT_OUTCOMES,
+    GATE1_MINIMUM_AVAILABILITY_WRITER_CONTRIBUTIONS,
+    GATE1_MINIMUM_OVERLAPPING_CONTRIBUTOR_GROUPS,
+    GATE1_MINIMUM_SCAN_EVENTS,
+    GATE1_MINIMUM_SEQUENTIAL_CONTRIBUTOR_LIFECYCLES,
     _diagnostic_retention_independence,  # pyright: ignore[reportPrivateUsage]
     _envelope,  # pyright: ignore[reportPrivateUsage]
     _failed_acceptance_names,  # pyright: ignore[reportPrivateUsage]
@@ -33,6 +41,75 @@ from multi_market_arbitrage.pipeline.processor import ProcessorRetentionDomain  
 def test_gate1_capacity_defaults_exceed_historical_plateau() -> None:
     assert DEFAULT_SCAN_EVENTS > DEFAULT_SATURATION_THRESHOLD == 4_096
     assert DEFAULT_AUDIT_OUTCOMES > DEFAULT_SATURATION_THRESHOLD
+    assert (
+        DEFAULT_SEQUENTIAL_CONTRIBUTOR_LIFECYCLES
+        > GATE1_MINIMUM_SEQUENTIAL_CONTRIBUTOR_LIFECYCLES
+        == 10_000
+    )
+    assert (
+        DEFAULT_OVERLAPPING_CONTRIBUTOR_GROUPS
+        > GATE1_MINIMUM_OVERLAPPING_CONTRIBUTOR_GROUPS
+        == 1_000
+    )
+    assert DEFAULT_AVAILABILITY_WRITER_CONTRIBUTIONS >= 4_096
+    assert DEFAULT_SCAN_EVENTS > GATE1_MINIMUM_SCAN_EVENTS == 4_096
+    assert DEFAULT_AUDIT_OUTCOMES > GATE1_MINIMUM_AUDIT_OUTCOMES == 4_096
+    assert (
+        DEFAULT_AVAILABILITY_WRITER_CONTRIBUTIONS
+        >= GATE1_MINIMUM_AVAILABILITY_WRITER_CONTRIBUTIONS
+        == 4_096
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sequential_lifecycles", "overlapping_groups", "expected"),
+    [
+        (
+            GATE1_MINIMUM_SEQUENTIAL_CONTRIBUTOR_LIFECYCLES,
+            DEFAULT_OVERLAPPING_CONTRIBUTOR_GROUPS,
+            "sequential contributor lifecycle count",
+        ),
+        (
+            DEFAULT_SEQUENTIAL_CONTRIBUTOR_LIFECYCLES,
+            GATE1_MINIMUM_OVERLAPPING_CONTRIBUTOR_GROUPS,
+            "overlapping contributor group count",
+        ),
+    ],
+)
+async def test_gate1_capacity_rejects_non_strict_workload_minima(
+    tmp_path: Path,
+    sequential_lifecycles: int,
+    overlapping_groups: int,
+    expected: str,
+) -> None:
+    with pytest.raises(ValueError, match=expected):
+        await run_capacity_benchmark(
+            tmp_path / "capacity",
+            sequential_contributor_lifecycles=sequential_lifecycles,
+            overlapping_contributor_groups=overlapping_groups,
+        )
+
+
+@pytest.mark.asyncio
+async def test_gate1_capacity_rejects_undersized_stream_workloads(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="scan event count"):
+        await run_capacity_benchmark(
+            tmp_path / "scan-capacity",
+            scan_events=GATE1_MINIMUM_SCAN_EVENTS,
+            saturation_threshold=1,
+        )
+    with pytest.raises(ValueError, match="audit outcome count"):
+        await run_capacity_benchmark(
+            tmp_path / "audit-capacity",
+            audit_outcomes=GATE1_MINIMUM_AUDIT_OUTCOMES,
+            saturation_threshold=1,
+        )
+    with pytest.raises(ValueError, match="availability writer contribution count"):
+        await run_capacity_benchmark(
+            tmp_path / "writer-capacity",
+            availability_writer_contributions=(GATE1_MINIMUM_AVAILABILITY_WRITER_CONTRIBUTIONS - 1),
+        )
 
 
 def test_capacity_latency_distribution_uses_deterministic_nearest_rank() -> None:
@@ -66,6 +143,11 @@ async def test_capacity_workload_saturates_production_histories_and_persistence(
         latency_samples=3,
         slope_latency_samples=4,
         analytical_batch_size=32,
+        sequential_contributor_lifecycles=128,
+        overlapping_contributor_groups=16,
+        availability_writer_contributions=64,
+        reconciliation_latency_samples=2,
+        enforce_gate1_workload_minimums=False,
     )
 
     acceptance = cast(dict[str, object], result["acceptance"])
@@ -148,9 +230,27 @@ async def test_capacity_workload_saturates_production_histories_and_persistence(
         tuple[str, ...], reported_top_proof["nonempty_domains"]
     )
     availability = cast(dict[str, object], domain_capacity["availability_writer"])
-    assert availability["intervals"] == availability["contributions"] == 32
+    assert availability["intervals"] == availability["contributions"] == 64
     assert availability["published_reconciled"] is True
     assert availability["reconciliation_discrepancies"] == ()
+    projection = cast(dict[str, object], availability["six_hour_projection"])
+    assert projection["fits_committed_bounds"] is True
+    assert cast(int, projection["projected_interval_records"]) > 0
+    sequential = cast(dict[str, object], domain_capacity["sequential_contributor_lifecycles"])
+    assert sequential["sequential_lifecycles"] == 128
+    assert cast(int, sequential["active_count_maximum"]) <= 4
+    assert sequential["active_retained_bytes_after_each_completion_constant"] is True
+    overlapping = cast(dict[str, object], domain_capacity["overlapping_contributor_groups"])
+    assert overlapping["groups"] == 16
+    assert overlapping["active_count_maximum"] == 4
+    active_bound = cast(dict[str, object], domain_capacity["availability_active_bound"])
+    assert active_bound["legitimate_active_count"] == 64
+    assert active_bound["attempted_active_count"] == 65
+    assert active_bound["rejected_before_insertion"] is True
+    saturation = cast(dict[str, object], domain_capacity["availability_writer_saturation"])
+    assert saturation["fail_closed"] is True
+    recovery = cast(dict[str, object], domain_capacity["replacement_recovery"])
+    assert recovery["all_exhaustions_explicit"] is True
 
     analytical = cast(dict[str, object], result["analytical"])
     after_close = cast(dict[str, object], analytical["after_close"])

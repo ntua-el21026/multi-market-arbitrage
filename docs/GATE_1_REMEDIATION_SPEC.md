@@ -16,10 +16,10 @@ contribution, typed-resync, and local classification-latency defects. ADR-0055
 governs those corrections. A later pre-soak stability attempt exposed completed
 contributors retained in active authority until interval closure and replacement
 capture without bounded exhaustion. ADR-0056 reconciles that governance;
-implementation remediation remains pending. The post-fix candidate must complete
-offline validation, a new 60-second smoke, and a new 5,400- to 7,200-second
-stability observation before independent pre-soak review. No six-hour rerun was
-performed; the first soak remains `FAIL`.
+implementation and offline validation are complete. Independent public-preflight
+authorization, a new 60-second smoke, and a new 5,400- to 7,200-second stability
+observation remain required before independent pre-soak review. No six-hour
+rerun was performed; the first soak remains `FAIL`.
 
 Design Freeze v0.1 remains locked.
 
@@ -360,7 +360,7 @@ bound and verifies every required canonical book is healthy. Complete v2
 coverage is still pending/ineligible and every replacement snapshot, including
 the completing one, emits zero scans. The coordinator must durably journal and
 successfully process the self-contained bounded
-`mma.control.rest-audit-replacement-release.v1` control at that same paired
+`mma.control.rest-audit-replacement-release.v2` control at that same paired
 decision wall/monotonic boundary before state can clear or a recovery scan can
 run. The control commits the exact complete capture record and digest, including
 the original/replacement connections and every full-snapshot raw source,
@@ -603,10 +603,13 @@ bound to exactly one global interval. Paired/overlapping contributions retain
 all request/instrument sources while global duration remains the interval union
 and per-instrument coverage remains derivable.
 
-Post-ADR-0056 interval records carrying contributor count/digest and
-post-ADR-0056 contribution records both require explicitly newer schemas chosen
-during implementation. Existing interval-v1 and contribution-v1 evidence
-remains immutable and does not acquire or imply the new fields.
+Post-ADR-0056 interval records use `gate1-availability-interval-v2`; contribution
+records use `gate1-availability-interval-contribution-v2`; publication uses
+`gate1-availability-evidence-summary-v2`,
+`gate1-availability-evidence-completion-v2` and
+`gate1-availability-evidence-reconciliation-v2`. Existing interval-v1 and
+contribution-v1 evidence remains immutable and does not acquire or imply the new
+fields.
 
 Contributor closure is independent of interval closure. Completion freezes one
 immutable record, hands it to bounded derived-evidence persistence and removes
@@ -617,8 +620,9 @@ orphans, duplicate causal keys or completed contributors still active. A crash
 may leave explicit partial evidence but cannot claim clean completion.
 
 Replacement capture retains one stable recovery identity and causal contributor
-across permitted new connection generations. Phase configuration must bound
-attempts, first/latest attempt times, next retry, hard recovery and run deadlines,
+across permitted new connection generations. Phase configuration permits nine
+attempts, a five-second retry delay and a 120-second hard recovery deadline,
+bounded by the run deadline, and retains first/latest attempt times,
 required/captured instrument state, last typed failure and the deterministic
 evidence chain. Exhaustion is typed unresolved/open, leaves eligibility blocked,
 and produces fail-closed degraded or terminal behavior rather than remaining

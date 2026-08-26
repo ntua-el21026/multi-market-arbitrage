@@ -96,6 +96,11 @@ count/digest/sequence/hash reconciliation, and bounded replacement attempts,
 deadlines and typed exhaustion. Historical schemas report unavailable fields;
 validation never synthesizes them.
 
+Current validation recognizes `gate1-availability-interval-v2` and
+`gate1-availability-interval-contribution-v2` only through their paired v2
+summary, completion and reconciliation identities. V1 evidence remains a
+historical contract and cannot satisfy ADR-0056 terminal reconciliation.
+
 ## 6. V3 — Canonical state
 
 Checks:

@@ -426,6 +426,7 @@ def _audit_classification_attestation(
     hard_expiry_monotonic_ns: int,
     durable_monotonic_ns: int,
     processed_monotonic_ns: int,
+    attestation_monotonic_ns: int | None = None,
     schema: str = AUDIT_CLASSIFICATION_V2_SCHEMA,
 ) -> tuple[AuditClassificationCommand, RawEventEnvelope]:
     command = AuditClassificationCommand(
@@ -440,7 +441,9 @@ def _audit_classification_attestation(
         sequence,
         CONTROL_REST_AUDIT_CLASSIFY,
         command.to_payload(),
-        monotonic_ns=processed_monotonic_ns,
+        monotonic_ns=(
+            processed_monotonic_ns if attestation_monotonic_ns is None else attestation_monotonic_ns
+        ),
         connection_id=start.connection_id,
         transport_metadata={
             "classification_prepare_durable_monotonic_ns": durable_monotonic_ns,
@@ -1382,7 +1385,7 @@ def test_deferred_protocol_rejects_cross_epoch_response_and_classification() -> 
 
 
 @pytest.mark.parametrize("control_kind", ["classification-v1", "failure-v1"])
-def test_prepare_attest_rejects_v1_final_authority_without_completing_pending_audit(
+def test_prepare_attest_rejects_v1_completion_authority(
     control_kind: str,
 ) -> None:
     config = load_phase1_config(Path("config/phase1.toml"))
@@ -1396,7 +1399,6 @@ def test_prepare_attest_rejects_v1_final_authority_without_completing_pending_au
     )
     before = processor.summary()
     books_before = processor.snapshots()
-    ineligible_before = processor.audit_ineligible_instruments
 
     if control_kind == "classification-v1":
         _, rejected_envelope = _audit_classification_attestation(
@@ -1427,48 +1429,36 @@ def test_prepare_attest_rejects_v1_final_authority_without_completing_pending_au
     rejected = processor.process_replayed(rejected_envelope)
     after_rejection = processor.summary()
 
+    if control_kind == "classification-v1":
+        assert rejected.success
+        assert tuple(item.outcome for item in rejected.audit_outcomes) == (AuditOutcome.FAILED,)
+        assert rejected.audit_outcomes[0].reason is AuditFailureReason.BOOK_FRESHNESS_EXPIRED
+        assert rejected.canonical_event_count == 0
+        assert rejected.scan_count == 0
+        assert rejected.book_freshness_updates == ()
+        assert processor.snapshots() == books_before
+        assert after_rejection.pending_rest_audits == 0
+        assert after_rejection.audit_faults_permanent == before.audit_faults_permanent + 1
+        return
+
     assert not rejected.success
     assert rejected.error_type == "NormalizationError"
     assert rejected.audit_outcomes == ()
     assert processor.audit_outcomes == ()
     assert after_rejection.pending_rest_audits == 1
     assert after_rejection.rest_audits == before.rest_audits
-    if control_kind == "classification-v1":
-        assert rejected.canonical_event_count == 0
-        assert rejected.scan_count == 0
-        assert rejected.scan_triggers == ()
-        assert rejected.book_freshness_updates == ()
-        assert rejected.recovery_requests == ()
-        assert rejected.affected_instrument_ids == ()
-        assert not rejected.needs_resync
-        assert processor.snapshots() == books_before
-        assert processor.audit_ineligible_instruments == ineligible_before
-        assert after_rejection.invalidations == before.invalidations
-        assert after_rejection.scans == before.scans
-
-        _, accepted_envelope = _audit_classification_attestation(
-            run_id,
-            8,
-            start,
-            response,
-            preparation,
-            hard_expiry_monotonic_ns=hard_expiry_ns,
-            durable_monotonic_ns=201,
-            processed_monotonic_ns=251,
-        )
-    else:
-        accepted_command = AuditFailureCommand(
-            request_id=start.request_id,
-            reason=AuditFailureReason.HTTP_REQUEST_FAILED,
-            schema=AUDIT_FAILURE_V2_SCHEMA,
-        )
-        accepted_envelope = _envelope(
-            run_id,
-            8,
-            CONTROL_REST_AUDIT_FAILED,
-            accepted_command.to_payload(),
-            connection_id=start.connection_id,
-        )
+    accepted_command = AuditFailureCommand(
+        request_id=start.request_id,
+        reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+        schema=AUDIT_FAILURE_V2_SCHEMA,
+    )
+    accepted_envelope = _envelope(
+        run_id,
+        8,
+        CONTROL_REST_AUDIT_FAILED,
+        accepted_command.to_payload(),
+        connection_id=start.connection_id,
+    )
 
     accepted = processor.process_replayed(accepted_envelope)
     assert accepted.success
@@ -1539,7 +1529,7 @@ def test_rejected_duplicate_prepare_is_inert_and_retains_first_preparation() -> 
     assert processor.summary().pending_rest_audits == 0
 
 
-def test_rejected_attestation_without_metadata_request_id_is_inert() -> None:
+def test_attributable_malformed_attestation_fails_closed_permanently() -> None:
     config = load_phase1_config(Path("config/phase1.toml"))
     run_id = CollectorRunId("processor-prepare-attest-missing-metadata-request")
     processor = CanonicalProcessor(config)
@@ -1571,17 +1561,18 @@ def test_rejected_attestation_without_metadata_request_id_is_inert() -> None:
     rejected = processor.process_replayed(malformed)
     summary_after = processor.summary()
 
-    assert not rejected.success
-    assert rejected.error_type == "NormalizationError"
+    assert rejected.success
     assert rejected.canonical_event_count == 0
     assert rejected.scan_count == 0
     assert rejected.scan_triggers == ()
-    assert rejected.audit_outcomes == ()
+    assert tuple(item.outcome for item in rejected.audit_outcomes) == (AuditOutcome.FAILED,)
+    assert rejected.audit_outcomes[0].reason is AuditFailureReason.BOOK_FRESHNESS_EXPIRED
     assert rejected.affected_instrument_ids == ()
     assert not rejected.needs_resync
     assert processor.snapshots() == books_before
-    assert summary_after.pending_rest_audits == 1
-    assert summary_after.parse_failures == summary_before.parse_failures + 1
+    assert summary_after.pending_rest_audits == 0
+    assert summary_after.parse_failures == summary_before.parse_failures
+    assert summary_after.audit_faults_permanent == summary_before.audit_faults_permanent + 1
     assert summary_after.invalidations == summary_before.invalidations
     assert summary_after.scans == summary_before.scans
 
@@ -3044,6 +3035,7 @@ def test_v2_replacement_release_accepts_historical_divergence_identity() -> None
         capture_record=historical_capture_record,
         monotonic_epoch_id=current_command.monotonic_epoch_id,
         decision_monotonic_ns=current_command.decision_monotonic_ns,
+        schema=current_command.schema,
     )
 
     released = processor.process_replayed(
@@ -3580,6 +3572,7 @@ def test_audit_replacement_release_capture_record_has_exact_parser_bound() -> No
         capture_record=capture_record,
         monotonic_epoch_id=valid.monotonic_epoch_id,
         decision_monotonic_ns=valid.decision_monotonic_ns,
+        schema=valid.schema,
     )
 
     assert len(bounded.capture_record_json.encode("utf-8")) == (AUDIT_REPLACEMENT_CAPTURE_MAX_BYTES)
@@ -3593,6 +3586,7 @@ def test_audit_replacement_release_capture_record_has_exact_parser_bound() -> No
             capture_record_json=bounded.capture_record_json,
             monotonic_epoch_id=bounded.monotonic_epoch_id,
             decision_monotonic_ns=bounded.decision_monotonic_ns,
+            schema=bounded.schema,
         )
         == bounded
     )
@@ -3614,6 +3608,7 @@ def test_audit_replacement_release_capture_record_has_exact_parser_bound() -> No
             capture_record=oversized_record,
             monotonic_epoch_id=valid.monotonic_epoch_id,
             decision_monotonic_ns=valid.decision_monotonic_ns,
+            schema=valid.schema,
         )
 
 

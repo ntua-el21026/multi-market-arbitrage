@@ -172,6 +172,7 @@ SIX_HOUR_CHECKPOINT_CADENCE_SECONDS = 10
 SIX_HOUR_CHECKPOINT_COUNT = math.ceil(SIX_HOUR_SECONDS / SIX_HOUR_CHECKPOINT_CADENCE_SECONDS) + 1
 HEALTH_EVIDENCE_MAXIMUM_BYTES = 64 * 1024 * 1024
 HEALTH_EVIDENCE_MAXIMUM_RECORDS = 8_192
+MINIMUM_SIX_HOUR_FILE_HEADROOM_BYTES = 2 * 1024 * 1024
 MAXIMUM_PENDING_DIVERGENCES = 2
 SINGLE_TARGET_MAXIMUM_PENDING_DIVERGENCES = 2
 MAXIMUM_MISMATCH_CAUSE_REPRESENTATIVES = len(AuditMismatchCause)
@@ -2563,6 +2564,25 @@ def _capacity_projection(
     }
 
 
+def _maximum_periodic_checkpoint_bytes_acceptance(
+    *,
+    maximum_terminal_checkpoint_bytes: int,
+) -> int:
+    """Derive the periodic ceiling while preserving the exact file reserve."""
+
+    if maximum_terminal_checkpoint_bytes <= 0:
+        raise ValueError("maximum terminal checkpoint bytes must be positive")
+    periodic_checkpoint_count = SIX_HOUR_CHECKPOINT_COUNT - 1
+    periodic_budget = (
+        HEALTH_EVIDENCE_MAXIMUM_BYTES
+        - MINIMUM_SIX_HOUR_FILE_HEADROOM_BYTES
+        - maximum_terminal_checkpoint_bytes
+    )
+    if periodic_budget <= 0:
+        return 0
+    return periodic_budget // periodic_checkpoint_count
+
+
 def _capacity_evidence_shape(checkpoint: HealthCheckpoint) -> dict[str, int | str | bool]:
     mismatch_value = checkpoint.audit.get("mismatch_causes")
     divergence_value = checkpoint.audit.get("divergences")
@@ -3190,11 +3210,14 @@ def run_benchmark(
     replacement_capture_capacity_shape = _capacity_evidence_shape(
         replacement_capture_capacity_checkpoint
     )
+    periodic_checkpoint_bytes_acceptance = _maximum_periodic_checkpoint_bytes_acceptance(
+        maximum_terminal_checkpoint_bytes=terminal_checkpoint_bytes
+    )
     if (
         not capacity["within_file_bound"]
         or not capacity["within_record_bound"]
-        or periodic_checkpoint_bytes > 30_000
-        or cast(int, capacity["remaining_file_bytes"]) < 2 * 1024 * 1024
+        or periodic_checkpoint_bytes > periodic_checkpoint_bytes_acceptance
+        or cast(int, capacity["remaining_file_bytes"]) < MINIMUM_SIX_HOUR_FILE_HEADROOM_BYTES
     ):
         raise RuntimeError("six-hour health checkpoint projection exceeds a configured bound")
     if (
@@ -3271,8 +3294,8 @@ def run_benchmark(
             ),
             "maximum_mismatch_cause_representatives": (MAXIMUM_MISMATCH_CAUSE_REPRESENTATIVES),
             "maximum_resolution_representatives": MAXIMUM_RESOLUTION_REPRESENTATIVES,
-            "maximum_periodic_checkpoint_bytes_acceptance": 30_000,
-            "minimum_six_hour_file_headroom_bytes": 2 * 1024 * 1024,
+            "maximum_periodic_checkpoint_bytes_acceptance": (periodic_checkpoint_bytes_acceptance),
+            "minimum_six_hour_file_headroom_bytes": (MINIMUM_SIX_HOUR_FILE_HEADROOM_BYTES),
             "pending_update_path": "NOT_IMPLEMENTED_BY_ADR_0054_IMMEDIATE_RESNAPSHOT",
         },
         "capacity_evidence_shape": capacity_shape,

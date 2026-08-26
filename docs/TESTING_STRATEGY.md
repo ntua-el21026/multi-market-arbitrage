@@ -130,10 +130,10 @@ snapshot/full-summary parity. Historical
 raw, control and journal bytes remain immutable, and their recorded terminal
 hashes remain historical evidence. Replay under terminal-v3 semantics
 deterministically produces and documents a new terminal identity without
-invented fault closures, contributions, causal keys or retry fields. A producer
-implementing ADR-0056 uses an explicitly newer interval schema and contribution
-schema; replay never silently assigns the new contract to interval-v1 or
-contribution-v1 evidence.
+invented fault closures, contributions, causal keys or retry fields. An ADR-0056
+producer uses `gate1-availability-interval-v2` and
+`gate1-availability-interval-contribution-v2`; replay never silently assigns the
+new contract to interval-v1 or contribution-v1 evidence.
 
 Current v2 replacement eligibility releases only through a self-contained
 durable control that binds the exact capture preimage, digest, and one sampled

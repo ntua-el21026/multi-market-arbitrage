@@ -464,7 +464,7 @@ uv run --frozen --all-groups --no-sync python benchmarks/gate1_pre_soak_capacity
   --output "${capacity_root}/final-capacity-benchmark.json"
 ```
 
-The `mma-gate1-final-pre-soak-capacity-v2` JSON includes `latency`,
+The `mma-gate1-final-pre-soak-capacity-v3` JSON includes `latency`,
 `history_retention`, `post_saturation`, `domain_capacity`, `production_health`,
 `memory`, `analytical`, `journal`, `acceptance_policy`, and `acceptance`.
 `domain_capacity` separately saturates mismatch/resolution, audit-fault,
@@ -501,10 +501,15 @@ The stability report must include operational/terminal latency, stage-specific
 audit timing, fault/divergence/contribution lifecycles, history occupancy,
 Python/PyArrow/RSS attribution and a defensible post-saturation plateau.
 
-The preserved candidate benchmark predates ADR-0056 and cannot satisfy this
-expanded gate. Its implementation and benchmark fixtures must be remediated and
-rerun before any new public validation.
+The successor's strict offline run exercised 10,001 sequential lifecycles, 1,001
+overlapping groups, 4,608 scans/audit outcomes, 4,096 durable interval/
+contribution pairs, the genuine 64/attempted-65 active boundary, recovery
+exhaustion, 56 analytical flushes and two journal rotations. All 58 acceptance
+predicates passed. The six-hour availability projection is 5,566 intervals plus
+5,566 contributions and 34,882,122 bytes against the committed count/file/disk
+bounds. Active retained bytes remained constant after each sequential
+completion, and operational-snapshot p95 did not grow with cumulative history.
 
-This section specifies evidence; it claims no benchmark or public-run result
-until exact commands, source/config/host identity, immutable artifacts and
-validation output are retained.
+This offline result does not claim a public smoke, stability observation,
+six-hour soak or Gate-1 pass. Those require separate authorization and exact-SHA
+public evidence.

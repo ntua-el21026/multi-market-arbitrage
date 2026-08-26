@@ -1084,6 +1084,33 @@ async def test_ingress_overflow_is_journaled_and_forces_rest_resnapshot(
     )
 
     class _AcceptingProcessor:
+        audit_replacement_captures_pending = 0
+        audit_replacement_recovery_authorities: tuple[()] = ()
+
+        @staticmethod
+        def audit_replacement_attempt_start_commands(**kwargs: object) -> tuple[()]:
+            del kwargs
+            return ()
+
+        @staticmethod
+        def audit_replacement_next_action_deadline_ns(**kwargs: object) -> None:
+            del kwargs
+
+        @staticmethod
+        def audit_replacement_deadline_commands(**kwargs: object) -> tuple[()]:
+            del kwargs
+            return ()
+
+        @staticmethod
+        def audit_replacement_attempt_abandon_commands(**kwargs: object) -> tuple[()]:
+            del kwargs
+            return ()
+
+        @staticmethod
+        def audit_replacement_terminal_commands(**kwargs: object) -> tuple[()]:
+            del kwargs
+            return ()
+
         def process_durable(
             self,
             envelope: RawEventEnvelope,
@@ -1184,8 +1211,17 @@ async def test_ingress_overflow_is_journaled_and_forces_rest_resnapshot(
         deadline: float | None = None,
         refresh_reference: bool = True,
         runtime_health: ObservationRuntimeHealth | None = None,
+        replacement_deadline_supervisor: object | None = None,
     ) -> None:
-        del service, client, capture, deadline, refresh_reference, runtime_health
+        del (
+            service,
+            client,
+            capture,
+            deadline,
+            refresh_reference,
+            runtime_health,
+            replacement_deadline_supervisor,
+        )
         resnapshots.append(tuple(market.gamma_market_id for market in selected))
 
     monkeypatch.setattr(
@@ -1651,11 +1687,33 @@ async def test_successful_state_invalidation_resync_is_not_a_protocol_deviation(
     class _SuccessfulInvalidationCapture:
         def __init__(self) -> None:
             now_ns = observe_module.time.monotonic_ns()
+            self.collector_run_id = CollectorRunId("successful-state-invalidation-run")
             self.book_freshness_receive_ns = (now_ns, now_ns)
             self.book_freshness_receive_ns_by_instrument = {
                 InstrumentId(asset_id): now_ns for asset_id in ("token-yes", "token-no")
             }
             self.processor = self
+            self.audit_replacement_captures_pending = 0
+            self.audit_replacement_recovery_authorities: tuple[()] = ()
+
+        @staticmethod
+        def audit_replacement_attempt_start_commands(**kwargs: object) -> tuple[()]:
+            del kwargs
+            return ()
+
+        @staticmethod
+        def audit_replacement_next_action_deadline_ns(**kwargs: object) -> None:
+            del kwargs
+
+        @staticmethod
+        def audit_replacement_attempt_abandon_commands(**kwargs: object) -> tuple[()]:
+            del kwargs
+            return ()
+
+        @staticmethod
+        def audit_replacement_terminal_commands(**kwargs: object) -> tuple[()]:
+            del kwargs
+            return ()
 
         @staticmethod
         def audit_book_identity(native_asset_id: str) -> object:
@@ -1875,8 +1933,9 @@ async def test_refresh_requests_are_selected_market_bounded_and_coalesced(
         deadline: float | None = None,
         refresh_reference: bool = True,
         runtime_health: ObservationRuntimeHealth | None = None,
+        replacement_deadline_supervisor: object | None = None,
     ) -> None:
-        del service, client, capture, runtime_health
+        del service, client, capture, runtime_health, replacement_deadline_supervisor
         snapshots.append(
             (tuple(market.gamma_market_id for market in selected), deadline, refresh_reference)
         )

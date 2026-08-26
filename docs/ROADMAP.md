@@ -29,7 +29,9 @@ Completed:
 - deterministic replay and analytical rebuild;
 - pre-soak correctness/performance hardening;
 - first explicit-target six-hour Polymarket soak;
-- independent post-soak artifact audit.
+- independent post-soak artifact audit;
+- ADR-0056 contributor-lifecycle/replacement-recovery implementation and
+  deterministic offline validation.
 
 Current result:
 
@@ -41,6 +43,10 @@ The failure is documented in `GATE_1_FAILURE_20260822.md`; its remediation is
 governed by `GATE_1_REMEDIATION_SPEC.md`, ADR-0053, ADR-0054, ADR-0055 and
 ADR-0056. The first result is not
 rewritten: Gate 1 remains `FAIL` until a new authorized six-hour run passes.
+
+The implementation branch is eligible only for independent public-preflight
+authorization review. A public smoke, stability observation and six-hour soak
+remain unperformed and cannot be inferred from the offline result.
 
 The raw journal, deterministic replay, rebuild, data validation, immutability
 and no-live boundary passed. The first-soak defects were concentrated in:
@@ -59,10 +65,10 @@ direct-interval-contribution, typed-resync and local classification-latency
 defects. ADR-0055 governs checkpoint v4 and strict pre-expiry PREPARE plus exact
 attestation. A later stability attempt exposed cumulative completed contributors
 retained as active and replacement recovery without bounded exhaustion. ADR-0056
-reconciles that governance, but implementation remediation remains pending.
-Final offline gates plus a new post-fix exact-SHA 60-second smoke and 5,400–7,200
-second stability observation remain pending. No six-hour rerun was run for this
-remediation task.
+reconciles that governance. Implementation and final offline gates are complete;
+a new post-fix exact-SHA 60-second smoke and 5,400–7,200 second stability
+observation remain pending independent authorization. No six-hour rerun was run
+for this remediation task.
 
 ## 3. Phase A — Design foundation — COMPLETE
 

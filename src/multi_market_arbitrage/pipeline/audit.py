@@ -19,7 +19,12 @@ from multi_market_arbitrage.core.ids import (
 )
 from multi_market_arbitrage.core.provenance import RawSourceRef
 from multi_market_arbitrage.core.serialization import canonical_json_bytes, canonical_sha256
-from multi_market_arbitrage.core.time import UtcTimestamp
+from multi_market_arbitrage.core.time import MonotonicTimestamp, UtcTimestamp
+from multi_market_arbitrage.observability.availability import (
+    AvailabilityCausalFamily,
+    availability_audit_contribution_id,
+    availability_stable_causal_key,
+)
 from multi_market_arbitrage.venues.polymarket.errors import (
     MAXIMUM_RETRY_AFTER_EVIDENCE_NANOSECONDS,
     PolymarketEndpointClass,
@@ -28,6 +33,17 @@ from multi_market_arbitrage.venues.polymarket.errors import (
     PolymarketRetryAfterDisposition,
     PolymarketRetryBlockedReason,
     validate_polymarket_http_failure_metadata,
+)
+
+from .replacement_recovery import (
+    REPLACEMENT_RECOVERY_ID_SCHEMA,
+    REPLACEMENT_RECOVERY_RESOLUTION_ID_SCHEMA,
+    CapturedReplacementSnapshot,
+    ReplacementRecoveryAuthority,
+    ReplacementRecoveryBounds,
+    ReplacementRecoveryFailure,
+    ReplacementRecoveryResult,
+    ReplacementRecoveryStatus,
 )
 
 AUDIT_START_V1_SCHEMA: Final = "mma-rest-audit-start-v1"
@@ -44,15 +60,41 @@ AUDIT_CLASSIFICATION_V2_SCHEMA: Final = "mma-rest-audit-classification-v2"
 AUDIT_CLASSIFICATION_SCHEMA: Final = AUDIT_CLASSIFICATION_V2_SCHEMA
 AUDIT_CLASSIFICATION_PREPARE_SCHEMA: Final = "mma-rest-audit-classification-prepare-v1"
 AUDIT_CLASSIFICATION_PREPARE_ATTEST_PROTOCOL: Final = "PREPARE_ATTEST_V1"
-AUDIT_REPLACEMENT_RELEASE_SCHEMA: Final = "mma-rest-audit-replacement-release-v1"
+AUDIT_REPLACEMENT_RELEASE_V1_SCHEMA: Final = "mma-rest-audit-replacement-release-v1"
+AUDIT_REPLACEMENT_RELEASE_V2_SCHEMA: Final = "mma-rest-audit-replacement-release-v2"
+AUDIT_REPLACEMENT_RELEASE_SCHEMA: Final = AUDIT_REPLACEMENT_RELEASE_V2_SCHEMA
 AUDIT_MISMATCH_DIAGNOSTIC_SCHEMA: Final = "mma-rest-audit-mismatch-diagnostic-v1"
 AUDIT_REST_BOOK_IDENTITY_SCHEMA: Final = "mma-rest-audit-rest-book-identity-v1"
 AUDIT_EXACT_DEPTH_DIFFERENCE_SCHEMA: Final = "mma-rest-audit-depth-difference-v1"
 AUDIT_RAW_SOURCE_SUMMARY_SCHEMA: Final = "mma-rest-audit-raw-source-summary-v1"
 AUDIT_DIVERGENCE_PENDING_SCHEMA: Final = "mma-rest-audit-divergence-pending-v1"
 AUDIT_DIVERGENCE_RESOLUTION_SCHEMA: Final = "mma-rest-audit-divergence-resolution-v1"
-AUDIT_FAULT_LIFECYCLE_SCHEMA: Final = "mma-rest-audit-fault-lifecycle-v1"
+AUDIT_FAULT_LIFECYCLE_V1_SCHEMA: Final = "mma-rest-audit-fault-lifecycle-v1"
+AUDIT_FAULT_LIFECYCLE_V2_SCHEMA: Final = "mma-rest-audit-fault-lifecycle-v2"
+# Historical/direct failure records retain v1. Only the additive typed
+# PREPARE/ATTEST validation authority uses v2.
+AUDIT_FAULT_LIFECYCLE_SCHEMA: Final = AUDIT_FAULT_LIFECYCLE_V1_SCHEMA
 AUDIT_REPLACEMENT_CAPTURE_MAX_BYTES: Final = 65_536
+
+_AUDIT_REPLACEMENT_CAPTURE_LEGACY_KEYS: Final = frozenset(
+    {
+        "captured_snapshot_sources",
+        "divergence_id",
+        "market_id",
+        "mismatch_cause",
+        "original_connection_id",
+        "pre_open_connection_count",
+        "pre_open_connection_ids_sha256",
+        "replacement_connection_id",
+        "resolution_ingest_seq",
+        "resolution_monotonic",
+        "resolution_source",
+        "required_instrument_ids",
+    }
+)
+_AUDIT_REPLACEMENT_CAPTURE_RECOVERY_KEYS: Final = _AUDIT_REPLACEMENT_CAPTURE_LEGACY_KEYS | {
+    "recovery_authority"
+}
 
 # These limits match or exceed the corresponding owner bounds while ensuring
 # diagnostic construction cannot become a history-sized allocation.
@@ -187,6 +229,7 @@ class AuditFaultFailureEvidenceKind(StrEnum):
 
     AUDIT_FAILURE_CONTROL = "AUDIT_FAILURE_CONTROL"
     AUDIT_CLASSIFICATION_CONTROL = "AUDIT_CLASSIFICATION_CONTROL"
+    AUDIT_ATTESTATION_VALIDATION_FAILURE = "AUDIT_ATTESTATION_VALIDATION_FAILURE"
     REST_AUDIT_RESPONSE = "REST_AUDIT_RESPONSE"
     BOOK_INVALIDATION_CONTROL = "BOOK_INVALIDATION_CONTROL"
 
@@ -213,6 +256,15 @@ def audit_fault_evidence_blocks_current_scope(
         if failure_schema == AUDIT_CLASSIFICATION_V2_SCHEMA:
             return True
         raise ValueError("audit classification-control source schema is unsupported")
+    if kind is AuditFaultFailureEvidenceKind.AUDIT_ATTESTATION_VALIDATION_FAILURE:
+        if audit_start_schema != AUDIT_START_V2_SCHEMA:
+            raise ValueError("attestation validation requires a current audit start")
+        if failure_schema is not None and (not failure_schema or len(failure_schema) > 256):
+            raise ValueError("observed attestation schema evidence is unbounded")
+        # Blocking authority comes from the current PREPARE/ATTEST transaction
+        # and typed rejection, not from pretending the rejected raw control
+        # carried the expected v2 schema.
+        return True
     if failure_schema is not None:
         raise ValueError("unversioned audit fault source cannot claim a source schema")
     if audit_start_schema == AUDIT_START_V1_SCHEMA:
@@ -1053,8 +1105,17 @@ class AuditFaultLifecycleRecord:
     schema: str = AUDIT_FAULT_LIFECYCLE_SCHEMA
 
     def __post_init__(self) -> None:
-        if self.schema != AUDIT_FAULT_LIFECYCLE_SCHEMA:
+        if self.schema not in {
+            AUDIT_FAULT_LIFECYCLE_V1_SCHEMA,
+            AUDIT_FAULT_LIFECYCLE_V2_SCHEMA,
+        }:
             raise ValueError("audit fault lifecycle schema is unsupported")
+        is_attestation_validation = (
+            self.failure_evidence_kind
+            is AuditFaultFailureEvidenceKind.AUDIT_ATTESTATION_VALIDATION_FAILURE
+        )
+        if is_attestation_validation != (self.schema == AUDIT_FAULT_LIFECYCLE_V2_SCHEMA):
+            raise ValueError("audit fault lifecycle schema contradicts its evidence kind")
         if not is_sha256_hex(self.fault_id):
             raise ValueError("audit fault ID must be SHA-256 hex")
         if not self.request_id or len(self.request_id) > 128:
@@ -1361,6 +1422,422 @@ class AuditClassificationPrepareCommand:
         )
 
 
+def _replacement_record_object(
+    value: object,
+    *,
+    expected_keys: frozenset[str],
+    label: str,
+) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} shape is invalid")
+    record = cast(dict[str, object], value)
+    if frozenset(record) != expected_keys:
+        raise ValueError(f"{label} shape is invalid")
+    return record
+
+
+def _replacement_record_text(value: object, *, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string")
+    return value
+
+
+def _replacement_record_integer(value: object, *, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label} must be an integer")
+    return value
+
+
+def _replacement_record_list(value: object, *, label: str) -> list[object]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a list")
+    return cast(list[object], value)
+
+
+def _replacement_monotonic_from_record(value: object) -> MonotonicTimestamp:
+    encoded = _replacement_record_text(
+        value,
+        label="replacement recovery monotonic timestamp",
+    )
+    epoch_id, separator, raw_nanoseconds = encoded.rpartition(":")
+    if (
+        not separator
+        or not epoch_id
+        or not raw_nanoseconds.isascii()
+        or not raw_nanoseconds.isdigit()
+    ):
+        raise ValueError("replacement recovery monotonic timestamp is invalid")
+    timestamp = MonotonicTimestamp(
+        epoch_id=epoch_id,
+        nanoseconds=int(raw_nanoseconds),
+    )
+    if str(timestamp) != encoded:
+        raise ValueError("replacement recovery monotonic timestamp is not canonical")
+    return timestamp
+
+
+def _replacement_raw_source_from_record(value: object) -> RawSourceRef:
+    record = _replacement_record_object(
+        value,
+        expected_keys=frozenset({"ingest_id", "payload_sha256"}),
+        label="replacement recovery raw source",
+    )
+    return RawSourceRef(
+        ingest_id=IngestId(
+            _replacement_record_text(
+                record["ingest_id"],
+                label="replacement recovery source ingest ID",
+            )
+        ),
+        payload_sha256=_replacement_record_text(
+            record["payload_sha256"],
+            label="replacement recovery source payload hash",
+        ),
+    )
+
+
+def _replacement_optional_monotonic(value: object) -> MonotonicTimestamp | None:
+    return None if value is None else _replacement_monotonic_from_record(value)
+
+
+def _replacement_optional_raw_source(value: object) -> RawSourceRef | None:
+    return None if value is None else _replacement_raw_source_from_record(value)
+
+
+def _replacement_recovery_from_record(value: object) -> ReplacementRecoveryAuthority:
+    expected_keys = frozenset(
+        {
+            "attempt_chain_sha256",
+            "attempt_count",
+            "attempted_connection_ids",
+            "bounds",
+            "captured_snapshot_sources",
+            "contribution_id",
+            "current_connection_id",
+            "divergence_id",
+            "evidence_chain_sha256",
+            "evidence_event_count",
+            "excluded_connection_ids",
+            "first_attempt_monotonic",
+            "hard_deadline",
+            "last_failure",
+            "last_result",
+            "latest_attempt_monotonic",
+            "next_retry_monotonic",
+            "original_connection_id",
+            "recovery_id",
+            "release_ingest_seq",
+            "release_monotonic",
+            "release_source",
+            "required_instrument_ids",
+            "resolution_ingest_seq",
+            "resolution_id",
+            "resolution_monotonic",
+            "resolution_source",
+            "run_deadline",
+            "schema_version",
+            "stable_contributor_key",
+            "status",
+            "unresolved",
+        }
+    )
+    record = _replacement_record_object(
+        value,
+        expected_keys=expected_keys,
+        label="replacement recovery authority",
+    )
+    bounds_record = _replacement_record_object(
+        record["bounds"],
+        expected_keys=frozenset(
+            {
+                "maximum_attempts",
+                "maximum_snapshot_age_ns",
+                "retry_delay_ns",
+            }
+        ),
+        label="replacement recovery bounds",
+    )
+    bounds = ReplacementRecoveryBounds(
+        maximum_attempts=_replacement_record_integer(
+            bounds_record["maximum_attempts"],
+            label="replacement recovery maximum attempts",
+        ),
+        retry_delay_ns=_replacement_record_integer(
+            bounds_record["retry_delay_ns"],
+            label="replacement recovery retry delay",
+        ),
+        maximum_snapshot_age_ns=_replacement_record_integer(
+            bounds_record["maximum_snapshot_age_ns"],
+            label="replacement recovery maximum snapshot age",
+        ),
+    )
+    captured_sources: list[CapturedReplacementSnapshot] = []
+    for raw_source in _replacement_record_list(
+        record["captured_snapshot_sources"],
+        label="replacement recovery captured sources",
+    ):
+        source_record = _replacement_record_object(
+            raw_source,
+            expected_keys=frozenset(
+                {
+                    "admission_ordinal",
+                    "connection_id",
+                    "ingest_seq",
+                    "instrument_id",
+                    "raw_source",
+                    "received_monotonic",
+                }
+            ),
+            label="replacement recovery captured source",
+        )
+        captured_sources.append(
+            CapturedReplacementSnapshot(
+                instrument_id=InstrumentId(
+                    _replacement_record_text(
+                        source_record["instrument_id"],
+                        label="replacement recovery captured instrument",
+                    )
+                ),
+                connection_id=ConnectionId(
+                    _replacement_record_text(
+                        source_record["connection_id"],
+                        label="replacement recovery captured connection",
+                    )
+                ),
+                admission_ordinal=_replacement_record_integer(
+                    source_record["admission_ordinal"],
+                    label="replacement recovery captured admission ordinal",
+                ),
+                ingest_seq=_replacement_record_integer(
+                    source_record["ingest_seq"],
+                    label="replacement recovery captured ingest sequence",
+                ),
+                received_monotonic=_replacement_monotonic_from_record(
+                    source_record["received_monotonic"]
+                ),
+                raw_source=_replacement_raw_source_from_record(source_record["raw_source"]),
+            )
+        )
+
+    def connection_ids(key: str) -> tuple[ConnectionId, ...]:
+        return tuple(
+            ConnectionId(
+                _replacement_record_text(
+                    item,
+                    label=f"replacement recovery {key}",
+                )
+            )
+            for item in _replacement_record_list(
+                record[key],
+                label=f"replacement recovery {key}",
+            )
+        )
+
+    def instrument_ids(key: str) -> tuple[InstrumentId, ...]:
+        return tuple(
+            InstrumentId(
+                _replacement_record_text(
+                    item,
+                    label=f"replacement recovery {key}",
+                )
+            )
+            for item in _replacement_record_list(
+                record[key],
+                label=f"replacement recovery {key}",
+            )
+        )
+
+    current_connection_raw = record["current_connection_id"]
+    current_connection = (
+        None
+        if current_connection_raw is None
+        else ConnectionId(
+            _replacement_record_text(
+                current_connection_raw,
+                label="replacement recovery current connection",
+            )
+        )
+    )
+    last_failure_raw = record["last_failure"]
+    release_ingest_seq_raw = record["release_ingest_seq"]
+    unresolved = record["unresolved"]
+    if not isinstance(unresolved, bool):
+        raise ValueError("replacement recovery unresolved marker must be boolean")
+    authority = ReplacementRecoveryAuthority(
+        recovery_id=_replacement_record_text(
+            record["recovery_id"],
+            label="replacement recovery ID",
+        ),
+        resolution_id=_replacement_record_text(
+            record["resolution_id"],
+            label="replacement recovery resolution ID",
+        ),
+        contribution_id=_replacement_record_text(
+            record["contribution_id"],
+            label="replacement recovery contribution ID",
+        ),
+        stable_contributor_key=_replacement_record_text(
+            record["stable_contributor_key"],
+            label="replacement recovery contributor key",
+        ),
+        divergence_id=_replacement_record_text(
+            record["divergence_id"],
+            label="replacement recovery divergence ID",
+        ),
+        resolution_source=_replacement_raw_source_from_record(record["resolution_source"]),
+        resolution_ingest_seq=_replacement_record_integer(
+            record["resolution_ingest_seq"],
+            label="replacement recovery resolution ingest sequence",
+        ),
+        resolution_monotonic=_replacement_monotonic_from_record(record["resolution_monotonic"]),
+        original_connection_id=ConnectionId(
+            _replacement_record_text(
+                record["original_connection_id"],
+                label="replacement recovery original connection",
+            )
+        ),
+        excluded_connection_ids=connection_ids("excluded_connection_ids"),
+        required_instrument_ids=instrument_ids("required_instrument_ids"),
+        bounds=bounds,
+        hard_deadline=_replacement_monotonic_from_record(record["hard_deadline"]),
+        run_deadline=_replacement_monotonic_from_record(record["run_deadline"]),
+        status=ReplacementRecoveryStatus(
+            _replacement_record_text(
+                record["status"],
+                label="replacement recovery status",
+            )
+        ),
+        attempt_count=_replacement_record_integer(
+            record["attempt_count"],
+            label="replacement recovery attempt count",
+        ),
+        attempted_connection_ids=connection_ids("attempted_connection_ids"),
+        first_attempt_monotonic=_replacement_optional_monotonic(record["first_attempt_monotonic"]),
+        latest_attempt_monotonic=_replacement_optional_monotonic(
+            record["latest_attempt_monotonic"]
+        ),
+        next_retry_monotonic=_replacement_optional_monotonic(record["next_retry_monotonic"]),
+        current_connection_id=current_connection,
+        captured_snapshot_sources=tuple(captured_sources),
+        last_result=ReplacementRecoveryResult(
+            _replacement_record_text(
+                record["last_result"],
+                label="replacement recovery result",
+            )
+        ),
+        last_failure=(
+            None
+            if last_failure_raw is None
+            else ReplacementRecoveryFailure(
+                _replacement_record_text(
+                    last_failure_raw,
+                    label="replacement recovery failure",
+                )
+            )
+        ),
+        attempt_chain_sha256=_replacement_record_text(
+            record["attempt_chain_sha256"],
+            label="replacement recovery attempt chain",
+        ),
+        evidence_chain_sha256=_replacement_record_text(
+            record["evidence_chain_sha256"],
+            label="replacement recovery evidence chain",
+        ),
+        evidence_event_count=_replacement_record_integer(
+            record["evidence_event_count"],
+            label="replacement recovery evidence event count",
+        ),
+        release_source=_replacement_optional_raw_source(record["release_source"]),
+        release_ingest_seq=(
+            None
+            if release_ingest_seq_raw is None
+            else _replacement_record_integer(
+                release_ingest_seq_raw,
+                label="replacement recovery release ingest sequence",
+            )
+        ),
+        release_monotonic=_replacement_optional_monotonic(record["release_monotonic"]),
+        schema_version=_replacement_record_text(
+            record["schema_version"],
+            label="replacement recovery schema version",
+        ),
+    )
+    if unresolved is not authority.unresolved:
+        raise ValueError("replacement recovery unresolved marker is inconsistent")
+    expected_recovery_id = canonical_sha256(
+        {
+            "divergence_id": authority.divergence_id,
+            "original_connection_id": authority.original_connection_id,
+            "required_instrument_ids": authority.required_instrument_ids,
+            "resolution_ingest_seq": authority.resolution_ingest_seq,
+            "resolution_monotonic": authority.resolution_monotonic,
+            "resolution_source": authority.resolution_source,
+            "schema": REPLACEMENT_RECOVERY_ID_SCHEMA,
+        }
+    )
+    expected_contributor_key = availability_stable_causal_key(
+        causal_family=AvailabilityCausalFamily.AUDIT_DIVERGENCE,
+        causal_lifecycle_id=f"divergence:{authority.divergence_id}",
+    )
+    expected_contribution_id = availability_audit_contribution_id(
+        stable_causal_key=expected_contributor_key
+    )
+    expected_resolution_id = canonical_sha256(
+        {
+            "divergence_id": authority.divergence_id,
+            "resolution_ingest_seq": authority.resolution_ingest_seq,
+            "resolution_monotonic": authority.resolution_monotonic,
+            "resolution_source": authority.resolution_source,
+            "schema": REPLACEMENT_RECOVERY_RESOLUTION_ID_SCHEMA,
+        }
+    )
+    if (
+        authority.recovery_id != expected_recovery_id
+        or authority.stable_contributor_key != expected_contributor_key
+        or authority.contribution_id != expected_contribution_id
+        or authority.resolution_id != expected_resolution_id
+    ):
+        raise ValueError("replacement recovery stable identity is invalid")
+    if canonical_json_bytes(authority.to_record()) != canonical_json_bytes(record):
+        raise ValueError("replacement recovery authority is not canonical")
+    return authority
+
+
+def _validate_current_replacement_capture_record(
+    capture_record: dict[str, object],
+) -> None:
+    recovery = _replacement_recovery_from_record(capture_record["recovery_authority"])
+    captured_projection = canonical_json_bytes(capture_record["captured_snapshot_sources"])
+    capture_complete_result = (recovery.last_result, recovery.last_failure) in {
+        (ReplacementRecoveryResult.CAPTURE_SUCCEEDED, None),
+        (
+            ReplacementRecoveryResult.RELEASE_NOT_PROJECTED,
+            ReplacementRecoveryFailure.RELEASE_CONTROL_NOT_PROJECTED,
+        ),
+        (
+            ReplacementRecoveryResult.RELEASE_REJECTED,
+            ReplacementRecoveryFailure.RELEASE_CONTROL_REJECTED,
+        ),
+    }
+    if (
+        recovery.status is not ReplacementRecoveryStatus.CAPTURE_COMPLETE
+        or not capture_complete_result
+        or recovery.divergence_id != capture_record["divergence_id"]
+        or recovery.original_connection_id.value != capture_record["original_connection_id"]
+        or recovery.current_connection_id is None
+        or recovery.current_connection_id.value != capture_record["replacement_connection_id"]
+        or [item.value for item in recovery.required_instrument_ids]
+        != capture_record["required_instrument_ids"]
+        or recovery.resolution_ingest_seq != capture_record["resolution_ingest_seq"]
+        or canonical_json_bytes(recovery.resolution_monotonic)
+        != canonical_json_bytes(capture_record["resolution_monotonic"])
+        or canonical_json_bytes(recovery.resolution_source)
+        != canonical_json_bytes(capture_record["resolution_source"])
+        or canonical_json_bytes(recovery.captured_snapshot_sources) != captured_projection
+    ):
+        raise ValueError("audit replacement capture differs from its recovery authority")
+
+
 @dataclass(frozen=True, slots=True)
 class AuditReplacementReleaseCommand:
     """Durable coordinator proof that releases one replacement capture.
@@ -1380,6 +1857,7 @@ class AuditReplacementReleaseCommand:
     capture_record_json: str
     monotonic_epoch_id: str
     decision_monotonic_ns: int
+    schema: str = AUDIT_REPLACEMENT_RELEASE_SCHEMA
 
     def __post_init__(self) -> None:
         if not is_sha256_hex(self.divergence_id):
@@ -1396,21 +1874,22 @@ class AuditReplacementReleaseCommand:
         if not isinstance(raw_capture_record, dict):
             raise ValueError("audit replacement release capture record shape is invalid")
         capture_record = cast(dict[str, object], raw_capture_record)
-        if set(capture_record) != {
-            "captured_snapshot_sources",
-            "divergence_id",
-            "market_id",
-            "mismatch_cause",
-            "original_connection_id",
-            "pre_open_connection_count",
-            "pre_open_connection_ids_sha256",
-            "replacement_connection_id",
-            "resolution_ingest_seq",
-            "resolution_monotonic",
-            "resolution_source",
-            "required_instrument_ids",
-        }:
+        capture_keys = frozenset(capture_record)
+        if self.schema == AUDIT_REPLACEMENT_RELEASE_V1_SCHEMA:
+            expected_capture_keys = _AUDIT_REPLACEMENT_CAPTURE_LEGACY_KEYS
+        elif self.schema == AUDIT_REPLACEMENT_RELEASE_V2_SCHEMA:
+            expected_capture_keys = _AUDIT_REPLACEMENT_CAPTURE_RECOVERY_KEYS
+        else:
+            raise ValueError("audit replacement release schema is unsupported")
+        if capture_keys != expected_capture_keys:
             raise ValueError("audit replacement release capture record shape is invalid")
+        if self.schema == AUDIT_REPLACEMENT_RELEASE_V2_SCHEMA:
+            try:
+                _validate_current_replacement_capture_record(capture_record)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "audit replacement release recovery authority is invalid"
+                ) from error
         if canonical_json_bytes(capture_record) != capture_record_bytes:
             raise ValueError("audit replacement release capture record must be canonical")
         if hashlib.sha256(capture_record_bytes).hexdigest() != self.capture_state_sha256:
@@ -1431,6 +1910,7 @@ class AuditReplacementReleaseCommand:
         capture_record: object,
         monotonic_epoch_id: str,
         decision_monotonic_ns: int,
+        schema: str = AUDIT_REPLACEMENT_RELEASE_SCHEMA,
     ) -> AuditReplacementReleaseCommand:
         capture_record_bytes = canonical_json_bytes(capture_record)
         return cls(
@@ -1442,6 +1922,7 @@ class AuditReplacementReleaseCommand:
             capture_record_json=capture_record_bytes.decode("utf-8"),
             monotonic_epoch_id=monotonic_epoch_id,
             decision_monotonic_ns=decision_monotonic_ns,
+            schema=schema,
         )
 
     @property
@@ -1462,7 +1943,7 @@ class AuditReplacementReleaseCommand:
                 "market_id": self.market_id,
                 "monotonic_epoch_id": self.monotonic_epoch_id,
                 "replacement_connection_id": self.replacement_connection_id,
-                "schema": AUDIT_REPLACEMENT_RELEASE_SCHEMA,
+                "schema": self.schema,
             }
         )
 
@@ -1957,6 +2438,8 @@ __all__ = [
     "AUDIT_FAILURE_V1_SCHEMA",
     "AUDIT_FAILURE_V2_SCHEMA",
     "AUDIT_FAULT_LIFECYCLE_SCHEMA",
+    "AUDIT_FAULT_LIFECYCLE_V1_SCHEMA",
+    "AUDIT_FAULT_LIFECYCLE_V2_SCHEMA",
     "AUDIT_MISMATCH_DIAGNOSTIC_SCHEMA",
     "AUDIT_MISMATCH_MAX_CONTEXT_IDENTITIES",
     "AUDIT_MISMATCH_MAX_LEVELS_PER_SIDE",
@@ -1966,6 +2449,8 @@ __all__ = [
     "AUDIT_RAW_SOURCE_SUMMARY_SCHEMA",
     "AUDIT_REPLACEMENT_CAPTURE_MAX_BYTES",
     "AUDIT_REPLACEMENT_RELEASE_SCHEMA",
+    "AUDIT_REPLACEMENT_RELEASE_V1_SCHEMA",
+    "AUDIT_REPLACEMENT_RELEASE_V2_SCHEMA",
     "AUDIT_REST_BOOK_IDENTITY_SCHEMA",
     "AUDIT_START_SCHEMA",
     "AUDIT_START_V1_SCHEMA",

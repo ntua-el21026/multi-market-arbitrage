@@ -255,18 +255,20 @@ partial coverage, the first binary leg, and socket readiness are insufficient.
 
 The replacement recovery has one stable identity across permitted connection
 generations and updates the same causal availability contributor. Its configured
-phase contract bounds attempts, first/latest attempt times, next retry, hard
+phase contract enforces finite attempt, retry-delay and hard-recovery limits,
+all bounded by the run deadline, while retaining first/latest attempt times,
 recovery and enclosing run deadlines, required/captured instruments, last typed
-failure and a deterministic evidence chain. Attempt or deadline exhaustion is a
-typed unresolved outcome: evidence and the contributor/interval remain open,
-scanner/research eligibility remains blocked, and recovery transitions to
-fail-closed degraded or terminal behavior instead of remaining indefinitely
-pending or creating a duplicate contributor.
+failure and a deterministic evidence chain. Exact values are Phase-1
+configuration/specification decisions rather than error-model constants. Attempt
+or deadline exhaustion is a typed unresolved outcome: evidence and the
+contributor/interval remain open, scanner/research eligibility remains blocked,
+and recovery transitions to fail-closed degraded or terminal behavior instead
+of remaining indefinitely pending or creating a duplicate contributor.
 
 For a newly produced v2 audit, complete replacement coverage remains pending and
 audit-ineligible and every replacement snapshot emits zero scans. Only after the
 post-processing freshness/health checks pass may the coordinator durably journal
-`mma.control.rest-audit-replacement-release.v1`. Its bounded self-contained
+`mma.control.rest-audit-replacement-release.v2`. Its bounded self-contained
 payload commits the exact complete capture preimage and SHA-256; that preimage
 includes the divergence, market, original/replacement connections, required
 instruments, and every full-snapshot raw source with admission/ingest and

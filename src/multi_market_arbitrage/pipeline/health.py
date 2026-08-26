@@ -10,7 +10,7 @@ import shutil
 import sys
 import time
 import tracemalloc
-import uuid
+import unicodedata
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
@@ -31,9 +31,14 @@ from multi_market_arbitrage.availability_authority import (
 )
 from multi_market_arbitrage.core.config import Phase1Config
 from multi_market_arbitrage.core.health import BookHealth
-from multi_market_arbitrage.core.ids import CollectorRunId, ConnectionId, InstrumentId
+from multi_market_arbitrage.core.ids import (
+    CollectorRunId,
+    ConnectionId,
+    InstrumentId,
+    is_sha256_hex,
+)
 from multi_market_arbitrage.core.provenance import RawSourceRef
-from multi_market_arbitrage.core.serialization import canonical_json_bytes, canonical_sha256
+from multi_market_arbitrage.core.serialization import canonical_sha256
 from multi_market_arbitrage.core.time import MonotonicTimestamp, UtcTimestamp
 from multi_market_arbitrage.journal import JournalMetricsSnapshot
 from multi_market_arbitrage.observability import (
@@ -54,6 +59,21 @@ from multi_market_arbitrage.observability import (
     evaluate_health_decision,
     is_audit_mismatch_availability_cause,
     normalize_git_commit,
+)
+from multi_market_arbitrage.observability.availability import (
+    EMPTY_AVAILABILITY_CONTRIBUTION_V2_CHAIN_SHA256,
+    MAXIMUM_OBSERVATION_COUNT,
+    MAXIMUM_SOURCE_REPRESENTATIVES_V2,
+    AvailabilityCausalFamily,
+    AvailabilityIntervalContributionV2,
+    AvailabilityIntervalV2,
+    AvailabilityReplacementRecoveryStatus,
+    AvailabilityReplacementRecoveryV2,
+    availability_active_period_union_sha256,
+    availability_audit_contribution_id,
+    availability_contribution_v2_chain_extend,
+    availability_interval_reconciliation_id,
+    availability_stable_causal_key,
 )
 from multi_market_arbitrage.reference import POLYMARKET_VENUE_ID
 from multi_market_arbitrage.research import AnalyticalRuntimeSnapshot
@@ -80,6 +100,7 @@ from .processor import (
     ProcessorRetentionDomain,
     ProcessorSummary,
 )
+from .replacement_recovery import ReplacementRecoveryAuthority
 from .targeting import ResolvedPolymarketTarget
 from .transitions import ReportedTopTransition
 
@@ -88,6 +109,9 @@ MAXIMUM_REPORTED_PYTHON_ALLOCATION_GROUPS = 12
 MAXIMUM_ALLOCATION_GROUP_FILENAME_BYTES = 1024
 MAXIMUM_RESOURCE_SOURCE_BYTES = 256
 MAXIMUM_OPEN_AVAILABILITY_CONTRIBUTIONS = 64
+EMPTY_AVAILABILITY_PERSISTENCE_FAILURE_CHAIN_SHA256 = canonical_sha256(
+    {"schema": "gate1-availability-contribution-persistence-failure-chain-seed-v1"}
+)
 MAXIMUM_AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVES = 1
 AUDIT_DIVERGENCE_PENDING_REPRESENTATIVE_SCHEMA = "gate1-audit-divergence-pending-representative-v1"
 AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVE_SCHEMA = (
@@ -333,6 +357,14 @@ class ObservationRuntimeHealthSnapshot:
     availability_open_at_shutdown_intervals: int = 0
     availability_ledger_healthy: bool = True
     availability_contributions_emitted: int = 0
+    active_availability_contributors: int = 0
+    active_availability_contributors_high_water: int = 0
+    completed_availability_contributors: int = 0
+    availability_contribution_persistence_failures: int = 0
+    availability_contribution_persistence_failure_chain_sha256: str = (
+        EMPTY_AVAILABILITY_PERSISTENCE_FAILURE_CHAIN_SHA256
+    )
+    availability_contributor_authority_scoped: bool = False
     audit_availability_authority: AuditAvailabilityAuthoritySnapshot = field(
         default_factory=empty_audit_availability_authority_snapshot
     )
@@ -354,9 +386,21 @@ class ObservationRuntimeHealthSnapshot:
             self.availability_records_emitted,
             self.availability_open_at_shutdown_intervals,
             self.availability_contributions_emitted,
+            self.active_availability_contributors,
+            self.active_availability_contributors_high_water,
+            self.completed_availability_contributors,
+            self.availability_contribution_persistence_failures,
         )
         if any(value < 0 for value in counts):
             raise ValueError("observation runtime health counters cannot be negative")
+        if (
+            self.active_availability_contributors > self.active_availability_contributors_high_water
+            or self.active_availability_contributors_high_water
+            > MAXIMUM_OPEN_AVAILABILITY_CONTRIBUTIONS
+        ):
+            raise ValueError("availability active-contributor counters are inconsistent")
+        if not is_sha256_hex(self.availability_contribution_persistence_failure_chain_sha256):
+            raise ValueError("availability persistence-failure chain must be SHA-256 hex")
         if self.resync_reason_counts:
             expected_reasons = tuple(sorted(ProcessorRecoveryReason, key=lambda item: item.value))
             if tuple(reason for reason, _count in self.resync_reason_counts) != expected_reasons:
@@ -391,6 +435,13 @@ class AvailabilityInterruption:
     audit_classification_source: RawSourceRef | None = None
     authoritative_resolution_source: RawSourceRef | None = None
     replacement_release_source: RawSourceRef | None = None
+    replacement_recovery: AvailabilityReplacementRecoveryV2 | None = None
+    causal_family: AvailabilityCausalFamily | None = None
+    causal_lifecycle_id: str | None = None
+    fault_lifecycle_id: str | None = None
+    recovery_id: str | None = None
+    reported_top_transition_id: str | None = None
+    target_lifecycle_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.reason_code or len(self.reason_code) > 256:
@@ -399,6 +450,13 @@ class AvailabilityInterruption:
             raise ValueError("availability interruption evidence exceeds its hard bound")
         if len(set(self.source_evidence_ids)) != len(self.source_evidence_ids):
             raise ValueError("availability interruption source evidence must be unique")
+        if any(
+            not value
+            or len(value.encode("utf-8")) > 4096
+            or any(unicodedata.category(character) == "Cc" for character in value)
+            for value in self.source_evidence_ids
+        ):
+            raise ValueError("availability interruption source evidence must be bounded text")
         if len(set(self.affected_instruments)) != len(self.affected_instruments):
             raise ValueError("availability interruption instruments must be unique")
         if len(set(self.affected_scopes)) != len(self.affected_scopes):
@@ -424,10 +482,25 @@ class AvailabilityInterruption:
                 raise ValueError("audit mismatch interruption must bind exactly one instrument")
         elif any(value is not None for value in audit_provenance):
             raise ValueError("non-audit interruption cannot carry an audit mismatch binding")
+        if self.replacement_recovery is not None and (
+            not is_audit_mismatch_availability_cause(self.cause)
+            or self.replacement_recovery.divergence_id != self.divergence_id
+            or self.replacement_recovery.recovery_id != self.recovery_id
+        ):
+            raise ValueError("availability replacement authority binding is inconsistent")
         if self.replacement_release_source is not None and (
             self.authoritative_resolution_source is None
         ):
             raise ValueError("replacement release requires authoritative resolution evidence")
+        for label, value in (
+            ("causal lifecycle ID", self.causal_lifecycle_id),
+            ("fault lifecycle ID", self.fault_lifecycle_id),
+            ("recovery ID", self.recovery_id),
+            ("reported-top transition ID", self.reported_top_transition_id),
+            ("target lifecycle ID", self.target_lifecycle_id),
+        ):
+            if value is not None and (not value or len(value.encode("utf-8")) > 4096):
+                raise ValueError(f"availability interruption {label} must be bounded text")
 
     def audit_availability_binding(self) -> AuditAvailabilityBinding | None:
         """Return the exact mismatch authority carried by this interruption."""
@@ -458,12 +531,63 @@ class AvailabilityInterruption:
 
 
 @dataclass(frozen=True, slots=True)
-class _OpenAvailabilityContribution:
+class ActiveAvailabilityContributorSnapshot:
+    """Bounded diagnostic projection of one unresolved ADR-0056 lifecycle."""
+
+    contribution_id: str
+    interval_id: str
+    stable_causal_key: str
+    causal_family: AvailabilityCausalFamily
+    causal_lifecycle_id: str
+    socket_generation: int
+    connection_id: str
+    cause: AvailabilityCause
+    reason_code: str
+    started_monotonic_ns: int
+    latest_observation_monotonic_ns: int
+    observation_count: int
+    observation_evidence_sha256: str
+    source_representatives: tuple[str, ...]
+    replacement_recovery: AvailabilityReplacementRecoveryV2 | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ActiveAvailabilityContributor:
+    interval_id: str
+    stable_causal_key: str
+    causal_family: AvailabilityCausalFamily
+    causal_lifecycle_id: str
+    contribution_id: str
     started_at: UtcTimestamp
     started_monotonic: MonotonicTimestamp
+    latest_observed_at: UtcTimestamp
+    latest_observed_monotonic: MonotonicTimestamp
+    socket_generation: int
+    connection_id: str
     interruption: AvailabilityInterruption
-    ended_at: UtcTimestamp | None = None
-    ended_monotonic: MonotonicTimestamp | None = None
+    initiating_contributor: bool
+    observation_count: int
+    observation_evidence_sha256: str
+    source_representatives: tuple[str, ...]
+
+    def snapshot(self) -> ActiveAvailabilityContributorSnapshot:
+        return ActiveAvailabilityContributorSnapshot(
+            contribution_id=self.contribution_id,
+            interval_id=self.interval_id,
+            stable_causal_key=self.stable_causal_key,
+            causal_family=self.causal_family,
+            causal_lifecycle_id=self.causal_lifecycle_id,
+            socket_generation=self.socket_generation,
+            connection_id=self.connection_id,
+            cause=self.interruption.cause,
+            reason_code=self.interruption.reason_code,
+            started_monotonic_ns=self.started_monotonic.nanoseconds,
+            latest_observation_monotonic_ns=self.latest_observed_monotonic.nanoseconds,
+            observation_count=self.observation_count,
+            observation_evidence_sha256=self.observation_evidence_sha256,
+            source_representatives=self.source_representatives,
+            replacement_recovery=self.interruption.replacement_recovery,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,7 +598,18 @@ class _OpenAvailabilityInterval:
     started_at: UtcTimestamp
     started_monotonic: MonotonicTimestamp
     interruption: AvailabilityInterruption
-    contributions: tuple[_OpenAvailabilityContribution, ...]
+    opener_causal_key: str
+    total_contributor_count: int
+    completed_contributor_count: int = 0
+    terminal_open_contributor_count: int = 0
+    completion_sequence: int = 0
+    contributor_sequence_sha256: str = EMPTY_AVAILABILITY_CONTRIBUTION_V2_CHAIN_SHA256
+    affected_instruments: tuple[str, ...] = ()
+    affected_scopes: tuple[AvailabilityScope, ...] = ()
+    cause_counts: tuple[tuple[AvailabilityCause, int], ...] = ()
+    scope_counts: tuple[tuple[AvailabilityScope, int], ...] = ()
+    connection_context_count: int = 0
+    connection_context_sha256: str = ""
 
 
 def _empty_ingress() -> RawIngressMetricsSnapshot:
@@ -543,6 +678,14 @@ class ObservationRuntimeHealth:
         self._unavailable_total_nanoseconds = 0
         self._longest_unavailable_nanoseconds = 0
         self._open_unavailable: _OpenAvailabilityInterval | None = None
+        self._active_availability_contributors: dict[str, _ActiveAvailabilityContributor] = {}
+        self._active_availability_contributors_high_water = 0
+        self._completed_availability_contributors = 0
+        self._availability_contribution_persistence_failures = 0
+        self._availability_contribution_persistence_failure_chain = (
+            EMPTY_AVAILABILITY_PERSISTENCE_FAILURE_CHAIN_SHA256
+        )
+        self._legacy_v1_compatibility_contributions: list[AvailabilityIntervalContributionV2] = []
         self._availability_records_emitted = 0
         self._availability_contributions_emitted = 0
         self._availability_open_at_shutdown_intervals = 0
@@ -588,13 +731,43 @@ class ObservationRuntimeHealth:
         if self._current_ingress is None:
             raise RuntimeError("cannot mark an absent socket generation connected")
         self._socket_connected = True
-        if close_unavailable and self._open_unavailable is not None:
-            self._close_unavailable(
-                ended_at=UtcTimestamp.now() if now_utc is None else now_utc,
+        ended_at = UtcTimestamp.now() if now_utc is None else now_utc
+        if self._collector_run_id is None:
+            # Preserve the pre-ledger aggregate behavior used by lightweight
+            # runtime callers.  Scoped Gate evidence always uses the v2
+            # independent lifecycle path below.
+            if close_unavailable and self._open_unavailable is not None:
+                self._close_all_active_contributors(
+                    ended_at=ended_at,
+                    ended_monotonic_ns=now_ns,
+                    recovery_outcome=AvailabilityRecoveryOutcome.RESTORED,
+                    research_eligibility_restored=research_eligibility_restored,
+                    open_at_shutdown=False,
+                    closure_reason_code="LEGACY_CAPTURE_RESTORED",
+                    closure_source_evidence_ids=self._connection_closure_sources(),
+                )
+            return
+
+        # ADR-0056 closure is per causal lifecycle.  The legacy
+        # ``close_unavailable`` flag may keep an audit recovery's shared union
+        # open, but it cannot retain already resolved generation causes.
+        closable_keys = tuple(
+            contributor.stable_causal_key
+            for contributor in sorted(
+                self._active_availability_contributors.values(),
+                key=lambda item: item.stable_causal_key,
+            )
+            if self._closes_on_connected_generation(contributor)
+        )
+        for stable_causal_key in closable_keys:
+            self.close_contributor(
+                stable_causal_key=stable_causal_key,
+                ended_at=ended_at,
                 ended_monotonic_ns=now_ns,
                 recovery_outcome=AvailabilityRecoveryOutcome.RESTORED,
                 research_eligibility_restored=research_eligibility_restored,
-                open_at_shutdown=False,
+                closure_reason_code="CONNECTED_GENERATION_RESTORED_CAUSE",
+                closure_source_evidence_ids=self._connection_closure_sources(),
             )
 
     def complete_recovery(
@@ -602,14 +775,17 @@ class ObservationRuntimeHealth:
         *,
         now_ns: int,
         now_utc: UtcTimestamp,
-    ) -> AvailabilityInterval | None:
+    ) -> AvailabilityIntervalV2 | None:
         """Close deferred recovery only after all replacement scopes recover."""
 
         if not self._socket_connected or self._current_ingress is None:
             raise RuntimeError("cannot complete recovery without connected capture")
-        if self._open_unavailable is None:
+        if self._open_unavailable is None or self._active_availability_contributors:
             return None
-        return self._close_unavailable(
+        # Independent contributor closure normally finalizes the interval when
+        # it removes the last key.  Reaching this branch is therefore only a
+        # defensive reconciliation path.
+        return self._close_interval_v2(
             ended_at=now_utc,
             ended_monotonic_ns=now_ns,
             recovery_outcome=AvailabilityRecoveryOutcome.RESTORED,
@@ -646,92 +822,154 @@ class ObservationRuntimeHealth:
         now_utc: UtcTimestamp | None = None,
         interruption: AvailabilityInterruption | None = None,
     ) -> None:
-        """Open unavailability at its causal boundary before ordered drain finishes."""
+        """Open or update exactly one unresolved ADR-0056 causal lifecycle."""
 
         self._socket_connected = False
         opened = self._open_unavailable
-        if opened is not None:
-            if interruption is None:
-                return
-            candidate_key = self._interruption_identity(interruption)
-            epoch_id = opened.started_monotonic.epoch_id
-            candidate = _OpenAvailabilityContribution(
-                started_at=UtcTimestamp.now() if now_utc is None else now_utc,
-                started_monotonic=MonotonicTimestamp(epoch_id, now_ns),
-                interruption=interruption,
-            )
-            matching_indices = tuple(
-                index
-                for index, item in enumerate(opened.contributions)
-                if self._interruption_identity(item.interruption) == candidate_key
-            )
-            if len(matching_indices) > 1:
-                self._availability_ledger_healthy = False
-                raise RuntimeError("availability contribution identity is duplicated")
-            if matching_indices:
-                index = matching_indices[0]
-                existing = opened.contributions[index]
-                if self._open_contribution_order_key(candidate) >= (
-                    self._open_contribution_order_key(existing)
-                ):
-                    return
-                self._require_nonoverlapping_open_start(candidate.started_monotonic.nanoseconds)
-                updated = list(opened.contributions)
-                # Preserve any recovery/release state already bound to this
-                # semantic contributor; only its more precise causal boundary
-                # is being rebased.
-                updated[index] = replace(
-                    existing,
-                    started_at=candidate.started_at,
-                    started_monotonic=candidate.started_monotonic,
-                )
-                self._open_unavailable = self._rebase_open_interval(
-                    opened,
-                    tuple(updated),
-                )
-                return
-            if len(opened.contributions) >= MAXIMUM_OPEN_AVAILABILITY_CONTRIBUTIONS:
-                self._availability_ledger_healthy = False
-                raise RuntimeError("availability contribution hard bound reached")
-            self._require_nonoverlapping_open_start(candidate.started_monotonic.nanoseconds)
-            rebased = self._rebase_open_interval(
-                opened,
-                (*opened.contributions, candidate),
-            )
-            # Mutate audit authority only after every local chronology/order
-            # projection above has been proven constructible.
-            self._open_audit_availability_authority(interruption)
-            self._open_unavailable = rebased
-            return
-        if self._connection_id is None or self._socket_generation <= 0:
-            raise RuntimeError("cannot open availability interval without a generation")
         if interruption is None:
+            if opened is not None:
+                return
             interruption = AvailabilityInterruption(
                 cause=AvailabilityCause.UNKNOWN,
                 reason_code="UNCLASSIFIED_GENERATION_INTERRUPTION",
             )
+        connection_id = self._connection_id
+        if connection_id is None or self._socket_generation <= 0:
+            raise RuntimeError("cannot open availability interval without a generation")
         run_id = self._collector_run_id
         epoch_id = "legacy-unscoped-runtime" if run_id is None else run_id.value
-        started_at = UtcTimestamp.now() if now_utc is None else now_utc
-        started_monotonic = MonotonicTimestamp(epoch_id, now_ns)
-        self._require_nonoverlapping_open_start(started_monotonic.nanoseconds)
-        initial_contribution = _OpenAvailabilityContribution(
-            started_at=started_at,
-            started_monotonic=started_monotonic,
-            interruption=interruption,
-        )
-        opened = _OpenAvailabilityInterval(
-            interval_id=str(uuid.uuid4()),
+        observed_at = UtcTimestamp.now() if now_utc is None else now_utc
+        observed_monotonic = MonotonicTimestamp(epoch_id, now_ns)
+        self._require_nonoverlapping_open_start(now_ns)
+
+        causal_family = self._causal_family(interruption)
+        causal_lifecycle_id = self._causal_lifecycle_id(
+            interruption,
+            causal_family=causal_family,
             socket_generation=self._socket_generation,
-            connection_id=self._connection_id.value,
-            started_at=started_at,
-            started_monotonic=started_monotonic,
-            interruption=interruption,
-            contributions=(initial_contribution,),
+            connection_id=connection_id.value,
         )
+        stable_causal_key = self._stable_causal_key(
+            causal_family=causal_family,
+            causal_lifecycle_id=causal_lifecycle_id,
+        )
+        existing = self._active_availability_contributors.get(stable_causal_key)
+        if existing is not None:
+            if opened is None or existing.interval_id != opened.interval_id:
+                self._availability_ledger_healthy = False
+                raise RuntimeError("active availability contributor has no current interval")
+            updated = self._update_active_contributor_observation(
+                existing,
+                interruption=interruption,
+                observed_at=observed_at,
+                observed_monotonic=observed_monotonic,
+            )
+            if (
+                self._active_contributor_order_key(updated)
+                < (
+                    opened.started_monotonic.nanoseconds,
+                    opened.started_at.nanoseconds_since_epoch,
+                    opened.opener_causal_key,
+                )
+                and updated.stable_causal_key != opened.opener_causal_key
+            ):
+                if opened.completion_sequence > 0:
+                    self._availability_ledger_healthy = False
+                    raise ValueError(
+                        "cannot rebase an availability opener after contributor completion"
+                    )
+                prior_opener = self._active_availability_contributors.get(opened.opener_causal_key)
+                if prior_opener is None or not prior_opener.initiating_contributor:
+                    self._availability_ledger_healthy = False
+                    raise RuntimeError("availability interval lacks its active initiating cause")
+                self._active_availability_contributors[opened.opener_causal_key] = replace(
+                    prior_opener,
+                    initiating_contributor=False,
+                )
+                updated = replace(updated, initiating_contributor=True)
+            self._active_availability_contributors[stable_causal_key] = updated
+            opened = self._merge_repeated_contributor_attribution(
+                opened,
+                prior=existing,
+                updated=updated,
+            )
+            self._open_unavailable = self._rebase_interval_to_contributor(opened, updated)
+            return
+
+        if len(self._active_availability_contributors) >= (MAXIMUM_OPEN_AVAILABILITY_CONTRIBUTIONS):
+            self._availability_ledger_healthy = False
+            raise RuntimeError("availability contribution hard bound reached")
+
+        interval_id = (
+            self._interval_id(
+                epoch_id=epoch_id,
+                socket_generation=self._socket_generation,
+                connection_id=connection_id.value,
+                started_monotonic_ns=now_ns,
+                stable_causal_key=stable_causal_key,
+                interval_ordinal=self._unavailable_intervals + 1,
+            )
+            if opened is None
+            else opened.interval_id
+        )
+        becomes_initiator = opened is None or (
+            (now_ns, observed_at.nanoseconds_since_epoch, stable_causal_key)
+            < (
+                opened.started_monotonic.nanoseconds,
+                opened.started_at.nanoseconds_since_epoch,
+                opened.opener_causal_key,
+            )
+        )
+        if opened is not None and becomes_initiator and opened.completion_sequence > 0:
+            self._availability_ledger_healthy = False
+            raise ValueError("cannot rebase an availability opener after contributor completion")
+        prior_opener = (
+            None
+            if opened is None or not becomes_initiator
+            else self._active_availability_contributors.get(opened.opener_causal_key)
+        )
+        if (
+            opened is not None
+            and becomes_initiator
+            and (prior_opener is None or not prior_opener.initiating_contributor)
+        ):
+            self._availability_ledger_healthy = False
+            raise RuntimeError("availability interval lacks its active initiating cause")
+        contributor = self._new_active_contributor(
+            interval_id=interval_id,
+            stable_causal_key=stable_causal_key,
+            causal_family=causal_family,
+            causal_lifecycle_id=causal_lifecycle_id,
+            started_at=observed_at,
+            started_monotonic=observed_monotonic,
+            interruption=interruption,
+            initiating_contributor=becomes_initiator,
+            socket_generation=self._socket_generation,
+            connection_id=connection_id.value,
+        )
+        candidate_interval = (
+            self._new_open_interval(contributor)
+            if opened is None
+            else self._join_open_interval(opened, contributor)
+        )
+        # Audit authority changes only after all bounded state is proven
+        # constructible, and before the contributor becomes externally visible.
         self._open_audit_availability_authority(interruption)
-        self._unavailable_intervals += 1
-        self._open_unavailable = opened
+        if opened is not None and becomes_initiator:
+            if prior_opener is None:  # pragma: no cover - narrowed before audit mutation
+                raise RuntimeError("availability interval lacks its active initiating cause")
+            self._active_availability_contributors[opened.opener_causal_key] = replace(
+                prior_opener,
+                initiating_contributor=False,
+            )
+        self._active_availability_contributors[stable_causal_key] = contributor
+        self._active_availability_contributors_high_water = max(
+            self._active_availability_contributors_high_water,
+            len(self._active_availability_contributors),
+        )
+        if opened is None:
+            self._unavailable_intervals += 1
+        self._open_unavailable = candidate_interval
 
     def _open_audit_availability_authority(
         self,
@@ -752,14 +990,364 @@ class ObservationRuntimeHealth:
         )
 
     @staticmethod
-    def _interruption_identity(interruption: AvailabilityInterruption) -> tuple[object, ...]:
+    def _causal_family(interruption: AvailabilityInterruption) -> AvailabilityCausalFamily:
+        if interruption.causal_family is not None:
+            return interruption.causal_family
+        cause = interruption.cause
+        if is_audit_mismatch_availability_cause(cause):
+            return AvailabilityCausalFamily.AUDIT_DIVERGENCE
+        if cause in {
+            AvailabilityCause.TRANSPORT_DISCONNECT,
+            AvailabilityCause.EXTERNAL_CONNECTION_TRANSPORT,
+        }:
+            return AvailabilityCausalFamily.TRANSPORT_INTERRUPTION
+        if cause in {
+            AvailabilityCause.REPORTED_TOP_TRANSITION_FAILURE,
+            AvailabilityCause.REPORTED_TOP_TRANSITION_EXPIRY,
+        }:
+            return AvailabilityCausalFamily.REPORTED_TOP_TRANSITION
+        if cause in {
+            AvailabilityCause.FRESHNESS_EXPIRY,
+            AvailabilityCause.AUDIT_FRESHNESS_EXPIRY,
+        }:
+            return AvailabilityCausalFamily.FRESHNESS_EXPIRY
+        if cause is AvailabilityCause.REFERENCE_REFRESH:
+            return AvailabilityCausalFamily.REFERENCE_RECOVERY
+        if cause is AvailabilityCause.BACKPRESSURE_RESOURCE:
+            return AvailabilityCausalFamily.WRITER_RESOURCE_FAULT
+        if cause is AvailabilityCause.TARGET_LIFECYCLE:
+            return AvailabilityCausalFamily.TARGET_LIFECYCLE
+        if cause in {
+            AvailabilityCause.CANONICAL_STATE_INVALIDATION,
+            AvailabilityCause.SCHEMA_PROTOCOL_ERROR,
+            AvailabilityCause.PROTOCOL_SCHEMA_INVARIANT,
+        }:
+            return AvailabilityCausalFamily.PUBLIC_READ_FAULT
+        return AvailabilityCausalFamily.UNKNOWN
+
+    @staticmethod
+    def _prefixed_lifecycle_ids(
+        source_evidence_ids: tuple[str, ...],
+        *,
+        prefix: str,
+    ) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                {
+                    value.removeprefix(prefix)
+                    for value in source_evidence_ids
+                    if value.startswith(prefix) and value != prefix
+                }
+            )
+        )
+
+    @classmethod
+    def _causal_lifecycle_id(
+        cls,
+        interruption: AvailabilityInterruption,
+        *,
+        causal_family: AvailabilityCausalFamily,
+        socket_generation: int,
+        connection_id: str,
+    ) -> str:
+        explicit = interruption.causal_lifecycle_id
+        if explicit is not None:
+            return explicit
+        if causal_family is AvailabilityCausalFamily.AUDIT_DIVERGENCE:
+            if interruption.divergence_id is None:  # pragma: no cover - constructor rejects
+                raise ValueError("audit causal lifecycle lacks divergence identity")
+            return f"divergence:{interruption.divergence_id}"
+        for label, value in (
+            ("fault", interruption.fault_lifecycle_id),
+            ("recovery", interruption.recovery_id),
+            ("reported-top", interruption.reported_top_transition_id),
+            ("target", interruption.target_lifecycle_id),
+        ):
+            if value is not None:
+                return f"{label}:{value}"
+
+        if causal_family is AvailabilityCausalFamily.REPORTED_TOP_TRANSITION:
+            transition_ids = cls._prefixed_lifecycle_ids(
+                interruption.source_evidence_ids,
+                prefix="reported-top-transition:",
+            )
+            if transition_ids:
+                return "reported-top:" + canonical_sha256(transition_ids)
+        if causal_family in {
+            AvailabilityCausalFamily.REFERENCE_RECOVERY,
+            AvailabilityCausalFamily.TARGET_LIFECYCLE,
+        }:
+            canonical_event_ids = cls._prefixed_lifecycle_ids(
+                interruption.source_evidence_ids,
+                prefix="canonical-event:",
+            )
+            if canonical_event_ids:
+                return "canonical-event:" + canonical_sha256(canonical_event_ids)
+
+        # Observation-specific raw ingest/request identities are deliberately
+        # absent. The fallback binds the lifecycle to its owning generation and
+        # stable semantic scope, so repeated symptoms deduplicate while the same
+        # symptom after replacement capture starts a new lifecycle.
+        identity: dict[str, object] = {
+            "affected_instruments": tuple(
+                sorted(item.value for item in interruption.affected_instruments)
+            ),
+            "affected_scopes": tuple(sorted(scope.value for scope in interruption.affected_scopes)),
+            "causal_family": causal_family,
+            "connection_id": connection_id,
+            "schema": "gate1-availability-causal-lifecycle-fallback-v2",
+            "socket_generation": socket_generation,
+        }
+        if causal_family in {
+            AvailabilityCausalFamily.PUBLIC_READ_FAULT,
+            AvailabilityCausalFamily.TRANSPORT_INTERRUPTION,
+            AvailabilityCausalFamily.WRITER_RESOURCE_FAULT,
+            AvailabilityCausalFamily.UNKNOWN,
+        }:
+            identity["cause"] = interruption.cause
+            identity["reason_code"] = interruption.reason_code
+        return canonical_sha256(identity)
+
+    @staticmethod
+    def _stable_causal_key(
+        *,
+        causal_family: AvailabilityCausalFamily,
+        causal_lifecycle_id: str,
+    ) -> str:
+        return availability_stable_causal_key(
+            causal_family=causal_family,
+            causal_lifecycle_id=causal_lifecycle_id,
+        )
+
+    @staticmethod
+    def _interval_id(
+        *,
+        epoch_id: str,
+        socket_generation: int,
+        connection_id: str,
+        started_monotonic_ns: int,
+        stable_causal_key: str,
+        interval_ordinal: int,
+    ) -> str:
+        return canonical_sha256(
+            {
+                "collector_run_epoch_id": epoch_id,
+                "connection_id": connection_id,
+                "opener_stable_causal_key": stable_causal_key,
+                "interval_ordinal": interval_ordinal,
+                "schema": "gate1-availability-interval-identity-v2",
+                "socket_generation": socket_generation,
+                "started_monotonic_ns": started_monotonic_ns,
+            }
+        )
+
+    @staticmethod
+    def _contribution_id(
+        *,
+        interval_id: str,
+        stable_causal_key: str,
+        socket_generation: int,
+        connection_id: str,
+        started_monotonic_ns: int,
+    ) -> str:
+        return canonical_sha256(
+            {
+                "connection_id": connection_id,
+                "interval_id": interval_id,
+                "schema": "gate1-availability-contribution-identity-v2",
+                "socket_generation": socket_generation,
+                "stable_causal_key": stable_causal_key,
+                "started_monotonic_ns": started_monotonic_ns,
+            }
+        )
+
+    @staticmethod
+    def _observation_source_representatives(
+        interruption: AvailabilityInterruption,
+    ) -> tuple[str, ...]:
+        # Direct audit raw-source pairs have dedicated exact typed fields in the
+        # v2 record. The bounded representative set therefore retains the
+        # producer's observation identities without duplicating that authority.
+        return interruption.source_evidence_ids[:MAXIMUM_SOURCE_REPRESENTATIVES_V2]
+
+    @staticmethod
+    def _observation_chain_extend(
+        *,
+        previous_sha256: str | None,
+        stable_causal_key: str,
+        interruption: AvailabilityInterruption,
+        observed_at: UtcTimestamp,
+        observed_monotonic: MonotonicTimestamp,
+    ) -> str:
+        previous = (
+            canonical_sha256(
+                {
+                    "schema": "gate1-availability-observation-chain-seed-v2",
+                    "stable_causal_key": stable_causal_key,
+                }
+            )
+            if previous_sha256 is None
+            else previous_sha256
+        )
+        return canonical_sha256(
+            {
+                "observation": {
+                    "affected_instruments": interruption.affected_instruments,
+                    "affected_scopes": interruption.affected_scopes,
+                    "cause": interruption.cause,
+                    "observed_at_utc_ns": observed_at.nanoseconds_since_epoch,
+                    "observed_monotonic_epoch_id": observed_monotonic.epoch_id,
+                    "observed_monotonic_ns": observed_monotonic.nanoseconds,
+                    "reason_code": interruption.reason_code,
+                    "recovery_action": interruption.recovery_action,
+                    "source_evidence_ids": interruption.source_evidence_ids,
+                },
+                "previous_sha256": previous,
+                "schema": "gate1-availability-observation-chain-link-v2",
+                "stable_causal_key": stable_causal_key,
+            }
+        )
+
+    @classmethod
+    def _new_active_contributor(
+        cls,
+        *,
+        interval_id: str,
+        stable_causal_key: str,
+        causal_family: AvailabilityCausalFamily,
+        causal_lifecycle_id: str,
+        started_at: UtcTimestamp,
+        started_monotonic: MonotonicTimestamp,
+        interruption: AvailabilityInterruption,
+        initiating_contributor: bool,
+        socket_generation: int,
+        connection_id: str,
+    ) -> _ActiveAvailabilityContributor:
+        return _ActiveAvailabilityContributor(
+            interval_id=interval_id,
+            stable_causal_key=stable_causal_key,
+            causal_family=causal_family,
+            causal_lifecycle_id=causal_lifecycle_id,
+            contribution_id=(
+                availability_audit_contribution_id(stable_causal_key=stable_causal_key)
+                if causal_family is AvailabilityCausalFamily.AUDIT_DIVERGENCE
+                else cls._contribution_id(
+                    interval_id=interval_id,
+                    stable_causal_key=stable_causal_key,
+                    socket_generation=socket_generation,
+                    connection_id=connection_id,
+                    started_monotonic_ns=started_monotonic.nanoseconds,
+                )
+            ),
+            started_at=started_at,
+            started_monotonic=started_monotonic,
+            latest_observed_at=started_at,
+            latest_observed_monotonic=started_monotonic,
+            socket_generation=socket_generation,
+            connection_id=connection_id,
+            interruption=interruption,
+            initiating_contributor=initiating_contributor,
+            observation_count=1,
+            observation_evidence_sha256=cls._observation_chain_extend(
+                previous_sha256=None,
+                stable_causal_key=stable_causal_key,
+                interruption=interruption,
+                observed_at=started_at,
+                observed_monotonic=started_monotonic,
+            ),
+            source_representatives=cls._observation_source_representatives(interruption),
+        )
+
+    def _update_active_contributor_observation(
+        self,
+        contributor: _ActiveAvailabilityContributor,
+        *,
+        interruption: AvailabilityInterruption,
+        observed_at: UtcTimestamp,
+        observed_monotonic: MonotonicTimestamp,
+    ) -> _ActiveAvailabilityContributor:
+        if (
+            contributor.causal_family is not self._causal_family(interruption)
+            or contributor.interruption.cause is not interruption.cause
+            or contributor.interruption.reason_code != interruption.reason_code
+            or contributor.interruption.recovery_action is not interruption.recovery_action
+            or self._direct_causal_identity(contributor.interruption)
+            != self._direct_causal_identity(interruption)
+        ):
+            self._availability_ledger_healthy = False
+            raise ValueError("repeated availability observation conflicts with its causal key")
+        if contributor.observation_count >= MAXIMUM_OBSERVATION_COUNT:
+            self._availability_ledger_healthy = False
+            raise RuntimeError("availability observation count hard bound reached")
+        if observed_monotonic.epoch_id != contributor.started_monotonic.epoch_id:
+            self._availability_ledger_healthy = False
+            raise ValueError("availability observation belongs to another run epoch")
+        if observed_monotonic.nanoseconds < contributor.started_monotonic.nanoseconds:
+            self._availability_ledger_healthy = False
+            raise ValueError("availability observation precedes its causal lifecycle start")
+
+        observed_pair = (observed_monotonic.nanoseconds, observed_at)
+        latest_pair = (
+            contributor.latest_observed_monotonic.nanoseconds,
+            contributor.latest_observed_at,
+        )
+        latest_observed_monotonic, latest_observed_at = (
+            (observed_monotonic, observed_at)
+            if observed_pair > latest_pair
+            else (contributor.latest_observed_monotonic, contributor.latest_observed_at)
+        )
+        representatives = tuple(
+            dict.fromkeys(
+                (
+                    *contributor.source_representatives,
+                    *self._observation_source_representatives(interruption),
+                )
+            )
+        )[:MAXIMUM_SOURCE_REPRESENTATIVES_V2]
+        affected_instruments = tuple(
+            sorted(
+                {
+                    *contributor.interruption.affected_instruments,
+                    *interruption.affected_instruments,
+                },
+                key=lambda item: item.value,
+            )
+        )
+        if len(affected_instruments) > 32:
+            self._availability_ledger_healthy = False
+            raise RuntimeError("availability contributor instrument union exceeds its hard bound")
+        affected_scopes = tuple(
+            sorted(
+                {
+                    *contributor.interruption.affected_scopes,
+                    *interruption.affected_scopes,
+                },
+                key=lambda item: item.value,
+            )
+        )
+        return replace(
+            contributor,
+            interruption=replace(
+                contributor.interruption,
+                affected_instruments=affected_instruments,
+                affected_scopes=affected_scopes,
+            ),
+            latest_observed_at=latest_observed_at,
+            latest_observed_monotonic=latest_observed_monotonic,
+            observation_count=contributor.observation_count + 1,
+            observation_evidence_sha256=self._observation_chain_extend(
+                previous_sha256=contributor.observation_evidence_sha256,
+                stable_causal_key=contributor.stable_causal_key,
+                interruption=interruption,
+                observed_at=observed_at,
+                observed_monotonic=observed_monotonic,
+            ),
+            source_representatives=representatives,
+        )
+
+    @staticmethod
+    def _direct_causal_identity(interruption: AvailabilityInterruption) -> tuple[object, ...]:
         return (
-            interruption.cause,
-            interruption.reason_code,
-            interruption.source_evidence_ids,
-            interruption.affected_instruments,
-            interruption.affected_scopes,
-            interruption.recovery_action,
             interruption.request_id,
             interruption.divergence_id,
             interruption.instrument_id,
@@ -767,24 +1355,20 @@ class ObservationRuntimeHealth:
             interruption.audit_start_source,
             interruption.audit_response_source,
             interruption.audit_classification_source,
+            interruption.fault_lifecycle_id,
+            interruption.recovery_id,
+            interruption.reported_top_transition_id,
+            interruption.target_lifecycle_id,
         )
 
-    @classmethod
-    def _open_contribution_order_key(
-        cls,
-        contribution: _OpenAvailabilityContribution,
-    ) -> tuple[int, int, bytes]:
-        """Order contributors by exact causal boundary and immutable identity."""
-
+    @staticmethod
+    def _active_contributor_order_key(
+        contributor: _ActiveAvailabilityContributor,
+    ) -> tuple[int, int, str]:
         return (
-            contribution.started_monotonic.nanoseconds,
-            contribution.started_at.nanoseconds_since_epoch,
-            canonical_json_bytes(
-                {
-                    "identity": cls._interruption_identity(contribution.interruption),
-                    "schema": "gate1-open-availability-contribution-order-v1",
-                }
-            ),
+            contributor.started_monotonic.nanoseconds,
+            contributor.started_at.nanoseconds_since_epoch,
+            contributor.stable_causal_key,
         )
 
     def _require_nonoverlapping_open_start(self, started_monotonic_ns: int) -> None:
@@ -793,26 +1377,152 @@ class ObservationRuntimeHealth:
             self._availability_ledger_healthy = False
             raise ValueError("availability interval would overlap a completed interval")
 
+    @staticmethod
+    def _increment_cause_counts(
+        rows: tuple[tuple[AvailabilityCause, int], ...],
+        cause: AvailabilityCause,
+    ) -> tuple[tuple[AvailabilityCause, int], ...]:
+        counts = dict(rows)
+        counts[cause] = counts.get(cause, 0) + 1
+        return tuple(sorted(counts.items(), key=lambda item: item[0].value))
+
+    @staticmethod
+    def _increment_scope_counts(
+        rows: tuple[tuple[AvailabilityScope, int], ...],
+        scopes: tuple[AvailabilityScope, ...],
+    ) -> tuple[tuple[AvailabilityScope, int], ...]:
+        counts = dict(rows)
+        for scope in scopes:
+            counts[scope] = counts.get(scope, 0) + 1
+        return tuple(sorted(counts.items(), key=lambda item: item[0].value))
+
     @classmethod
-    def _rebase_open_interval(
+    def _new_open_interval(
+        cls,
+        contributor: _ActiveAvailabilityContributor,
+    ) -> _OpenAvailabilityInterval:
+        interruption = contributor.interruption
+        return _OpenAvailabilityInterval(
+            interval_id=contributor.interval_id,
+            socket_generation=contributor.socket_generation,
+            connection_id=contributor.connection_id,
+            started_at=contributor.started_at,
+            started_monotonic=contributor.started_monotonic,
+            interruption=interruption,
+            opener_causal_key=contributor.stable_causal_key,
+            total_contributor_count=1,
+            affected_instruments=tuple(
+                sorted(item.value for item in interruption.affected_instruments)
+            ),
+            affected_scopes=tuple(
+                sorted(interruption.affected_scopes, key=lambda scope: scope.value)
+            ),
+            cause_counts=((interruption.cause, 1),),
+            scope_counts=cls._increment_scope_counts((), interruption.affected_scopes),
+            connection_context_count=1,
+            connection_context_sha256=canonical_sha256(
+                {
+                    "connection_id": contributor.connection_id,
+                    "previous_sha256": None,
+                    "schema": "gate1-availability-connection-context-chain-v2",
+                    "socket_generation": contributor.socket_generation,
+                }
+            ),
+        )
+
+    @classmethod
+    def _join_open_interval(
         cls,
         opened: _OpenAvailabilityInterval,
-        contributions: tuple[_OpenAvailabilityContribution, ...],
+        contributor: _ActiveAvailabilityContributor,
     ) -> _OpenAvailabilityInterval:
-        """Return one canonically ordered union rooted at its earliest cause."""
+        interruption = contributor.interruption
+        instrument_union = tuple(
+            sorted(
+                {
+                    *opened.affected_instruments,
+                    *(item.value for item in interruption.affected_instruments),
+                }
+            )
+        )
+        scope_union = tuple(
+            sorted(
+                {*opened.affected_scopes, *interruption.affected_scopes},
+                key=lambda scope: scope.value,
+            )
+        )
+        joined = replace(
+            opened,
+            total_contributor_count=opened.total_contributor_count + 1,
+            affected_instruments=instrument_union,
+            affected_scopes=scope_union,
+            cause_counts=cls._increment_cause_counts(opened.cause_counts, interruption.cause),
+            scope_counts=cls._increment_scope_counts(
+                opened.scope_counts,
+                interruption.affected_scopes,
+            ),
+            connection_context_count=opened.connection_context_count + 1,
+            connection_context_sha256=canonical_sha256(
+                {
+                    "connection_id": contributor.connection_id,
+                    "previous_sha256": opened.connection_context_sha256,
+                    "schema": "gate1-availability-connection-context-chain-v2",
+                    "socket_generation": contributor.socket_generation,
+                }
+            ),
+        )
+        return cls._rebase_interval_to_contributor(joined, contributor)
 
-        if not contributions:
-            raise ValueError("availability interval requires at least one contribution")
-        ordered = tuple(sorted(contributions, key=cls._open_contribution_order_key))
-        if len({cls._interruption_identity(item.interruption) for item in ordered}) != len(ordered):
-            raise ValueError("availability contribution identities must be unique")
-        opener = ordered[0]
+    @classmethod
+    def _merge_repeated_contributor_attribution(
+        cls,
+        opened: _OpenAvailabilityInterval,
+        *,
+        prior: _ActiveAvailabilityContributor,
+        updated: _ActiveAvailabilityContributor,
+    ) -> _OpenAvailabilityInterval:
+        prior_scopes = set(prior.interruption.affected_scopes)
+        updated_scopes = set(updated.interruption.affected_scopes)
+        new_scopes = tuple(sorted(updated_scopes - prior_scopes, key=lambda item: item.value))
         return replace(
             opened,
-            started_at=opener.started_at,
-            started_monotonic=opener.started_monotonic,
-            interruption=opener.interruption,
-            contributions=ordered,
+            affected_instruments=tuple(
+                sorted(
+                    {
+                        *opened.affected_instruments,
+                        *(item.value for item in updated.interruption.affected_instruments),
+                    }
+                )
+            ),
+            affected_scopes=tuple(
+                sorted(
+                    {*opened.affected_scopes, *updated_scopes},
+                    key=lambda item: item.value,
+                )
+            ),
+            scope_counts=cls._increment_scope_counts(opened.scope_counts, new_scopes),
+        )
+
+    @classmethod
+    def _rebase_interval_to_contributor(
+        cls,
+        opened: _OpenAvailabilityInterval,
+        contributor: _ActiveAvailabilityContributor,
+    ) -> _OpenAvailabilityInterval:
+        current_key = (
+            opened.started_monotonic.nanoseconds,
+            opened.started_at.nanoseconds_since_epoch,
+            opened.opener_causal_key,
+        )
+        candidate_key = cls._active_contributor_order_key(contributor)
+        if candidate_key >= current_key:
+            return opened
+        return replace(
+            opened,
+            started_at=contributor.started_at,
+            started_monotonic=contributor.started_monotonic,
+            interruption=contributor.interruption,
+            opener_causal_key=contributor.stable_causal_key,
         )
 
     def bind_contribution_authoritative_resolution(
@@ -823,34 +1533,38 @@ class ObservationRuntimeHealth:
     ) -> None:
         """Bind the separately journaled REST recovery to one open mismatch."""
 
-        opened = self._open_unavailable
-        if opened is None:
+        if self._open_unavailable is None:
             raise RuntimeError("cannot bind recovery without an open availability interval")
-        matched = 0
-        updated: list[_OpenAvailabilityContribution] = []
-        for contribution in opened.contributions:
-            interruption = contribution.interruption
-            if interruption.divergence_id == divergence_id:
-                matched += 1
-                if interruption.authoritative_resolution_source not in (None, source):
-                    self._availability_ledger_healthy = False
-                    raise ValueError("availability resolution source conflicts with prior evidence")
-                contribution = replace(
-                    contribution,
-                    interruption=replace(
-                        interruption,
-                        authoritative_resolution_source=source,
-                    ),
-                )
-            updated.append(contribution)
-        if matched != 1:
+        matches = tuple(
+            contributor
+            for contributor in self._active_availability_contributors.values()
+            if contributor.interruption.divergence_id == divergence_id
+        )
+        if len(matches) != 1:
             self._availability_ledger_healthy = False
             raise ValueError("availability resolution must bind exactly one contribution")
+        contributor = matches[0]
+        interruption = contributor.interruption
+        if interruption.authoritative_resolution_source not in (None, source):
+            self._availability_ledger_healthy = False
+            raise ValueError("availability resolution source conflicts with prior evidence")
         binding = self._audit_availability_bindings.get(divergence_id)
-        if binding is None or binding.authoritative_resolution_source is not None:
+        if binding is None:
             self._availability_ledger_healthy = False
             raise ValueError("availability resolution lacks one current authority binding")
+        if binding.authoritative_resolution_source is not None:
+            if binding.authoritative_resolution_source == source:
+                return
+            self._availability_ledger_healthy = False
+            raise ValueError("availability resolution source conflicts with prior authority")
         resolved_binding = binding.with_authoritative_resolution(source)
+        self._active_availability_contributors[contributor.stable_causal_key] = replace(
+            contributor,
+            interruption=replace(
+                interruption,
+                authoritative_resolution_source=source,
+            ),
+        )
         self._audit_availability_bindings[divergence_id] = resolved_binding
         self._audit_availability_resolved += 1
         self._audit_availability_resolution_chain = audit_availability_chain_extend(
@@ -858,7 +1572,97 @@ class ObservationRuntimeHealth:
             "resolution",
             resolved_binding,
         )
-        self._open_unavailable = replace(opened, contributions=tuple(updated))
+
+    @staticmethod
+    def _replacement_recovery_evidence(
+        authority: ReplacementRecoveryAuthority,
+    ) -> AvailabilityReplacementRecoveryV2:
+        return AvailabilityReplacementRecoveryV2(
+            recovery_id=authority.recovery_id,
+            resolution_id=authority.resolution_id,
+            contribution_id=authority.contribution_id,
+            stable_contributor_key=authority.stable_contributor_key,
+            divergence_id=authority.divergence_id,
+            status=AvailabilityReplacementRecoveryStatus(authority.status.value),
+            attempt_count=authority.attempt_count,
+            maximum_attempts=authority.bounds.maximum_attempts,
+            original_connection_id=authority.original_connection_id.value,
+            excluded_connection_count=len(authority.excluded_connection_ids),
+            excluded_connection_ids_sha256=canonical_sha256(
+                {
+                    "connection_ids": tuple(
+                        item.value for item in authority.excluded_connection_ids
+                    ),
+                    "schema": "gate1-availability-excluded-connections-v2",
+                }
+            ),
+            attempted_connection_ids=tuple(
+                item.value for item in authority.attempted_connection_ids
+            ),
+            current_connection_id=(
+                None
+                if authority.current_connection_id is None
+                else authority.current_connection_id.value
+            ),
+            first_attempt_monotonic=authority.first_attempt_monotonic,
+            latest_attempt_monotonic=authority.latest_attempt_monotonic,
+            next_retry_monotonic=authority.next_retry_monotonic,
+            hard_deadline=authority.hard_deadline,
+            run_deadline=authority.run_deadline,
+            required_instrument_ids=tuple(item.value for item in authority.required_instrument_ids),
+            captured_instrument_ids=tuple(item.value for item in authority.captured_instrument_ids),
+            last_result=authority.last_result.value,
+            last_failure=(None if authority.last_failure is None else authority.last_failure.value),
+            attempt_chain_sha256=authority.attempt_chain_sha256,
+            evidence_chain_sha256=authority.evidence_chain_sha256,
+            evidence_event_count=authority.evidence_event_count,
+        )
+
+    def bind_contribution_replacement_recovery(
+        self,
+        *,
+        divergence_id: str,
+        authority: ReplacementRecoveryAuthority,
+    ) -> None:
+        """Bind the latest monotone recovery authority to one active cause."""
+
+        if self._open_unavailable is None:
+            raise RuntimeError("cannot bind replacement recovery without an open interval")
+        matches = tuple(
+            contributor
+            for contributor in self._active_availability_contributors.values()
+            if contributor.interruption.divergence_id == divergence_id
+        )
+        if len(matches) != 1:
+            self._availability_ledger_healthy = False
+            raise ValueError("replacement recovery must bind exactly one contribution")
+        contributor = matches[0]
+        interruption = contributor.interruption
+        if (
+            authority.divergence_id != divergence_id
+            or authority.stable_contributor_key != contributor.stable_causal_key
+            or authority.contribution_id != contributor.contribution_id
+            or interruption.authoritative_resolution_source != authority.resolution_source
+        ):
+            self._availability_ledger_healthy = False
+            raise ValueError("replacement recovery differs from availability authority")
+        evidence = self._replacement_recovery_evidence(authority)
+        prior = interruption.replacement_recovery
+        if prior is not None and (
+            prior.recovery_id != evidence.recovery_id
+            or prior.attempt_count > evidence.attempt_count
+            or prior.evidence_event_count > evidence.evidence_event_count
+        ):
+            self._availability_ledger_healthy = False
+            raise ValueError("replacement recovery authority regressed")
+        self._active_availability_contributors[contributor.stable_causal_key] = replace(
+            contributor,
+            interruption=replace(
+                interruption,
+                recovery_id=authority.recovery_id,
+                replacement_recovery=evidence,
+            ),
+        )
 
     def bind_contribution_replacement_release(
         self,
@@ -867,48 +1671,55 @@ class ObservationRuntimeHealth:
         source: RawSourceRef,
         ended_at: UtcTimestamp,
         ended_monotonic_ns: int,
+        recovery_authority: ReplacementRecoveryAuthority | None = None,
     ) -> None:
         """Close one contributor while preserving the shared union interval."""
 
-        opened = self._open_unavailable
-        if opened is None:
+        if self._open_unavailable is None:
             raise RuntimeError("cannot bind release without an open availability interval")
-        matched = 0
-        updated: list[_OpenAvailabilityContribution] = []
-        for contribution in opened.contributions:
-            interruption = contribution.interruption
-            if interruption.divergence_id == divergence_id:
-                matched += 1
-                if interruption.authoritative_resolution_source is None:
-                    self._availability_ledger_healthy = False
-                    raise ValueError("availability release lacks authoritative resolution")
-                if contribution.ended_monotonic is not None:
-                    self._availability_ledger_healthy = False
-                    raise ValueError("availability contribution was already released")
-                if ended_monotonic_ns < contribution.started_monotonic.nanoseconds:
-                    self._availability_ledger_healthy = False
-                    raise ValueError("availability release precedes contribution start")
-                contribution = replace(
-                    contribution,
-                    interruption=replace(
-                        interruption,
-                        replacement_release_source=source,
-                    ),
-                    ended_at=ended_at,
-                    ended_monotonic=MonotonicTimestamp(
-                        contribution.started_monotonic.epoch_id,
-                        ended_monotonic_ns,
-                    ),
-                )
-            updated.append(contribution)
-        if matched != 1:
+        matches = tuple(
+            contributor
+            for contributor in self._active_availability_contributors.values()
+            if contributor.interruption.divergence_id == divergence_id
+        )
+        if len(matches) != 1:
             self._availability_ledger_healthy = False
             raise ValueError("availability release must bind exactly one contribution")
+        contributor = matches[0]
+        interruption = contributor.interruption
+        if interruption.authoritative_resolution_source is None:
+            self._availability_ledger_healthy = False
+            raise ValueError("availability release lacks authoritative resolution")
+        if ended_monotonic_ns < contributor.started_monotonic.nanoseconds:
+            self._availability_ledger_healthy = False
+            raise ValueError("availability release precedes contribution start")
         binding = self._audit_availability_bindings.get(divergence_id)
         if binding is None:
             self._availability_ledger_healthy = False
             raise ValueError("availability release lacks one current authority binding")
         released_binding = binding.with_replacement_release(source)
+        if recovery_authority is not None:
+            self.bind_contribution_replacement_recovery(
+                divergence_id=divergence_id,
+                authority=recovery_authority,
+            )
+            contributor = self._active_availability_contributors[contributor.stable_causal_key]
+            interruption = contributor.interruption
+        self._active_availability_contributors[contributor.stable_causal_key] = replace(
+            contributor,
+            interruption=replace(interruption, replacement_release_source=source),
+        )
+        self.close_contributor(
+            stable_causal_key=contributor.stable_causal_key,
+            ended_at=ended_at,
+            ended_monotonic_ns=ended_monotonic_ns,
+            recovery_outcome=AvailabilityRecoveryOutcome.RESTORED,
+            research_eligibility_restored=True,
+            closure_reason_code="DURABLE_REPLACEMENT_CAPTURE_RELEASE",
+            closure_source_evidence_ids=(
+                f"raw-source:{source.ingest_id.value}:{source.payload_sha256}",
+            ),
+        )
         self._audit_availability_released += 1
         self._audit_availability_release_chain = audit_availability_chain_extend(
             self._audit_availability_release_chain,
@@ -916,202 +1727,239 @@ class ObservationRuntimeHealth:
             released_binding,
         )
         self._audit_availability_bindings.pop(divergence_id)
-        self._open_unavailable = replace(opened, contributions=tuple(updated))
 
     @staticmethod
-    def _contribution_id(
-        *,
-        interval_id: str,
-        index: int,
-        opened: _OpenAvailabilityContribution,
-    ) -> str:
-        interruption = opened.interruption
-        identity = "\x1f".join(
-            (
-                interval_id,
-                str(index),
-                str(opened.started_monotonic.nanoseconds),
-                interruption.cause.value,
-                interruption.reason_code,
-                *interruption.source_evidence_ids,
-                *(item.value for item in interruption.affected_instruments),
-            )
+    def _closes_on_connected_generation(
+        contributor: _ActiveAvailabilityContributor,
+    ) -> bool:
+        if contributor.causal_family in {
+            AvailabilityCausalFamily.AUDIT_DIVERGENCE,
+            AvailabilityCausalFamily.TARGET_LIFECYCLE,
+        }:
+            return False
+        # A fallback UNKNOWN generated by an unclassified socket interruption
+        # belongs to that connection generation and closes on replacement
+        # capture.  An explicitly identified UNKNOWN lifecycle has an external
+        # owner/close condition and must not be guessed closed here.
+        return not (
+            contributor.causal_family is AvailabilityCausalFamily.UNKNOWN
+            and contributor.interruption.causal_lifecycle_id is not None
         )
-        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
-    def _close_unavailable(
+    def _connection_closure_sources(self) -> tuple[str, ...]:
+        connection_id = self._connection_id
+        return () if connection_id is None else (f"connection:{connection_id.value}",)
+
+    def _record_contribution_persistence_failure(
         self,
         *,
+        contributor: _ActiveAvailabilityContributor,
+        phase: str,
+        error: BaseException | None,
+    ) -> None:
+        self._availability_ledger_healthy = False
+        self._availability_contribution_persistence_failures += 1
+        self._availability_contribution_persistence_failure_chain = canonical_sha256(
+            {
+                "contribution_id": contributor.contribution_id,
+                "error_type": None if error is None else type(error).__name__,
+                "interval_id": contributor.interval_id,
+                "phase": phase,
+                "previous_sha256": (self._availability_contribution_persistence_failure_chain),
+                "schema": "gate1-availability-persistence-failure-chain-link-v2",
+                "stable_causal_key": contributor.stable_causal_key,
+            }
+        )
+
+    def close_contributor(
+        self,
+        *,
+        stable_causal_key: str,
         ended_at: UtcTimestamp,
         ended_monotonic_ns: int,
         recovery_outcome: AvailabilityRecoveryOutcome,
         research_eligibility_restored: bool,
-        open_at_shutdown: bool,
-    ) -> AvailabilityInterval | None:
+        closure_reason_code: str,
+        closure_source_evidence_ids: tuple[str, ...] = (),
+        open_at_shutdown: bool = False,
+    ) -> AvailabilityIntervalV2 | None:
+        """Freeze, admit, and remove one independently resolved contributor."""
+
         opened = self._open_unavailable
-        if opened is None:
-            return None
-        if not opened.contributions:
+        contributor = self._active_availability_contributors.get(stable_causal_key)
+        if opened is None or contributor is None:
             self._availability_ledger_healthy = False
-            raise RuntimeError("availability interval has no initiating contribution")
-        if len(opened.contributions) > MAXIMUM_OPEN_AVAILABILITY_CONTRIBUTIONS:
+            raise KeyError("availability contributor is not active")
+        if contributor.interval_id != opened.interval_id:
             self._availability_ledger_healthy = False
-            raise RuntimeError("availability contribution hard bound was exceeded")
-        try:
-            canonical_opened = self._rebase_open_interval(opened, opened.contributions)
-        except TypeError, ValueError:
+            raise RuntimeError("availability contributor references another interval")
+        if ended_monotonic_ns < contributor.latest_observed_monotonic.nanoseconds:
             self._availability_ledger_healthy = False
-            raise
-        if (
-            canonical_opened.started_at != opened.started_at
-            or canonical_opened.started_monotonic != opened.started_monotonic
-            or self._interruption_identity(canonical_opened.interruption)
-            != self._interruption_identity(opened.interruption)
-            or canonical_opened.contributions != opened.contributions
-        ):
+            raise ValueError("availability closure precedes its latest observation")
+        if ended_monotonic_ns < contributor.started_monotonic.nanoseconds:
             self._availability_ledger_healthy = False
-            raise RuntimeError("availability interval is not canonically rebased")
-        self._require_nonoverlapping_open_start(opened.started_monotonic.nanoseconds)
-        if ended_monotonic_ns < opened.started_monotonic.nanoseconds:
+            raise ValueError("availability closure precedes contributor start")
+        normalized_closure_sources = tuple(dict.fromkeys(closure_source_evidence_ids))[
+            :MAXIMUM_SOURCE_REPRESENTATIVES_V2
+        ]
+        if any(not value or len(value) > 4096 for value in normalized_closure_sources):
             self._availability_ledger_healthy = False
-            raise ValueError("availability interval end precedes its monotonic start")
-        for contribution in opened.contributions:
-            if contribution.started_monotonic.epoch_id != opened.started_monotonic.epoch_id:
-                self._availability_ledger_healthy = False
-                raise ValueError("availability contribution belongs to another run epoch")
-            if (contribution.ended_at is None) != (contribution.ended_monotonic is None):
-                self._availability_ledger_healthy = False
-                raise ValueError("availability contribution has a partial terminal boundary")
-            contribution_end = contribution.ended_monotonic
-            if contribution_end is None:
-                continue
-            if contribution_end.epoch_id != contribution.started_monotonic.epoch_id:
-                self._availability_ledger_healthy = False
-                raise ValueError("availability contribution terminal epoch is inconsistent")
-            if contribution_end.nanoseconds < contribution.started_monotonic.nanoseconds:
-                self._availability_ledger_healthy = False
-                raise ValueError("availability contribution end precedes its start")
-            if contribution_end.nanoseconds > ended_monotonic_ns:
-                self._availability_ledger_healthy = False
-                raise ValueError("availability contribution ends after its union interval")
-        elapsed = ended_monotonic_ns - opened.started_monotonic.nanoseconds
+            raise ValueError("availability closure source representative is invalid")
+        if open_at_shutdown:
+            recovery_outcome = AvailabilityRecoveryOutcome.NOT_RESTORED_AT_SHUTDOWN
+            research_eligibility_restored = False
+
         run_id = self._collector_run_id
-        if run_id is None:
-            # Legacy unit/runtime callers retain aggregate behavior but cannot
-            # claim versioned Gate evidence without an explicit run/writer.
-            self._unavailable_total_nanoseconds += elapsed
-            self._longest_unavailable_nanoseconds = max(
-                self._longest_unavailable_nanoseconds,
-                elapsed,
+        next_sequence = self._completed_availability_contributors + 1
+        record: AvailabilityIntervalContributionV2 | None = None
+        accepted = run_id is None
+        persistence_error: BaseException | None = None
+        if run_id is not None:
+            ended_monotonic = MonotonicTimestamp(run_id.value, ended_monotonic_ns)
+            interruption = contributor.interruption
+            record = AvailabilityIntervalContributionV2(
+                contribution_id=contributor.contribution_id,
+                interval_id=opened.interval_id,
+                stable_causal_key=contributor.stable_causal_key,
+                causal_family=contributor.causal_family,
+                collector_run_id=run_id,
+                socket_generation=contributor.socket_generation,
+                connection_id=contributor.connection_id,
+                started_at=contributor.started_at,
+                started_monotonic=contributor.started_monotonic,
+                latest_observed_at=contributor.latest_observed_at,
+                latest_observed_monotonic=contributor.latest_observed_monotonic,
+                ended_at=ended_at,
+                ended_monotonic=ended_monotonic,
+                duration_nanoseconds=(
+                    ended_monotonic_ns - contributor.started_monotonic.nanoseconds
+                ),
+                cause=interruption.cause,
+                reason_code=interruption.reason_code,
+                source_evidence_ids=contributor.source_representatives,
+                observation_count=contributor.observation_count,
+                observation_chain_sha256=contributor.observation_evidence_sha256,
+                affected_instruments=tuple(
+                    sorted(item.value for item in interruption.affected_instruments)
+                ),
+                affected_scopes=tuple(
+                    sorted(interruption.affected_scopes, key=lambda scope: scope.value)
+                ),
+                recovery_action=interruption.recovery_action,
+                initiating_contributor=contributor.initiating_contributor,
+                recovery_outcome=recovery_outcome,
+                completion_sequence=next_sequence,
+                open_at_shutdown=open_at_shutdown,
+                closure_reason_code=closure_reason_code,
+                closure_source_evidence_ids=normalized_closure_sources,
+                request_id=interruption.request_id,
+                divergence_id=interruption.divergence_id,
+                fault_lifecycle_id=interruption.fault_lifecycle_id,
+                recovery_id=interruption.recovery_id,
+                reported_top_transition_id=interruption.reported_top_transition_id,
+                instrument_id=(
+                    None if interruption.instrument_id is None else interruption.instrument_id.value
+                ),
+                market_id=interruption.market_id,
+                audit_start_source=interruption.audit_start_source,
+                audit_response_source=interruption.audit_response_source,
+                audit_classification_source=interruption.audit_classification_source,
+                authoritative_resolution_source=(interruption.authoritative_resolution_source),
+                replacement_release_source=interruption.replacement_release_source,
+                replacement_recovery=interruption.replacement_recovery,
             )
-            self._last_closed_unavailable_ended_monotonic_ns = ended_monotonic_ns
-            self._open_unavailable = None
-            return None
-        if opened.started_monotonic.epoch_id != run_id.value:
+            writer = self._availability_writer
+            enqueue_contribution = getattr(writer, "enqueue_contribution_nowait", None)
+            if callable(enqueue_contribution):
+                try:
+                    accepted = bool(enqueue_contribution(record))
+                except Exception as error:
+                    accepted = False
+                    persistence_error = error
+            elif (
+                writer is not None
+                and len(self._legacy_v1_compatibility_contributions)
+                < MAXIMUM_OPEN_AVAILABILITY_CONTRIBUTIONS
+            ):
+                # Narrow compatibility for pre-v2 in-memory/test owners. This
+                # is a separately bounded completed backlog, never active
+                # authority; production Gate writers expose the v2 methods.
+                self._legacy_v1_compatibility_contributions.append(record)
+                accepted = True
+
+        # A completed cause is removed regardless of derived-evidence admission
+        # outcome. Re-inserting it would turn a publication fault into false
+        # causal unavailability and recreate the ADR-0056 retention defect.
+        current = self._active_availability_contributors.get(stable_causal_key)
+        if current != contributor:
             self._availability_ledger_healthy = False
-            raise ValueError("availability interval belongs to another run epoch")
-        interval = AvailabilityInterval(
-            interval_id=opened.interval_id,
-            collector_run_id=run_id,
-            socket_generation=opened.socket_generation,
-            connection_id=opened.connection_id,
-            started_at=opened.started_at,
-            started_monotonic=opened.started_monotonic,
-            ended_at=ended_at,
-            ended_monotonic=MonotonicTimestamp(run_id.value, ended_monotonic_ns),
-            duration_nanoseconds=elapsed,
-            cause=opened.interruption.cause,
-            reason_code=opened.interruption.reason_code,
-            source_evidence_ids=opened.interruption.source_evidence_ids,
-            affected_instruments=tuple(
-                sorted(
-                    {
-                        instrument_id.value
-                        for contribution in opened.contributions
-                        for instrument_id in contribution.interruption.affected_instruments
-                    }
+            raise RuntimeError("availability contributor changed during closure")
+        self._active_availability_contributors.pop(stable_causal_key)
+        self._completed_availability_contributors += 1
+        completion_record: dict[str, object]
+        if record is None:
+            completion_record = {
+                "completion_sequence": next_sequence,
+                "contribution_id": contributor.contribution_id,
+                "interval_id": contributor.interval_id,
+                "open_at_shutdown": open_at_shutdown,
+                "stable_causal_key": stable_causal_key,
+            }
+        else:
+            completion_record = record.to_record()
+        updated_opened = replace(
+            opened,
+            completed_contributor_count=(
+                opened.completed_contributor_count + int(not open_at_shutdown)
+            ),
+            terminal_open_contributor_count=(
+                opened.terminal_open_contributor_count + int(open_at_shutdown)
+            ),
+            completion_sequence=next_sequence,
+            contributor_sequence_sha256=availability_contribution_v2_chain_extend(
+                opened.contributor_sequence_sha256,
+                completion_record,
+            ),
+        )
+        self._open_unavailable = updated_opened
+        if run_id is not None:
+            if not accepted:
+                self._record_contribution_persistence_failure(
+                    contributor=contributor,
+                    phase="enqueue_contribution",
+                    error=persistence_error,
                 )
-            ),
-            affected_scopes=tuple(
-                scope
-                for scope in AvailabilityScope
-                if scope
-                in {
-                    affected_scope
-                    for contribution in opened.contributions
-                    for affected_scope in contribution.interruption.affected_scopes
-                }
-            ),
-            recovery_action=opened.interruption.recovery_action,
+            else:
+                self._availability_contributions_emitted += 1
+                if record is not None and is_audit_mismatch_availability_cause(record.cause):
+                    self._audit_availability_contribution_chain = (
+                        audit_availability_contribution_chain_extend(
+                            self._audit_availability_contribution_chain,
+                            record.to_record(),
+                        )
+                    )
+                    self._audit_availability_contributions_emitted += 1
+        if self._active_availability_contributors:
+            return None
+        if run_id is None:
+            self._close_legacy_interval(ended_monotonic_ns=ended_monotonic_ns)
+            return None
+        return self._close_interval_v2(
+            ended_at=ended_at,
+            ended_monotonic_ns=ended_monotonic_ns,
             recovery_outcome=recovery_outcome,
             research_eligibility_restored=research_eligibility_restored,
             open_at_shutdown=open_at_shutdown,
         )
-        contribution_records: list[AvailabilityIntervalContribution] = []
-        for index, contribution in enumerate(opened.contributions):
-            contribution_ended_at = contribution.ended_at or ended_at
-            contribution_ended_monotonic = contribution.ended_monotonic or MonotonicTimestamp(
-                run_id.value,
-                ended_monotonic_ns,
-            )
-            interruption = contribution.interruption
-            contribution_records.append(
-                AvailabilityIntervalContribution(
-                    contribution_id=self._contribution_id(
-                        interval_id=opened.interval_id,
-                        index=index,
-                        opened=contribution,
-                    ),
-                    interval_id=opened.interval_id,
-                    collector_run_id=run_id,
-                    socket_generation=opened.socket_generation,
-                    connection_id=opened.connection_id,
-                    started_at=contribution.started_at,
-                    started_monotonic=contribution.started_monotonic,
-                    ended_at=contribution_ended_at,
-                    ended_monotonic=contribution_ended_monotonic,
-                    duration_nanoseconds=(
-                        contribution_ended_monotonic.nanoseconds
-                        - contribution.started_monotonic.nanoseconds
-                    ),
-                    cause=interruption.cause,
-                    reason_code=interruption.reason_code,
-                    source_evidence_ids=interruption.source_evidence_ids,
-                    affected_instruments=tuple(
-                        instrument_id.value for instrument_id in interruption.affected_instruments
-                    ),
-                    affected_scopes=interruption.affected_scopes,
-                    recovery_action=interruption.recovery_action,
-                    initiating_contributor=index == 0,
-                    recovery_outcome=(
-                        AvailabilityRecoveryOutcome.RESTORED
-                        if contribution.ended_monotonic is not None
-                        else recovery_outcome
-                    ),
-                    request_id=interruption.request_id,
-                    divergence_id=interruption.divergence_id,
-                    instrument_id=(
-                        None
-                        if interruption.instrument_id is None
-                        else interruption.instrument_id.value
-                    ),
-                    market_id=interruption.market_id,
-                    audit_start_source=interruption.audit_start_source,
-                    audit_response_source=interruption.audit_response_source,
-                    audit_classification_source=interruption.audit_classification_source,
-                    authoritative_resolution_source=(interruption.authoritative_resolution_source),
-                    replacement_release_source=interruption.replacement_release_source,
-                )
-            )
-        contributions = tuple(contribution_records)
-        writer = self._availability_writer
-        try:
-            accepted = writer is not None and writer.enqueue_nowait(
-                interval, contributions=contributions
-            )
-        except Exception:
+
+    def _close_legacy_interval(self, *, ended_monotonic_ns: int) -> None:
+        opened = self._open_unavailable
+        if opened is None:
+            return
+        elapsed = ended_monotonic_ns - opened.started_monotonic.nanoseconds
+        if elapsed < 0:
             self._availability_ledger_healthy = False
-            raise
+            raise ValueError("availability interval end precedes its monotonic start")
         self._unavailable_total_nanoseconds += elapsed
         self._longest_unavailable_nanoseconds = max(
             self._longest_unavailable_nanoseconds,
@@ -1119,38 +1967,234 @@ class ObservationRuntimeHealth:
         )
         self._last_closed_unavailable_ended_monotonic_ns = ended_monotonic_ns
         self._open_unavailable = None
-        if not accepted:
+
+    def _close_interval_v2(
+        self,
+        *,
+        ended_at: UtcTimestamp,
+        ended_monotonic_ns: int,
+        recovery_outcome: AvailabilityRecoveryOutcome,
+        research_eligibility_restored: bool,
+        open_at_shutdown: bool,
+    ) -> AvailabilityIntervalV2 | None:
+        opened = self._open_unavailable
+        run_id = self._collector_run_id
+        if opened is None or run_id is None:
+            return None
+        if self._active_availability_contributors:
             self._availability_ledger_healthy = False
-        else:
-            self._availability_records_emitted += 1
-            self._availability_contributions_emitted += len(contributions)
-            for contribution in contributions:
-                if not is_audit_mismatch_availability_cause(contribution.cause):
-                    continue
-                self._audit_availability_contribution_chain = (
-                    audit_availability_contribution_chain_extend(
-                        self._audit_availability_contribution_chain,
-                        contribution.to_record(),
+            raise RuntimeError("cannot close availability interval with active contributors")
+        if opened.started_monotonic.epoch_id != run_id.value:
+            self._availability_ledger_healthy = False
+            raise ValueError("availability interval belongs to another run epoch")
+        if ended_monotonic_ns < opened.started_monotonic.nanoseconds:
+            self._availability_ledger_healthy = False
+            raise ValueError("availability interval end precedes its monotonic start")
+        if opened.total_contributor_count != (
+            opened.completed_contributor_count + opened.terminal_open_contributor_count
+        ):
+            self._availability_ledger_healthy = False
+            raise RuntimeError("availability interval contributor counts do not reconcile")
+        if open_at_shutdown != (opened.terminal_open_contributor_count > 0):
+            self._availability_ledger_healthy = False
+            raise RuntimeError("availability terminal contributor state is inconsistent")
+
+        ended_monotonic = MonotonicTimestamp(run_id.value, ended_monotonic_ns)
+        active_period_union_sha256 = availability_active_period_union_sha256(
+            collector_run_id=run_id,
+            started_monotonic=opened.started_monotonic,
+            ended_monotonic=ended_monotonic,
+        )
+        reconciliation_id = availability_interval_reconciliation_id(
+            interval_id=opened.interval_id,
+            active_period_union_sha256=active_period_union_sha256,
+            total_contributor_count=opened.total_contributor_count,
+            completed_contributor_count=opened.completed_contributor_count,
+            terminal_open_contributor_count=opened.terminal_open_contributor_count,
+            contributor_chain_sha256=opened.contributor_sequence_sha256,
+        )
+        interval = AvailabilityIntervalV2(
+            interval_id=opened.interval_id,
+            collector_run_id=run_id,
+            socket_generation=opened.socket_generation,
+            connection_id=opened.connection_id,
+            started_at=opened.started_at,
+            started_monotonic=opened.started_monotonic,
+            ended_at=ended_at,
+            ended_monotonic=ended_monotonic,
+            duration_nanoseconds=ended_monotonic_ns - opened.started_monotonic.nanoseconds,
+            cause=opened.interruption.cause,
+            reason_code=opened.interruption.reason_code,
+            source_evidence_ids=tuple(
+                opened.interruption.source_evidence_ids[:MAXIMUM_SOURCE_REPRESENTATIVES_V2]
+            ),
+            affected_instruments=opened.affected_instruments,
+            affected_scopes=opened.affected_scopes,
+            recovery_action=opened.interruption.recovery_action,
+            recovery_outcome=recovery_outcome,
+            research_eligibility_restored=research_eligibility_restored,
+            open_at_shutdown=open_at_shutdown,
+            active_period_union_sha256=active_period_union_sha256,
+            total_contributor_count=opened.total_contributor_count,
+            completed_contributor_count=opened.completed_contributor_count,
+            terminal_open_contributor_count=opened.terminal_open_contributor_count,
+            contributor_chain_sha256=opened.contributor_sequence_sha256,
+            per_cause_counts=opened.cause_counts,
+            per_scope_counts=opened.scope_counts,
+            reconciliation_id=reconciliation_id,
+        )
+        writer = self._availability_writer
+        accepted = False
+        enqueue_interval = getattr(writer, "enqueue_interval_nowait", None)
+        if callable(enqueue_interval):
+            try:
+                accepted = bool(enqueue_interval(interval))
+            except Exception:
+                accepted = False
+        elif writer is not None:
+            compatibility_contributions = tuple(self._legacy_v1_compatibility_contributions)
+            enqueue_bundle = getattr(writer, "enqueue_nowait", None)
+            if (
+                callable(enqueue_bundle)
+                and len(compatibility_contributions) == interval.total_contributor_count
+            ):
+                try:
+                    accepted = bool(
+                        enqueue_bundle(
+                            self._as_v1_interval(interval),
+                            contributions=tuple(
+                                self._as_v1_contribution(item)
+                                for item in compatibility_contributions
+                            ),
+                        )
                     )
-                )
-                self._audit_availability_contributions_emitted += 1
+                except Exception:
+                    accepted = False
+            self._legacy_v1_compatibility_contributions.clear()
+        elapsed = interval.duration_nanoseconds
+        self._unavailable_total_nanoseconds += elapsed
+        self._longest_unavailable_nanoseconds = max(
+            self._longest_unavailable_nanoseconds,
+            elapsed,
+        )
+        self._last_closed_unavailable_ended_monotonic_ns = ended_monotonic_ns
+        self._open_unavailable = None
+        if accepted:
+            self._availability_records_emitted += 1
             self._availability_open_at_shutdown_intervals += int(open_at_shutdown)
+        else:
+            self._availability_ledger_healthy = False
         return interval
+
+    @staticmethod
+    def _as_v1_contribution(
+        contribution: AvailabilityIntervalContributionV2,
+    ) -> AvailabilityIntervalContribution:
+        return AvailabilityIntervalContribution(
+            contribution_id=contribution.contribution_id,
+            interval_id=contribution.interval_id,
+            collector_run_id=contribution.collector_run_id,
+            socket_generation=contribution.socket_generation,
+            connection_id=contribution.connection_id,
+            started_at=contribution.started_at,
+            started_monotonic=contribution.started_monotonic,
+            ended_at=contribution.ended_at,
+            ended_monotonic=contribution.ended_monotonic,
+            duration_nanoseconds=contribution.duration_nanoseconds,
+            cause=contribution.cause,
+            reason_code=contribution.reason_code,
+            source_evidence_ids=contribution.source_evidence_ids,
+            affected_instruments=contribution.affected_instruments,
+            affected_scopes=contribution.affected_scopes,
+            recovery_action=contribution.recovery_action,
+            initiating_contributor=contribution.initiating_contributor,
+            recovery_outcome=contribution.recovery_outcome,
+            request_id=contribution.request_id,
+            divergence_id=contribution.divergence_id,
+            instrument_id=contribution.instrument_id,
+            market_id=contribution.market_id,
+            audit_start_source=contribution.audit_start_source,
+            audit_response_source=contribution.audit_response_source,
+            audit_classification_source=contribution.audit_classification_source,
+            authoritative_resolution_source=contribution.authoritative_resolution_source,
+            replacement_release_source=contribution.replacement_release_source,
+        )
+
+    @staticmethod
+    def _as_v1_interval(interval: AvailabilityIntervalV2) -> AvailabilityInterval:
+        return AvailabilityInterval(
+            interval_id=interval.interval_id,
+            collector_run_id=interval.collector_run_id,
+            socket_generation=interval.socket_generation,
+            connection_id=interval.connection_id,
+            started_at=interval.started_at,
+            started_monotonic=interval.started_monotonic,
+            ended_at=interval.ended_at,
+            ended_monotonic=interval.ended_monotonic,
+            duration_nanoseconds=interval.duration_nanoseconds,
+            cause=interval.cause,
+            reason_code=interval.reason_code,
+            source_evidence_ids=interval.source_evidence_ids,
+            affected_instruments=interval.affected_instruments,
+            affected_scopes=interval.affected_scopes,
+            recovery_action=interval.recovery_action,
+            recovery_outcome=interval.recovery_outcome,
+            research_eligibility_restored=interval.research_eligibility_restored,
+            open_at_shutdown=interval.open_at_shutdown,
+        )
+
+    def _close_all_active_contributors(
+        self,
+        *,
+        ended_at: UtcTimestamp,
+        ended_monotonic_ns: int,
+        recovery_outcome: AvailabilityRecoveryOutcome,
+        research_eligibility_restored: bool,
+        open_at_shutdown: bool,
+        closure_reason_code: str,
+        closure_source_evidence_ids: tuple[str, ...],
+    ) -> AvailabilityIntervalV2 | None:
+        result: AvailabilityIntervalV2 | None = None
+        ordered_keys = tuple(
+            contributor.stable_causal_key
+            for contributor in sorted(
+                self._active_availability_contributors.values(),
+                key=self._active_contributor_order_key,
+            )
+        )
+        for stable_causal_key in ordered_keys:
+            closed = self.close_contributor(
+                stable_causal_key=stable_causal_key,
+                ended_at=ended_at,
+                ended_monotonic_ns=ended_monotonic_ns,
+                recovery_outcome=recovery_outcome,
+                research_eligibility_restored=research_eligibility_restored,
+                open_at_shutdown=open_at_shutdown,
+                closure_reason_code=closure_reason_code,
+                closure_source_evidence_ids=closure_source_evidence_ids,
+            )
+            if closed is not None:
+                result = closed
+        return result
 
     def finalize_open_interval(
         self,
         *,
         cutoff_at: UtcTimestamp,
         cutoff_monotonic_ns: int,
-    ) -> AvailabilityInterval | None:
+    ) -> AvailabilityIntervalV2 | None:
         """Bound an unrecovered interval at the exact capture cutoff."""
 
-        return self._close_unavailable(
+        if self._open_unavailable is None:
+            return None
+        return self._close_all_active_contributors(
             ended_at=cutoff_at,
             ended_monotonic_ns=cutoff_monotonic_ns,
             recovery_outcome=AvailabilityRecoveryOutcome.NOT_RESTORED_AT_SHUTDOWN,
             research_eligibility_restored=False,
             open_at_shutdown=True,
+            closure_reason_code="TERMINAL_CAPTURE_CUTOFF",
+            closure_source_evidence_ids=("terminal-capture-cutoff",),
         )
 
     def finish_target_lifecycle(
@@ -1158,16 +2202,63 @@ class ObservationRuntimeHealth:
         *,
         ended_at: UtcTimestamp,
         ended_monotonic_ns: int,
-    ) -> AvailabilityInterval | None:
+    ) -> AvailabilityIntervalV2 | None:
         """Close an interval because the selected target itself ended."""
 
-        return self._close_unavailable(
-            ended_at=ended_at,
-            ended_monotonic_ns=ended_monotonic_ns,
-            recovery_outcome=AvailabilityRecoveryOutcome.TARGET_ENDED,
-            research_eligibility_restored=False,
-            open_at_shutdown=False,
+        result: AvailabilityIntervalV2 | None = None
+        target_keys = tuple(
+            contributor.stable_causal_key
+            for contributor in sorted(
+                self._active_availability_contributors.values(),
+                key=self._active_contributor_order_key,
+            )
+            if contributor.causal_family is AvailabilityCausalFamily.TARGET_LIFECYCLE
         )
+        for stable_causal_key in target_keys:
+            closed = self.close_contributor(
+                stable_causal_key=stable_causal_key,
+                ended_at=ended_at,
+                ended_monotonic_ns=ended_monotonic_ns,
+                recovery_outcome=AvailabilityRecoveryOutcome.TARGET_ENDED,
+                research_eligibility_restored=False,
+                closure_reason_code="TARGET_LIFECYCLE_ENDED",
+                closure_source_evidence_ids=("target-lifecycle-ended",),
+            )
+            if closed is not None:
+                result = closed
+        return result
+
+    @property
+    def active_availability_contributor_count(self) -> int:
+        return len(self._active_availability_contributors)
+
+    @property
+    def active_availability_contributors(
+        self,
+    ) -> tuple[ActiveAvailabilityContributorSnapshot, ...]:
+        return tuple(
+            contributor.snapshot()
+            for contributor in sorted(
+                self._active_availability_contributors.values(),
+                key=self._active_contributor_order_key,
+            )
+        )
+
+    @property
+    def active_availability_contributors_high_water(self) -> int:
+        return self._active_availability_contributors_high_water
+
+    @property
+    def completed_availability_contributor_count(self) -> int:
+        return self._completed_availability_contributors
+
+    @property
+    def availability_contribution_persistence_failures(self) -> int:
+        return self._availability_contribution_persistence_failures
+
+    @property
+    def availability_contribution_persistence_failure_chain_sha256(self) -> str:
+        return self._availability_contribution_persistence_failure_chain
 
     def record_reconnect(self) -> None:
         self._reconnects += 1
@@ -1226,6 +2317,18 @@ class ObservationRuntimeHealth:
             availability_open_at_shutdown_intervals=(self._availability_open_at_shutdown_intervals),
             availability_ledger_healthy=self._availability_ledger_healthy,
             availability_contributions_emitted=self._availability_contributions_emitted,
+            active_availability_contributors=len(self._active_availability_contributors),
+            active_availability_contributors_high_water=(
+                self._active_availability_contributors_high_water
+            ),
+            completed_availability_contributors=(self._completed_availability_contributors),
+            availability_contribution_persistence_failures=(
+                self._availability_contribution_persistence_failures
+            ),
+            availability_contribution_persistence_failure_chain_sha256=(
+                self._availability_contribution_persistence_failure_chain
+            ),
+            availability_contributor_authority_scoped=(self._collector_run_id is not None),
             audit_availability_authority=AuditAvailabilityAuthoritySnapshot(
                 opened=self._audit_availability_opened,
                 resolved=self._audit_availability_resolved,
@@ -2703,6 +3806,9 @@ def build_observation_health_checkpoint(
     availability_queue_saturated = (
         availability_writer.rejected > 0
         or availability_writer.queue_high_water >= config.health.availability_queue_capacity
+        or availability_writer.contribution_rejected > 0
+        or availability_writer.contribution_queue_high_water
+        >= config.health.availability_contribution_queue_capacity
     )
     availability_open = runtime.current_unavailable_started_monotonic_ns is not None
     completed_availability_intervals = runtime.unavailable_intervals - int(availability_open)
@@ -2714,6 +3820,18 @@ def build_observation_health_checkpoint(
     availability_reconciled = (
         completed_availability_intervals >= 0
         and runtime.availability_ledger_healthy
+        and (
+            not runtime.availability_contributor_authority_scoped
+            or (
+                (runtime.active_availability_contributors > 0) == availability_open
+                and runtime.active_availability_contributors
+                <= runtime.active_availability_contributors_high_water
+                <= MAXIMUM_OPEN_AVAILABILITY_CONTRIBUTIONS
+                and runtime.availability_contribution_persistence_failures == 0
+                and runtime.completed_availability_contributors
+                == runtime.availability_contributions_emitted
+            )
+        )
         and runtime.availability_records_emitted == completed_availability_intervals
         and availability_writer.accepted == runtime.availability_records_emitted
         and availability_writer.written <= availability_writer.accepted
@@ -3151,6 +4269,13 @@ def build_observation_health_checkpoint(
         recovery={
             "availability": {
                 "accepted_records": availability_writer.accepted,
+                "active_contributors": runtime.active_availability_contributors,
+                "active_contributors_high_water": (
+                    runtime.active_availability_contributors_high_water
+                ),
+                "active_contributor_authority_scoped": (
+                    runtime.availability_contributor_authority_scoped
+                ),
                 "aggregate_reconciled": availability_reconciled,
                 "audit_authority_reconciled": audit_availability_reconciled,
                 "audit_contribution_accepted_chain_sha256": (
@@ -3183,6 +4308,13 @@ def build_observation_health_checkpoint(
                     0 if availability_writer.rejected == 0 else availability_writer.rejected
                 ),
                 "contributions_written": availability_writer.contributions_written,
+                "completed_contributors": runtime.completed_availability_contributors,
+                "contribution_persistence_failure_chain_sha256": (
+                    runtime.availability_contribution_persistence_failure_chain_sha256
+                ),
+                "contribution_persistence_failures": (
+                    runtime.availability_contribution_persistence_failures
+                ),
                 "current_interval_open": availability_open,
                 "failure_type": availability_writer.failure_type,
                 "healthy": (availability_writer.healthy and runtime.availability_ledger_healthy),

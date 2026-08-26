@@ -66,6 +66,17 @@
 | 0055 | Audit/public-read fault evidence dimensions and lifecycles | Accepted |
 | 0056 | Availability contributor ownership and bounded replacement recovery | Accepted |
 
+## Narrow successor contracts
+
+ADR-0054 remains accepted. ADR-0056's second explicit narrow refinement adds
+bounded recovery identity, retry, deadline and exhaustion authority around the
+durable replacement-release control. Post-ADR-0056 producers therefore use the
+versioned successor channel `mma.control.rest-audit-replacement-release.v2` so
+the added authority is explicit; ADR-0054's paired decision boundary, complete
+capture preimage and fail-closed release conditions remain unchanged. Historical
+`.v1` controls retain their exact original meaning and replay contract and are
+never reinterpreted as `.v2`.
+
 ## Rule
 
 A future change creates a new ADR rather than rewriting the reasoning of an accepted historical ADR. Updating an ADR's status to `Superseded` is allowed.

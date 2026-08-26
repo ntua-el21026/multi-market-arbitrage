@@ -4,7 +4,7 @@ Multi-venue quantitative arbitrage, market-making, and delta-neutral trading res
 
 **Initial venues:** Polymarket, Kalshi, Kraken  
 **Architecture:** Python modular monolith  
-**Current project state:** Phase-1 Gate-1 ADR-0056 implementation remediation pending; first six-hour soak remains failed
+**Current project state:** Phase-1 Gate-1 ADR-0056 implementation and offline gates complete; independent public preflight review pending; first six-hour soak remains failed
 
 **Live trading:** Structurally unavailable in Phase 1
 
@@ -92,11 +92,13 @@ evidence.
 
 The preserved ADR-0055 candidate then exposed completed contributor history
 retained in active authority until a shared interval closed and replacement
-capture without bounded exhaustion. ADR-0056 reconciles documentation only: it
-requires unresolved-only active causal keys, independent completed-contributor
-publication, separate active/cumulative bounds, global interval-union and cross-
-stream reconciliation, plus bounded retry/deadline/exhaustion under one stable
-replacement-recovery identity. Implementation remediation remains pending.
+capture without bounded exhaustion. The ADR-0056 implementation now keeps only
+unresolved stable causal keys active, independently persists completed
+contributors, enforces separate active/cumulative bounds, derives global
+interval union, reconciles the v2 interval/contribution streams, and supervises
+bounded retry/deadline/exhaustion under one stable replacement-recovery
+identity. Deterministic offline replay, regression, capacity, static, build and
+dependency-security gates pass; this does not constitute public validation.
 
 Gate 1 remains `FAIL`. A new post-fix final-SHA 60-second smoke and 5,400–7,200
 second stability observation are still required before independent pre-soak

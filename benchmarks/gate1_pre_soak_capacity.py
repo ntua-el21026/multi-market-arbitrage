@@ -1,9 +1,10 @@
 """Deterministic offline Gate-1 pre-soak capacity and retention benchmark.
 
-The workload uses only production ``RawEventEnvelope`` and ``CanonicalProcessor``
-entry points.  It deliberately runs beyond the historical 4,096-event plateau,
-persists enough analytical records to force several Parquet flushes, and seals a
-small raw journal across multiple segments.  No network or venue credential is
+The workload uses production envelope/processor, availability lifecycle,
+completed-contributor persistence, reconciliation, and replacement-recovery
+entry points. It deliberately runs beyond the historical 4,096-event plateau,
+persists enough analytical records to force several Parquet flushes, and seals
+a small raw journal across multiple segments. No network or venue credential is
 used.
 
 Timing and allocator observations are host diagnostics.  The workload corpus,
@@ -19,6 +20,7 @@ import hashlib
 import json
 import math
 import resource
+import shutil
 import statistics
 import sys
 import time
@@ -44,6 +46,7 @@ from multi_market_arbitrage.core.ids import (  # noqa: E402
     CollectorRunId,
     ConnectionId,
     IngestId,
+    InstrumentId,
     SubscriptionId,
     VenueId,
     WriterId,
@@ -51,6 +54,7 @@ from multi_market_arbitrage.core.ids import (  # noqa: E402
 from multi_market_arbitrage.core.limits import (  # noqa: E402
     MAX_ANALYTICAL_FRAGMENTS_PER_DATASET,
 )
+from multi_market_arbitrage.core.provenance import RawSourceRef  # noqa: E402
 from multi_market_arbitrage.core.serialization import (  # noqa: E402
     canonical_json_bytes,
     canonical_sha256,
@@ -68,14 +72,21 @@ from multi_market_arbitrage.journal import (  # noqa: E402
     RunCompletionHead,
 )
 from multi_market_arbitrage.observability import (  # noqa: E402
+    AVAILABILITY_INTERVAL_V2_SCHEMA_VERSION,
+    AvailabilityCausalFamily,
     AvailabilityCause,
     AvailabilityEvidenceRuntimeSnapshot,
+    AvailabilityIntervalContributionV2,
+    AvailabilityIntervalV2,
+    AvailabilityRecoveryAction,
+    AvailabilityRecoveryOutcome,
     HealthCheckpoint,
     HealthEvidenceRuntimeSnapshot,
     HostRuntimeIdentity,
     InMemoryMetrics,
     SupervisedAvailabilityIntervalWriter,
     SupervisedHealthCheckpointWriter,
+    reconcile_availability_v2,
     reconcile_published_availability_evidence,
 )
 from multi_market_arbitrage.pipeline import (  # noqa: E402
@@ -96,6 +107,7 @@ from multi_market_arbitrage.pipeline import (  # noqa: E402
     ProcessedEnvelope,
 )
 from multi_market_arbitrage.pipeline.health import (  # noqa: E402
+    MAXIMUM_OPEN_AVAILABILITY_CONTRIBUTIONS,
     AvailabilityInterruption,
     ObservationRuntimeHealth,
     ObservationRuntimeHealthSnapshot,
@@ -114,6 +126,12 @@ from multi_market_arbitrage.pipeline.processor import (  # noqa: E402
     ProcessorRetentionSnapshot,
     ProcessorSummary,
 )
+from multi_market_arbitrage.pipeline.replacement_recovery import (  # noqa: E402
+    ReplacementRecoveryAuthority,
+    ReplacementRecoveryBounds,
+    ReplacementRecoveryFailure,
+    ReplacementRecoveryStatus,
+)
 from multi_market_arbitrage.reference import POLYMARKET_VENUE_ID  # noqa: E402
 from multi_market_arbitrage.research import (  # noqa: E402
     AnalyticalRuntimeSnapshot,
@@ -128,9 +146,12 @@ from multi_market_arbitrage.venues.polymarket import (  # noqa: E402
     PublicReadMetricsSnapshot,
 )
 
-RESULT_SCHEMA = "mma-gate1-final-pre-soak-capacity-v2"
-WORKLOAD_SCHEMA = "mma-gate1-final-pre-soak-capacity-workload-v2"
+RESULT_SCHEMA = "mma-gate1-final-pre-soak-capacity-v3"
+WORKLOAD_SCHEMA = "mma-gate1-final-pre-soak-capacity-workload-v3"
 DEFAULT_SATURATION_THRESHOLD = 4_096
+GATE1_MINIMUM_SCAN_EVENTS = 4_096
+GATE1_MINIMUM_AUDIT_OUTCOMES = 4_096
+GATE1_MINIMUM_AVAILABILITY_WRITER_CONTRIBUTIONS = 4_096
 # One whole analytical batch beyond 4,096 compares equivalent buffer phases at
 # the saturation and final checkpoints instead of measuring a mid-batch sawtooth.
 DEFAULT_SCAN_EVENTS = 4_608
@@ -145,7 +166,20 @@ HEALTH_CLASSIFICATION_PERIOD = 64
 MISMATCH_RESOLUTION_CAPACITY_CYCLES = 80
 FAULT_LIFECYCLE_CAPACITY_CYCLES = 40
 REPORTED_TOP_CAPACITY_CYCLES = 320
-AVAILABILITY_WRITER_INTERVALS = 32
+GATE1_MINIMUM_SEQUENTIAL_CONTRIBUTOR_LIFECYCLES = 10_000
+GATE1_MINIMUM_OVERLAPPING_CONTRIBUTOR_GROUPS = 1_000
+DEFAULT_SEQUENTIAL_CONTRIBUTOR_LIFECYCLES = GATE1_MINIMUM_SEQUENTIAL_CONTRIBUTOR_LIFECYCLES + 1
+DEFAULT_OVERLAPPING_CONTRIBUTOR_GROUPS = GATE1_MINIMUM_OVERLAPPING_CONTRIBUTOR_GROUPS + 1
+DEFAULT_AVAILABILITY_WRITER_CONTRIBUTIONS = 4_096
+DEFAULT_RECONCILIATION_LATENCY_SAMPLES = 3
+OVERLAPPING_CONTRIBUTORS_PER_GROUP = 4
+SIX_HOUR_SECONDS = 6 * 60 * 60
+# The interrupted retained prefix produced 64 contributor observations over
+# 496.757070666 seconds. A 2x cadence multiplier plus maximum measured line
+# sizes is the committed-bound projection, rather than optimistic averages.
+PROJECTION_OBSERVED_CONTRIBUTORS = 64
+PROJECTION_OBSERVED_WINDOW_SECONDS = 496.757070666
+PROJECTION_CADENCE_HEADROOM_FACTOR = 2
 PYMALLOC_ARENA_BYTES = 1_048_576
 ANALYTICAL_BUFFER_DOMAINS = 3
 ANALYTICAL_FRAGMENT_HISTORY_DOMAINS = 3
@@ -459,6 +493,19 @@ def latency_distribution(samples: Sequence[int]) -> dict[str, int]:
     }
 
 
+def _byte_distribution(samples: Sequence[int]) -> dict[str, int]:
+    if not samples:
+        raise ValueError("byte sample set cannot be empty")
+    return {
+        "count": len(samples),
+        "p50_bytes": nearest_rank(samples, 50),
+        "p95_bytes": nearest_rank(samples, 95),
+        "p99_bytes": nearest_rank(samples, 99),
+        "max_bytes": max(samples),
+        "mean_bytes": round(statistics.fmean(samples)),
+    }
+
+
 @dataclass(slots=True)
 class _BoundedLatencySamples:
     """Fixed-capacity diagnostic samples plus constant-memory all-run totals."""
@@ -663,6 +710,264 @@ def _allocator_measurement() -> dict[str, int | None]:
         "pyarrow_peak_bytes": memory_pool.max_memory(),
         "rss_current_bytes": _current_rss_bytes(),
         "rss_process_lifetime_peak_bytes": _peak_rss_bytes(),
+    }
+
+
+def _availability_interruption(label: str) -> AvailabilityInterruption:
+    """Return one fixed-width, explicitly owned non-audit causal lifecycle."""
+
+    lifecycle_id = canonical_sha256(
+        {
+            "label": label,
+            "schema": "mma-capacity-availability-lifecycle-v1",
+        }
+    )
+    return AvailabilityInterruption(
+        cause=AvailabilityCause.SCHEMA_PROTOCOL_ERROR,
+        causal_family=AvailabilityCausalFamily.PUBLIC_READ_FAULT,
+        causal_lifecycle_id=lifecycle_id,
+        reason_code="CAPACITY_EXPLICIT_PUBLIC_READ_FAULT",
+        source_evidence_ids=(f"capacity-source:{lifecycle_id}",),
+    )
+
+
+def _availability_runtime_with_generation(label: str) -> ObservationRuntimeHealth:
+    runtime = ObservationRuntimeHealth()
+    connection_id = ConnectionId(f"capacity-lifecycle-{label}")
+    runtime.begin_generation(
+        connection_id,
+        BoundedRawIngress(
+            max_items=8,
+            max_bytes=1_024,
+            connection_id=connection_id,
+        ),
+    )
+    runtime.mark_connected(
+        now_ns=1,
+        now_utc=UtcTimestamp(_BASE_WALL_NS + 1),
+    )
+    return runtime
+
+
+def _active_contributor_bytes(runtime: ObservationRuntimeHealth) -> int:
+    """Measure only the bounded unresolved-authority projection."""
+
+    return _deep_size_bytes(runtime.active_availability_contributors)
+
+
+def _open_lifecycle(
+    runtime: ObservationRuntimeHealth,
+    *,
+    label: str,
+    monotonic_ns: int,
+) -> str:
+    before = {item.stable_causal_key for item in runtime.active_availability_contributors}
+    runtime.mark_interrupted(
+        now_ns=monotonic_ns,
+        now_utc=UtcTimestamp(_BASE_WALL_NS + monotonic_ns),
+        interruption=_availability_interruption(label),
+    )
+    added = {item.stable_causal_key for item in runtime.active_availability_contributors} - before
+    if len(added) != 1:
+        raise RuntimeError("availability workload did not open exactly one causal key")
+    return next(iter(added))
+
+
+def _close_lifecycle(
+    runtime: ObservationRuntimeHealth,
+    *,
+    stable_causal_key: str,
+    monotonic_ns: int,
+) -> None:
+    runtime.close_contributor(
+        stable_causal_key=stable_causal_key,
+        ended_at=UtcTimestamp(_BASE_WALL_NS + monotonic_ns),
+        ended_monotonic_ns=monotonic_ns,
+        recovery_outcome=AvailabilityRecoveryOutcome.RESTORED,
+        research_eligibility_restored=True,
+        closure_reason_code="CAPACITY_CAUSE_RESOLVED",
+        closure_source_evidence_ids=("capacity-authoritative-close",),
+    )
+
+
+def _sequential_contributor_capacity_workload(
+    lifecycle_count: int,
+    *,
+    latency_sample_capacity: int,
+) -> dict[str, object]:
+    """Rotate completed causes under one continuously open union interval."""
+
+    if lifecycle_count <= 0:
+        raise ValueError("sequential lifecycle count must be positive")
+    runtime = _availability_runtime_with_generation("sequential")
+    _open_lifecycle(runtime, label="sequential-guard", monotonic_ns=10)
+    retained_before = _active_contributor_bytes(runtime)
+    retained_min = retained_before
+    retained_max = retained_before
+    active_maximum = runtime.active_availability_contributor_count
+    lifecycle_latency = _BoundedLatencySamples.with_capacity(latency_sample_capacity)
+    operational_latency = _BoundedLatencySamples.with_capacity(latency_sample_capacity)
+    operational_initial_samples: list[int] = []
+    operational_terminal_samples: deque[int] = deque(maxlen=latency_sample_capacity)
+    process_started_ns = time.process_time_ns()
+    wall_started_ns = time.perf_counter_ns()
+    cursor_ns = 20
+    for index in range(lifecycle_count):
+        started_ns = time.perf_counter_ns()
+        key = _open_lifecycle(
+            runtime,
+            label=f"sequential-{index:08d}",
+            monotonic_ns=cursor_ns,
+        )
+        active_maximum = max(active_maximum, runtime.active_availability_contributor_count)
+        _close_lifecycle(
+            runtime,
+            stable_causal_key=key,
+            monotonic_ns=cursor_ns + 1,
+        )
+        lifecycle_latency.observe(time.perf_counter_ns() - started_ns)
+        retained = _active_contributor_bytes(runtime)
+        retained_min = min(retained_min, retained)
+        retained_max = max(retained_max, retained)
+        snapshot_started_ns = time.perf_counter_ns()
+        runtime.snapshot(now_ns=cursor_ns + 1)
+        operational_elapsed_ns = time.perf_counter_ns() - snapshot_started_ns
+        operational_latency.observe(operational_elapsed_ns)
+        if len(operational_initial_samples) < latency_sample_capacity:
+            operational_initial_samples.append(operational_elapsed_ns)
+        operational_terminal_samples.append(operational_elapsed_ns)
+        cursor_ns += 2
+    wall_elapsed_ns = time.perf_counter_ns() - wall_started_ns
+    cpu_elapsed_ns = time.process_time_ns() - process_started_ns
+    if runtime.active_availability_contributor_count != 1:
+        raise RuntimeError("rotating lifecycle workload did not retain exactly one guard")
+    terminal_started_ns = time.perf_counter_ns()
+    runtime.finalize_open_interval(
+        cutoff_at=UtcTimestamp(_BASE_WALL_NS + cursor_ns),
+        cutoff_monotonic_ns=cursor_ns,
+    )
+    terminal_latency_ns = time.perf_counter_ns() - terminal_started_ns
+    active_after_terminal = runtime.active_availability_contributor_count
+    terminal_snapshot = runtime.snapshot(now_ns=cursor_ns)
+    operational_initial = latency_distribution(operational_initial_samples)
+    operational_terminal = latency_distribution(operational_terminal_samples)
+    return {
+        "sequential_lifecycles": lifecycle_count,
+        "continuously_open_interval": True,
+        "rotating_contributors": True,
+        "terminal_open_guard_contributors": 1,
+        "union_interval_count": terminal_snapshot.unavailable_intervals,
+        "union_duration_nanoseconds": terminal_snapshot.unavailable_total_nanoseconds,
+        "cumulative_completed": runtime.completed_availability_contributor_count,
+        "active_count_maximum": active_maximum,
+        "active_count_after_terminal": active_after_terminal,
+        "active_retained_bytes_before": retained_before,
+        "active_retained_bytes_minimum": retained_min,
+        "active_retained_bytes_maximum": retained_max,
+        "active_retained_bytes_after_each_completion_constant": (
+            retained_before == retained_min == retained_max
+        ),
+        "lifecycle_latency": lifecycle_latency.distribution(),
+        "operational_snapshot_latency": operational_latency.distribution(),
+        "operational_snapshot_initial_latency": operational_initial,
+        "operational_snapshot_terminal_latency": operational_terminal,
+        "operational_snapshot_p95_growth_factor": (
+            operational_terminal["p95_ns"] / operational_initial["p95_ns"]
+        ),
+        "terminal_interval_latency": latency_distribution((terminal_latency_ns,)),
+        "cpu_time_ns": cpu_elapsed_ns,
+        "wall_time_ns": wall_elapsed_ns,
+    }
+
+
+def _overlapping_contributor_capacity_workload(
+    group_count: int,
+    *,
+    latency_sample_capacity: int,
+) -> dict[str, object]:
+    """Open four independent causes, then close them in staggered order."""
+
+    if group_count <= 0:
+        raise ValueError("overlapping contributor group count must be positive")
+    runtime = _availability_runtime_with_generation("overlapping")
+    active_bytes: deque[int] = deque(maxlen=latency_sample_capacity)
+    terminal_latency = _BoundedLatencySamples.with_capacity(latency_sample_capacity)
+    process_started_ns = time.process_time_ns()
+    wall_started_ns = time.perf_counter_ns()
+    cursor_ns = 10
+    for group in range(group_count):
+        keys = tuple(
+            _open_lifecycle(
+                runtime,
+                label=f"overlap-{group:06d}-{member}",
+                monotonic_ns=cursor_ns + member,
+            )
+            for member in range(OVERLAPPING_CONTRIBUTORS_PER_GROUP)
+        )
+        active_bytes.append(_active_contributor_bytes(runtime))
+        close_started_ns = time.perf_counter_ns()
+        for offset, member in enumerate((1, 3, 0, 2), start=1):
+            _close_lifecycle(
+                runtime,
+                stable_causal_key=keys[member],
+                monotonic_ns=cursor_ns + OVERLAPPING_CONTRIBUTORS_PER_GROUP + offset,
+            )
+        terminal_latency.observe(time.perf_counter_ns() - close_started_ns)
+        cursor_ns += 16
+    wall_elapsed_ns = time.perf_counter_ns() - wall_started_ns
+    cpu_elapsed_ns = time.process_time_ns() - process_started_ns
+    return {
+        "groups": group_count,
+        "contributors_per_group": OVERLAPPING_CONTRIBUTORS_PER_GROUP,
+        "cumulative_completed": runtime.completed_availability_contributor_count,
+        "active_count_maximum": runtime.active_availability_contributors_high_water,
+        "active_count_final": runtime.active_availability_contributor_count,
+        "active_retained_bytes": _byte_distribution(active_bytes),
+        "group_terminal_latency": terminal_latency.distribution(),
+        "cpu_time_ns": cpu_elapsed_ns,
+        "wall_time_ns": wall_elapsed_ns,
+    }
+
+
+def _availability_active_bound_workload() -> dict[str, object]:
+    """Prove 64 legitimate concurrent causes and reject the 65th pre-insertion."""
+
+    runtime = _availability_runtime_with_generation("active-bound")
+    for index in range(MAXIMUM_OPEN_AVAILABILITY_CONTRIBUTIONS):
+        _open_lifecycle(
+            runtime,
+            label=f"active-bound-{index:03d}",
+            monotonic_ns=10 + index,
+        )
+    active_before_rejection = runtime.active_availability_contributor_count
+    active_bytes = _active_contributor_bytes(runtime)
+    rejected = False
+    rejection_type: str | None = None
+    try:
+        _open_lifecycle(
+            runtime,
+            label="active-bound-rejected-65",
+            monotonic_ns=10 + MAXIMUM_OPEN_AVAILABILITY_CONTRIBUTIONS,
+        )
+    except RuntimeError as error:
+        rejected = True
+        rejection_type = type(error).__name__
+    active_after_rejection = runtime.active_availability_contributor_count
+    runtime.finalize_open_interval(
+        cutoff_at=UtcTimestamp(_BASE_WALL_NS + 100),
+        cutoff_monotonic_ns=100,
+    )
+    return {
+        "configured_hard_active_bound": MAXIMUM_OPEN_AVAILABILITY_CONTRIBUTIONS,
+        "legitimate_active_count": active_before_rejection,
+        "attempted_active_count": active_before_rejection + 1,
+        "attempted_65th_rejected": rejected,
+        "rejection_type": rejection_type,
+        "active_count_after_rejection": active_after_rejection,
+        "rejected_before_insertion": (
+            rejected and active_after_rejection == active_before_rejection
+        ),
+        "active_retained_bytes_at_bound": active_bytes,
     }
 
 
@@ -1636,15 +1941,153 @@ def _availability_runtime_record(
     }
 
 
-async def _availability_writer_capacity(root: Path) -> dict[str, object]:
-    """Exercise the real interval/contribution queue and both bounded files."""
+class _CapacityAvailabilityCapture:
+    """Minimal synchronous sink for canonical runtime-generated size fixtures."""
 
+    def __init__(self) -> None:
+        self.contributions: list[AvailabilityIntervalContributionV2] = []
+        self.intervals: list[AvailabilityIntervalV2] = []
+
+    def enqueue_contribution_nowait(
+        self,
+        contribution: AvailabilityIntervalContributionV2,
+    ) -> bool:
+        self.contributions.append(contribution)
+        return True
+
+    def enqueue_interval_nowait(self, interval: AvailabilityIntervalV2) -> bool:
+        self.intervals.append(interval)
+        return True
+
+
+def _jsonl_record_size_measurement(path: Path) -> dict[str, int]:
+    sizes = tuple(len(line) for line in path.read_bytes().splitlines(keepends=True))
+    if not sizes:
+        raise RuntimeError("capacity JSONL stream is unexpectedly empty")
+    return {
+        "records": len(sizes),
+        "minimum_bytes": min(sizes),
+        "mean_bytes": round(statistics.fmean(sizes)),
+        "maximum_bytes": max(sizes),
+        "total_bytes": sum(sizes),
+    }
+
+
+def _six_hour_availability_projection(
+    *,
+    config: Phase1Config,
+    interval_size: Mapping[str, int],
+    contribution_size: Mapping[str, int],
+    free_disk_bytes_at_start: int,
+    free_disk_bytes_after_evidence: int,
+) -> dict[str, object]:
+    if free_disk_bytes_at_start <= 0 or free_disk_bytes_after_evidence <= 0:
+        raise ValueError("availability projection requires positive native disk observations")
+    projected_records = math.ceil(
+        PROJECTION_OBSERVED_CONTRIBUTORS
+        / PROJECTION_OBSERVED_WINDOW_SECONDS
+        * SIX_HOUR_SECONDS
+        * PROJECTION_CADENCE_HEADROOM_FACTOR
+    )
+    projected_interval_bytes = projected_records * interval_size["maximum_bytes"]
+    projected_contribution_bytes = projected_records * contribution_size["maximum_bytes"]
+    projected_total_bytes = projected_interval_bytes + projected_contribution_bytes
+    projected_free_disk_bytes = free_disk_bytes_at_start - projected_total_bytes
+    disk_reserve_headroom_bytes = projected_free_disk_bytes - config.health.minimum_free_disk_bytes
+    return {
+        "duration_seconds": SIX_HOUR_SECONDS,
+        "basis": {
+            "retained_prefix_contributors": PROJECTION_OBSERVED_CONTRIBUTORS,
+            "retained_prefix_window_seconds": PROJECTION_OBSERVED_WINDOW_SECONDS,
+            "cadence_headroom_factor": PROJECTION_CADENCE_HEADROOM_FACTOR,
+            "record_size_policy": "maximum measured canonical JSONL line",
+            "interval_policy": "one interval per projected contribution",
+            "interval_record_maximum_bytes": interval_size["maximum_bytes"],
+            "contribution_record_maximum_bytes": contribution_size["maximum_bytes"],
+        },
+        "projected_interval_records": projected_records,
+        "projected_contribution_records": projected_records,
+        "projected_interval_bytes": projected_interval_bytes,
+        "projected_contribution_bytes": projected_contribution_bytes,
+        "projected_total_bytes": projected_total_bytes,
+        "committed_bounds": {
+            "maximum_interval_records": config.health.maximum_availability_intervals,
+            "maximum_contribution_records": config.health.maximum_availability_contributions,
+            "maximum_interval_file_bytes": config.health.maximum_availability_file_bytes,
+            "maximum_contribution_file_bytes": (
+                config.health.maximum_availability_contribution_file_bytes
+            ),
+            "minimum_free_disk_bytes": config.health.minimum_free_disk_bytes,
+            "free_disk_bytes_at_start": free_disk_bytes_at_start,
+            "free_disk_bytes_after_evidence": free_disk_bytes_after_evidence,
+        },
+        "headroom": {
+            "interval_records": (config.health.maximum_availability_intervals - projected_records),
+            "contribution_records": (
+                config.health.maximum_availability_contributions - projected_records
+            ),
+            "interval_file_bytes": (
+                config.health.maximum_availability_file_bytes - projected_interval_bytes
+            ),
+            "contribution_file_bytes": (
+                config.health.maximum_availability_contribution_file_bytes
+                - projected_contribution_bytes
+            ),
+            "projected_free_disk_bytes": projected_free_disk_bytes,
+            "disk_reserve_headroom_bytes": disk_reserve_headroom_bytes,
+        },
+        "fits_committed_bounds": (
+            projected_records <= config.health.maximum_availability_intervals
+            and projected_records <= config.health.maximum_availability_contributions
+            and projected_interval_bytes <= config.health.maximum_availability_file_bytes
+            and projected_contribution_bytes
+            <= config.health.maximum_availability_contribution_file_bytes
+            and projected_free_disk_bytes >= config.health.minimum_free_disk_bytes
+        ),
+    }
+
+
+async def _wait_for_availability_queue_headroom(
+    writer: SupervisedAvailabilityIntervalWriter,
+    *,
+    interval_capacity: int,
+    contribution_capacity: int,
+) -> None:
+    while True:
+        snapshot = writer.runtime_snapshot
+        if (
+            snapshot.queue_depth < interval_capacity
+            and snapshot.contribution_queue_depth < contribution_capacity
+        ):
+            return
+        await asyncio.sleep(0.001)
+
+
+async def _availability_writer_capacity(
+    root: Path,
+    *,
+    config: Phase1Config,
+    record_count: int,
+    reconciliation_latency_samples: int,
+) -> dict[str, object]:
+    """Write thousands of real v2 records, publish, and strictly reconcile."""
+
+    if not 0 < record_count <= config.health.maximum_availability_intervals:
+        raise ValueError("availability writer record count is outside the committed bound")
+    free_disk_bytes_at_start = shutil.disk_usage(root.parent).free
     writer = SupervisedAvailabilityIntervalWriter(
         root=root,
         collector_run_id=_RUN_ID,
-        queue_capacity=AVAILABILITY_WRITER_INTERVALS,
-        maximum_intervals=AVAILABILITY_WRITER_INTERVALS,
-        maximum_file_bytes=4 * 1_024 * 1_024,
+        queue_capacity=config.health.availability_queue_capacity,
+        maximum_intervals=config.health.maximum_availability_intervals,
+        maximum_file_bytes=config.health.maximum_availability_file_bytes,
+        contribution_queue_capacity=(config.health.availability_contribution_queue_capacity),
+        maximum_contributions=config.health.maximum_availability_contributions,
+        maximum_contribution_file_bytes=(
+            config.health.maximum_availability_contribution_file_bytes
+        ),
+        maximum_record_bytes=config.health.maximum_availability_record_bytes,
+        evidence_schema_version=AVAILABILITY_INTERVAL_V2_SCHEMA_VERSION,
     )
     await writer.start()
     runtime = ObservationRuntimeHealth(
@@ -1652,7 +2095,16 @@ async def _availability_writer_capacity(root: Path) -> dict[str, object]:
         availability_writer=writer,
     )
     points = {"zero": _availability_runtime_record(writer.runtime_snapshot)}
-    for index in range(AVAILABILITY_WRITER_INTERVALS):
+    active_retained_bytes: deque[int] = deque(maxlen=MAXIMUM_LATENCY_SAMPLES)
+    operational_latency = _BoundedLatencySamples.with_capacity(MAXIMUM_LATENCY_SAMPLES)
+    process_started_ns = time.process_time_ns()
+    wall_started_ns = time.perf_counter_ns()
+    for index in range(record_count):
+        await _wait_for_availability_queue_headroom(
+            writer,
+            interval_capacity=config.health.availability_queue_capacity,
+            contribution_capacity=config.health.availability_contribution_queue_capacity,
+        )
         start_ns = 10_000 + index * 10
         failed_connection = ConnectionId(f"capacity-availability-failed-{index:04d}")
         runtime.begin_generation(
@@ -1677,6 +2129,7 @@ async def _availability_writer_capacity(root: Path) -> dict[str, object]:
                 source_evidence_ids=(f"capacity-disconnect:{index:04d}",),
             ),
         )
+        active_retained_bytes.append(_active_contributor_bytes(runtime))
         recovered_connection = ConnectionId(f"capacity-availability-recovered-{index:04d}")
         runtime.begin_generation(
             recovered_connection,
@@ -1695,39 +2148,551 @@ async def _availability_writer_capacity(root: Path) -> dict[str, object]:
             now_ns=start_ns + 7,
             now_utc=UtcTimestamp(_BASE_WALL_NS + start_ns + 7),
         )
+        snapshot_started_ns = time.perf_counter_ns()
+        runtime.snapshot(now_ns=start_ns + 7)
+        operational_latency.observe(time.perf_counter_ns() - snapshot_started_ns)
         if index + 1 in {
-            AVAILABILITY_WRITER_INTERVALS // 2,
-            AVAILABILITY_WRITER_INTERVALS,
+            record_count // 2,
+            record_count,
         }:
-            points["half" if index + 1 == AVAILABILITY_WRITER_INTERVALS // 2 else "full"] = (
+            points["half" if index + 1 == record_count // 2 else "full"] = (
                 _availability_runtime_record(writer.runtime_snapshot)
             )
     runtime_snapshot = runtime.snapshot(now_ns=20_000)
-    summary = await writer.close(completed=True)
+    terminal_active_causal_keys = tuple(
+        sorted(
+            contributor.stable_causal_key
+            for contributor in runtime.active_availability_contributors
+        )
+    )
+    close_started_ns = time.perf_counter_ns()
+    summary = await writer.close(
+        completed=True,
+        terminal_active_causal_keys=terminal_active_causal_keys,
+    )
+    terminal_publish_latency_ns = time.perf_counter_ns() - close_started_ns
+    wall_elapsed_ns = time.perf_counter_ns() - wall_started_ns
+    cpu_elapsed_ns = time.process_time_ns() - process_started_ns
     reconciliation = reconcile_published_availability_evidence(
         summary,
         expected_audit_contributions=(runtime_snapshot.audit_availability_contributions_emitted),
     )
+    reconciliation_latency = _measure_calls(
+        lambda: reconcile_published_availability_evidence(
+            summary,
+            expected_audit_contributions=(
+                runtime_snapshot.audit_availability_contributions_emitted
+            ),
+        ),
+        reconciliation_latency_samples,
+    )
     if (
         not summary.gate1_evidence_eligible
-        or summary.written != AVAILABILITY_WRITER_INTERVALS
-        or summary.contributions_written != AVAILABILITY_WRITER_INTERVALS
+        or summary.written != record_count
+        or summary.contributions_written != record_count
         or not reconciliation.reconciled
     ):
         raise RuntimeError("availability capacity evidence did not publish and reconcile")
+    contribution_path = summary.contribution_path
+    if contribution_path is None:
+        raise RuntimeError("availability capacity summary lacks its contribution path")
+    interval_size = _jsonl_record_size_measurement(summary.path)
+    contribution_size = _jsonl_record_size_measurement(contribution_path)
+    representative_audit_record = _maximum_replacement_availability_record_size(config)
+    projected_contribution_size = dict(contribution_size)
+    projected_contribution_size["maximum_bytes"] = max(
+        contribution_size["maximum_bytes"],
+        cast(int, representative_audit_record["record_bytes"]),
+    )
+    projection = _six_hour_availability_projection(
+        config=config,
+        interval_size=interval_size,
+        contribution_size=projected_contribution_size,
+        free_disk_bytes_at_start=free_disk_bytes_at_start,
+        free_disk_bytes_after_evidence=shutil.disk_usage(root).free,
+    )
     return {
+        "artifact_root_native": str(root),
         "intervals": summary.written,
         "contributions": summary.contributions_written,
         "queue_high_water": summary.queue_high_water,
+        "contribution_queue_high_water": summary.contribution_queue_high_water,
         "interval_file_bytes": summary.file_bytes,
         "contribution_file_bytes": summary.contribution_file_bytes,
+        "interval_record_bytes": interval_size,
+        "contribution_record_bytes": contribution_size,
+        "representative_maximum_attempt_audit_record": representative_audit_record,
         "content_sha256": summary.content_sha256,
         "contribution_content_sha256": summary.contribution_content_sha256,
+        "completion_identity": summary.completion_identity,
+        "reconciliation_sha256": summary.reconciliation_sha256,
         "points": points,
         "runtime_records_emitted": runtime_snapshot.availability_records_emitted,
         "runtime_contributions_emitted": (runtime_snapshot.availability_contributions_emitted),
+        "runtime_completed_contributors": runtime.completed_availability_contributor_count,
+        "runtime_active_contributors": runtime.active_availability_contributor_count,
+        "active_retained_bytes": {
+            "samples": len(active_retained_bytes),
+            "minimum_bytes": min(active_retained_bytes),
+            "maximum_bytes": max(active_retained_bytes),
+            "mean_bytes": round(statistics.fmean(active_retained_bytes)),
+        },
+        "operational_snapshot_latency": operational_latency.distribution(),
+        "terminal_publish_latency": latency_distribution((terminal_publish_latency_ns,)),
+        "reconciliation_latency": reconciliation_latency,
+        "cpu_time_ns": cpu_elapsed_ns,
+        "wall_time_ns": wall_elapsed_ns,
+        "six_hour_projection": projection,
         "published_reconciled": reconciliation.reconciled,
         "reconciliation_discrepancies": reconciliation.discrepancies,
+    }
+
+
+async def _availability_writer_saturation_case(
+    root: Path,
+    *,
+    queue_capacity: int,
+    maximum_intervals: int,
+    maximum_file_bytes: int,
+    contribution_queue_capacity: int,
+    maximum_contributions: int,
+    maximum_contribution_file_bytes: int,
+) -> dict[str, object]:
+    """Exercise one fail-closed v2 persistence boundary with two completions."""
+
+    writer = SupervisedAvailabilityIntervalWriter(
+        root=root,
+        collector_run_id=_RUN_ID,
+        queue_capacity=queue_capacity,
+        maximum_intervals=maximum_intervals,
+        maximum_file_bytes=maximum_file_bytes,
+        contribution_queue_capacity=contribution_queue_capacity,
+        maximum_contributions=maximum_contributions,
+        maximum_contribution_file_bytes=maximum_contribution_file_bytes,
+        maximum_record_bytes=64 * 1_024,
+        evidence_schema_version=AVAILABILITY_INTERVAL_V2_SCHEMA_VERSION,
+    )
+    await writer.start()
+    runtime = ObservationRuntimeHealth(
+        collector_run_id=_RUN_ID,
+        availability_writer=writer,
+    )
+    for index in range(2):
+        start_ns = 100 + index * 10
+        failed = ConnectionId(f"capacity-saturation-failed-{index}")
+        runtime.begin_generation(
+            failed,
+            BoundedRawIngress(max_items=2, max_bytes=512, connection_id=failed),
+        )
+        runtime.mark_connected(
+            now_ns=start_ns,
+            now_utc=UtcTimestamp(_BASE_WALL_NS + start_ns),
+        )
+        runtime.finish_generation(
+            continuity_interrupted=True,
+            now_ns=start_ns + 1,
+            now_utc=UtcTimestamp(_BASE_WALL_NS + start_ns + 1),
+            interruption=AvailabilityInterruption(
+                cause=AvailabilityCause.EXTERNAL_CONNECTION_TRANSPORT,
+                reason_code="CAPACITY_SATURATION_DISCONNECT",
+                source_evidence_ids=(f"capacity-saturation:{index}",),
+            ),
+        )
+        recovered = ConnectionId(f"capacity-saturation-recovered-{index}")
+        runtime.begin_generation(
+            recovered,
+            BoundedRawIngress(max_items=2, max_bytes=512, connection_id=recovered),
+        )
+        runtime.mark_connected(
+            now_ns=start_ns + 2,
+            now_utc=UtcTimestamp(_BASE_WALL_NS + start_ns + 2),
+        )
+        runtime.finish_generation(
+            continuity_interrupted=False,
+            now_ns=start_ns + 3,
+            now_utc=UtcTimestamp(_BASE_WALL_NS + start_ns + 3),
+        )
+    boundary = writer.runtime_snapshot
+    terminal_active_causal_keys = tuple(
+        sorted(
+            contributor.stable_causal_key
+            for contributor in runtime.active_availability_contributors
+        )
+    )
+    summary = await writer.close(
+        completed=False,
+        terminal_active_causal_keys=terminal_active_causal_keys,
+    )
+    contribution_path = summary.contribution_path
+    if contribution_path is None:
+        raise RuntimeError("availability saturation summary lacks its contribution path")
+    return {
+        "queue_capacity": queue_capacity,
+        "contribution_queue_capacity": contribution_queue_capacity,
+        "maximum_intervals": maximum_intervals,
+        "maximum_contributions": maximum_contributions,
+        "maximum_file_bytes": maximum_file_bytes,
+        "maximum_contribution_file_bytes": maximum_contribution_file_bytes,
+        "accepted_intervals_at_boundary": boundary.accepted,
+        "accepted_contributions_at_boundary": boundary.contributions_accepted,
+        "rejected_at_boundary": boundary.rejected,
+        "queue_high_water": boundary.queue_high_water,
+        "contribution_queue_high_water": boundary.contribution_queue_high_water,
+        "runtime_persistence_failures": (runtime.availability_contribution_persistence_failures),
+        "active_contributors_after_rejection": (runtime.active_availability_contributor_count),
+        "completed_contributors_after_rejection": (
+            runtime.completed_availability_contributor_count
+        ),
+        "completed": summary.completed,
+        "gate1_evidence_eligible": summary.gate1_evidence_eligible,
+        "failure_type": summary.failure_type,
+        "partial_interval_path": summary.path.name.endswith(".partial"),
+        "partial_contribution_path": contribution_path.name.endswith(".partial"),
+        "fail_closed": (
+            boundary.rejected > 0
+            and not summary.completed
+            and not summary.gate1_evidence_eligible
+            and runtime.active_availability_contributor_count == 0
+        ),
+    }
+
+
+async def _availability_writer_saturation(root: Path) -> dict[str, object]:
+    """Exercise queue, count, and file-byte boundaries in the capacity artifact."""
+
+    large_bytes = 4 * 1_024 * 1_024
+    cases = {
+        "queue": await _availability_writer_saturation_case(
+            root / "queue",
+            queue_capacity=1,
+            maximum_intervals=2,
+            maximum_file_bytes=large_bytes,
+            contribution_queue_capacity=1,
+            maximum_contributions=2,
+            maximum_contribution_file_bytes=large_bytes,
+        ),
+        "contribution_count": await _availability_writer_saturation_case(
+            root / "contribution-count",
+            queue_capacity=4,
+            maximum_intervals=2,
+            maximum_file_bytes=large_bytes,
+            contribution_queue_capacity=4,
+            maximum_contributions=1,
+            maximum_contribution_file_bytes=large_bytes,
+        ),
+        "interval_count": await _availability_writer_saturation_case(
+            root / "interval-count",
+            queue_capacity=4,
+            maximum_intervals=1,
+            maximum_file_bytes=large_bytes,
+            contribution_queue_capacity=4,
+            maximum_contributions=2,
+            maximum_contribution_file_bytes=large_bytes,
+        ),
+        "contribution_file_bytes": await _availability_writer_saturation_case(
+            root / "contribution-file-bytes",
+            queue_capacity=4,
+            maximum_intervals=2,
+            maximum_file_bytes=large_bytes,
+            contribution_queue_capacity=4,
+            maximum_contributions=2,
+            maximum_contribution_file_bytes=1,
+        ),
+        "interval_file_bytes": await _availability_writer_saturation_case(
+            root / "interval-file-bytes",
+            queue_capacity=4,
+            maximum_intervals=2,
+            maximum_file_bytes=1,
+            contribution_queue_capacity=4,
+            maximum_contributions=2,
+            maximum_contribution_file_bytes=large_bytes,
+        ),
+    }
+    all_fail_closed = all(case["fail_closed"] is True for case in cases.values())
+    return {
+        "cases": cases,
+        "queue_boundary_exercised": cast(int, cases["queue"]["rejected_at_boundary"]) > 0,
+        "contribution_count_boundary_exercised": (
+            cases["contribution_count"]["accepted_contributions_at_boundary"] == 1
+            and cast(int, cases["contribution_count"]["rejected_at_boundary"]) > 0
+        ),
+        "interval_count_boundary_exercised": (
+            cases["interval_count"]["accepted_intervals_at_boundary"] == 1
+            and cast(int, cases["interval_count"]["rejected_at_boundary"]) > 0
+        ),
+        "contribution_file_boundary_exercised": (
+            cases["contribution_file_bytes"]["accepted_contributions_at_boundary"] == 0
+            and cast(int, cases["contribution_file_bytes"]["rejected_at_boundary"]) > 0
+        ),
+        "interval_file_boundary_exercised": (
+            cases["interval_file_bytes"]["accepted_intervals_at_boundary"] == 0
+            and cast(int, cases["interval_file_bytes"]["rejected_at_boundary"]) > 0
+        ),
+        "fail_closed": all_fail_closed,
+    }
+
+
+def _replacement_source(label: str) -> RawSourceRef:
+    return RawSourceRef(
+        ingest_id=IngestId(f"capacity-replacement-{label}"),
+        payload_sha256=canonical_sha256(
+            {"label": label, "schema": "mma-capacity-replacement-source-v1"}
+        ),
+    )
+
+
+def _replacement_recovery_authority(
+    config: Phase1Config,
+    *,
+    hard_deadline_ns: int,
+    run_deadline_ns: int,
+) -> ReplacementRecoveryAuthority:
+    resolution_ns = 100
+    return ReplacementRecoveryAuthority.start(
+        divergence_id=canonical_sha256({"schema": "mma-capacity-replacement-divergence-v1"}),
+        resolution_source=_replacement_source("resolution"),
+        resolution_ingest_seq=10,
+        resolution_monotonic=MonotonicTimestamp(_RUN_ID.value, resolution_ns),
+        original_connection_id=ConnectionId("capacity-replacement-original"),
+        excluded_connection_ids=(ConnectionId("capacity-replacement-excluded"),),
+        required_instrument_ids=(
+            InstrumentId("capacity-replacement-no"),
+            InstrumentId("capacity-replacement-yes"),
+        ),
+        bounds=ReplacementRecoveryBounds(
+            maximum_attempts=config.polymarket.audit_replacement_maximum_attempts,
+            retry_delay_ns=round(
+                config.polymarket.audit_replacement_retry_delay_seconds * 1_000_000_000
+            ),
+            maximum_snapshot_age_ns=round(
+                config.polymarket.snapshot_audit_freshness_guard_seconds * 1_000_000_000
+            ),
+        ),
+        hard_deadline=MonotonicTimestamp(_RUN_ID.value, hard_deadline_ns),
+        run_deadline=MonotonicTimestamp(_RUN_ID.value, run_deadline_ns),
+    )
+
+
+def _replacement_recovery_capacity_workload(config: Phase1Config) -> dict[str, object]:
+    """Exercise fixed-delay retries and each independent terminal exhaustion."""
+
+    hard_duration_ns = round(
+        config.polymarket.audit_replacement_hard_deadline_seconds * 1_000_000_000
+    )
+    resolution_ns = 100
+    transition_latency = _BoundedLatencySamples.with_capacity(
+        3 * config.polymarket.audit_replacement_maximum_attempts
+    )
+    process_started_ns = time.process_time_ns()
+
+    maximum = _replacement_recovery_authority(
+        config,
+        hard_deadline_ns=resolution_ns + hard_duration_ns,
+        run_deadline_ns=resolution_ns + 2 * hard_duration_ns,
+    )
+    attempt_started_ns = resolution_ns + 1
+    for attempt in range(config.polymarket.audit_replacement_maximum_attempts):
+        started_ns = time.perf_counter_ns()
+        maximum = maximum.start_attempt(
+            connection_id=ConnectionId(f"capacity-replacement-attempt-{attempt + 1:02d}"),
+            started_monotonic=MonotonicTimestamp(_RUN_ID.value, attempt_started_ns),
+        )
+        transition_latency.observe(time.perf_counter_ns() - started_ns)
+        decision_ns = attempt_started_ns + 1
+        started_ns = time.perf_counter_ns()
+        maximum = maximum.abandon_attempt(
+            failure=ReplacementRecoveryFailure.TRANSPORT_INTERRUPTED,
+            abandoned_monotonic=MonotonicTimestamp(_RUN_ID.value, decision_ns),
+            source=_replacement_source(f"abandon-{attempt + 1:02d}"),
+        )
+        transition_latency.observe(time.perf_counter_ns() - started_ns)
+        started_ns = time.perf_counter_ns()
+        maximum = maximum.schedule_retry(
+            decided_monotonic=MonotonicTimestamp(_RUN_ID.value, decision_ns)
+        )
+        transition_latency.observe(time.perf_counter_ns() - started_ns)
+        if maximum.status is ReplacementRecoveryStatus.MAXIMUM_ATTEMPTS_EXHAUSTED:
+            break
+        next_retry = maximum.next_retry_monotonic
+        if next_retry is None:
+            raise RuntimeError("replacement retry workload lost its retry boundary")
+        attempt_started_ns = next_retry.nanoseconds
+
+    hard = _replacement_recovery_authority(
+        config,
+        hard_deadline_ns=resolution_ns + hard_duration_ns,
+        run_deadline_ns=resolution_ns + 2 * hard_duration_ns,
+    )
+    hard = hard.exhaust_hard_deadline(at=hard.hard_deadline)
+
+    run = _replacement_recovery_authority(
+        config,
+        hard_deadline_ns=resolution_ns + hard_duration_ns,
+        run_deadline_ns=resolution_ns + hard_duration_ns // 2,
+    )
+    run = run.exhaust_run_deadline(at=run.run_deadline)
+    cpu_elapsed_ns = time.process_time_ns() - process_started_ns
+
+    if maximum.status is not ReplacementRecoveryStatus.MAXIMUM_ATTEMPTS_EXHAUSTED:
+        raise RuntimeError("replacement recovery did not exhaust its configured attempt bound")
+    if hard.status is not ReplacementRecoveryStatus.HARD_DEADLINE_EXHAUSTED:
+        raise RuntimeError("replacement recovery did not exhaust its hard deadline")
+    if run.status is not ReplacementRecoveryStatus.RUN_DEADLINE_EXHAUSTED:
+        raise RuntimeError("replacement recovery did not exhaust its run deadline")
+    return {
+        "maximum_attempts": config.polymarket.audit_replacement_maximum_attempts,
+        "retry_delay_ns": maximum.bounds.retry_delay_ns,
+        "hard_deadline_duration_ns": hard_duration_ns,
+        "maximum_attempt_exhaustion": {
+            "status": maximum.status.value,
+            "attempt_count": maximum.attempt_count,
+            "stable_recovery_id": maximum.recovery_id,
+            "stable_contributor_key": maximum.stable_contributor_key,
+            "attempt_chain_sha256": maximum.attempt_chain_sha256,
+            "evidence_chain_sha256": maximum.evidence_chain_sha256,
+        },
+        "hard_deadline_exhaustion": {
+            "status": hard.status.value,
+            "attempt_count": hard.attempt_count,
+            "evidence_chain_sha256": hard.evidence_chain_sha256,
+        },
+        "run_deadline_exhaustion": {
+            "status": run.status.value,
+            "attempt_count": run.attempt_count,
+            "evidence_chain_sha256": run.evidence_chain_sha256,
+        },
+        "transition_latency": transition_latency.distribution(),
+        "cpu_time_ns": cpu_elapsed_ns,
+        "all_exhaustions_explicit": True,
+    }
+
+
+def _maximum_replacement_availability_record_size(
+    config: Phase1Config,
+) -> dict[str, object]:
+    """Measure a canonical maximum-attempt audit contribution from production owners."""
+
+    capture = _CapacityAvailabilityCapture()
+    runtime = ObservationRuntimeHealth(
+        collector_run_id=_RUN_ID,
+        availability_writer=cast(SupervisedAvailabilityIntervalWriter, capture),
+    )
+    original_connection = ConnectionId("capacity-size-audit-original")
+    runtime.begin_generation(
+        original_connection,
+        BoundedRawIngress(
+            max_items=2,
+            max_bytes=512,
+            connection_id=original_connection,
+        ),
+    )
+    runtime.mark_connected(now_ns=800, now_utc=UtcTimestamp(_BASE_WALL_NS + 800))
+    divergence_id = canonical_sha256({"schema": "mma-capacity-size-audit-divergence-v1"})
+    instrument_id = InstrumentId("capacity-size-audit-instrument")
+    runtime.mark_interrupted(
+        now_ns=900,
+        now_utc=UtcTimestamp(_BASE_WALL_NS + 900),
+        interruption=AvailabilityInterruption(
+            cause=AvailabilityCause.AUDIT_MISMATCH_RECOVERY,
+            reason_code="CAPACITY_AUDIT_REPLACEMENT_EXHAUSTED",
+            source_evidence_ids=("capacity-size-audit:start",),
+            affected_instruments=(instrument_id,),
+            recovery_action=AvailabilityRecoveryAction.RESNAPSHOT,
+            request_id="capacity-size-audit-request",
+            divergence_id=divergence_id,
+            instrument_id=instrument_id,
+            market_id="capacity-size-audit-market",
+            audit_start_source=_replacement_source("size-audit-start"),
+            audit_response_source=_replacement_source("size-audit-response"),
+            audit_classification_source=_replacement_source("size-audit-classification"),
+        ),
+    )
+    resolution_source = _replacement_source("size-audit-resolution")
+    resolution_ns = 1_000
+    runtime.bind_contribution_authoritative_resolution(
+        divergence_id=divergence_id,
+        source=resolution_source,
+    )
+    hard_duration_ns = round(
+        config.polymarket.audit_replacement_hard_deadline_seconds * 1_000_000_000
+    )
+    authority = ReplacementRecoveryAuthority.start(
+        divergence_id=divergence_id,
+        resolution_source=resolution_source,
+        resolution_ingest_seq=10,
+        resolution_monotonic=MonotonicTimestamp(_RUN_ID.value, resolution_ns),
+        original_connection_id=original_connection,
+        excluded_connection_ids=(),
+        required_instrument_ids=(instrument_id,),
+        bounds=ReplacementRecoveryBounds(
+            maximum_attempts=config.polymarket.audit_replacement_maximum_attempts,
+            retry_delay_ns=round(
+                config.polymarket.audit_replacement_retry_delay_seconds * 1_000_000_000
+            ),
+            maximum_snapshot_age_ns=round(config.scanner.maximum_book_age_seconds * 1_000_000_000),
+        ),
+        hard_deadline=MonotonicTimestamp(
+            _RUN_ID.value,
+            resolution_ns + hard_duration_ns,
+        ),
+        run_deadline=MonotonicTimestamp(
+            _RUN_ID.value,
+            resolution_ns + 2 * hard_duration_ns,
+        ),
+    )
+    next_attempt_ns = resolution_ns + 1
+    for attempt in range(authority.bounds.maximum_attempts):
+        authority = authority.start_attempt(
+            connection_id=ConnectionId(f"capacity-size-audit-attempt-{attempt + 1:02d}"),
+            started_monotonic=MonotonicTimestamp(_RUN_ID.value, next_attempt_ns),
+        )
+        decision_ns = next_attempt_ns + 1
+        authority = authority.abandon_attempt(
+            failure=ReplacementRecoveryFailure.TRANSPORT_INTERRUPTED,
+            abandoned_monotonic=MonotonicTimestamp(_RUN_ID.value, decision_ns),
+            source=_replacement_source(f"size-audit-abandon-{attempt + 1:02d}"),
+        ).schedule_retry(decided_monotonic=MonotonicTimestamp(_RUN_ID.value, decision_ns))
+        if authority.status is ReplacementRecoveryStatus.MAXIMUM_ATTEMPTS_EXHAUSTED:
+            break
+        next_retry = authority.next_retry_monotonic
+        if next_retry is None:
+            raise RuntimeError("capacity size authority lost its retry boundary")
+        next_attempt_ns = next_retry.nanoseconds
+    runtime.bind_contribution_replacement_recovery(
+        divergence_id=divergence_id,
+        authority=authority,
+    )
+    terminal_keys = tuple(
+        sorted(
+            contributor.stable_causal_key
+            for contributor in runtime.active_availability_contributors
+        )
+    )
+    cutoff_ns = max(next_attempt_ns + 2, resolution_ns + 1)
+    runtime.finalize_open_interval(
+        cutoff_at=UtcTimestamp(_BASE_WALL_NS + cutoff_ns),
+        cutoff_monotonic_ns=cutoff_ns,
+    )
+    reconciliation = reconcile_availability_v2(
+        tuple(capture.intervals),
+        tuple(capture.contributions),
+        active_causal_keys=terminal_keys,
+    )
+    if (
+        authority.status is not ReplacementRecoveryStatus.MAXIMUM_ATTEMPTS_EXHAUSTED
+        or len(capture.contributions) != 1
+        or len(capture.intervals) != 1
+        or not reconciliation.reconciled
+    ):
+        raise RuntimeError("capacity audit-size fixture did not reconcile")
+    contribution = capture.contributions[0]
+    return {
+        "status": authority.status.value,
+        "attempt_count": authority.attempt_count,
+        "maximum_attempts": authority.bounds.maximum_attempts,
+        "record_bytes": len(canonical_json_bytes(contribution.to_record())) + 1,
+        "record_sha256": canonical_sha256(contribution.to_record()),
+        "reconciliation_sha256": reconciliation.reconciliation_sha256,
     }
 
 
@@ -1762,16 +2727,48 @@ async def run_capacity_benchmark(
     latency_samples: int = DEFAULT_LATENCY_SAMPLES,
     slope_latency_samples: int = DEFAULT_SLOPE_LATENCY_SAMPLES,
     analytical_batch_size: int = DEFAULT_ANALYTICAL_BATCH_SIZE,
+    sequential_contributor_lifecycles: int = DEFAULT_SEQUENTIAL_CONTRIBUTOR_LIFECYCLES,
+    overlapping_contributor_groups: int = DEFAULT_OVERLAPPING_CONTRIBUTOR_GROUPS,
+    availability_writer_contributions: int = DEFAULT_AVAILABILITY_WRITER_CONTRIBUTIONS,
+    reconciliation_latency_samples: int = DEFAULT_RECONCILIATION_LATENCY_SAMPLES,
+    enforce_gate1_workload_minimums: bool = True,
 ) -> dict[str, object]:
     """Run the offline workload and return one JSON-serializable evidence object."""
 
+    artifact_root = await asyncio.to_thread(artifact_root.resolve)
     if saturation_threshold <= 0:
         raise ValueError("saturation threshold must be positive")
     if scan_events <= saturation_threshold or audit_outcomes <= saturation_threshold:
         raise ValueError("scan and audit workloads must exceed the saturation threshold")
     if analytical_batch_size <= 0:
         raise ValueError("analytical batch size must be positive")
+    if sequential_contributor_lifecycles <= 0:
+        raise ValueError("sequential contributor lifecycle count must be positive")
+    if overlapping_contributor_groups <= 0:
+        raise ValueError("overlapping contributor group count must be positive")
+    if enforce_gate1_workload_minimums and scan_events <= GATE1_MINIMUM_SCAN_EVENTS:
+        raise ValueError("scan event count must exceed the Gate-1 minimum")
+    if enforce_gate1_workload_minimums and audit_outcomes <= GATE1_MINIMUM_AUDIT_OUTCOMES:
+        raise ValueError("audit outcome count must exceed the Gate-1 minimum")
+    if enforce_gate1_workload_minimums and sequential_contributor_lifecycles <= (
+        GATE1_MINIMUM_SEQUENTIAL_CONTRIBUTOR_LIFECYCLES
+    ):
+        raise ValueError("sequential contributor lifecycle count must exceed the Gate-1 minimum")
+    if enforce_gate1_workload_minimums and overlapping_contributor_groups <= (
+        GATE1_MINIMUM_OVERLAPPING_CONTRIBUTOR_GROUPS
+    ):
+        raise ValueError("overlapping contributor group count must exceed the Gate-1 minimum")
+    if availability_writer_contributions <= 0:
+        raise ValueError("availability writer contribution count must be positive")
+    if enforce_gate1_workload_minimums and availability_writer_contributions < (
+        GATE1_MINIMUM_AVAILABILITY_WRITER_CONTRIBUTIONS
+    ):
+        raise ValueError("availability writer contribution count is below the Gate-1 minimum")
+    if not 0 < reconciliation_latency_samples <= MAXIMUM_LATENCY_SAMPLES:
+        raise ValueError("reconciliation latency samples are outside the supported bound")
     _prepare_artifact_root(artifact_root)
+    benchmark_process_started_ns = time.process_time_ns()
+    benchmark_wall_started_ns = time.perf_counter_ns()
 
     tracing_was_active = tracemalloc.is_tracing()
     if not tracing_was_active:
@@ -2128,7 +3125,29 @@ async def run_capacity_benchmark(
             in covered_saturated_domains
         ),
     }
-    availability_capacity = await _availability_writer_capacity(artifact_root / "availability")
+    lifecycle_sample_capacity = min(
+        MAXIMUM_LATENCY_SAMPLES,
+        max(1, latency_samples),
+    )
+    sequential_contributor_capacity = _sequential_contributor_capacity_workload(
+        sequential_contributor_lifecycles,
+        latency_sample_capacity=lifecycle_sample_capacity,
+    )
+    overlapping_contributor_capacity = _overlapping_contributor_capacity_workload(
+        overlapping_contributor_groups,
+        latency_sample_capacity=lifecycle_sample_capacity,
+    )
+    availability_active_bound = _availability_active_bound_workload()
+    replacement_recovery_capacity = _replacement_recovery_capacity_workload(config)
+    availability_capacity = await _availability_writer_capacity(
+        artifact_root / "availability",
+        config=config,
+        record_count=availability_writer_contributions,
+        reconciliation_latency_samples=reconciliation_latency_samples,
+    )
+    availability_saturation = await _availability_writer_saturation(
+        artifact_root / "availability-saturation"
+    )
     journal = await _journal_rotation(artifact_root / "journal")
     if cast(int, journal["rotation_count"]) < 1:
         raise RuntimeError("journal capacity workload did not force a segment rotation")
@@ -2219,6 +3238,8 @@ async def run_capacity_benchmark(
         "mma_processor_operational_snapshot_latency_ns",
     )
     expected_health_checkpoints = math.ceil(audit_outcomes / HEALTH_CLASSIFICATION_PERIOD)
+    benchmark_process_elapsed_ns = time.process_time_ns() - benchmark_process_started_ns
+    benchmark_wall_elapsed_ns = time.perf_counter_ns() - benchmark_wall_started_ns
 
     result: dict[str, object] = {
         "schema": RESULT_SCHEMA,
@@ -2230,6 +3251,24 @@ async def run_capacity_benchmark(
             "audit_outcomes": audit_outcomes,
             "saturation_threshold": saturation_threshold,
             "analytical_batch_size": analytical_batch_size,
+            "sequential_contributor_lifecycles": sequential_contributor_lifecycles,
+            "overlapping_contributor_groups": overlapping_contributor_groups,
+            "gate1_workload_minimums_enforced": enforce_gate1_workload_minimums,
+            "gate1_workload_minima": {
+                "scan_events_exclusive": GATE1_MINIMUM_SCAN_EVENTS,
+                "audit_outcomes_exclusive": GATE1_MINIMUM_AUDIT_OUTCOMES,
+                "sequential_contributor_lifecycles_exclusive": (
+                    GATE1_MINIMUM_SEQUENTIAL_CONTRIBUTOR_LIFECYCLES
+                ),
+                "overlapping_contributor_groups_exclusive": (
+                    GATE1_MINIMUM_OVERLAPPING_CONTRIBUTOR_GROUPS
+                ),
+                "availability_writer_contributions_inclusive": (
+                    GATE1_MINIMUM_AVAILABILITY_WRITER_CONTRIBUTIONS
+                ),
+            },
+            "overlapping_contributors_per_group": OVERLAPPING_CONTRIBUTORS_PER_GROUP,
+            "availability_writer_contributions": availability_writer_contributions,
             "production_health_classification_period": (HEALTH_CLASSIFICATION_PERIOD),
             "journal_events": JOURNAL_EVENT_COUNT,
             "journal_events_per_segment": JOURNAL_EVENTS_PER_SEGMENT,
@@ -2297,7 +3336,12 @@ async def run_capacity_benchmark(
             "mismatch_resolution": mismatch_resolution_capacity,
             "fault_lifecycle": fault_lifecycle_capacity,
             "reported_top_transition": reported_top_capacity,
+            "sequential_contributor_lifecycles": sequential_contributor_capacity,
+            "overlapping_contributor_groups": overlapping_contributor_capacity,
+            "availability_active_bound": availability_active_bound,
             "availability_writer": availability_capacity,
+            "availability_writer_saturation": availability_saturation,
+            "replacement_recovery": replacement_recovery_capacity,
         },
         "production_health": {
             "checkpoint_period_audit_outcomes": HEALTH_CLASSIFICATION_PERIOD,
@@ -2415,6 +3459,11 @@ async def run_capacity_benchmark(
                 "sampling granularity"
             ),
         },
+        "cpu": {
+            "process_time_ns": benchmark_process_elapsed_ns,
+            "wall_time_ns": benchmark_wall_elapsed_ns,
+            "process_to_wall_ratio": (benchmark_process_elapsed_ns / benchmark_wall_elapsed_ns),
+        },
         "artifact_inventory": _artifact_inventory(artifact_root),
         "acceptance_policy": {
             "scheduling_budget_ns": scheduling_budget_ns,
@@ -2498,8 +3547,102 @@ async def run_capacity_benchmark(
             is True,
             "availability_writer_published_and_reconciled": (
                 availability_capacity["published_reconciled"] is True
-                and availability_capacity["intervals"] == AVAILABILITY_WRITER_INTERVALS
-                and availability_capacity["contributions"] == AVAILABILITY_WRITER_INTERVALS
+                and availability_capacity["intervals"] == availability_writer_contributions
+                and availability_capacity["contributions"] == availability_writer_contributions
+            ),
+            "sequential_lifecycle_count_exact": (
+                sequential_contributor_capacity["sequential_lifecycles"]
+                == sequential_contributor_lifecycles
+                and sequential_contributor_capacity["cumulative_completed"]
+                == sequential_contributor_lifecycles + 1
+            ),
+            "sequential_active_authority_bounded": (
+                cast(int, sequential_contributor_capacity["active_count_maximum"]) <= 4
+                and sequential_contributor_capacity[
+                    "active_retained_bytes_after_each_completion_constant"
+                ]
+                is True
+            ),
+            "sequential_operational_snapshot_effectively_constant": (
+                cast(
+                    float,
+                    sequential_contributor_capacity["operational_snapshot_p95_growth_factor"],
+                )
+                <= 4.0
+            ),
+            "continuously_open_rotating_interval_terminalized": (
+                sequential_contributor_capacity["continuously_open_interval"] is True
+                and sequential_contributor_capacity["rotating_contributors"] is True
+                and sequential_contributor_capacity["union_interval_count"] == 1
+                and cast(int, sequential_contributor_capacity["union_duration_nanoseconds"]) > 0
+                and sequential_contributor_capacity["active_count_after_terminal"] == 0
+            ),
+            "overlapping_group_count_exact_and_bounded": (
+                overlapping_contributor_capacity["groups"] == overlapping_contributor_groups
+                and overlapping_contributor_capacity["cumulative_completed"]
+                == overlapping_contributor_groups * OVERLAPPING_CONTRIBUTORS_PER_GROUP
+                and overlapping_contributor_capacity["active_count_maximum"]
+                == OVERLAPPING_CONTRIBUTORS_PER_GROUP
+                and overlapping_contributor_capacity["active_count_final"] == 0
+            ),
+            "legitimate_active_64_accepted": (
+                availability_active_bound["legitimate_active_count"]
+                == MAXIMUM_OPEN_AVAILABILITY_CONTRIBUTIONS
+            ),
+            "legitimate_active_65_rejected_before_insertion": (
+                availability_active_bound["attempted_65th_rejected"] is True
+                and availability_active_bound["rejected_before_insertion"] is True
+            ),
+            "completed_contributor_writer_bounded": (
+                availability_capacity["runtime_completed_contributors"]
+                == availability_writer_contributions
+                and availability_capacity["runtime_active_contributors"] == 0
+                and cast(int, availability_capacity["queue_high_water"])
+                <= config.health.availability_queue_capacity
+                and cast(int, availability_capacity["contribution_queue_high_water"])
+                <= config.health.availability_contribution_queue_capacity
+            ),
+            "completed_contributor_writer_saturation_fail_closed": (
+                availability_saturation["fail_closed"] is True
+                and availability_saturation["queue_boundary_exercised"] is True
+                and availability_saturation["contribution_count_boundary_exercised"] is True
+                and availability_saturation["interval_count_boundary_exercised"] is True
+                and availability_saturation["contribution_file_boundary_exercised"] is True
+                and availability_saturation["interval_file_boundary_exercised"] is True
+            ),
+            "replacement_recovery_exhaustions_explicit": (
+                replacement_recovery_capacity["all_exhaustions_explicit"] is True
+                and cast(
+                    dict[str, object],
+                    replacement_recovery_capacity["maximum_attempt_exhaustion"],
+                )["attempt_count"]
+                == config.polymarket.audit_replacement_maximum_attempts
+            ),
+            "six_hour_availability_projection_fits_committed_bounds": (
+                cast(
+                    dict[str, object],
+                    availability_capacity["six_hour_projection"],
+                )["fits_committed_bounds"]
+                is True
+            ),
+            "six_hour_projection_includes_maximum_attempt_audit_record": (
+                cast(
+                    int,
+                    cast(
+                        dict[str, object],
+                        cast(
+                            dict[str, object],
+                            availability_capacity["six_hour_projection"],
+                        )["basis"],
+                    )["contribution_record_maximum_bytes"],
+                )
+                >= cast(
+                    int,
+                    cast(
+                        dict[str, object],
+                        availability_capacity["representative_maximum_attempt_audit_record"],
+                    )["record_bytes"],
+                )
             ),
             "production_health_checkpoint_count_exact": (
                 health_evidence.accepted == health_evidence.written == expected_health_checkpoints
@@ -2563,6 +3706,26 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_ANALYTICAL_BATCH_SIZE,
     )
+    parser.add_argument(
+        "--sequential-contributor-lifecycles",
+        type=int,
+        default=DEFAULT_SEQUENTIAL_CONTRIBUTOR_LIFECYCLES,
+    )
+    parser.add_argument(
+        "--overlapping-contributor-groups",
+        type=int,
+        default=DEFAULT_OVERLAPPING_CONTRIBUTOR_GROUPS,
+    )
+    parser.add_argument(
+        "--availability-writer-contributions",
+        type=int,
+        default=DEFAULT_AVAILABILITY_WRITER_CONTRIBUTIONS,
+    )
+    parser.add_argument(
+        "--reconciliation-latency-samples",
+        type=int,
+        default=DEFAULT_RECONCILIATION_LATENCY_SAMPLES,
+    )
     return parser.parse_args()
 
 
@@ -2582,6 +3745,10 @@ def main() -> None:
             latency_samples=args.latency_samples,
             slope_latency_samples=args.slope_latency_samples,
             analytical_batch_size=args.analytical_batch_size,
+            sequential_contributor_lifecycles=(args.sequential_contributor_lifecycles),
+            overlapping_contributor_groups=args.overlapping_contributor_groups,
+            availability_writer_contributions=(args.availability_writer_contributions),
+            reconciliation_latency_samples=args.reconciliation_latency_samples,
         )
     )
     content = json.dumps(result, indent=2, sort_keys=True) + "\n"

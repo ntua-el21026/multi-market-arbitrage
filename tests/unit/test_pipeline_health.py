@@ -102,6 +102,11 @@ from multi_market_arbitrage.pipeline.processor import (
     ProcessorRetentionDomain,
     ProcessorRetentionSnapshot,
 )
+from multi_market_arbitrage.pipeline.replacement_recovery import (
+    ReplacementRecoveryAuthority,
+    ReplacementRecoveryBounds,
+    ReplacementSnapshotCandidate,
+)
 from multi_market_arbitrage.pipeline.targeting import (
     ObservationTargetMode,
     ResolvedPolymarketTarget,
@@ -669,6 +674,7 @@ def _checkpoint(
     resource_trend: ProcessResourceTrendSnapshot | None = None,
     history_saturation_recorder: Callable[[int], None] | None = None,
     analytical: AnalyticalRuntimeSnapshot | None = None,
+    availability_writer: AvailabilityEvidenceRuntimeSnapshot | None = None,
     terminal: bool = False,
 ) -> HealthCheckpoint:
     test_audit_contributions = empty_audit_availability_contribution_snapshot()
@@ -771,27 +777,33 @@ def _checkpoint(
             file_bytes=0,
             failure_type=None,
         ),
-        availability_writer=AvailabilityEvidenceRuntimeSnapshot(
-            healthy=True,
-            queue_depth=0,
-            queue_high_water=0,
-            accepted=completed_availability_intervals,
-            written=completed_availability_intervals,
-            rejected=0,
-            file_bytes=0,
-            unavailable_duration_nanoseconds=(runtime_snapshot.unavailable_total_nanoseconds),
-            longest_interval_nanoseconds=(runtime_snapshot.longest_unavailable_nanoseconds),
-            open_at_shutdown_intervals=(runtime_snapshot.availability_open_at_shutdown_intervals),
-            failure_type=None,
-            contributions_accepted=test_audit_contributions.count,
-            contributions_written=test_audit_contributions.count,
-            audit_contributions_accepted=test_audit_contributions.count,
-            audit_contributions_written=test_audit_contributions.count,
-            audit_contribution_accepted_chain_sha256=(test_audit_contributions.chain_sha256),
-            audit_contribution_written_chain_sha256=(test_audit_contributions.chain_sha256),
-            audit_contribution_expected_written_chain_sha256=(
-                test_audit_contributions.chain_sha256
-            ),
+        availability_writer=(
+            AvailabilityEvidenceRuntimeSnapshot(
+                healthy=True,
+                queue_depth=0,
+                queue_high_water=0,
+                accepted=completed_availability_intervals,
+                written=completed_availability_intervals,
+                rejected=0,
+                file_bytes=0,
+                unavailable_duration_nanoseconds=(runtime_snapshot.unavailable_total_nanoseconds),
+                longest_interval_nanoseconds=(runtime_snapshot.longest_unavailable_nanoseconds),
+                open_at_shutdown_intervals=(
+                    runtime_snapshot.availability_open_at_shutdown_intervals
+                ),
+                failure_type=None,
+                contributions_accepted=test_audit_contributions.count,
+                contributions_written=test_audit_contributions.count,
+                audit_contributions_accepted=test_audit_contributions.count,
+                audit_contributions_written=test_audit_contributions.count,
+                audit_contribution_accepted_chain_sha256=(test_audit_contributions.chain_sha256),
+                audit_contribution_written_chain_sha256=(test_audit_contributions.chain_sha256),
+                audit_contribution_expected_written_chain_sha256=(
+                    test_audit_contributions.chain_sha256
+                ),
+            )
+            if availability_writer is None
+            else availability_writer
         ),
         public_reads=(
             PublicReadMetricsSnapshot(
@@ -1754,6 +1766,44 @@ def test_checkpoint_builder_emits_all_scoped_groups_and_fail_closed_decision() -
     assert HealthDecisionReason.BOOK_NOT_HEALTHY in checkpoint.reason_codes
 
 
+def test_checkpoint_propagates_contribution_queue_saturation() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    updated_at = UtcTimestamp(1_800_000_000_000_000_000)
+    processor, target = _healthy_target_processor(config, updated_at=updated_at)
+    writer = AvailabilityEvidenceRuntimeSnapshot(
+        healthy=True,
+        queue_depth=0,
+        queue_high_water=0,
+        accepted=0,
+        written=0,
+        rejected=0,
+        file_bytes=0,
+        unavailable_duration_nanoseconds=0,
+        longest_interval_nanoseconds=0,
+        open_at_shutdown_intervals=0,
+        failure_type=None,
+        contribution_queue_high_water=(config.health.availability_contribution_queue_capacity),
+    )
+
+    checkpoint = _checkpoint(
+        config=config,
+        target=target,
+        processor=processor,
+        book_last_valid_receive_monotonic_ns=_target_receive_times(target, 10_000),
+        emitted_at=updated_at,
+        monotonic_now_ns=10_000,
+        availability_writer=writer,
+    )
+
+    assert checkpoint.capture_healthy is True
+    assert checkpoint.research_eligible is True
+    assert checkpoint.gate1_eligible_so_far is False
+    assert checkpoint.reason_codes == (HealthDecisionReason.AVAILABILITY_QUEUE_SATURATED,)
+    assert checkpoint.gate1_sticky_reason_codes == (
+        HealthDecisionReason.AVAILABILITY_QUEUE_SATURATED,
+    )
+
+
 def test_checkpoint_book_freshness_accepts_exact_bound_and_scopes_selected_target() -> None:
     config = load_phase1_config(Path("config/phase1.toml"))
     updated_at = UtcTimestamp(1_800_000_000_000_000_000)
@@ -2711,32 +2761,106 @@ async def test_runtime_health_emits_typed_recovered_availability_interval(
     )
     recovered_connection = ConnectionId("typed-availability-recovered")
     runtime.begin_generation(recovered_connection, _ingress(recovered_connection))
+    first_resolution_source = source("resolution-1")
+    second_resolution_source = source("resolution-2")
+    first_release_source = source("release-1")
+    second_release_source = source("release-2")
     runtime.bind_contribution_authoritative_resolution(
         divergence_id=first_divergence,
-        source=source("resolution-1"),
+        source=first_resolution_source,
     )
     runtime.bind_contribution_authoritative_resolution(
         divergence_id=second_divergence,
-        source=source("resolution-2"),
+        source=second_resolution_source,
+    )
+
+    def released_authority(
+        *,
+        divergence_id: str,
+        affected_instrument: InstrumentId,
+        resolution_source: RawSourceRef,
+        release_source: RawSourceRef,
+        attempt_started_ns: int,
+        capture_ns: int,
+        release_ns: int,
+        capture_label: str,
+    ) -> ReplacementRecoveryAuthority:
+        authority = ReplacementRecoveryAuthority.start(
+            divergence_id=divergence_id,
+            resolution_source=resolution_source,
+            resolution_ingest_seq=10,
+            resolution_monotonic=MonotonicTimestamp(run_id.value, 41),
+            original_connection_id=failed_connection,
+            excluded_connection_ids=(),
+            required_instrument_ids=(affected_instrument,),
+            bounds=ReplacementRecoveryBounds(
+                maximum_attempts=2,
+                retry_delay_ns=5,
+                maximum_snapshot_age_ns=10,
+            ),
+            hard_deadline=MonotonicTimestamp(run_id.value, 100),
+            run_deadline=MonotonicTimestamp(run_id.value, 200),
+        ).start_attempt(
+            connection_id=recovered_connection,
+            started_monotonic=MonotonicTimestamp(run_id.value, attempt_started_ns),
+        )
+        authority = authority.observe_snapshot(
+            candidate=ReplacementSnapshotCandidate(
+                connection_id=recovered_connection,
+                instrument_ids=(affected_instrument,),
+                admission_ordinal=1,
+                ingest_seq=11,
+                received_monotonic=MonotonicTimestamp(run_id.value, capture_ns),
+                raw_source=source(capture_label),
+            ),
+            observed_monotonic=MonotonicTimestamp(run_id.value, capture_ns),
+        ).succeed_attempt(decided_monotonic=MonotonicTimestamp(run_id.value, capture_ns + 1))
+        return authority.release(
+            release_source=release_source,
+            release_ingest_seq=12,
+            release_monotonic=MonotonicTimestamp(run_id.value, release_ns),
+        )
+
+    first_recovery = released_authority(
+        divergence_id=first_divergence,
+        affected_instrument=second_instrument,
+        resolution_source=first_resolution_source,
+        release_source=first_release_source,
+        attempt_started_ns=42,
+        capture_ns=43,
+        release_ns=45,
+        capture_label="capture-1",
+    )
+    second_recovery = released_authority(
+        divergence_id=second_divergence,
+        affected_instrument=instrument,
+        resolution_source=second_resolution_source,
+        release_source=second_release_source,
+        attempt_started_ns=46,
+        capture_ns=47,
+        release_ns=50,
+        capture_label="capture-2",
     )
     runtime.bind_contribution_replacement_release(
         divergence_id=first_divergence,
-        source=source("release-1"),
+        source=first_release_source,
         ended_at=UtcTimestamp(1_400),
         ended_monotonic_ns=45,
+        recovery_authority=first_recovery,
     )
     runtime.bind_contribution_replacement_release(
         divergence_id=second_divergence,
-        source=source("release-2"),
+        source=second_release_source,
         ended_at=UtcTimestamp(1_500),
         ended_monotonic_ns=50,
+        recovery_authority=second_recovery,
     )
     # UTC regresses while the run-scoped monotonic duration remains exact.
     runtime.mark_connected(now_ns=50, now_utc=UtcTimestamp(1_500))
     runtime.finish_generation(continuity_interrupted=False, now_ns=60)
 
     snapshot = runtime.snapshot(now_ns=60)
-    summary = await writer.close(completed=True)
+    summary = await writer.close(completed=True, terminal_active_causal_keys=())
 
     assert snapshot.unavailable_intervals == 1
     assert during_ordered_drain.socket_connected is False
@@ -2775,6 +2899,17 @@ async def test_runtime_health_emits_typed_recovered_availability_interval(
         False,
         True,
     )
+    replacement_recoveries = tuple(item["replacement_recovery"] for item in contribution_records)
+    assert tuple(item["recovery_id"] for item in replacement_recoveries) == (
+        first_recovery.recovery_id,
+        second_recovery.recovery_id,
+    )
+    assert tuple(item["status"] for item in replacement_recoveries) == ("RELEASED", "RELEASED")
+    assert tuple(item["last_result"] for item in replacement_recoveries) == (
+        "RELEASED",
+        "RELEASED",
+    )
+    assert tuple(item["last_failure"] for item in replacement_recoveries) == (None, None)
 
 
 @pytest.mark.asyncio
@@ -2838,11 +2973,17 @@ async def test_runtime_health_rebases_disconnect_union_to_earlier_drained_audit(
     )
 
     during_drain = runtime.snapshot(now_ns=250)
+    terminal_active_causal_keys = tuple(
+        sorted(item.stable_causal_key for item in runtime.active_availability_contributors)
+    )
     interval = runtime.finalize_open_interval(
         cutoff_at=UtcTimestamp(3_000),
         cutoff_monotonic_ns=300,
     )
-    summary = await writer.close(completed=True)
+    summary = await writer.close(
+        completed=True,
+        terminal_active_causal_keys=terminal_active_causal_keys,
+    )
 
     assert interval is not None
     assert during_drain.current_unavailable_started_monotonic_ns == 100
@@ -2868,7 +3009,7 @@ async def test_runtime_health_rebases_disconnect_union_to_earlier_drained_audit(
 
 
 @pytest.mark.asyncio
-async def test_runtime_health_repeated_rebases_preserve_exact_wall_monotonic_pairs(
+async def test_runtime_health_repeated_observations_preserve_original_start_boundary(
     tmp_path: Path,
 ) -> None:
     run_id = CollectorRunId("availability-repeated-rebase")
@@ -2904,19 +3045,25 @@ async def test_runtime_health_repeated_rebases_preserve_exact_wall_monotonic_pai
     )
     runtime.mark_interrupted(now_ns=100, now_utc=UtcTimestamp(1_000), interruption=first)
     runtime.mark_interrupted(now_ns=80, now_utc=UtcTimestamp(8_000), interruption=refined)
-    runtime.mark_interrupted(now_ns=60, now_utc=UtcTimestamp(6_000), interruption=refined)
-    runtime.mark_interrupted(now_ns=40, now_utc=UtcTimestamp(9_000), interruption=refined)
+    runtime.mark_interrupted(now_ns=90, now_utc=UtcTimestamp(6_000), interruption=refined)
+    runtime.mark_interrupted(now_ns=120, now_utc=UtcTimestamp(9_000), interruption=refined)
     runtime.mark_interrupted(
         now_ns=40,
         now_utc=UtcTimestamp(4_000),
         interruption=simultaneous,
+    )
+    terminal_active_causal_keys = tuple(
+        sorted(item.stable_causal_key for item in runtime.active_availability_contributors)
     )
     interval = runtime.finalize_open_interval(
         # Wall time is permitted to regress; monotonic time remains authoritative.
         cutoff_at=UtcTimestamp(3_000),
         cutoff_monotonic_ns=150,
     )
-    summary = await writer.close(completed=True)
+    summary = await writer.close(
+        completed=True,
+        terminal_active_causal_keys=terminal_active_causal_keys,
+    )
 
     assert interval is not None
     assert interval.started_monotonic.nanoseconds == 40
@@ -2934,9 +3081,9 @@ async def test_runtime_health_repeated_rebases_preserve_exact_wall_monotonic_pai
         ["refined"],
         ["first"],
     )
-    assert tuple(item["started_monotonic_ns"] for item in contributions) == (40, 40, 100)
-    assert tuple(item["started_at_utc_ns"] for item in contributions) == (4_000, 9_000, 1_000)
-    assert tuple(item["duration_ns"] for item in contributions) == (110, 110, 50)
+    assert tuple(item["started_monotonic_ns"] for item in contributions) == (40, 80, 100)
+    assert tuple(item["started_at_utc_ns"] for item in contributions) == (4_000, 8_000, 1_000)
+    assert tuple(item["duration_ns"] for item in contributions) == (110, 70, 50)
 
 
 def test_runtime_health_rejects_rebase_across_completed_interval() -> None:
@@ -3001,13 +3148,13 @@ def test_runtime_health_enforces_bounded_contributors_after_duplicate_rebase() -
 
     # Refining an existing semantic contributor does not consume another slot.
     runtime.mark_interrupted(
-        now_ns=50,
+        now_ns=164,
         now_utc=UtcTimestamp(5_000),
         interruption=interruptions[-1],
     )
     with pytest.raises(RuntimeError, match="hard bound reached"):
         runtime.mark_interrupted(
-            now_ns=49,
+            now_ns=165,
             now_utc=UtcTimestamp(4_900),
             interruption=AvailabilityInterruption(
                 cause=AvailabilityCause.UNKNOWN,
@@ -3017,7 +3164,7 @@ def test_runtime_health_enforces_bounded_contributors_after_duplicate_rebase() -
         )
 
     snapshot = runtime.snapshot(now_ns=200)
-    assert snapshot.current_unavailable_started_monotonic_ns == 50
+    assert snapshot.current_unavailable_started_monotonic_ns == 100
     assert snapshot.availability_ledger_healthy is False
 
 
@@ -3051,12 +3198,18 @@ async def test_runtime_health_bounds_open_interval_at_terminal_cutoff(
         ),
     )
 
+    terminal_active_causal_keys = tuple(
+        sorted(item.stable_causal_key for item in runtime.active_availability_contributors)
+    )
     interval = runtime.finalize_open_interval(
         cutoff_at=UtcTimestamp(3_000),
         cutoff_monotonic_ns=70,
     )
     snapshot = runtime.snapshot(now_ns=70)
-    summary = await writer.close(completed=True)
+    summary = await writer.close(
+        completed=True,
+        terminal_active_causal_keys=terminal_active_causal_keys,
+    )
 
     assert interval is not None
     assert interval.open_at_shutdown is True
