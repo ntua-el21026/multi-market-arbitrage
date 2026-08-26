@@ -1262,6 +1262,37 @@ def test_known_historical_source_retains_direct_deferred_compatibility() -> None
     assert processor.summary().pending_rest_audits == 1
 
 
+def test_known_historical_source_reconstructs_legacy_precision_book_identity() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("processor-historical-precision-book-identity")
+    historical_source = "6dc5dc43bbb673a35ff960bb7d84fed062aefda4"
+
+    producer = CanonicalProcessor(config, source_journal_git_commit=historical_source)
+    replay = CanonicalProcessor(config, source_journal_git_commit=historical_source)
+    current = CanonicalProcessor(
+        config,
+        source_journal_git_commit="2222222222222222222222222222222222222222",
+    )
+    for envelope in _bootstrap(run_id):
+        assert producer.process_replayed(envelope).success
+        assert replay.process_replayed(envelope).success
+        assert current.process_replayed(envelope).success
+
+    start, historical_intent = _audit_start(
+        producer,
+        run_id,
+        4,
+        request_id="historical-precision-book-identity",
+    )
+    assert replay.audit_book_identity(start.native_asset_id) == start.starting_book
+    assert replay.process_replayed(historical_intent).success
+
+    assert current.audit_book_identity(start.native_asset_id) != start.starting_book
+    rejected = current.process_replayed(historical_intent)
+    assert not rejected.success
+    assert rejected.error_type == "NormalizationError"
+
+
 def test_deferred_audit_response_requires_bound_start_and_predeadline_receipt() -> None:
     config = load_phase1_config(Path("config/phase1.toml"))
     run_id = CollectorRunId("processor-deferred-audit-mode")

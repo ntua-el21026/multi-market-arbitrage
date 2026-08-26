@@ -138,10 +138,15 @@ def _resolved_prepare_attest_mismatch(
     label: str,
     *,
     config: Phase1Config | None = None,
+    source_journal_git_commit: str | None = None,
+    expect_recovery_authority: bool = True,
 ) -> _ResolvedMismatch:
     effective_config = _current_config() if config is None else config
     run_id = CollectorRunId(f"replacement-recovery-processor-{label}")
-    processor = CanonicalProcessor(effective_config)
+    processor = CanonicalProcessor(
+        effective_config,
+        source_journal_git_commit=source_journal_git_commit,
+    )
     envelopes: list[RawEventEnvelope] = []
 
     for envelope in _bootstrap(run_id):
@@ -229,6 +234,16 @@ def _resolved_prepare_attest_mismatch(
     assert summary.audit_replacement_captures_pending == 1
     capture = summary.audit_replacement_capture_authority[0]
     recovery = capture.recovery_authority
+    if not expect_recovery_authority:
+        assert recovery is None
+        return _ResolvedMismatch(
+            config=effective_config,
+            run_id=run_id,
+            processor=processor,
+            envelopes=envelopes,
+            mismatched_yes=mismatched_yes,
+            run_deadline_ns=run_deadline_ns,
+        )
     assert recovery is not None
     assert recovery.status is ReplacementRecoveryStatus.READY
     assert recovery.attempt_count == 0
@@ -407,7 +422,11 @@ def test_prepare_attest_mismatch_releases_complete_first_connection_capture_and_
 def test_retained_pre_adr0056_source_replays_v1_replacement_release(
     source_commit: str,
 ) -> None:
-    base = _resolved_prepare_attest_mismatch(f"retained-v1-{source_commit[:8]}")
+    base = _resolved_prepare_attest_mismatch(
+        f"retained-v1-{source_commit[:8]}",
+        source_journal_git_commit=source_commit,
+        expect_recovery_authority=False,
+    )
     processor = CanonicalProcessor(
         base.config,
         source_journal_git_commit=source_commit,

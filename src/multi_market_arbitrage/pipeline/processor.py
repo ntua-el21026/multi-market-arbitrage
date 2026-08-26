@@ -249,6 +249,18 @@ _HISTORICAL_UNSUPERVISED_REPLACEMENT_CAPTURE_SOURCE_COMMITS = frozenset(
         "6dc5dc43bbb673a35ff960bb7d84fed062aefda4",
     }
 )
+_HISTORICAL_GAMMA_MINIMUM_SHARE_SOURCE_COMMITS = frozenset(
+    {
+        # These immutable public producers interpreted Gamma `orderMinSize`
+        # as the CLOB share minimum. Current official documentation identifies
+        # it as a USDC notional, but replay must reproduce the exact historical
+        # reference/book identities before validating their durable controls.
+        "a382b93220011428703fe02483f7034f59c1f045",
+        "ff7054ac2167026ce1ed14111b7e144cfd4fd865",
+        "ee240c51184cccfc6e425906097758b5ca019a95",
+        "6dc5dc43bbb673a35ff960bb7d84fed062aefda4",
+    }
+)
 
 
 def _chain_seed(name: str) -> bytes:
@@ -1347,7 +1359,11 @@ class CanonicalProcessor:
     ) -> None:
         self._config = config
         self._registry = ReferenceRegistry()
-        self._builder = PolymarketReferenceBuilder()
+        self._builder = PolymarketReferenceBuilder(
+            historical_gamma_minimum_was_share_quantity=(
+                source_journal_git_commit in _HISTORICAL_GAMMA_MINIMUM_SHARE_SOURCE_COMMITS
+            )
+        )
         self._normalizer = PolymarketNormalizer(self._builder)
         self._scanner = PolymarketCompleteSetScanner(
             CompleteSetScannerConfig.from_values(

@@ -128,6 +128,32 @@ def test_clob_info_and_rest_minimum_order_size_mismatch_is_indeterminate() -> No
     assert bundle.precision.reason == "cross-source minimum order quantities disagree"
 
 
+def test_missing_clob_share_minimum_fails_closed_without_breaking_replay() -> None:
+    gamma, clob, rest = _sources()
+    missing_clob_minimum = replace(clob, minimum_order_size=None)
+
+    without_rest = PolymarketReferenceBuilder().build(
+        gamma=gamma,
+        clob=missing_clob_minimum,
+        rest_book=None,
+        observed_at=UtcTimestamp(1),
+    )
+    with_rest = PolymarketReferenceBuilder().build(
+        gamma=gamma,
+        clob=missing_clob_minimum,
+        rest_book=rest,
+        observed_at=UtcTimestamp(2),
+    )
+
+    for bundle in (without_rest, with_rest):
+        assert bundle.precision.status is ReferenceStatus.INDETERMINATE
+        assert bundle.precision.minimum_order_size is None
+        assert (
+            bundle.precision.reason
+            == "tick size or minimum order quantity is missing from a required source"
+        )
+
+
 def test_fee_schedule_mismatch_fails_closed() -> None:
     gamma, clob, rest = _sources()
     assert clob.fee_schedule is not None
