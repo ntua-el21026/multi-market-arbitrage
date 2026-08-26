@@ -148,8 +148,11 @@ def _candidate_repository(tmp_path: Path) -> tuple[Path, str]:
     # still needs its own explicit candidate identity in that case.
     _git(repository, "commit", "--allow-empty", "-m", "test: freeze operational scripts")
     candidate = _git(repository, "rev-parse", "HEAD")
-    origin_main = _git(_ROOT, "rev-parse", "origin/main")
-    _git(repository, "update-ref", "refs/remotes/origin/main", origin_main)
+    # A pull-request checkout need not materialize refs/remotes/origin/main.
+    # The fixture candidate's parent is the exact cloned source commit and is
+    # the deterministic distinct-main authority this fixture needs.
+    fixture_main = _git(repository, "rev-parse", f"{candidate}^")
+    _git(repository, "update-ref", "refs/remotes/origin/main", fixture_main)
     assert _git(repository, "rev-parse", "design-freeze-v0.1^{commit}") == _DESIGN_FREEZE_SHA
     assert not _git(repository, "status", "--porcelain=v1", "--untracked-files=all")
     return repository, candidate
