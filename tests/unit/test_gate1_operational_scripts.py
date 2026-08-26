@@ -143,7 +143,10 @@ def _candidate_repository(tmp_path: Path) -> tuple[Path, str]:
         str(_AUDITOR_RELATIVE),
         str(_SEALER_RELATIVE),
     )
-    _git(repository, "commit", "-m", "test: freeze operational scripts")
+    # The scripts may already match the exact committed candidate when this
+    # suite runs from a detached public-qualification worktree.  The fixture
+    # still needs its own explicit candidate identity in that case.
+    _git(repository, "commit", "--allow-empty", "-m", "test: freeze operational scripts")
     candidate = _git(repository, "rev-parse", "HEAD")
     origin_main = _git(_ROOT, "rev-parse", "origin/main")
     _git(repository, "update-ref", "refs/remotes/origin/main", origin_main)
