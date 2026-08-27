@@ -137,6 +137,28 @@ exact sum and enter disk workload once. It does not assume a favorable
 compression ratio. A v1-v2 report or a missing component cannot qualify a new
 ADR-0057 candidate.
 
+The calibration schema remains v3; this producer correction is conformance to
+ADR-0057. Qualification additionally requires producer contract
+`phase1-pre-soak-calibration-producer-contract-v1` and projection method
+`phase1-pre-soak-calibration-projection-method-v2`; older v3 reports lacking
+either binding are nonqualifying. Generic stochastic rate fields retain ceiling integer projection,
+2.0x workload headroom, and the WebSocket observation duration denominator.
+Health v5 is projected independently from fixed cardinality and qualified
+record maxima. The producer opens the completed current-v5 health file through
+one no-follow descriptor, proves stable regular-file inode/link/size identity,
+matches and binds the writer SHA-256, reconciles its bytes and records, binds
+observed periodic/terminal counts and maximum sizes, and requires exactly one
+terminal record last. Producer role/version, target identity, and terminal
+cutoff must reconcile to the observation summary. The report binds
+the exact requested duration and exact completed monotonic duration. Any
+observed health-record maximum above its qualified bound, health count/file
+overrun, completion shorter than requested, or less than 2 MiB projected
+health-file margin blocks the soak.
+Observed periodic count outside the cadence-derived range for the requested
+duration blocks the fixed-cardinality projection.
+The calibration rejects any cadence/count/file limit other than the fixed
+ten-second, 8,192-record, and 68 MiB qualification profile.
+
 The replay/rebuild disk allowance additionally covers one temporary exact
 ingest-ID index capped at the selected uncompressed raw bytes, with a 1 MiB
 minimum, fixed 2 MiB SQLite cache and mmap disabled. Preflight uses a fresh
@@ -332,9 +354,11 @@ checkpoint. Historical v1-v4 evidence remains readable without inferred
 chronology, trigger, evidence-dimension, fault-closure, contribution, or
 journal-seal fields.
 
-The ten-second cadence and 8,192-checkpoint count bound remain fixed. Measured
-v5 maxima are 30,819 bytes periodic and 44,463 bytes terminal, producing a
-66,613,503-byte conservative six-hour projection. The exact configuration uses
+The ten-second cadence and 8,192-checkpoint count bound remain fixed. The
+capacity-qualified v5 maxima are 30,819 bytes periodic and 44,463 bytes
+terminal. The fixed six-hour shape is 2,160 periodic records plus one terminal
+record, so `2,160 * 30,819 + 1 * 44,463 = 66,613,503` bytes. The exact
+configuration uses
 a 68 MiB (71,303,168-byte) file cap, leaving 4,689,665 bytes and exceeding the
 required 2 MiB headroom. Reaching the file/count bound, missing a checkpoint, or
 emitting incomplete health evidence still fails closed; the provisioned cap is

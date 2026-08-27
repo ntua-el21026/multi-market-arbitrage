@@ -232,6 +232,32 @@ the bounded compact crash-evidence ledger); reconciles their exact
 once. Historical v1-v2 evidence remains strict and gains no synthesized v3
 fields.
 
+The v3 calibration validator also enforces the corrected ADR-0057 health
+producer contract without accepting a new schema version. It requires the
+exact producer-contract and projection-method bindings
+`phase1-pre-soak-calibration-producer-contract-v1` and
+`phase1-pre-soak-calibration-projection-method-v2`; older v3 reports missing
+either are nonqualifying. The producer must open the completed current-v5 health
+file once without following links, prove stable regular-file inode/link/size
+identity, match the writer-reported SHA-256, reconcile reported bytes and
+records to the file, and bind the digest plus observed periodic/terminal counts
+and maximum record sizes, and find exactly one terminal record last. Producer
+role/version, exact target record, and terminal cutoff identity must reconcile
+to the observation summary. Observed
+periodic or terminal maxima above 30,819 or 44,463 bytes fail. The accepted
+six-hour projection is fixed at 2,160 periodic records plus one terminal record,
+or exactly 66,613,503 bytes, leaving exactly 4,689,665 bytes under the
+71,303,168-byte cap. Other stochastic rate-derived fields retain 2.0x headroom
+and the WebSocket observation duration denominator. The report must bind the
+exact requested duration and exact completed monotonic duration; a completed
+duration shorter than requested, a health count/record/file overrun, or less
+than 2 MiB projected health-file margin is a fail-closed validation result.
+Observed periodic count must remain within the cadence-derived lower and upper
+bounds for the requested duration; a faster apparent producer cannot use the
+fixed-cardinality projection.
+The validator rejects any calibration limit other than the fixed ten-second
+cadence, 8,192-record bound, and 68 MiB file bound.
+
 ## 11. V8 — Opportunity coherence
 
 Checks the entire `OpportunityInputSnapshot`:

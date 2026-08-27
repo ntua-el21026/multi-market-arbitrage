@@ -216,8 +216,11 @@ Calibration is a bounded projection workflow, not a Gate-1 result. It binds
 code, config, lock, runtime, host, filesystem, and target identities; measures
 message, raw, canonical, and scan rates, queue high-water marks, journal
 groups/fsyncs, audit outcomes, latency, CPU, RSS, and artifact growth; and
-projects 21,600 seconds with ceiling integer arithmetic and 2.0x workload
-headroom. The journal latency distribution is explicitly commit-start to
+projects generic stochastic rate fields over 21,600 seconds with ceiling integer
+arithmetic, the WebSocket observation duration as denominator, and 2.0x workload
+headroom. The exact requested duration and exact completed monotonic duration
+are separate report bindings; completion shorter than requested fails closed.
+The journal latency distribution is explicitly commit-start to
 durable-receipt time: it includes subgroup selection/serialization, possible
 segment creation and directory sync, append/flush, and the data `fsync`; it is
 not mislabeled as syscall-only `fsync` latency. Disk accounting includes raw,
@@ -231,8 +234,23 @@ bounds, configured health-checkpoint count, or configured health-evidence file
 size fails calibration; the tool does not enlarge a limit. The
 `phase1-pre-soak-calibration-v3` report binds the configured checkpoint
 cadence/count/file bounds, journal seal-queue capacity, and pending-seal byte
-limit and includes the mandatory final checkpoint in its count projection. It
-reports `temporary_sealing_active_bytes`, `temporary_sealing_pending_bytes`,
+limit. This corrected v3 producer conforms to ADR-0057 without changing the
+schema. It requires producer contract
+`phase1-pre-soak-calibration-producer-contract-v1` and projection method
+`phase1-pre-soak-calibration-projection-method-v2`, making older v3 reports
+without those fields nonqualifying. It opens the completed current-v5 health
+file once without following links, proves stable single-link file identity,
+matches and binds the writer SHA-256, reconciles reported bytes and records,
+binds the observed periodic/terminal counts and record-size
+maxima, and requires exactly one terminal checkpoint last. Health is not
+rate-scaled from that mixed file: the six-hour projection has exactly 2,160
+periodic checkpoints at the capacity-qualified 30,819-byte maximum plus one
+terminal checkpoint at the capacity-qualified 44,463-byte maximum, totaling
+66,613,503 bytes and leaving 4,689,665 bytes under the 68 MiB cap. An observed
+record maximum above its qualified bound, a count/file overrun, an incomplete
+requested duration, or less than 2 MiB remaining health-file margin fails
+closed. The report includes `temporary_sealing_active_bytes`,
+`temporary_sealing_pending_bytes`,
 `temporary_sealing_compressed_scratch_bytes`,
 `temporary_sealing_metadata_scratch_bytes`, and
 `temporary_sealing_recovery_bytes`; `temporary_sealing_bytes` is exactly their
@@ -1046,8 +1064,9 @@ directory sync only after clean completion; the summary records counts,
 high-water, bytes, SHA-256, completion/evidence eligibility, and failure type.
 The exact Gate-1 bounds are ten-second cadence, 8,192 checkpoints, and a 68 MiB
 (71,303,168-byte) health-evidence file. The measured v5 six-hour projection is
-66,613,503 bytes, leaving 4,689,665 bytes of file headroom; overflow or missing
-evidence remains a hard failure.
+exactly 2,160 periodic records at 30,819 bytes plus one terminal-last record at
+44,463 bytes, or 66,613,503 bytes, leaving 4,689,665 bytes of file headroom;
+overflow or missing evidence remains a hard failure.
 
 Checkpoint groups are `target`, `capture`, per-book `books`, `ingress`,
 `journal`, `analytical`, `http`, `audit`, `scanner`, `recovery`, and `resources`,

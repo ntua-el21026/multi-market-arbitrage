@@ -255,13 +255,15 @@ construction consumes the immutable lightweight processor operational snapshot;
 it cannot call full summary/terminal-hash construction or copy complete recent
 histories.
 
-The maximum measured v5 record sizes are 30,819 bytes periodic and 44,463 bytes
-terminal. At the unchanged ten-second cadence the six-hour projection is
-66,613,503 bytes. The committed health-evidence bound is 68 MiB (71,303,168
-bytes), leaving 4,689,665 bytes and satisfying the unchanged 2 MiB minimum
-headroom. The 8,192-checkpoint count bound, cadence, complete-field contract,
-and fail-closed health-writer requirements remain unchanged. This is explicit
-capacity provisioning for v5, not acceptance-criterion weakening.
+The capacity-qualified v5 record maxima are 30,819 bytes periodic and 44,463
+bytes terminal. At the unchanged ten-second cadence the fixed six-hour shape is
+2,160 periodic records plus one terminal record, so
+`2,160 * 30,819 + 1 * 44,463 = 66,613,503` bytes. The committed health-evidence
+bound is 68 MiB (71,303,168 bytes), leaving 4,689,665 bytes and satisfying the
+unchanged 2 MiB minimum headroom. The 8,192-checkpoint count bound, cadence,
+complete-field contract, and fail-closed health-writer requirements remain
+unchanged. This is explicit capacity provisioning for v5, not acceptance-
+criterion weakening.
 
 ### 6.2 Typed unavailable intervals
 
@@ -924,6 +926,16 @@ If corrected semantics intentionally change terminal hashes, bind and explain th
      active, pending, compressed-scratch, metadata/atomic-scratch,
      recovery-tail plus bounded compact crash-evidence ledger,
      and summed temporary-sealing disk reserves;
+   - corrected calibration-v3 ADR-0057 conformance: generic stochastic rate
+     fields retain the WebSocket observation-duration denominator and 2.0x
+     headroom; the report binds producer contract
+     `phase1-pre-soak-calibration-producer-contract-v1` and projection method
+     `phase1-pre-soak-calibration-projection-method-v2`; the producer reads
+     current-v5 health evidence through one no-follow descriptor, proves stable
+     single-link identity, matches and binds its writer SHA-256, reconciles and
+     binds its observed periodic/terminal counts and maxima, requires exactly
+     one terminal record last, and binds exact requested/completed monotonic
+     durations;
    - operational/full-summary latency and post-saturation memory attribution/
      slope;
    - storage projection;
@@ -960,7 +972,14 @@ The rerun is not authorized until:
   miss under the unchanged timing contract;
 - exact-source `phase1-pre-soak-calibration-v3` passes with every temporary-
   sealing reserve component present, its exact sum reconciled once into disk
-  workload, and no synthesized v3 fields from historical v1-v2 evidence;
+  workload, and no synthesized v3 fields from historical v1-v2 evidence; its
+  health projection uses exactly 2,160 periodic records at 30,819 bytes plus one
+  terminal-last record at 44,463 bytes, totaling 66,613,503 bytes and leaving
+  4,689,665 bytes under the 68 MiB cap; any observed record/count/file overrun,
+  completed duration shorter than requested, or margin below 2 MiB fails closed;
+  any different ten-second cadence, 8,192-record cap, or 68 MiB file cap is
+  rejected, and pre-correction v3 reports lacking the required producer/
+  projection revisions cannot qualify;
 - the final exact SHA passes the v4 production-scale dual-book analytical and
   journal capacity workload, including all exact-zero phase-equivalent slopes,
   eight full-segment samples and unchanged RSS/Python/native-residual bounds;

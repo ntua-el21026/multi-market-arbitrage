@@ -155,6 +155,22 @@ crash-evidence ledger. The reported
 disk projection once. A missing component, favorable compression assumption,
 or historical v1-v2 report fails current ADR-0057 capacity qualification.
 
+This is a corrected v3 producer contract, not a schema change. Qualifying v3
+evidence carries `phase1-pre-soak-calibration-producer-contract-v1` and
+`phase1-pre-soak-calibration-projection-method-v2`; pre-correction v3 evidence
+lacking those bindings is nonqualifying. Generic
+stochastic rate fields continue to use ceiling integer projection from the
+WebSocket observation duration with 2.0x workload headroom. Health v5 is not
+rate-scaled from the mixed calibration file: the producer reads that current v5
+file through one no-follow descriptor, proves stable single-link file identity,
+matches the writer SHA-256, and binds that digest with observed periodic/
+terminal counts and record-size maxima,
+requires exactly one terminal record last, and projects the fixed six-hour
+cardinality of 2,160 periodic plus one terminal record. The report binds both
+the exact requested duration and exact completed monotonic duration. A health
+capacity overrun, completed duration shorter than requested, or remaining
+health-file margin below 2 MiB fails closed.
+
 At least 100 consecutive rotations exercise steady-state handoff/seal overlap.
 The report proves that compression and complete verification remain streaming,
 that append-owner wait attributable to ordinary seal work is zero, and that
@@ -527,7 +543,8 @@ create a false post-saturation Python-memory slope.
 For health v5, capacity acceptance uses the maximum across known/unknown-host
 and current/replacement-capture periodic and terminal fixtures. The measured
 maxima are 30,819 bytes periodic and 44,463 bytes terminal. At ten-second
-cadence the six-hour projection is 66,613,503 bytes. The exact 68 MiB
+cadence the fixed projection is 2,160 periodic records plus one terminal record:
+`2,160 * 30,819 + 1 * 44,463 = 66,613,503` bytes. The exact 68 MiB
 (71,303,168-byte) file cap leaves 4,689,665 bytes, above the fixed 2 MiB minimum
 headroom; the 8,192 checkpoint-count bound and cadence remain unchanged.
 Exceeding any projected record/file/count predicate fails rather than truncates

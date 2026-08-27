@@ -12,9 +12,13 @@ from typing import cast
 
 import pytest
 
+from multi_market_arbitrage.core.serialization import canonical_json_bytes
 from multi_market_arbitrage.observability import HistogramSnapshot, MetricKey, MetricsSnapshot
 from multi_market_arbitrage.pipeline.calibration import (
     _counter,  # pyright: ignore[reportPrivateUsage]
+    _duration_nanoseconds,  # pyright: ignore[reportPrivateUsage]
+    _health_checkpoint_sizes,  # pyright: ignore[reportPrivateUsage]
+    _HealthCheckpointSizes,  # pyright: ignore[reportPrivateUsage]
     _journal_commit_to_durable_distribution,  # pyright: ignore[reportPrivateUsage]
     _verify_clean_source_checkout,  # pyright: ignore[reportPrivateUsage]
 )
@@ -69,7 +73,9 @@ def _identity() -> CalibrationIdentity:
 
 def _measurements() -> CalibrationMeasurements:
     return CalibrationMeasurements(
+        requested_duration_ns=300 * 1_000_000_000,
         actual_duration_ns=300 * 1_000_000_000,
+        completed_run_duration_ns=300 * 1_000_000_000,
         websocket_messages=1_000,
         websocket_bytes=1_000_000,
         durable_raw_records=1_010,
@@ -116,6 +122,11 @@ def _measurements() -> CalibrationMeasurements:
         peak_rss_bytes=128 * 1024 * 1024,
         analytical_bytes=500_000,
         health_bytes=50_000,
+        health_content_sha256="d" * 64,
+        health_periodic_checkpoints=29,
+        health_terminal_checkpoints=1,
+        health_maximum_periodic_checkpoint_bytes=20_000,
+        health_maximum_terminal_checkpoint_bytes=21_000,
         log_bytes=0,
         log_storage_model=STDIO_STREAM_LOG_STORAGE_MODEL,
         artifacts_created=15,
@@ -154,6 +165,72 @@ def _git(repository: Path, *arguments: str) -> str:
     return completed.stdout.strip()
 
 
+def _health_record(*, terminal: bool, monotonic_ns: int) -> dict[str, object]:
+    return {
+        "analytical": {},
+        "audit": {},
+        "books": [],
+        "capture": {},
+        "collector_run_id": "run-1",
+        "config_hash": "b" * 64,
+        "decisions": {
+            "capture_healthy": True,
+            "gate1_eligible_so_far": True,
+            "gate1_sticky_reason_mask": 0,
+            "reason_mask": 0,
+            "reason_mask_schema": "gate1-health-decision-reason-mask-v1",
+            "research_eligible": True,
+        },
+        "emitted_at_utc_ns": 1_000 + monotonic_ns,
+        "emitted_monotonic_epoch_id": "run-1",
+        "emitted_monotonic_ns": monotonic_ns,
+        "git_commit": "a" * 40,
+        "http": {},
+        "identity": {"code_version": "phase1-test", "runtime_role": "OBSERVE"},
+        "ingress": {},
+        "journal": {"terminal": terminal},
+        "recovery": {},
+        "resources": {},
+        "scanner": {},
+        "schema_version": "gate1-health-checkpoint-v5",
+        "target": {},
+    }
+
+
+def _health_file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _inventory(
+    path: Path,
+    *,
+    expected_records: int,
+    expected_terminal_records: int = 1,
+    expected_collector_run_id: str = "run-1",
+    expected_content_sha256: str | None = None,
+    expected_terminal_utc_ns: int = 1_001,
+    expected_target: dict[str, object] | None = None,
+) -> _HealthCheckpointSizes:
+    return _health_checkpoint_sizes(
+        path,
+        expected_bytes=path.stat().st_size,
+        expected_records=expected_records,
+        expected_terminal_records=expected_terminal_records,
+        expected_collector_run_id=expected_collector_run_id,
+        expected_content_sha256=(
+            _health_file_sha256(path)
+            if expected_content_sha256 is None
+            else expected_content_sha256
+        ),
+        expected_git_commit="a" * 40,
+        expected_config_hash="b" * 64,
+        expected_code_version="phase1-test",
+        expected_runtime_role="OBSERVE",
+        expected_target={} if expected_target is None else expected_target,
+        expected_terminal_utc_ns=expected_terminal_utc_ns,
+    )
+
+
 def test_projection_uses_exact_ceiling_integer_arithmetic() -> None:
     assert (
         project_measurement(
@@ -164,6 +241,202 @@ def test_projection_uses_exact_ceiling_integer_arithmetic() -> None:
         )
         == 3
     )
+
+
+def test_calibration_duration_uses_exact_decimal_nanoseconds() -> None:
+    assert _duration_nanoseconds(180.0) == 180_000_000_000
+    assert _duration_nanoseconds(0.125) == 125_000_000
+
+
+def test_health_checkpoint_size_inventory_separates_periodic_and_terminal(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "health.jsonl"
+    records = (
+        _health_record(terminal=False, monotonic_ns=1),
+        _health_record(terminal=False, monotonic_ns=2),
+        _health_record(terminal=True, monotonic_ns=3),
+    )
+    lines = tuple(canonical_json_bytes(record) + b"\n" for record in records)
+    path.write_bytes(b"".join(lines))
+
+    sizes = _inventory(path, expected_records=3, expected_terminal_utc_ns=1_003)
+
+    assert sizes.periodic_count == 2
+    assert sizes.terminal_count == 1
+    assert sizes.maximum_periodic_bytes == max(map(len, lines[:2]))
+    assert sizes.maximum_terminal_bytes == len(lines[2])
+    assert sizes.total_bytes == path.stat().st_size
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("schema_version", "gate1-health-checkpoint-v4", "health-v5"),
+        ("collector_run_id", "other-run", "run identity"),
+    ],
+)
+def test_health_checkpoint_size_inventory_rejects_wrong_identity(
+    tmp_path: Path,
+    field: str,
+    value: str,
+    error: str,
+) -> None:
+    record = _health_record(terminal=True, monotonic_ns=1)
+    record[field] = value
+    path = tmp_path / "health.jsonl"
+    path.write_bytes(canonical_json_bytes(record) + b"\n")
+
+    with pytest.raises(RuntimeError, match=error):
+        _inventory(path, expected_records=1)
+
+
+def test_health_checkpoint_size_inventory_requires_one_terminal_last(tmp_path: Path) -> None:
+    terminal = canonical_json_bytes(_health_record(terminal=True, monotonic_ns=1)) + b"\n"
+    periodic = canonical_json_bytes(_health_record(terminal=False, monotonic_ns=2)) + b"\n"
+    path = tmp_path / "health.jsonl"
+    path.write_bytes(terminal + periodic)
+
+    with pytest.raises(RuntimeError, match="not last"):
+        _inventory(path, expected_records=2)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'{"collector_run_id":"run-1","collector_run_id":"run-1",'
+        b'"journal":{"terminal":true},"schema_version":"gate1-health-checkpoint-v5"}\n',
+        b'{"collector_run_id":"run-1","journal":{"terminal":true},',
+    ],
+)
+def test_health_checkpoint_size_inventory_rejects_ambiguous_jsonl(
+    tmp_path: Path,
+    payload: bytes,
+) -> None:
+    path = tmp_path / "health.jsonl"
+    path.write_bytes(payload)
+
+    with pytest.raises(RuntimeError, match=r"malformed|incomplete"):
+        _inventory(path, expected_records=1)
+
+
+def test_health_checkpoint_size_inventory_rejects_symlink_and_count_mismatch(
+    tmp_path: Path,
+) -> None:
+    record = canonical_json_bytes(_health_record(terminal=True, monotonic_ns=1)) + b"\n"
+    real = tmp_path / "real.jsonl"
+    real.write_bytes(record)
+    link = tmp_path / "link.jsonl"
+    link.symlink_to(real)
+
+    with pytest.raises(RuntimeError, match="without following"):
+        _inventory(link, expected_records=1)
+    with pytest.raises(RuntimeError, match="record inventory"):
+        _inventory(real, expected_records=2)
+
+
+def test_health_checkpoint_inventory_rejects_writer_digest_mismatch(tmp_path: Path) -> None:
+    path = tmp_path / "health.jsonl"
+    original = _health_record(terminal=True, monotonic_ns=1)
+    original["capture"] = {"marker": "one"}
+    path.write_bytes(canonical_json_bytes(original) + b"\n")
+    expected_sha256 = _health_file_sha256(path)
+    original["capture"] = {"marker": "two"}
+    path.write_bytes(canonical_json_bytes(original) + b"\n")
+
+    with pytest.raises(RuntimeError, match="SHA-256 identity differs"):
+        _inventory(
+            path,
+            expected_records=1,
+            expected_content_sha256=expected_sha256,
+        )
+
+
+def test_health_checkpoint_inventory_rejects_hard_link_identity(tmp_path: Path) -> None:
+    path = tmp_path / "health.jsonl"
+    path.write_bytes(canonical_json_bytes(_health_record(terminal=True, monotonic_ns=1)) + b"\n")
+    other = tmp_path / "other.jsonl"
+    other.hardlink_to(path)
+
+    with pytest.raises(RuntimeError, match="file identity is invalid"):
+        _inventory(path, expected_records=1)
+
+
+def test_health_checkpoint_inventory_rejects_incomplete_v5_shape_and_chronology(
+    tmp_path: Path,
+) -> None:
+    incomplete = tmp_path / "incomplete.jsonl"
+    incomplete.write_bytes(
+        canonical_json_bytes(
+            {
+                "collector_run_id": "run-1",
+                "journal": {"terminal": True},
+                "schema_version": "gate1-health-checkpoint-v5",
+            }
+        )
+        + b"\n"
+    )
+    with pytest.raises(RuntimeError, match="shape is incomplete"):
+        _inventory(incomplete, expected_records=1)
+
+    chronology = tmp_path / "chronology.jsonl"
+    chronology.write_bytes(
+        canonical_json_bytes(_health_record(terminal=False, monotonic_ns=2))
+        + b"\n"
+        + canonical_json_bytes(_health_record(terminal=True, monotonic_ns=2))
+        + b"\n"
+    )
+    with pytest.raises(RuntimeError, match="monotonic chronology"):
+        _inventory(chronology, expected_records=2, expected_terminal_utc_ns=1_002)
+
+
+@pytest.mark.parametrize("mutation", ["code_version", "runtime_role", "target"])
+def test_health_checkpoint_inventory_reconciles_producer_and_target_identity(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    record = _health_record(terminal=True, monotonic_ns=1)
+    if mutation == "target":
+        record["target"] = {"condition_id": "different"}
+    else:
+        identity = cast(dict[str, object], record["identity"])
+        identity[mutation] = "different"
+    path = tmp_path / "health.jsonl"
+    path.write_bytes(canonical_json_bytes(record) + b"\n")
+
+    with pytest.raises(RuntimeError, match=r"producer identity differs|target identity differs"):
+        _inventory(path, expected_records=1)
+
+
+def test_health_checkpoint_inventory_reconciles_terminal_cutoff_identity(tmp_path: Path) -> None:
+    path = tmp_path / "health.jsonl"
+    path.write_bytes(canonical_json_bytes(_health_record(terminal=True, monotonic_ns=1)) + b"\n")
+
+    with pytest.raises(RuntimeError, match="terminal health cutoff identity differs"):
+        _inventory(path, expected_records=1, expected_terminal_utc_ns=1_002)
+
+
+def test_health_checkpoint_inventory_compares_target_canonical_representation(
+    tmp_path: Path,
+) -> None:
+    record = _health_record(terminal=True, monotonic_ns=1)
+    record["target"] = {
+        "condition_id": "condition",
+        "reference_version_ids": ["one", "two"],
+    }
+    path = tmp_path / "health.jsonl"
+    path.write_bytes(canonical_json_bytes(record) + b"\n")
+
+    sizes = _inventory(
+        path,
+        expected_records=1,
+        expected_target={
+            "condition_id": "condition",
+            "reference_version_ids": ("one", "two"),
+        },
+    )
+
+    assert sizes.terminal_count == 1
 
 
 def test_calibration_source_binding_requires_exact_clean_checkout(tmp_path: Path) -> None:
@@ -253,6 +526,14 @@ def test_calibration_under_cap_passes_with_all_disk_workloads() -> None:
     assert report.projection.replay_rebuild_bytes > report.projection.uncompressed_raw_bytes
     assert report.projection.health_checkpoints == 2_161
     assert report.projection.health_checkpoints < report.limits.health_maximum_checkpoints
+    assert report.projection.health_periodic_checkpoints == 2_160
+    assert report.projection.health_terminal_checkpoints == 1
+    assert report.projection.health_periodic_checkpoint_bytes == 30_819
+    assert report.projection.health_terminal_checkpoint_bytes == 44_463
+    assert report.projection.health_periodic_bytes == 66_569_040
+    assert report.projection.health_terminal_bytes == 44_463
+    assert report.projection.health_bytes == 66_613_503
+    assert report.projection.health_remaining_file_bytes == 4_689_665
     assert report.projection.health_bytes < report.limits.health_maximum_file_bytes
     assert report.projection.temporary_sealing_active_bytes == 64 * 1024 * 1024
     assert report.projection.temporary_sealing_pending_bytes == 256 * 1024 * 1024
@@ -279,6 +560,8 @@ def test_calibration_binds_health_bounds_and_stdio_stream_log_model() -> None:
     limits_record = report.limits.to_record()
     queue_record = report.measurements.queues[0].to_record()
     assert report.schema_version == "phase1-pre-soak-calibration-v3"
+    assert report.producer_contract_version == ("phase1-pre-soak-calibration-producer-contract-v1")
+    assert report.projection_method_version == "phase1-pre-soak-calibration-projection-method-v2"
     assert measurement_record["log_bytes"] == 0
     assert measurement_record["log_storage_model"] == STDIO_STREAM_LOG_STORAGE_MODEL
     assert measurement_record["journal_commit_to_durable"] == {
@@ -292,22 +575,25 @@ def test_calibration_binds_health_bounds_and_stdio_stream_log_model() -> None:
     assert limits_record["health_checkpoint_interval_nanoseconds"] == 10_000_000_000
     assert limits_record["health_maximum_checkpoints"] == 8_192
     assert limits_record["health_maximum_file_bytes"] == 68 * 1024 * 1024
+    assert limits_record["health_capacity_maximum_periodic_checkpoint_bytes"] == 30_819
+    assert limits_record["health_capacity_maximum_terminal_checkpoint_bytes"] == 44_463
+    assert limits_record["health_minimum_file_headroom_bytes"] == 2 * 1024 * 1024
     assert limits_record["journal_seal_queue_capacity"] == 4
     assert limits_record["journal_pending_seal_max_uncompressed_bytes"] == 256 * 1024 * 1024
     assert set(queue_record) == {"capacity", "high_water", "name", "threat_basis_points"}
 
 
-def test_calibration_fails_when_projected_health_checkpoint_count_exceeds_bound() -> None:
+def test_calibration_fails_when_observed_health_checkpoint_count_reaches_bound() -> None:
     report = build_calibration_report(
         _identity(),
-        _measurements(),
-        _limits(
-            health_checkpoint_interval_nanoseconds=1_000_000_000,
-            health_maximum_checkpoints=21_600,
+        replace(
+            _measurements(),
+            health_periodic_checkpoints=8_191,
+            health_terminal_checkpoints=1,
         ),
+        _limits(),
     )
 
-    assert report.projection.health_checkpoints == 21_601
     assert (
         CalibrationDecisionReason.HEALTH_CHECKPOINT_COUNT_LIMIT_THREATENED
         in report.decision.reasons
@@ -317,11 +603,180 @@ def test_calibration_fails_when_projected_health_checkpoint_count_exceeds_bound(
 def test_calibration_fails_when_projected_health_bytes_exceed_file_bound() -> None:
     report = build_calibration_report(
         _identity(),
-        _measurements(),
-        _limits(health_maximum_file_bytes=7_199_999),
+        replace(
+            _measurements(),
+            health_maximum_periodic_checkpoint_bytes=33_000,
+        ),
+        _limits(),
     )
 
-    assert report.projection.health_bytes == 7_200_000
+    assert report.projection.health_bytes > report.limits.health_maximum_file_bytes
+    assert CalibrationDecisionReason.HEALTH_FILE_LIMIT_THREATENED in report.decision.reasons
+
+
+def test_calibration_uses_capacity_health_shape_instead_of_rate_scaling_mixed_file() -> None:
+    measured = replace(
+        _measurements(),
+        requested_duration_ns=180_000_000_000,
+        actual_duration_ns=178_272_324_219,
+        completed_run_duration_ns=180_001_398_657,
+        health_bytes=355_772,
+        health_periodic_checkpoints=17,
+        health_terminal_checkpoints=1,
+        health_maximum_periodic_checkpoint_bytes=20_244,
+        health_maximum_terminal_checkpoint_bytes=20_602,
+        uncompressed_raw_bytes=3_147_222,
+        analytical_bytes=176_033,
+    )
+
+    report = build_calibration_report(_identity(), measured, _limits())
+
+    assert report.decision.passed
+    assert report.projection.health_bytes == 66_613_503
+    assert report.projection.health_remaining_file_bytes == 4_689_665
+    assert report.projection.health_periodic_checkpoints == 2_160
+    assert report.projection.health_terminal_checkpoints == 1
+    assert report.projection.total_required_disk_bytes == 3_790_993_376
+
+
+def test_calibration_fails_if_public_health_record_exceeds_capacity_qualification() -> None:
+    measured = replace(
+        _measurements(),
+        health_maximum_periodic_checkpoint_bytes=30_820,
+    )
+
+    report = build_calibration_report(_identity(), measured, _limits())
+
+    assert CalibrationDecisionReason.HEALTH_RECORD_CAPACITY_EXCEEDED in report.decision.reasons
+
+
+def test_calibration_fails_if_requested_monotonic_duration_is_incomplete() -> None:
+    measured = replace(
+        _measurements(),
+        requested_duration_ns=180_000_000_000,
+        actual_duration_ns=179_000_000_000,
+        completed_run_duration_ns=179_999_999_999,
+    )
+
+    report = build_calibration_report(_identity(), measured, _limits())
+
+    assert CalibrationDecisionReason.CALIBRATION_DURATION_INCOMPLETE in report.decision.reasons
+
+
+def test_calibration_rejects_websocket_duration_beyond_completed_run() -> None:
+    with pytest.raises(ValueError, match="cannot exceed"):
+        replace(
+            _measurements(),
+            actual_duration_ns=300_000_000_001,
+            completed_run_duration_ns=300_000_000_000,
+        )
+
+
+def test_calibration_rate_projection_keeps_websocket_duration_denominator() -> None:
+    measured = replace(
+        _measurements(),
+        requested_duration_ns=180_000_000_000,
+        actual_duration_ns=178_272_324_219,
+        completed_run_duration_ns=180_001_398_657,
+        uncompressed_raw_bytes=3_147_222,
+    )
+
+    report = build_calibration_report(_identity(), measured, _limits())
+
+    assert report.projection.uncompressed_raw_bytes == project_measurement(
+        3_147_222,
+        measured_duration_ns=178_272_324_219,
+    )
+    assert report.projection.uncompressed_raw_bytes != project_measurement(
+        3_147_222,
+        measured_duration_ns=180_001_398_657,
+    )
+
+
+def test_calibration_rejects_changed_health_profile() -> None:
+    with pytest.raises(ValueError, match="qualified health-v5 profile"):
+        _limits(health_checkpoint_interval_nanoseconds=20_000_000_000)
+    with pytest.raises(ValueError, match="qualified health-v5 profile"):
+        _limits(health_maximum_checkpoints=20_000)
+    with pytest.raises(ValueError, match="qualified health-v5 profile"):
+        _limits(health_maximum_file_bytes=256 * 1024 * 1024)
+    with pytest.raises(ValueError, match="qualified health-v5 profile"):
+        _limits(health_capacity_maximum_periodic_checkpoint_bytes=30_820)
+    with pytest.raises(ValueError, match="qualified health-v5 profile"):
+        _limits(health_capacity_maximum_terminal_checkpoint_bytes=44_464)
+    with pytest.raises(ValueError, match="qualified health-v5 profile"):
+        _limits(health_minimum_file_headroom_bytes=2 * 1024 * 1024 - 1)
+
+
+def test_calibration_requires_minimum_health_file_headroom() -> None:
+    passing = build_calibration_report(
+        _identity(),
+        replace(
+            _measurements(),
+            health_maximum_periodic_checkpoint_bytes=32_000,
+            health_maximum_terminal_checkpoint_bytes=86_016,
+        ),
+        _limits(),
+    )
+    failing = build_calibration_report(
+        _identity(),
+        replace(
+            _measurements(),
+            health_maximum_periodic_checkpoint_bytes=32_000,
+            health_maximum_terminal_checkpoint_bytes=86_017,
+        ),
+        _limits(),
+    )
+
+    assert passing.projection.health_remaining_file_bytes == 2 * 1024 * 1024
+    assert failing.projection.health_remaining_file_bytes == 2 * 1024 * 1024 - 1
+    assert CalibrationDecisionReason.HEALTH_FILE_LIMIT_THREATENED not in passing.decision.reasons
+    assert CalibrationDecisionReason.HEALTH_FILE_LIMIT_THREATENED in failing.decision.reasons
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"health_periodic_checkpoints": 0},
+        {"health_terminal_checkpoints": 0},
+        {"health_terminal_checkpoints": 2},
+        {"health_bytes": 0},
+        {"health_maximum_periodic_checkpoint_bytes": 0},
+        {"health_maximum_terminal_checkpoint_bytes": 0},
+        {"health_bytes": 40_999},
+        {"health_bytes": 1_000_000},
+        {"health_periodic_checkpoints": 28},
+        {"health_bytes": 2_021_000, "health_periodic_checkpoints": 100},
+    ],
+)
+def test_calibration_fails_closed_on_incomplete_health_observation(
+    changes: dict[str, int],
+) -> None:
+    report = build_calibration_report(
+        _identity(),
+        replace(_measurements(), **changes),
+        _limits(),
+    )
+
+    assert CalibrationDecisionReason.HEALTH_OBSERVATION_INCOMPLETE in report.decision.reasons
+
+
+def test_calibration_fails_closed_on_over_limit_observed_health_file_and_count() -> None:
+    report = build_calibration_report(
+        _identity(),
+        replace(
+            _measurements(),
+            health_bytes=100 * 1024 * 1024,
+            health_periodic_checkpoints=8_999,
+            health_terminal_checkpoints=1,
+        ),
+        _limits(),
+    )
+
+    assert (
+        CalibrationDecisionReason.HEALTH_CHECKPOINT_COUNT_LIMIT_THREATENED
+        in report.decision.reasons
+    )
     assert CalibrationDecisionReason.HEALTH_FILE_LIMIT_THREATENED in report.decision.reasons
 
 
@@ -376,6 +831,9 @@ def test_calibration_report_identity_and_artifacts_are_deterministic(tmp_path: P
     assert bindings["report_sha256"] == first.report_sha256
     assert bindings["code_commit"] == first.identity.git_commit
     assert bindings["config_sha256"] == first.identity.config_sha256
+    assert bindings["health_content_sha256"] == first.measurements.health_content_sha256
+    assert bindings["producer_contract_version"] == first.producer_contract_version
+    assert bindings["projection_method_version"] == first.projection_method_version
     assert bindings["target_sha256"] == first.identity.target.target_sha256
     assert (
         artifacts.report_file_sha256

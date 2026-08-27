@@ -177,6 +177,24 @@ scratch, metadata/atomic-write scratch, and aggregate recovery-evidence reserves
 Their exact sum is `temporary_sealing_bytes` and is counted once in disk
 workload. Historical v1-v2 reports do not acquire these fields by inference.
 
+The corrected v3 producer conforms health capacity to ADR-0057 without changing
+the calibration schema. A qualifying report must carry producer contract
+`phase1-pre-soak-calibration-producer-contract-v1` and projection method
+`phase1-pre-soak-calibration-projection-method-v2`; an older v3 artifact lacking
+either exact binding remains historical and cannot qualify. Generic stochastic rate projections retain ceiling
+integer arithmetic, the WebSocket observation duration as their denominator,
+and 2.0x workload headroom. Health v5 is instead a fixed-cardinality projection:
+2,160 periodic checkpoints plus one terminal checkpoint, using the
+capacity-qualified 30,819-byte periodic and 44,463-byte terminal maxima. The
+producer opens the current v5 health file once without following links, requires
+a single-link stable regular-file identity, streams and matches the writer's
+SHA-256, reconciles its observed byte and record counts, binds that digest plus
+the observed periodic/terminal counts and maxima, and
+requires exactly one terminal record in the last position. It also binds the
+exact requested duration and exact completed monotonic duration; completion
+shorter than requested is ineligible. Any health record/count/file overrun,
+incomplete duration, or projected file margin below 2 MiB fails closed.
+
 Replay/rebuild commands use the native-process temporary directory for the
 derived exact ingest-ID index. Preflight reserves at least the greater of 1 MiB
 and the selected uncompressed raw bytes, already represented by the raw-sized
@@ -188,8 +206,8 @@ Gate replay/rebuild commands run sequentially so only one raw-sized index is
 live at once; concurrency requires separately additive disk reservation.
 
 The Gate-1 health profile retains its ten-second cadence and checkpoint-count
-bound. Health v5 measured at most 30,819 bytes periodically and 44,463 bytes at
-terminal cutoff; its conservative six-hour projection is 66,613,503 bytes. The
+bound; calibration rejects any different cadence, count cap, or file cap. The fixed six-hour shape is exactly 2,160 periodic records plus one
+terminal record, so `2,160 * 30,819 + 1 * 44,463 = 66,613,503` bytes. The
 health-evidence file cap is 68 MiB (71,303,168 bytes), leaving 4,689,665 bytes
 and exceeding the required 2 MiB projection headroom. The writer still rejects
 before overflow, and missing or partial health evidence still fails closed.

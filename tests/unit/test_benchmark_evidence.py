@@ -21,6 +21,10 @@ from multi_market_arbitrage.pipeline.health import (
     PROCESSOR_HISTORY_CHAIN_TELEMETRY_FIELDS,
     PROCESSOR_RETENTION_TELEMETRY_SCHEMA,
 )
+from multi_market_arbitrage.research.calibration import (
+    HEALTH_V5_CAPACITY_MAXIMUM_PERIODIC_CHECKPOINT_BYTES,
+    HEALTH_V5_CAPACITY_MAXIMUM_TERMINAL_CHECKPOINT_BYTES,
+)
 from multi_market_arbitrage.venues.polymarket import PolymarketEndpointClass
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -220,6 +224,17 @@ def test_audit_divergence_benchmark_covers_changed_paths_and_capacity() -> None:
     assert capacity["checkpoint_count"] == SIX_HOUR_CHECKPOINT_COUNT == 2_161
     assert capacity["maximum_records"] == HEALTH_EVIDENCE_MAXIMUM_RECORDS == 8_192
     assert capacity["maximum_file_bytes"] == HEALTH_EVIDENCE_MAXIMUM_BYTES == 71_303_168
+    assert (
+        capacity["maximum_periodic_checkpoint_bytes"]
+        == HEALTH_V5_CAPACITY_MAXIMUM_PERIODIC_CHECKPOINT_BYTES
+        == 30_819
+    )
+    assert (
+        capacity["maximum_terminal_checkpoint_bytes"]
+        == HEALTH_V5_CAPACITY_MAXIMUM_TERMINAL_CHECKPOINT_BYTES
+        == 44_463
+    )
+    assert capacity["projected_file_bytes"] == 66_613_503
     assert capacity["projected_file_bytes"] <= HEALTH_EVIDENCE_MAXIMUM_BYTES
     assert (
         maximum_periodic_checkpoint_bytes_acceptance

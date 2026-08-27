@@ -4,20 +4,32 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import platform
 import resource
 import shutil
+import stat
 import subprocess
 import sys
 import time
 import tomllib
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import cast
 
 from multi_market_arbitrage.core.config import Phase1Config
-from multi_market_arbitrage.observability import HistogramSnapshot, MetricKey, MetricsSnapshot
+from multi_market_arbitrage.core.ids import is_sha256_hex
+from multi_market_arbitrage.core.serialization import canonical_json_bytes
+from multi_market_arbitrage.observability import (
+    HEALTH_CHECKPOINT_SCHEMA_VERSION,
+    HEALTH_DECISION_REASON_MASK_SCHEMA,
+    HistogramSnapshot,
+    MetricKey,
+    MetricsSnapshot,
+    health_decision_reasons_from_mask,
+)
 from multi_market_arbitrage.research import (
     STDIO_STREAM_LOG_STORAGE_MODEL,
     BoundedTreeUsage,
@@ -57,6 +69,68 @@ class _CalibrationPreparation:
     storage_before: BoundedTreeUsage
     analytical_before: BoundedTreeUsage
     environment: CalibrationEnvironment
+
+
+@dataclass(frozen=True, slots=True)
+class _HealthCheckpointSizes:
+    periodic_count: int
+    terminal_count: int
+    maximum_periodic_bytes: int
+    maximum_terminal_bytes: int
+    total_bytes: int
+    content_sha256: str
+
+
+_HEALTH_V5_TOP_LEVEL_FIELDS = frozenset(
+    {
+        "analytical",
+        "audit",
+        "books",
+        "capture",
+        "collector_run_id",
+        "config_hash",
+        "decisions",
+        "emitted_at_utc_ns",
+        "emitted_monotonic_epoch_id",
+        "emitted_monotonic_ns",
+        "git_commit",
+        "http",
+        "identity",
+        "ingress",
+        "journal",
+        "recovery",
+        "resources",
+        "scanner",
+        "schema_version",
+        "target",
+    }
+)
+_HEALTH_V5_MAPPING_FIELDS = frozenset(
+    {
+        "analytical",
+        "audit",
+        "capture",
+        "decisions",
+        "http",
+        "identity",
+        "ingress",
+        "journal",
+        "recovery",
+        "resources",
+        "scanner",
+        "target",
+    }
+)
+_HEALTH_V5_DECISION_FIELDS = frozenset(
+    {
+        "capture_healthy",
+        "gate1_eligible_so_far",
+        "gate1_sticky_reason_mask",
+        "reason_mask",
+        "reason_mask_schema",
+        "research_eligible",
+    }
+)
 
 
 def _sha256_file(path: Path) -> str:
@@ -316,6 +390,224 @@ def _delta(after: BoundedTreeUsage, before: BoundedTreeUsage) -> BoundedTreeUsag
     )
 
 
+def _duration_nanoseconds(duration_seconds: float) -> int:
+    value = Decimal(str(duration_seconds)) * Decimal(1_000_000_000)
+    integral = value.to_integral_value()
+    if value != integral or integral <= 0:
+        raise ValueError("calibration duration must resolve to positive whole nanoseconds")
+    return int(integral)
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _health_checkpoint_sizes(
+    path: Path,
+    *,
+    expected_bytes: int,
+    expected_records: int,
+    expected_terminal_records: int,
+    expected_collector_run_id: str,
+    expected_content_sha256: str | None,
+    expected_git_commit: str,
+    expected_config_hash: str,
+    expected_code_version: str,
+    expected_runtime_role: str,
+    expected_target: dict[str, object],
+    expected_terminal_utc_ns: int,
+) -> _HealthCheckpointSizes:
+    """Measure the completed health JSONL without projecting terminal bytes as periodic."""
+
+    if expected_content_sha256 is None or not is_sha256_hex(expected_content_sha256):
+        raise RuntimeError("calibration health evidence lacks its writer SHA-256 identity")
+    periodic_count = 0
+    terminal_count = 0
+    maximum_periodic_bytes = 0
+    maximum_terminal_bytes = 0
+    total_bytes = 0
+    terminal_seen = False
+    previous_monotonic_ns: int | None = None
+    digest = hashlib.sha256()
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise RuntimeError(
+            "calibration health evidence cannot be opened without following"
+        ) from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise RuntimeError("calibration health evidence file identity is invalid")
+        path_before = os.stat(path, follow_symlinks=False)
+        descriptor_identity = (before.st_dev, before.st_ino)
+        if descriptor_identity != (path_before.st_dev, path_before.st_ino):
+            raise RuntimeError("calibration health evidence path identity differs")
+        if before.st_size != expected_bytes:
+            raise RuntimeError("calibration health byte inventory does not reconcile")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            for line in stream:
+                digest.update(line)
+                if terminal_seen:
+                    raise RuntimeError("calibration terminal health record is not last")
+                if not line or not line.endswith(b"\n"):
+                    raise RuntimeError("calibration health evidence contains an incomplete record")
+                try:
+                    parsed = json.loads(line, object_pairs_hook=_reject_duplicate_json_keys)
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+                    raise RuntimeError("calibration health evidence is malformed") from error
+                if not isinstance(parsed, dict):
+                    raise RuntimeError("calibration health evidence record is not an object")
+                record = cast(dict[str, object], parsed)
+                if set(record) != set(_HEALTH_V5_TOP_LEVEL_FIELDS):
+                    raise RuntimeError("calibration health-v5 record shape is incomplete")
+                if any(not isinstance(record[field], dict) for field in _HEALTH_V5_MAPPING_FIELDS):
+                    raise RuntimeError("calibration health-v5 record group is not an object")
+                books_value = record["books"]
+                if not isinstance(books_value, list):
+                    raise RuntimeError("calibration health-v5 books group is malformed")
+                books = cast(list[object], books_value)
+                if any(not isinstance(book, dict) for book in books):
+                    raise RuntimeError("calibration health-v5 books group is malformed")
+                if record["schema_version"] != HEALTH_CHECKPOINT_SCHEMA_VERSION:
+                    raise RuntimeError("calibration health evidence is not current health-v5")
+                if record["collector_run_id"] != expected_collector_run_id:
+                    raise RuntimeError("calibration health evidence run identity differs")
+                if record["git_commit"] != expected_git_commit:
+                    raise RuntimeError("calibration health evidence source identity differs")
+                if record["config_hash"] != expected_config_hash:
+                    raise RuntimeError("calibration health evidence config identity differs")
+                if canonical_json_bytes(record, allow_floats=True) + b"\n" != line:
+                    raise RuntimeError("calibration health evidence is not canonical JSONL")
+                epoch = record["emitted_monotonic_epoch_id"]
+                monotonic_ns = record["emitted_monotonic_ns"]
+                emitted_at_utc_ns = record["emitted_at_utc_ns"]
+                if epoch != expected_collector_run_id:
+                    raise RuntimeError("calibration health evidence monotonic epoch differs")
+                if (
+                    isinstance(monotonic_ns, bool)
+                    or not isinstance(monotonic_ns, int)
+                    or monotonic_ns < 0
+                    or (previous_monotonic_ns is not None and monotonic_ns <= previous_monotonic_ns)
+                ):
+                    raise RuntimeError(
+                        "calibration health evidence monotonic chronology is invalid"
+                    )
+                if (
+                    isinstance(emitted_at_utc_ns, bool)
+                    or not isinstance(emitted_at_utc_ns, int)
+                    or emitted_at_utc_ns < 0
+                ):
+                    raise RuntimeError("calibration health evidence UTC timestamp is invalid")
+                previous_monotonic_ns = monotonic_ns
+                identity = cast(dict[str, object], record["identity"])
+                if set(identity) != {"code_version", "runtime_role"} or identity != {
+                    "code_version": expected_code_version,
+                    "runtime_role": expected_runtime_role,
+                }:
+                    raise RuntimeError("calibration health-v5 producer identity differs")
+                if canonical_json_bytes(
+                    record["target"], allow_floats=True
+                ) != canonical_json_bytes(expected_target, allow_floats=True):
+                    raise RuntimeError("calibration health-v5 target identity differs")
+                decisions = cast(dict[str, object], record["decisions"])
+                if set(decisions) != set(_HEALTH_V5_DECISION_FIELDS):
+                    raise RuntimeError("calibration health-v5 decisions group is malformed")
+                if any(
+                    not isinstance(decisions[field], bool)
+                    for field in ("capture_healthy", "gate1_eligible_so_far", "research_eligible")
+                ):
+                    raise RuntimeError("calibration health-v5 scoped decisions are malformed")
+                if any(
+                    isinstance(decisions[field], bool)
+                    or not isinstance(decisions[field], int)
+                    or cast(int, decisions[field]) < 0
+                    for field in ("gate1_sticky_reason_mask", "reason_mask")
+                ):
+                    raise RuntimeError("calibration health-v5 decision masks are malformed")
+                if decisions["reason_mask_schema"] != HEALTH_DECISION_REASON_MASK_SCHEMA:
+                    raise RuntimeError("calibration health-v5 decision-mask schema differs")
+                try:
+                    reason_codes = health_decision_reasons_from_mask(decisions["reason_mask"])
+                    sticky_reason_codes = health_decision_reasons_from_mask(
+                        decisions["gate1_sticky_reason_mask"]
+                    )
+                except ValueError as error:
+                    raise RuntimeError("calibration health-v5 decision mask is invalid") from error
+                if decisions["gate1_eligible_so_far"] and (
+                    not decisions["capture_healthy"]
+                    or not decisions["research_eligible"]
+                    or reason_codes
+                    or sticky_reason_codes
+                ):
+                    raise RuntimeError("calibration health-v5 scoped decisions contradict")
+                journal = cast(dict[str, object], record["journal"])
+                terminal = journal.get("terminal")
+                if not isinstance(terminal, bool):
+                    raise RuntimeError("calibration health evidence lacks typed terminal identity")
+                line_bytes = len(line)
+                total_bytes += line_bytes
+                if terminal:
+                    if emitted_at_utc_ns != expected_terminal_utc_ns:
+                        raise RuntimeError("calibration terminal health cutoff identity differs")
+                    terminal_seen = True
+                    terminal_count += 1
+                    maximum_terminal_bytes = max(maximum_terminal_bytes, line_bytes)
+                else:
+                    periodic_count += 1
+                    maximum_periodic_bytes = max(maximum_periodic_bytes, line_bytes)
+        after = os.fstat(descriptor)
+        stable_fields_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_nlink,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        stable_fields_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_nlink,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        path_after = os.stat(path, follow_symlinks=False)
+        if stable_fields_before != stable_fields_after or descriptor_identity != (
+            path_after.st_dev,
+            path_after.st_ino,
+        ):
+            raise RuntimeError("calibration health evidence changed while being measured")
+    except OSError as error:
+        raise RuntimeError("calibration health evidence identity cannot be verified") from error
+    finally:
+        os.close(descriptor)
+    content_sha256 = digest.hexdigest()
+    if content_sha256 != expected_content_sha256:
+        raise RuntimeError("calibration health evidence SHA-256 identity differs")
+    if total_bytes != expected_bytes:
+        raise RuntimeError("calibration health byte inventory does not reconcile")
+    if periodic_count + terminal_count != expected_records:
+        raise RuntimeError("calibration health record inventory does not reconcile")
+    if expected_terminal_records != 1 or terminal_count != expected_terminal_records:
+        raise RuntimeError("calibration terminal health inventory does not reconcile")
+    return _HealthCheckpointSizes(
+        periodic_count=periodic_count,
+        terminal_count=terminal_count,
+        maximum_periodic_bytes=maximum_periodic_bytes,
+        maximum_terminal_bytes=maximum_terminal_bytes,
+        total_bytes=total_bytes,
+        content_sha256=content_sha256,
+    )
+
+
 def _measurement(
     *,
     config: Phase1Config,
@@ -326,6 +618,8 @@ def _measurement(
     analytical_after: BoundedTreeUsage,
     cpu_time_ns: int,
     peak_rss_bytes: int,
+    requested_duration_ns: int,
+    health_checkpoint_sizes: _HealthCheckpointSizes,
 ) -> CalibrationMeasurements:
     storage_delta = _delta(storage_after, storage_before)
     analytical_delta = _delta(analytical_after, analytical_before)
@@ -335,7 +629,9 @@ def _measurement(
     )
     final = summary.health_decision
     return CalibrationMeasurements(
+        requested_duration_ns=requested_duration_ns,
         actual_duration_ns=summary.websocket_observation_nanoseconds,
+        completed_run_duration_ns=summary.actual_duration_nanoseconds,
         websocket_messages=summary.runtime_health.ingress.received,
         websocket_bytes=summary.runtime_health.ingress.received_bytes,
         durable_raw_records=summary.journal_metrics.durable,
@@ -389,6 +685,11 @@ def _measurement(
         peak_rss_bytes=peak_rss_bytes,
         analytical_bytes=analytical_delta.bytes,
         health_bytes=summary.health_evidence.file_bytes,
+        health_content_sha256=health_checkpoint_sizes.content_sha256,
+        health_periodic_checkpoints=health_checkpoint_sizes.periodic_count,
+        health_terminal_checkpoints=health_checkpoint_sizes.terminal_count,
+        health_maximum_periodic_checkpoint_bytes=(health_checkpoint_sizes.maximum_periodic_bytes),
+        health_maximum_terminal_checkpoint_bytes=(health_checkpoint_sizes.maximum_terminal_bytes),
         log_bytes=0,
         log_storage_model=STDIO_STREAM_LOG_STORAGE_MODEL,
         artifacts_created=storage_delta.regular_files,
@@ -423,6 +724,7 @@ async def run_polymarket_calibration(
         character not in "0123456789abcdef" for character in code_commit
     ):
         raise ValueError("calibration requires an exact lowercase Git SHA")
+    requested_duration_ns = _duration_nanoseconds(duration_seconds)
     workspace = await asyncio.to_thread(workspace_root.resolve)
     await asyncio.to_thread(
         _verify_clean_source_checkout,
@@ -456,6 +758,21 @@ async def run_polymarket_calibration(
     target = summary.target
     if target is None or not target.gate1_explicit:
         raise RuntimeError("calibration observation did not resolve the explicit target")
+    health_checkpoint_sizes = await asyncio.to_thread(
+        _health_checkpoint_sizes,
+        summary.health_evidence.path,
+        expected_bytes=summary.health_evidence.file_bytes,
+        expected_records=summary.health_evidence.written,
+        expected_terminal_records=summary.health_evidence.terminal_written,
+        expected_collector_run_id=summary.collector_run_id.value,
+        expected_content_sha256=summary.health_evidence.content_sha256,
+        expected_git_commit=code_commit,
+        expected_config_hash=config.config_hash.value,
+        expected_code_version=config.system.code_version,
+        expected_runtime_role=config.system.runtime_role.value,
+        expected_target=target.to_record(),
+        expected_terminal_utc_ns=summary.ended_at.nanoseconds_since_epoch,
+    )
     if summary.websocket_observation_nanoseconds <= 0:
         raise RuntimeError("calibration did not establish a bounded WebSocket window")
     identity = CalibrationIdentity(
@@ -487,6 +804,8 @@ async def run_polymarket_calibration(
         analytical_after=analytical_after,
         cpu_time_ns=cpu_time_ns,
         peak_rss_bytes=peak_rss_bytes,
+        requested_duration_ns=requested_duration_ns,
+        health_checkpoint_sizes=health_checkpoint_sizes,
     )
     limits = CalibrationLimits(
         raw_run_cap_bytes=config.storage.journal_run_max_uncompressed_bytes,

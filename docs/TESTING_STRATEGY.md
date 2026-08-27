@@ -281,6 +281,28 @@ crash ledger. Their sum must equal `temporary_sealing_bytes` and must
 appear exactly once in total disk workload. Boundary tests reject a missing,
 negative, inconsistent, double-counted, or legacy-synthesized component.
 
+Calibration-v3 conformance tests preserve the existing schema while exercising
+the corrected ADR-0057 health producer. They require the exact producer-contract
+and projection-method revisions and reject pre-correction v3 artifacts lacking
+them. They read canonical current-v5 JSONL through a no-follow descriptor,
+verify stable single-link identity and the writer SHA-256,
+reconcile file bytes and record counts, require exactly one terminal record in
+the final position, and bind observed periodic/terminal counts and maxima.
+Regression coverage uses a short mixed file whose terminal record is larger
+than its periodic records and proves that health is projected as exactly 2,160
+periodic records at 30,819 bytes plus one terminal record at 44,463 bytes:
+66,613,503 bytes with 4,689,665 bytes remaining. Negative cases cover a missing,
+duplicate or non-final terminal, malformed/partial/noncanonical/non-v5 or
+symlink evidence, inventory mismatch, either capacity-qualified record maximum
+exceeded, file/count overrun, mutated cadence/count/file limits, writer-digest
+mismatch, hard-link identity, monotonic chronology failure, and less than 2 MiB remaining margin. Separate
+tests prove that generic stochastic rate fields retain 2.0x headroom and the
+WebSocket observation-duration denominator, that exact requested and completed
+monotonic durations are bound, and that completion shorter than requested fails
+closed. Identity tests mutate producer role/version, target, and terminal cutoff;
+count tests reject both missing cadence coverage and a faster-than-ten-second
+producer before fixed-cardinality projection.
+
 The compressed-byte fixture compares the new ordered path with the existing
 synchronous helper for identical payload and compressor configuration. Expected
 manifest timestamps and new Git identity are compared semantically rather than
@@ -311,9 +333,10 @@ Required:
   sticky reasons; explicit v1-v4 historical compatibility without synthesized
   seal fields;
 - maximum periodic/terminal v5 serialization of 30,819/44,463 bytes, exact
-  66,613,503-byte six-hour projection, 68 MiB file cap, at least 2 MiB remaining
-  headroom, unchanged ten-second cadence/8,192 count bound, and injected
-  count/file overflow failure;
+  fixed cardinality of 2,160 periodic records plus one terminal-last record,
+  66,613,503-byte six-hour projection, 68 MiB file cap, exact 4,689,665-byte
+  margin, at least 2 MiB remaining headroom, unchanged ten-second cadence/8,192
+  count bound, and injected record/count/file overflow failure;
 - exact `audit.current_eligibility` shape and reconciliation against processor
   ineligible books, required-ineligible instruments, divergence pending and
   replacement-capture pending;
