@@ -76,8 +76,10 @@ from multi_market_arbitrage.research import (
 )
 from multi_market_arbitrage.state.order_books import InvalidationReason
 from multi_market_arbitrage.venues.polymarket import (
+    PolymarketEndpointClass,
     PolymarketHttpError,
     PolymarketHttpFailureCategory,
+    PolymarketHttpTransportError,
     PolymarketMarketWebSocket,
     PolymarketPublicClient,
     PolymarketWebSocketError,
@@ -2139,6 +2141,12 @@ class PolymarketObservationService:
             closed=False,
             deadline=deadline,
         )
+        discovery_returned = self._fence_public_read_return(
+            deadline=deadline,
+            deadline_monotonic_ns=None,
+            endpoint_class=PolymarketEndpointClass.GAMMA_MARKETS,
+            operation="Gamma market-discovery read",
+        )
         await capture.preserve_then_process(
             channel=GAMMA_MARKETS_KEYSET,
             payload=discovery,
@@ -2147,6 +2155,8 @@ class PolymarketObservationService:
                 GAMMA_MARKETS_KEYSET,
                 f"limit={self._config.polymarket.discovery_limit};closed=false",
             ),
+            received_wall_time=discovery_returned.wall_time,
+            received_monotonic_ns=discovery_returned.monotonic_ns,
         )
         eligible = tuple(
             market for market in processor.discovered_markets if _eligible_market(market)
@@ -2198,12 +2208,20 @@ class PolymarketObservationService:
             gamma_market_id,
             deadline=deadline,
         )
+        gamma_returned = self._fence_public_read_return(
+            deadline=deadline,
+            deadline_monotonic_ns=None,
+            endpoint_class=PolymarketEndpointClass.GAMMA_MARKETS,
+            operation="Gamma market read",
+        )
         gamma_channel = f"{GAMMA_MARKET_PREFIX}{gamma_market_id}"
         gamma_result = await capture.preserve_then_process(
             channel=gamma_channel,
             payload=gamma_payload,
             transport_type="HTTP",
             semantics_hash=_semantics(gamma_channel),
+            received_wall_time=gamma_returned.wall_time,
+            received_monotonic_ns=gamma_returned.monotonic_ns,
         )
         self._require_target_surface(gamma_result, surface="Gamma market")
         matching_markets = tuple(
@@ -2235,12 +2253,20 @@ class PolymarketObservationService:
                 event_id,
                 deadline=deadline,
             )
+            event_returned = self._fence_public_read_return(
+                deadline=deadline,
+                deadline_monotonic_ns=None,
+                endpoint_class=PolymarketEndpointClass.GAMMA_GENERAL,
+                operation="Gamma event read",
+            )
             event_channel = f"{GAMMA_EVENT_PREFIX}{event_id}"
             event_result = await capture.preserve_then_process(
                 channel=event_channel,
                 payload=event_payload,
                 transport_type="HTTP",
                 semantics_hash=_semantics(event_channel),
+                received_wall_time=event_returned.wall_time,
+                received_monotonic_ns=event_returned.monotonic_ns,
             )
             self._require_target_surface(event_result, surface="Gamma event")
 
@@ -2248,12 +2274,20 @@ class PolymarketObservationService:
             market.condition_id,
             deadline=deadline,
         )
+        clob_returned = self._fence_public_read_return(
+            deadline=deadline,
+            deadline_monotonic_ns=None,
+            endpoint_class=PolymarketEndpointClass.CLOB_GENERAL,
+            operation="CLOB market read",
+        )
         clob_channel = f"{CLOB_MARKET_PREFIX}{market.condition_id}"
         clob_result = await capture.preserve_then_process(
             channel=clob_channel,
             payload=clob_payload,
             transport_type="HTTP",
             semantics_hash=_semantics(clob_channel),
+            received_wall_time=clob_returned.wall_time,
+            received_monotonic_ns=clob_returned.monotonic_ns,
         )
         self._require_target_surface(clob_result, surface="CLOB market")
 
@@ -2284,6 +2318,7 @@ class PolymarketObservationService:
         capture: _RawCaptureBoundary,
         direct_market: GammaMarket,
         deadline: float | None,
+        deadline_monotonic_ns: int | None = None,
     ) -> GammaMarket:
         """Resolve an exact zero-or-one parent relationship omitted by the direct surface."""
 
@@ -2292,12 +2327,20 @@ class PolymarketObservationService:
             gamma_market_id,
             deadline=deadline,
         )
+        returned = self._fence_public_read_return(
+            deadline=deadline,
+            deadline_monotonic_ns=deadline_monotonic_ns,
+            endpoint_class=PolymarketEndpointClass.GAMMA_MARKETS,
+            operation="Gamma market-relationship read",
+        )
         relationship_channel = f"{GAMMA_MARKET_RELATIONSHIP_PREFIX}{gamma_market_id}"
         relationship_result = await capture.preserve_then_process(
             channel=relationship_channel,
             payload=relationship_payload,
             transport_type="HTTP",
             semantics_hash=_semantics(relationship_channel),
+            received_wall_time=returned.wall_time,
+            received_monotonic_ns=returned.monotonic_ns,
         )
         self._require_target_surface(
             relationship_result,
@@ -2354,6 +2397,32 @@ class PolymarketObservationService:
         )
         raise TargetSelectionError(f"{surface} could not be canonicalized: {detail}")
 
+    @staticmethod
+    def _fence_public_read_return(
+        *,
+        deadline: float | None,
+        deadline_monotonic_ns: int | None,
+        endpoint_class: PolymarketEndpointClass,
+        operation: str,
+    ) -> _CaptureCutoffMoment:
+        """Freeze one coordinator-return moment and reject a reached exact bound."""
+
+        returned_at = UtcTimestamp.now()
+        returned_monotonic_ns = time.monotonic_ns()
+        returned_loop_time = asyncio.get_running_loop().time()
+        deadline_reached = (
+            deadline_monotonic_ns is not None and returned_monotonic_ns >= deadline_monotonic_ns
+        ) or (deadline is not None and returned_loop_time >= deadline)
+        if deadline_reached:
+            raise PolymarketHttpTransportError(
+                endpoint_class=endpoint_class,
+                category=PolymarketHttpFailureCategory.DEADLINE_EXCEEDED,
+                retryable=False,
+                attempt=1,
+                detail=f"{operation} returned at or after its deadline",
+            )
+        return _CaptureCutoffMoment(returned_at, returned_monotonic_ns)
+
     async def _refresh_reference(
         self,
         client: PolymarketPublicClient,
@@ -2361,6 +2430,7 @@ class PolymarketObservationService:
         market: GammaMarket,
         *,
         deadline: float | None = None,
+        deadline_monotonic_ns: int | None = None,
     ) -> None:
         await self._refresh_reference_by_id(
             client,
@@ -2368,6 +2438,7 @@ class PolymarketObservationService:
             gamma_market_id=market.gamma_market_id,
             fallback=market,
             deadline=deadline,
+            deadline_monotonic_ns=deadline_monotonic_ns,
         )
 
     async def _refresh_reference_by_id(
@@ -2378,10 +2449,17 @@ class PolymarketObservationService:
         gamma_market_id: str,
         fallback: GammaMarket | None = None,
         deadline: float | None = None,
+        deadline_monotonic_ns: int | None = None,
     ) -> None:
         gamma_payload = await client.fetch_gamma_market_raw(
             gamma_market_id,
             deadline=deadline,
+        )
+        gamma_returned = self._fence_public_read_return(
+            deadline=deadline,
+            deadline_monotonic_ns=deadline_monotonic_ns,
+            endpoint_class=PolymarketEndpointClass.GAMMA_MARKETS,
+            operation="Gamma market read",
         )
         channel = f"{GAMMA_MARKET_PREFIX}{gamma_market_id}"
         gamma_result = await capture.preserve_then_process(
@@ -2389,6 +2467,8 @@ class PolymarketObservationService:
             payload=gamma_payload,
             transport_type="HTTP",
             semantics_hash=_semantics(channel),
+            received_wall_time=gamma_returned.wall_time,
+            received_monotonic_ns=gamma_returned.monotonic_ns,
         )
         self._require_target_surface(gamma_result, surface="Gamma market")
         direct_market = parse_gamma_market(gamma_payload)
@@ -2416,6 +2496,7 @@ class PolymarketObservationService:
                 capture=capture,
                 direct_market=direct_market,
                 deadline=deadline,
+                deadline_monotonic_ns=deadline_monotonic_ns,
             )
         if fallback is not None and current.event_id != fallback.event_id:
             raise TargetSelectionError(
@@ -2427,17 +2508,31 @@ class PolymarketObservationService:
                 event_id,
                 deadline=deadline,
             )
+            event_returned = self._fence_public_read_return(
+                deadline=deadline,
+                deadline_monotonic_ns=deadline_monotonic_ns,
+                endpoint_class=PolymarketEndpointClass.GAMMA_GENERAL,
+                operation="Gamma event read",
+            )
             event_channel = f"{GAMMA_EVENT_PREFIX}{event_id}"
             event_result = await capture.preserve_then_process(
                 channel=event_channel,
                 payload=event_payload,
                 transport_type="HTTP",
                 semantics_hash=_semantics(event_channel),
+                received_wall_time=event_returned.wall_time,
+                received_monotonic_ns=event_returned.monotonic_ns,
             )
             self._require_target_surface(event_result, surface="Gamma event")
         clob_payload = await client.fetch_clob_market_raw(
             current.condition_id,
             deadline=deadline,
+        )
+        clob_returned = self._fence_public_read_return(
+            deadline=deadline,
+            deadline_monotonic_ns=deadline_monotonic_ns,
+            endpoint_class=PolymarketEndpointClass.CLOB_GENERAL,
+            operation="CLOB market read",
         )
         clob_channel = f"{CLOB_MARKET_PREFIX}{current.condition_id}"
         clob_result = await capture.preserve_then_process(
@@ -2445,6 +2540,8 @@ class PolymarketObservationService:
             payload=clob_payload,
             transport_type="HTTP",
             semantics_hash=_semantics(clob_channel),
+            received_wall_time=clob_returned.wall_time,
+            received_monotonic_ns=clob_returned.monotonic_ns,
         )
         self._require_target_surface(clob_result, surface="CLOB market")
 
@@ -2456,10 +2553,17 @@ class PolymarketObservationService:
         *,
         audit: bool,
         deadline: float | None = None,
+        deadline_monotonic_ns: int | None = None,
     ) -> ProcessedEnvelope:
         payload = await client.fetch_order_book_raw(
             asset_id,
             deadline=deadline,
+        )
+        returned = PolymarketObservationService._fence_public_read_return(
+            deadline=deadline,
+            deadline_monotonic_ns=deadline_monotonic_ns,
+            endpoint_class=PolymarketEndpointClass.CLOB_BOOK,
+            operation="public order-book read",
         )
         channel = REST_BOOK_AUDIT if audit else REST_BOOK
         return await capture.preserve_then_process(
@@ -2467,6 +2571,8 @@ class PolymarketObservationService:
             payload=payload,
             transport_type="HTTP",
             semantics_hash=_semantics(channel, f"token_id={asset_id}"),
+            received_wall_time=returned.wall_time,
+            received_monotonic_ns=returned.monotonic_ns,
         )
 
     @staticmethod
@@ -2488,6 +2594,21 @@ class PolymarketObservationService:
             (recovery_deadline_ns - monotonic_now_ns) / 1e9,
         )
         return recovery_deadline if deadline is None else min(deadline, recovery_deadline)
+
+    @staticmethod
+    def _off_socket_operation_deadline_ns(
+        deadline_monotonic_ns: int | None,
+        supervisor: _ReplacementDeadlineSupervisor | None,
+    ) -> int | None:
+        """Return the exact earliest run/recovery boundary without clock conversion."""
+
+        recovery_deadline_ns = (
+            None if supervisor is None else supervisor.next_exhaustion_deadline_ns()
+        )
+        return min(
+            (item for item in (deadline_monotonic_ns, recovery_deadline_ns) if item is not None),
+            default=None,
+        )
 
     @staticmethod
     async def _process_due_off_socket_recovery_exhaustion(
@@ -2618,6 +2739,7 @@ class PolymarketObservationService:
         capture: _RawCaptureBoundary,
         selected: tuple[GammaMarket, ...],
         deadline: float | None = None,
+        deadline_monotonic_ns: int | None = None,
         refresh_reference: bool = True,
         runtime_health: ObservationRuntimeHealth | None = None,
         replacement_deadline_supervisor: _ReplacementDeadlineSupervisor | None = None,
@@ -2625,16 +2747,22 @@ class PolymarketObservationService:
         required_instrument_ids: set[InstrumentId] = set()
         for market in selected:
             if refresh_reference:
+                effective_reference_deadline = self._off_socket_operation_deadline(
+                    deadline,
+                    replacement_deadline_supervisor,
+                )
+                effective_reference_deadline_ns = self._off_socket_operation_deadline_ns(
+                    deadline_monotonic_ns,
+                    replacement_deadline_supervisor,
+                )
                 try:
                     await self._await_off_socket_operation(
                         self._refresh_reference(
                             client,
                             capture,
                             market,
-                            deadline=self._off_socket_operation_deadline(
-                                deadline,
-                                replacement_deadline_supervisor,
-                            ),
+                            deadline=effective_reference_deadline,
+                            deadline_monotonic_ns=effective_reference_deadline_ns,
                         ),
                         supervisor=replacement_deadline_supervisor,
                     )
@@ -2644,16 +2772,22 @@ class PolymarketObservationService:
                     ) from error
             for asset_id in market.clob_token_ids:
                 required_instrument_ids.add(InstrumentId.from_native(POLYMARKET_VENUE_ID, asset_id))
+                effective_deadline = self._off_socket_operation_deadline(
+                    deadline,
+                    replacement_deadline_supervisor,
+                )
+                effective_deadline_monotonic_ns = self._off_socket_operation_deadline_ns(
+                    deadline_monotonic_ns,
+                    replacement_deadline_supervisor,
+                )
                 result = await self._await_off_socket_operation(
                     self._fetch_book(
                         client,
                         capture,
                         asset_id,
                         audit=False,
-                        deadline=self._off_socket_operation_deadline(
-                            deadline,
-                            replacement_deadline_supervisor,
-                        ),
+                        deadline=effective_deadline,
+                        deadline_monotonic_ns=effective_deadline_monotonic_ns,
                     ),
                     supervisor=replacement_deadline_supervisor,
                 )
@@ -3414,6 +3548,7 @@ class PolymarketObservationService:
         capture: _RawCaptureBoundary,
         selected: tuple[GammaMarket, ...],
         deadline: float | None = None,
+        deadline_monotonic_ns: int | None = None,
         runtime_health: ObservationRuntimeHealth | None = None,
         metrics_already_recorded: bool = False,
         replacement_deadline_supervisor: _ReplacementDeadlineSupervisor | None = None,
@@ -3455,16 +3590,22 @@ class PolymarketObservationService:
         for market in selected:
             if market.gamma_market_id not in refresh_gamma_ids:
                 continue
+            effective_reference_deadline = self._off_socket_operation_deadline(
+                deadline,
+                replacement_deadline_supervisor,
+            )
+            effective_reference_deadline_ns = self._off_socket_operation_deadline_ns(
+                deadline_monotonic_ns,
+                replacement_deadline_supervisor,
+            )
             await self._await_off_socket_operation(
                 self._refresh_reference_by_id(
                     client,
                     capture,
                     gamma_market_id=market.gamma_market_id,
                     fallback=market,
-                    deadline=self._off_socket_operation_deadline(
-                        deadline,
-                        replacement_deadline_supervisor,
-                    ),
+                    deadline=effective_reference_deadline,
+                    deadline_monotonic_ns=effective_reference_deadline_ns,
                 ),
                 supervisor=replacement_deadline_supervisor,
             )
@@ -3481,6 +3622,7 @@ class PolymarketObservationService:
                     market for market in selected if market.gamma_market_id in refresh_gamma_ids
                 ),
                 deadline=deadline,
+                deadline_monotonic_ns=deadline_monotonic_ns,
                 refresh_reference=False,
                 runtime_health=runtime_health,
                 replacement_deadline_supervisor=replacement_deadline_supervisor,
@@ -5869,6 +6011,7 @@ class PolymarketObservationService:
                         capture=capture,
                         selected=selected,
                         deadline=deadline,
+                        deadline_monotonic_ns=deadline_ns,
                         runtime_health=runtime_health,
                         metrics_already_recorded=True,
                         replacement_deadline_supervisor=supervisor,
@@ -5917,6 +6060,7 @@ class PolymarketObservationService:
                     capture=capture,
                     selected=selected,
                     deadline=deadline,
+                    deadline_monotonic_ns=deadline_ns,
                     runtime_health=runtime_health,
                     replacement_deadline_supervisor=supervisor,
                 )
@@ -6044,6 +6188,7 @@ class PolymarketObservationService:
                         capture=capture,
                         selected=selected,
                         deadline=deadline,
+                        deadline_monotonic_ns=deadline_ns,
                         runtime_health=runtime_health,
                         replacement_deadline_supervisor=supervisor,
                     )

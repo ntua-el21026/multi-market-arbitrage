@@ -55,6 +55,7 @@ from multi_market_arbitrage.venues.polymarket import (
     PolymarketEndpointClass,
     PolymarketHttpFailureCategory,
     PolymarketHttpTransportError,
+    PolymarketPublicClient,
     PublicReadEvidence,
     PublicReadMetricsSnapshot,
     PublicReadResult,
@@ -905,7 +906,10 @@ async def test_ready_boundary_preceding_recovery_timer_starts_attempt_first(
         _ReadyBeforeDelayedTimerSocket,
     )
 
-    summary = await service.run(duration_seconds=1.5, gamma_market_id="101")
+    # Keep the run cutoff independent of the deliberate 500 ms event-loop
+    # stall below.  The assertion under test is readiness-versus-recovery
+    # deadline ordering, not terminal run-cutoff behavior on a loaded host.
+    summary = await service.run(duration_seconds=2.5, gamma_market_id="101")
 
     capture_authority = summary.processor.audit_replacement_capture_authority[0]
     recovery = capture_authority.recovery_authority
@@ -946,6 +950,170 @@ async def test_ready_boundary_preceding_recovery_timer_starts_attempt_first(
         <= deadline_record.received_monotonic.nanoseconds
         < recovery.run_deadline.nanoseconds
     )
+
+
+@pytest.mark.asyncio
+async def test_resnapshot_result_returned_after_effective_deadline_is_not_preserved() -> None:
+    class _ImmediateResultClient:
+        async def fetch_order_book_raw(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+        ) -> bytes:
+            assert asset_id == "token-yes"
+            assert deadline is not None
+            return _divergent_yes_payload()
+
+    class _RejectingCapture:
+        async def preserve_then_process(self, **kwargs: object) -> ProcessedEnvelope:
+            del kwargs
+            raise AssertionError("late resnapshot payload reached the preservation boundary")
+
+    deadline = asyncio.get_running_loop().time() + 1.0
+    deadline_monotonic_ns = time.monotonic_ns() - 1
+    with pytest.raises(PolymarketHttpTransportError) as captured:
+        await PolymarketObservationService._fetch_book(  # pyright: ignore[reportPrivateUsage]
+            cast(PolymarketPublicClient, _ImmediateResultClient()),
+            cast(observe_module._RawCaptureBoundary, _RejectingCapture()),  # pyright: ignore[reportPrivateUsage]
+            "token-yes",
+            audit=False,
+            deadline=deadline,
+            deadline_monotonic_ns=deadline_monotonic_ns,
+        )
+
+    assert captured.value.category is PolymarketHttpFailureCategory.DEADLINE_EXCEEDED
+
+
+@pytest.mark.asyncio
+async def test_reference_result_after_exact_deadline_is_not_preserved(tmp_path: Path) -> None:
+    class _ImmediateReferenceClient:
+        async def fetch_gamma_market_raw(
+            self,
+            gamma_market_id: str,
+            *,
+            deadline: float | None = None,
+        ) -> bytes:
+            assert gamma_market_id == "101"
+            assert deadline is not None
+            return _direct_gamma_payload()
+
+    class _RejectingCapture:
+        async def preserve_then_process(self, **kwargs: object) -> ProcessedEnvelope:
+            del kwargs
+            raise AssertionError("late reference payload reached the preservation boundary")
+
+    service = PolymarketObservationService(
+        load_phase1_config(Path("config/phase1.toml")),
+        workspace_root=tmp_path,
+        code_commit="fixture",
+    )
+    with pytest.raises(PolymarketHttpTransportError) as captured:
+        await service._refresh_reference_by_id(  # pyright: ignore[reportPrivateUsage]
+            cast(PolymarketPublicClient, _ImmediateReferenceClient()),
+            cast(observe_module._RawCaptureBoundary, _RejectingCapture()),  # pyright: ignore[reportPrivateUsage]
+            gamma_market_id="101",
+            deadline=asyncio.get_running_loop().time() + 1.0,
+            deadline_monotonic_ns=time.monotonic_ns() - 1,
+        )
+
+    assert captured.value.category is PolymarketHttpFailureCategory.DEADLINE_EXCEEDED
+
+
+@pytest.mark.asyncio
+async def test_exact_recovery_deadline_precedes_run_deadline() -> None:
+    async def _unused_process_due(
+        moment: observe_module._CaptureCutoffMoment,  # pyright: ignore[reportPrivateUsage]
+    ) -> None:
+        del moment
+
+    supervisor = observe_module._ReplacementDeadlineSupervisor(  # pyright: ignore[reportPrivateUsage]
+        next_exhaustion_deadline_ns=lambda: 100,
+        process_due_exhaustions=_unused_process_due,
+    )
+
+    assert (
+        PolymarketObservationService._off_socket_operation_deadline_ns(  # pyright: ignore[reportPrivateUsage]
+            200,
+            supervisor,
+        )
+        == 100
+    )
+
+
+@pytest.mark.asyncio
+async def test_late_authoritative_resnapshot_remains_terminally_unresolved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _configured_service(tmp_path)
+    _prepare_runtime(monkeypatch, fail_resnapshot=False)
+
+    class _RunDeadlineCrossingResnapshotClient(_LifecyclePublicClient):
+        async def fetch_order_book_raw(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+        ) -> bytes:
+            assert asset_id == "token-yes"
+            assert deadline is not None
+            self.first_generation_stopped_before_resnapshot = bool(
+                _LifecycleSocket.instances and _LifecycleSocket.instances[0].stopped
+            )
+            self.resnapshot_book_calls.append(asset_id)
+            await asyncio.sleep(max(0.0, deadline - asyncio.get_running_loop().time()) + 0.01)
+            return _divergent_yes_payload()
+
+    monkeypatch.setattr(
+        observe_module,
+        "PolymarketPublicClient",
+        _RunDeadlineCrossingResnapshotClient,
+    )
+
+    summary = await service.run(duration_seconds=3.0, gamma_market_id="101")
+
+    client = _RunDeadlineCrossingResnapshotClient.latest
+    assert isinstance(client, _RunDeadlineCrossingResnapshotClient)
+    assert client.resnapshot_book_calls == ["token-yes"]
+    assert client.first_generation_stopped_before_resnapshot
+    processor = summary.processor
+    assert processor.audit_divergences_observed == 1
+    assert processor.audit_divergences_resolved_by_authoritative_resnapshot == 0
+    assert processor.audit_divergences_pending == 1
+    assert processor.audit_divergences_unresolved == 1
+    assert processor.audit_replacement_captures_pending == 0
+    assert not processor.audit_divergence_resolution_records
+    assert summary.status is ComponentHealth.DEGRADED
+    assert not summary.health_decision.research_eligible
+    assert not summary.health_decision.gate1_eligible_so_far
+    assert HealthDecisionReason.AUDIT_DIVERGENCE_UNRESOLVED in (
+        summary.health_decision.gate1_sticky_reason_codes
+    )
+    assert summary.availability_evidence.open_at_shutdown_intervals == 1
+    interval = json.loads(summary.availability_evidence.path.read_text(encoding="utf-8"))
+    assert interval["cause_type"] == AvailabilityCause.AUDIT_MISMATCH_RECOVERY
+    assert interval["recovery_outcome"] == (AvailabilityRecoveryOutcome.NOT_RESTORED_AT_SHUTDOWN)
+    assert interval["research_eligibility_restored"] is False
+    assert interval["open_at_shutdown"] is True
+
+    final_checkpoint = json.loads(
+        summary.health_evidence.path.read_text(encoding="utf-8").splitlines()[-1]
+    )
+    assert final_checkpoint["audit"]["divergences"]["pending"] == 1
+    assert final_checkpoint["audit"]["divergences"]["unresolved"] == 1
+    assert final_checkpoint["decisions"]["research_eligible"] is False
+    assert HealthDecisionReason.AUDIT_DIVERGENCE_UNRESOLVED in _record_decision_reasons(
+        final_checkpoint,
+        sticky=True,
+    )
+    replay = replay_journal(
+        summary.journal_root,
+        summary.collector_run_id,
+        service._config,  # pyright: ignore[reportPrivateUsage]
+    )
+    assert replay.processor == processor
+    assert replay.processor.terminal_hash == processor.terminal_hash
 
 
 @pytest.mark.asyncio

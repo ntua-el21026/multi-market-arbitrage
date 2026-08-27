@@ -1209,6 +1209,7 @@ async def test_ingress_overflow_is_journaled_and_forces_rest_resnapshot(
         capture: object,
         selected: tuple[GammaMarket, ...],
         deadline: float | None = None,
+        deadline_monotonic_ns: int | None = None,
         refresh_reference: bool = True,
         runtime_health: ObservationRuntimeHealth | None = None,
         replacement_deadline_supervisor: object | None = None,
@@ -1218,6 +1219,7 @@ async def test_ingress_overflow_is_journaled_and_forces_rest_resnapshot(
             client,
             capture,
             deadline,
+            deadline_monotonic_ns,
             refresh_reference,
             runtime_health,
             replacement_deadline_supervisor,
@@ -1920,8 +1922,9 @@ async def test_refresh_requests_are_selected_market_bounded_and_coalesced(
         gamma_market_id: str,
         fallback: GammaMarket | None = None,
         deadline: float | None = None,
+        deadline_monotonic_ns: int | None = None,
     ) -> None:
-        del service, client, capture, fallback
+        del service, client, capture, fallback, deadline_monotonic_ns
         refreshed.append((gamma_market_id, deadline))
 
     async def record_snapshot(
@@ -1931,11 +1934,19 @@ async def test_refresh_requests_are_selected_market_bounded_and_coalesced(
         capture: object,
         selected: tuple[GammaMarket, ...],
         deadline: float | None = None,
+        deadline_monotonic_ns: int | None = None,
         refresh_reference: bool = True,
         runtime_health: ObservationRuntimeHealth | None = None,
         replacement_deadline_supervisor: object | None = None,
     ) -> None:
-        del service, client, capture, runtime_health, replacement_deadline_supervisor
+        del (
+            service,
+            client,
+            capture,
+            deadline_monotonic_ns,
+            runtime_health,
+            replacement_deadline_supervisor,
+        )
         snapshots.append(
             (tuple(market.gamma_market_id for market in selected), deadline, refresh_reference)
         )
@@ -2014,6 +2025,8 @@ async def test_remote_deadline_is_adapter_owned_but_not_applied_to_payload_prese
         def __init__(self, result: ProcessedEnvelope) -> None:
             self.result = result
             self.payload: bytes | None = None
+            self.received_wall_time: UtcTimestamp | None = None
+            self.received_monotonic_ns: int | None = None
 
         async def preserve_then_process(
             self,
@@ -2022,9 +2035,13 @@ async def test_remote_deadline_is_adapter_owned_but_not_applied_to_payload_prese
             payload: bytes,
             transport_type: str,
             semantics_hash: str,
+            received_wall_time: UtcTimestamp | None = None,
+            received_monotonic_ns: int | None = None,
         ) -> ProcessedEnvelope:
             del channel, transport_type, semantics_hash
             self.payload = payload
+            self.received_wall_time = received_wall_time
+            self.received_monotonic_ns = received_monotonic_ns
             await asyncio.sleep(0.02)
             return self.result
 
@@ -2063,6 +2080,8 @@ async def test_remote_deadline_is_adapter_owned_but_not_applied_to_payload_prese
     )
     assert actual is expected
     assert slow_capture.payload == b"received"
+    assert slow_capture.received_wall_time is not None
+    assert slow_capture.received_monotonic_ns is not None
 
 
 @pytest.mark.asyncio
