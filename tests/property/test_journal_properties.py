@@ -123,6 +123,12 @@ def test_group_commit_preserves_bytes_segment_hashes_and_receipt_coverage(
                 git_commit="abc123",
                 queue_capacity=8,
                 max_events_per_segment=segment_events,
+                # This property isolates group-commit equivalence.  Its generated
+                # case can create eight one-event segments before a slow CI sealer
+                # runs, so the bounded seal inventory must cover that exact
+                # generated maximum rather than introduce scheduling-dependent
+                # backpressure from the production default of four.
+                seal_queue_capacity=8,
                 group_commit_max_events=configured_group_size,
                 group_commit_max_delay_seconds=(0.0 if configured_group_size == 1 else 0.01),
                 zstd_level=3,
