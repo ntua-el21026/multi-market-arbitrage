@@ -410,8 +410,12 @@ async def test_capacity_workload_saturates_production_histories_and_persistence(
 
     production_health = cast(dict[str, object], result["production_health"])
     writer = cast(dict[str, object], production_health["writer"])
-    assert writer["accepted"] == writer["written"] == 9
+    assert production_health["expected_checkpoints"] == 10
+    assert writer["accepted"] == writer["written"] == 10
     assert writer["rejected"] == 0
+    assert writer["terminal_accepted"] == writer["terminal_written"] == 1
+    assert writer["terminal_record_count"] == 1
+    assert writer["last_record_terminal"] is True
     terminal_resources = cast(
         dict[str, object], production_health["terminal_post_cutoff_resources"]
     )

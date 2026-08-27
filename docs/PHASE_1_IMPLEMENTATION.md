@@ -239,11 +239,13 @@ reports `temporary_sealing_active_bytes`, `temporary_sealing_pending_bytes`,
 sum and is counted once in disk workload. Historical v1-v2 reports remain
 strict historical evidence and cannot qualify the current candidate by
 synthesizing these fields. Under the accepted profile, the five components are
-67,108,864; 268,435,456; 68,157,440; 25,427,968; and 67,371,008 bytes, totaling
-496,500,736 bytes. The last value covers one 64-MiB recovery tail plus the
-262,144-byte compact crash-evidence ledger. Phase 1 does not create
-an application-managed log file: logging is stdout/stderr only, so calibration
-binds `log_storage_model=STDIO_STREAM_ONLY_UNMANAGED` and `log_bytes=0`. An
+67,108,864; 268,435,456; 68,157,440; 25,493,504; and 67,371,008 bytes, totaling
+496,566,272 bytes. The metadata/scratch component includes the retained
+64-KiB run/stream source-authority sidecar; the last value covers one 64-MiB
+recovery tail plus the 262,144-byte compact crash-evidence ledger. Phase 1 does
+not create an application-managed log file: logging is stdout/stderr only, so
+calibration binds `log_storage_model=STDIO_STREAM_ONLY_UNMANAGED` and
+`log_bytes=0`. An
 operator who redirects process output to a file must budget and record that
 external file separately. A fresh successful publication contains
 `calibration.json`, `calibration.md`, and `calibration.bindings.json`, with

@@ -2007,75 +2007,74 @@ async def _journal_rotation(
     allocator_samples: list[dict[str, object]] = [
         {"phase": "before_start", **_allocator_measurement()}
     ]
-    pending_allocator_boundary: tuple[int, int] | None = None
     await writer.start()
+
+    async def sample_verified_segment_boundaries() -> None:
+        """Measure each completed full segment without coupling append to sealing."""
+
+        completed_full_segments = event_count // events_per_segment
+        next_segment = 1
+        while next_segment <= completed_full_segments:
+            if writer.metrics.source_partial_removed_transitions >= next_segment:
+                allocator_samples.append(
+                    {
+                        "phase": f"sealed_{next_segment}",
+                        "sealed_records": writer.metrics.sealed,
+                        **_allocator_measurement(),
+                    }
+                )
+                next_segment += 1
+                continue
+            await asyncio.sleep(0.01)
+
+    allocator_sampler = asyncio.create_task(sample_verified_segment_boundaries())
     tickets: list[JournalTicket] = []
-    for sequence in range(event_count):
-        envelope = _envelope(
-            sequence,
-            WS_MARKET,
-            _journal_capacity_payload(sequence, payload_bytes),
-            run_id=run_id,
-            connection_id=connection_id,
-            subscription_id=subscription_id,
-            metadata={"websocket_admission_ordinal": sequence + 1},
-        )
-        line = envelope.to_json_line()
-        submitted_chain.update(b"[" if sequence == 0 else b",")
-        submitted_chain.update(canonical_json_bytes(envelope.to_record()))
-        segment_payload_digest.update(line)
-        segment_uncompressed_bytes += len(line)
-        ticket = await writer.enqueue(envelope)
-        if pending_allocator_boundary is not None:
-            sealed_records, sealed_segments = pending_allocator_boundary
-            await ticket.wait_durable()
-            if writer.metrics.sealed < sealed_records:
-                raise RuntimeError("journal advanced without publishing prior sealed records")
-            allocator_samples.append(
-                {
-                    "phase": f"sealed_{sealed_segments}",
-                    "sealed_records": writer.metrics.sealed,
-                    **_allocator_measurement(),
-                }
+    try:
+        for sequence in range(event_count):
+            envelope = _envelope(
+                sequence,
+                WS_MARKET,
+                _journal_capacity_payload(sequence, payload_bytes),
+                run_id=run_id,
+                connection_id=connection_id,
+                subscription_id=subscription_id,
+                metadata={"websocket_admission_ordinal": sequence + 1},
             )
-            pending_allocator_boundary = None
-        else:
+            line = envelope.to_json_line()
+            submitted_chain.update(b"[" if sequence == 0 else b",")
+            submitted_chain.update(canonical_json_bytes(envelope.to_record()))
+            segment_payload_digest.update(line)
+            segment_uncompressed_bytes += len(line)
+            ticket = await writer.enqueue(envelope)
             tickets.append(ticket)
-        submitted_count = sequence + 1
-        segment_complete = submitted_count % events_per_segment == 0
-        if tickets and (
-            len(tickets) == config.storage.journal_group_commit_max_events
-            or submitted_count == event_count
-            or segment_complete
-        ):
-            await asyncio.gather(*(ticket.wait_durable() for ticket in tickets))
-            tickets.clear()
-        if segment_complete:
-            expected_segments.append(
-                {
-                    "event_count": events_per_segment,
-                    "first_ingest_seq": segment_first_sequence,
-                    "last_ingest_seq": sequence,
-                    "payload_digest": segment_payload_digest.hexdigest(),
-                    "uncompressed_bytes": segment_uncompressed_bytes,
-                }
-            )
-            pending_allocator_boundary = (submitted_count, len(expected_segments))
-            segment_first_sequence = submitted_count
-            segment_payload_digest = hashlib.sha256()
-            segment_uncompressed_bytes = 0
-    await writer.close()
-    if pending_allocator_boundary is not None:
-        sealed_records, sealed_segments = pending_allocator_boundary
-        if writer.metrics.sealed < sealed_records:
-            raise RuntimeError("journal close omitted expected sealed records")
-        allocator_samples.append(
-            {
-                "phase": f"sealed_{sealed_segments}",
-                "sealed_records": writer.metrics.sealed,
-                **_allocator_measurement(),
-            }
-        )
+            submitted_count = sequence + 1
+            segment_complete = submitted_count % events_per_segment == 0
+            if tickets and (
+                len(tickets) == config.storage.journal_group_commit_max_events
+                or submitted_count == event_count
+                or segment_complete
+            ):
+                await asyncio.gather(*(ticket.wait_durable() for ticket in tickets))
+                tickets.clear()
+            if segment_complete:
+                expected_segments.append(
+                    {
+                        "event_count": events_per_segment,
+                        "first_ingest_seq": segment_first_sequence,
+                        "last_ingest_seq": sequence,
+                        "payload_digest": segment_payload_digest.hexdigest(),
+                        "uncompressed_bytes": segment_uncompressed_bytes,
+                    }
+                )
+                segment_first_sequence = submitted_count
+                segment_payload_digest = hashlib.sha256()
+                segment_uncompressed_bytes = 0
+        await writer.close()
+        await allocator_sampler
+    except BaseException:
+        allocator_sampler.cancel()
+        await asyncio.gather(allocator_sampler, return_exceptions=True)
+        raise
     if segment_uncompressed_bytes:
         expected_segments.append(
             {
