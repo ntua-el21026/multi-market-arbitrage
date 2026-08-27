@@ -28,7 +28,13 @@ from multi_market_arbitrage.core.ids import (
 )
 from multi_market_arbitrage.core.provenance import RawSourceRef
 from multi_market_arbitrage.core.time import UtcTimestamp
-from multi_market_arbitrage.journal import JournalBackpressureError, RawJournalWriter
+from multi_market_arbitrage.journal import (
+    JournalBackpressureError,
+    JournalMetricsSnapshot,
+    RawJournalWriter,
+    completion_path_for_run,
+    load_run_completion_head,
+)
 from multi_market_arbitrage.observability import (
     AVAILABILITY_EVIDENCE_SUMMARY_VERSION,
     HEALTH_EVIDENCE_SUMMARY_VERSION,
@@ -1947,7 +1953,7 @@ async def test_immediate_capture_end_rejects_resource_sample_after_terminal_cuto
 
 
 @pytest.mark.asyncio
-async def test_terminal_checkpoint_is_frozen_before_delayed_owner_close(
+async def test_terminal_checkpoint_freezes_cutoff_but_builds_after_delayed_owner_close(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2082,7 +2088,86 @@ async def test_terminal_checkpoint_is_frozen_before_delayed_owner_close(
     assert summary.health_decision.reason_codes == ()
     assert len(records) == recording_builder.call_count
     assert build_counts_during_close
-    assert set(build_counts_during_close) == {recording_builder.call_count}
+    assert set(build_counts_during_close) == {recording_builder.call_count - 1}
+    assert final["journal"]["terminal"] is True
+    assert final["journal"]["run_completion_sha256"] is not None
+    assert final["journal"]["pending_segments"] == 0
+    assert final["journal"]["active_seal_jobs"] == 0
+    assert final["journal"]["active_segment_events"] == 0
+
+
+@pytest.mark.asyncio
+async def test_terminal_checkpoint_waits_for_slow_final_segment_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, service = _configured_service(tmp_path)
+    writer_module = importlib.import_module("multi_market_arbitrage.journal.writer")
+    original_prepare = writer_module._prepare_sealed_payload  # pyright: ignore[reportPrivateUsage]
+    original_builder = observe_module.build_observation_health_checkpoint
+    seal_started = threading.Event()
+    seal_finished = threading.Event()
+    terminal_snapshots: list[tuple[bool, bool, int, int]] = []
+
+    def delayed_prepare(*args: object, **kwargs: object) -> object:
+        seal_started.set()
+        time.sleep(0.08)
+        result = original_prepare(*args, **kwargs)
+        seal_finished.set()
+        return result
+
+    def recording_builder(*args: object, **kwargs: object) -> HealthCheckpoint:
+        if kwargs.get("terminal") is True:
+            journal = cast(JournalMetricsSnapshot, kwargs["journal"])
+            terminal_snapshots.append(
+                (
+                    seal_started.is_set(),
+                    seal_finished.is_set(),
+                    journal.pending_segments,
+                    journal.active_seal_jobs,
+                )
+            )
+        return original_builder(*args, **kwargs)
+
+    monkeypatch.setattr(writer_module, "_prepare_sealed_payload", delayed_prepare)
+    monkeypatch.setattr(
+        observe_module,
+        "build_observation_health_checkpoint",
+        recording_builder,
+    )
+    monkeypatch.setattr(observe_module, "PolymarketPublicClient", _PublicClient)
+    monkeypatch.setattr(
+        PolymarketObservationService,
+        "_bootstrap_explicit",
+        _healthy_bootstrap_fixture,
+    )
+    monkeypatch.setattr(
+        PolymarketObservationService,
+        "_observe_websocket",
+        _connected_stream_fixture,
+    )
+
+    summary = await service.run(duration_seconds=2.0, gamma_market_id="101")
+
+    records = tuple(
+        json.loads(line)
+        for line in summary.health_evidence.path.read_text(encoding="utf-8").splitlines()
+    )
+    assert seal_started.is_set()
+    assert seal_finished.is_set()
+    assert terminal_snapshots == [(True, True, 0, 0)]
+    assert [record["journal"]["terminal"] for record in records].count(True) == 1
+    assert records[-1]["journal"]["terminal"] is True
+    completion = load_run_completion_head(
+        completion_path_for_run(
+            summary.journal_root,
+            summary.collector_run_id,
+            "polymarket-public",
+        )
+    )
+    assert records[-1]["journal"]["run_completion_sha256"] == completion.completion_sha256
+    assert records[-1]["journal"]["total_unverified_segments"] == 0
+    assert summary.health_evidence.gate1_evidence_eligible
 
 
 @pytest.mark.asyncio

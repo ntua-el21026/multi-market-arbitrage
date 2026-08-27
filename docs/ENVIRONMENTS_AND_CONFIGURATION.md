@@ -148,3 +148,48 @@ Examples:
 - leveraged strategy requires margin thresholds;
 - enabled venue has current eligibility provider;
 - dead-man settings valid when required.
+
+Phase-1 raw-journal rotation additionally validates:
+
+- a positive pending-segment capacity within the implementation hard maximum;
+- a pending uncompressed-byte limit at least one maximum segment, no greater
+  than the run cap, and no greater than pending capacity times maximum segment
+  bytes;
+- a finite positive oldest-pending age;
+- one ordered seal worker;
+- count and byte accounting that includes the in-service job, not only queue
+  waiters;
+- recovered-age initialization from the immutable handoff UTC, with invalid or
+  future chronology rejected and no restart renewal of the age budget; and
+- disk headroom for the active maximum, complete pending-source byte allowance,
+  the compression bound for one maximum segment, and bounded descriptor/
+  manifest/scratch/recovery overhead.
+
+The accepted Gate-1 profile is four total outstanding segments, 256 MiB pending
+uncompressed bytes, 120 seconds oldest age, and one seal job. Its exact config
+hash is acceptance evidence. A different bound requires capacity measurement
+and revalidation; runtime pressure never causes silent enlargement.
+
+`phase1-pre-soak-calibration-v3` binds the seal-queue capacity and pending-seal
+byte limit and reports active-segment, full pending-source, worst-case compressed
+scratch, metadata/atomic-write scratch, and aggregate recovery-evidence reserves
+(one maximum recovery tail plus the 64-record/256-KiB compact ledger) separately.
+Their exact sum is `temporary_sealing_bytes` and is counted once in disk
+workload. Historical v1-v2 reports do not acquire these fields by inference.
+
+Replay/rebuild commands use the native-process temporary directory for the
+derived exact ingest-ID index. Preflight reserves at least the greater of 1 MiB
+and the selected uncompressed raw bytes, already represented by the raw-sized
+replay/rebuild allowance. SQLite page cache is fixed at 2 MiB and mmap is
+disabled; no runtime setting may silently enlarge the index or turn it into
+persistent state. Each command creates a fresh isolated directory; abandoned
+scratch after abrupt process death is never discovered or reused as evidence.
+Gate replay/rebuild commands run sequentially so only one raw-sized index is
+live at once; concurrency requires separately additive disk reservation.
+
+The Gate-1 health profile retains its ten-second cadence and checkpoint-count
+bound. Health v5 measured at most 30,819 bytes periodically and 44,463 bytes at
+terminal cutoff; its conservative six-hour projection is 66,613,503 bytes. The
+health-evidence file cap is 68 MiB (71,303,168 bytes), leaving 4,689,665 bytes
+and exceeding the required 2 MiB projection headroom. The writer still rejects
+before overflow, and missing or partial health evidence still fails closed.

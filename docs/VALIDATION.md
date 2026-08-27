@@ -47,6 +47,67 @@ V10 Experiment integrity
 
 Pass 3 later adds live-risk/execution validation.
 
+### Cross-cutting raw-journal authority
+
+Raw validation distinguishes record durability from segment publication. It
+verifies:
+
+- data-`fsync` durable receipt/range identity;
+- exact sealed, manifest-durable, and verified progress with
+  `verified <= manifest_durable <= durable`;
+- pending handoff-intent/source scope, provenance, filename, count, byte, time,
+  and sequence identity, including the intent's self-hash;
+- exact self-hashed source-authority scope, provenance and frozen writer policy,
+  including segment/aggregate bounds and completion-v2 digest binding;
+- one exact non-overlapping contiguous sealed/pending/active prefix;
+- compressed/payload digests and predecessor chain in ordered publication;
+- pending count, bytes, age, active job and total-unverified bounds, including
+  the in-service job;
+- recovered pending age derived from the original persisted handoff UTC and
+  advanced monotonically in the recovery process, with future or invalid wall
+  chronology rejected and no restart reset;
+- complete per-segment streaming verification without segment-sized
+  materialization;
+- exact cross-segment ingest-ID uniqueness through a temporary disk-backed
+  primary-key index capped at selected raw bytes, using a fixed 2 MiB cache and
+  no memory mapping, with cleanup required on success, failure and early close;
+  and
+- zero pending inventory plus exact count/byte/range/hash reconciliation before
+  accepting a run-completion head.
+
+Interrupted validation may report an exact verified/pending/active prefix, but
+never promotes it to clean completion. Missing sealed bytes for a manifest,
+overlap, gap, duplicate range, identity conflict, unbounded inventory, or a
+completion head with unfinished source state is invalid/indeterminate and fails
+closed. Historical one-partial and sealed schemas retain their original
+meaning; compatibility does not synthesize ADR-0057 lifecycle evidence. A
+legacy unsealed source without authority is readable only as unbound forensic
+evidence and is never valid writer-restart input. Authority-only and
+authority-plus-empty-active zero-event starts are valid interrupted inventory.
+
+The sidecar-before-rename state is validated as a write-ahead prepare, not as
+pending ownership. Exact intent plus active source may be completed by rename
+and directory `fsync` during recovery before queue admission. Intent plus
+pending source is revalidated and the directory re-`fsync`ed before committed
+recognition. Pending without intent, intent without either source, or both
+source paths for one intent is rejected, except that intent without source may
+close an interrupted verified-cleanup window only when exact sealed bytes and
+manifest completely reverify against it. Validation never synthesizes the
+missing sidecar.
+
+All sealed, pending and active sources are validated as one read-only recovery
+plan before any authoritative manifest publication, rename, deletion, partial
+repair/truncation, or recovery-evidence write. Failure in a later inventory item
+must leave every earlier planned artifact unchanged. This is the structural
+barrier for safe physical recovery actions; the independent disk-backed
+cross-segment ingest-ID proof remains mandatory before completion or another
+terminal result.
+
+A duplicate returned by the exact ingest-ID index is a raw-integrity failure.
+Failure to create, extend, query, or remove the derived index is instead a
+`JournalVerificationResourceError`: validation is incomplete and fails closed,
+but the failure alone does not assert raw corruption.
+
 ## 3. V0 — Transport
 
 Checks:
@@ -160,6 +221,16 @@ Checks:
 - venue order-size constraints where applicable.
 
 Produces capacity curve, not only boolean pass/fail.
+
+Current pre-soak storage validation accepts only
+`phase1-pre-soak-calibration-v3` for a new ADR-0057 candidate. It verifies the
+bound seal-queue capacity and pending-seal byte limit; separately validates the
+active, full-pending, worst-case compressed-scratch, metadata/atomic-scratch,
+and aggregate recovery-evidence reserve fields (one maximum recovery tail plus
+the bounded compact crash-evidence ledger); reconciles their exact
+`temporary_sealing_bytes` sum; and proves that subtotal enters disk workload
+once. Historical v1-v2 evidence remains strict and gains no synthesized v3
+fields.
 
 ## 11. V8 — Opportunity coherence
 

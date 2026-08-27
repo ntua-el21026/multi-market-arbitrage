@@ -39,6 +39,7 @@ def test_committed_phase1_configuration_loads_strictly() -> None:
     assert config.polymarket.public_reads.rate_limit_checked_on.isoformat() == "2026-08-22"
     assert config.scanner.maximum_capacity_evaluations == 4096
     assert config.health.checkpoint_interval_seconds == 10.0
+    assert config.health.maximum_file_bytes == 68 * 1024 * 1024
     assert config.health.availability_queue_capacity == 64
     assert config.health.maximum_availability_intervals == 8192
     assert config.health.maximum_availability_file_bytes == 64 * 1024 * 1024
@@ -48,6 +49,9 @@ def test_committed_phase1_configuration_loads_strictly() -> None:
     assert config.health.maximum_availability_record_bytes == 64 * 1024
     assert config.storage.journal_segment_max_uncompressed_bytes == 64 * 1024 * 1024
     assert config.storage.journal_run_max_uncompressed_bytes == 4 * 1024 * 1024 * 1024
+    assert config.storage.journal_seal_queue_capacity == 4
+    assert config.storage.journal_pending_seal_max_uncompressed_bytes == 256 * 1024 * 1024
+    assert config.storage.journal_pending_seal_max_age_seconds == 120.0
     assert config.storage.analytical_record_max_bytes == 8 * 1024 * 1024
     assert config.storage.analytical_buffer_max_bytes == 64 * 1024 * 1024
     assert len(config.config_hash.value) == 64
@@ -336,6 +340,10 @@ def test_public_read_policy_is_strict_and_hard_bounded(field: str, value: object
         ("journal_segment_max_uncompressed_bytes", 512 * 1024 * 1024 + 1),
         ("journal_run_max_uncompressed_bytes", 32 * 1024 * 1024),
         ("journal_run_max_uncompressed_bytes", 4 * 1024 * 1024 * 1024 + 1),
+        ("journal_seal_queue_capacity", 65),
+        ("journal_pending_seal_max_uncompressed_bytes", 32 * 1024 * 1024),
+        ("journal_pending_seal_max_uncompressed_bytes", 257 * 1024 * 1024),
+        ("journal_pending_seal_max_uncompressed_bytes", 4 * 1024 * 1024 * 1024 + 1),
     ],
 )
 def test_journal_byte_limits_are_hard_bounded(field: str, value: int) -> None:

@@ -53,6 +53,30 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _canonical_record_sha256(record: dict[str, object]) -> str:
+    return hashlib.sha256(_canonical_record_bytes(record)).hexdigest()
+
+
+def _canonical_record_bytes(record: dict[str, object]) -> bytes:
+    return json.dumps(
+        record,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+
+
+def _write_canonical_record(path: Path, record: dict[str, object]) -> None:
+    path.write_bytes(_canonical_record_bytes(record) + b"\n")
+
+
+def _self_hash(record: dict[str, object], field: str) -> dict[str, object]:
+    result = dict(record)
+    result[field] = _canonical_record_sha256(record)
+    return result
+
+
 def _canonical_config_value(value: object) -> object:
     if value is None or isinstance(value, (bool, int, str)):
         return value
@@ -135,6 +159,8 @@ def _candidate_repository(tmp_path: Path) -> tuple[Path, str]:
         destination = repository / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(_ROOT / relative, destination)
+    config_relative = Path("config/phase1.toml")
+    shutil.copy2(_ROOT / config_relative, repository / config_relative)
     _git(
         repository,
         "add",
@@ -142,6 +168,7 @@ def _candidate_repository(tmp_path: Path) -> tuple[Path, str]:
         str(_LAUNCHER_RELATIVE),
         str(_AUDITOR_RELATIVE),
         str(_SEALER_RELATIVE),
+        str(config_relative),
     )
     # The scripts may already match the exact committed candidate when this
     # suite runs from a detached public-qualification worktree.  The fixture
@@ -679,33 +706,104 @@ def _prepare_audit_fixture(
     analytical.mkdir(parents=True)
     (raw / "sealed.raw").write_bytes(b"immutable raw fixture\n")
     run_key = hashlib.sha256(run_id.encode()).hexdigest()[:16]
-    segment = raw / f"run-{run_key}.market.{0:020d}-{0:020d}.jsonl.zst"
-    segment.write_bytes(b"test-owned sealed segment fixture\n")
-    segment.with_name(f"{segment.name}.manifest.json").write_text(
-        json.dumps(
-            {
-                "collector_run_id": run_id,
-                "first_ingest_seq": 0,
-                "git_commit": candidate,
-                "last_ingest_seq": 0,
-                "stream": "market",
-            },
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
+    with (repository / "config/phase1.toml").open("rb") as handle:
+        config_document = tomllib.load(handle)
+    system = cast(dict[str, object], config_document["system"])
+    storage = cast(dict[str, object], config_document["storage"])
+    writer_id = "01a22222-3333-7444-8555-666666666666"
+    submit_timeout = float(cast(float, storage["journal_submit_timeout_seconds"]))
+    group_delay = float(cast(float, storage["journal_group_commit_max_delay_seconds"]))
+    pending_age = float(cast(float, storage["journal_pending_seal_max_age_seconds"]))
+    authority = _self_hash(
+        {
+            "authority_origin": "NEW_RUN",
+            "authority_version": "raw-journal-source-authority-v1",
+            "collector_run_id": run_id,
+            "git_commit": candidate,
+            "group_commit_max_delay_seconds_hex": group_delay.hex(),
+            "group_commit_max_events": storage["journal_group_commit_max_events"],
+            "max_events_per_segment": storage["journal_segment_max_events"],
+            "max_pending_seal_age_nanoseconds": int(pending_age * 1_000_000_000),
+            "max_pending_seal_age_seconds_hex": pending_age.hex(),
+            "max_pending_seal_uncompressed_bytes": storage[
+                "journal_pending_seal_max_uncompressed_bytes"
+            ],
+            "max_uncompressed_bytes_per_run": storage["journal_run_max_uncompressed_bytes"],
+            "max_uncompressed_bytes_per_segment": storage["journal_segment_max_uncompressed_bytes"],
+            "predecessor_manifest_sha256": None,
+            "queue_capacity": system["queue_capacity"],
+            "seal_queue_capacity": storage["journal_seal_queue_capacity"],
+            "stream": "market",
+            "submit_timeout_seconds_hex": submit_timeout.hex(),
+            "venue_id": "polymarket",
+            "writer_id": writer_id,
+            "writer_software_version": system["code_version"],
+            "zstd_level": 9,
+        },
+        "authority_sha256",
     )
-    (raw / f"run-{run_key}.market.completed.json").write_text(
-        json.dumps(
-            {
-                "collector_run_id": run_id,
-                "git_commit": candidate,
-                "stream": "market",
-            },
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
+    _write_canonical_record(
+        raw / f"run-{run_key}.market.source-authority.json",
+        authority,
+    )
+    segment = raw / f"run-{run_key}.market.{0:020d}-{0:020d}.jsonl.zst"
+    segment_payload = b"test-owned sealed segment fixture\n"
+    segment.write_bytes(segment_payload)
+    manifest = _self_hash(
+        {
+            "collector_run_id": run_id,
+            "compressed_bytes": len(segment_payload),
+            "created_at_utc_ns": 3,
+            "end_time_utc_ns": 2,
+            "event_count": 1,
+            "first_ingest_seq": 0,
+            "git_commit": candidate,
+            "hash_algorithm": "sha256",
+            "journal_format_version": "raw-journal-manifest-v1",
+            "last_ingest_seq": 0,
+            "payload_digest": "6" * 64,
+            "previous_segment_digest": None,
+            "recovery_evidence": [],
+            "segment_digest": _sha256(segment),
+            "start_time_utc_ns": 1,
+            "stream": "market",
+            "uncompressed_bytes": 37,
+            "venue": "polymarket",
+            "writer_id": writer_id,
+            "writer_software_version": system["code_version"],
+        },
+        "manifest_sha256",
+    )
+    _write_canonical_record(
+        segment.with_name(f"{segment.name}.manifest.json"),
+        manifest,
+    )
+    completion = _self_hash(
+        {
+            "collector_run_id": run_id,
+            "completed_at_utc_ns": 4,
+            "completion_version": "raw-journal-run-completion-v2",
+            "expected_event_count": 1,
+            "expected_segment_count": 1,
+            "expected_uncompressed_bytes": 37,
+            "first_ingest_seq": 0,
+            "git_commit": candidate,
+            "hash_algorithm": "sha256",
+            "last_ingest_seq": 0,
+            "max_uncompressed_bytes_per_run": storage["journal_run_max_uncompressed_bytes"],
+            "max_uncompressed_bytes_per_segment": storage["journal_segment_max_uncompressed_bytes"],
+            "source_authority_sha256": authority["authority_sha256"],
+            "stream": "market",
+            "terminal_manifest_sha256": manifest["manifest_sha256"],
+            "venue": "polymarket",
+            "writer_id": writer_id,
+            "writer_software_version": system["code_version"],
+        },
+        "completion_sha256",
+    )
+    _write_canonical_record(
+        raw / f"run-{run_key}.market.completed.json",
+        completion,
     )
     (analytical / "original.marker").write_bytes(b"original analytical fixture\n")
     assert not _git(repository, "status", "--porcelain=v1", "--untracked-files=all")
@@ -875,6 +973,29 @@ def _rewrite_seal_for_summary_mutation(
     seal_path.write_text(json.dumps(seal, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def test_operational_fixture_uses_current_reader_valid_v2_identity(tmp_path: Path) -> None:
+    from multi_market_arbitrage.journal.models import (
+        JOURNAL_RUN_COMPLETION_VERSION,
+        JOURNAL_SOURCE_AUTHORITY_VERSION,
+    )
+    from multi_market_arbitrage.journal.reader import (
+        load_run_completion_head,
+        load_segment_manifest,
+        load_source_authority,
+    )
+
+    repository, _, _, _, _, _, _ = _prepare_audit_fixture(tmp_path)
+    raw = repository / "data/raw"
+    authority = load_source_authority(next(raw.glob("run-*.source-authority.json")))
+    manifest = load_segment_manifest(next(raw.glob("run-*.jsonl.zst.manifest.json")))
+    completion = load_run_completion_head(next(raw.glob("run-*.completed.json")))
+
+    assert authority.to_record()["authority_version"] == JOURNAL_SOURCE_AUTHORITY_VERSION
+    assert completion.completion_version == JOURNAL_RUN_COMPLETION_VERSION
+    assert completion.source_authority_sha256 == authority.authority_sha256
+    assert completion.terminal_manifest_sha256 == manifest.manifest_sha256
+
+
 @pytest.mark.parametrize("duration_seconds", [60, 7_200])
 def test_audit_helper_sequences_hashes_rebuilds_and_compares(
     tmp_path: Path, duration_seconds: int
@@ -917,8 +1038,14 @@ def test_audit_helper_sequences_hashes_rebuilds_and_compares(
         repository / "config/phase1.toml"
     )
     assert seal["raw_source_identity"]["expected_git_commit"] == candidate
+    assert seal["raw_source_identity"]["schema_version"] == "mma-gate1-raw-source-identity-v2"
     assert len(seal["raw_source_identity"]["segment_manifests"]) == 1
     assert len(seal["raw_source_identity"]["completion_headers"]) == 1
+    assert len(seal["raw_source_identity"]["source_authorities"]) == 1
+    assert (
+        seal["raw_source_identity"]["completion_headers"][0]["source_authority_sha256"]
+        == seal["raw_source_identity"]["source_authorities"][0]["authority_sha256"]
+    )
     assert seal["raw_inventory"]["sha256"] == manifest["raw_pre_sha256"]
     comparison = json.loads((analysis / "replay-comparison.json").read_text())
     assert comparison["byte_identical"] is True
@@ -928,6 +1055,116 @@ def test_audit_helper_sequences_hashes_rebuilds_and_compares(
     after = json.loads((analysis / "raw-inventory.after.json").read_text())
     assert before["sha256"] == after["sha256"]
     assert not any(call[:2] == ["observe", "polymarket"] for call in calls)
+
+
+def _selected_raw_artifacts(repository: Path) -> tuple[Path, Path, str]:
+    authority = next(repository.glob("data/raw/run-*.source-authority.json"))
+    completion = next(repository.glob("data/raw/run-*.completed.json"))
+    run_prefix = authority.name.removesuffix("market.source-authority.json")
+    return authority, completion, run_prefix
+
+
+def _mutate_current_raw_authority_contract(repository: Path, mutation: str) -> None:
+    authority_path, completion_path, run_prefix = _selected_raw_artifacts(repository)
+    if mutation == "missing-authority":
+        authority_path.unlink()
+        return
+    if mutation == "authority-publication-temp":
+        (
+            authority_path.parent / f".{run_prefix}market.source-authority.json.fixture.tmp"
+        ).write_text("{}\n", encoding="utf-8")
+        return
+    if mutation == "authority-self-hash":
+        authority = cast(dict[str, object], json.loads(authority_path.read_text(encoding="utf-8")))
+        authority["authority_sha256"] = "0" * 64
+        authority_path.write_text(json.dumps(authority, sort_keys=True) + "\n", encoding="utf-8")
+        return
+    if mutation in {"authority-config-bound", "authority-git"}:
+        authority = cast(dict[str, object], json.loads(authority_path.read_text(encoding="utf-8")))
+        if mutation == "authority-config-bound":
+            authority["max_events_per_segment"] = cast(int, authority["max_events_per_segment"]) + 1
+        else:
+            authority["git_commit"] = "0" * 40
+        content = dict(authority)
+        content.pop("authority_sha256")
+        authority["authority_sha256"] = _canonical_record_sha256(content)
+        _write_canonical_record(authority_path, authority)
+        return
+    completion = cast(dict[str, object], json.loads(completion_path.read_text(encoding="utf-8")))
+    if mutation == "completion-authority-binding":
+        completion["source_authority_sha256"] = "0" * 64
+    elif mutation == "legacy-completion":
+        completion["completion_version"] = "raw-journal-run-completion-v1"
+        completion.pop("source_authority_sha256")
+    else:
+        raise AssertionError(f"unsupported fixture mutation: {mutation}")
+    content = dict(completion)
+    content.pop("completion_sha256")
+    completion["completion_sha256"] = _canonical_record_sha256(content)
+    completion_path.write_text(json.dumps(completion, sort_keys=True) + "\n", encoding="utf-8")
+
+
+_RAW_AUTHORITY_MUTATIONS = (
+    "missing-authority",
+    "authority-publication-temp",
+    "authority-self-hash",
+    "authority-config-bound",
+    "authority-git",
+    "completion-authority-binding",
+    "legacy-completion",
+)
+
+
+@pytest.mark.parametrize("mutation", _RAW_AUTHORITY_MUTATIONS)
+def test_sealer_rejects_invalid_current_source_authority_contract(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    repository, candidate, evidence, _, _, _, _ = _prepare_audit_fixture(tmp_path)
+    (evidence / "run-completion-seal.json").unlink()
+    _mutate_current_raw_authority_contract(repository, mutation)
+    completed = _run(
+        _seal_arguments(
+            repository,
+            candidate,
+            evidence,
+            duration_seconds=7_200,
+            exit_code=0,
+        )
+    )
+    assert completed.returncode == 1
+    assert (
+        "source-authority" in completed.stderr
+        or "source authority" in completed.stderr
+        or "completion" in completed.stderr
+    )
+    assert not (evidence / "run-completion-seal.json").exists()
+
+
+@pytest.mark.parametrize("mutation", _RAW_AUTHORITY_MUTATIONS)
+def test_auditor_rejects_invalid_current_source_authority_contract_before_mma(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    repository, candidate, evidence, analysis, run_id, environment, log = _prepare_audit_fixture(
+        tmp_path
+    )
+    _mutate_current_raw_authority_contract(repository, mutation)
+    seal_path = evidence / "run-completion-seal.json"
+    seal = cast(dict[str, object], json.loads(seal_path.read_text(encoding="utf-8")))
+    seal["raw_inventory"] = _raw_inventory_record(repository / "data/raw")
+    seal_path.write_text(json.dumps(seal, sort_keys=True) + "\n", encoding="utf-8")
+    completed = _run(
+        _audit_arguments(repository, candidate, evidence, analysis, run_id), env=environment
+    )
+    assert completed.returncode == 1
+    assert (
+        "source-authority" in completed.stderr
+        or "source authority" in completed.stderr
+        or "completion" in completed.stderr
+    )
+    assert _mma_calls(log) == []
+    assert not analysis.exists()
 
 
 def test_sealer_rejects_omitted_host_runtime_identity(tmp_path: Path) -> None:

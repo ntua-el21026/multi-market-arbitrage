@@ -128,6 +128,16 @@ bounded queues
 immutable consumer snapshots
 ```
 
+The raw journal applies that rule twice without shared mutable file ownership:
+one owner controls the active partial, ordered append and data `fsync`; one
+ordered owner controls immutable seal-pending sources, compression, manifest
+publication, full verification and cleanup. Their handoff uses a self-hashed
+write-ahead intent that is not an ownership transition, followed by an atomic
+rename plus directory `fsync` that commits immutable transfer. Dedicated one-
+worker execution boundaries prevent ordinary seal work from occupying the raw-
+durability owner or the shared default executor. Clean completion joins both
+owners and requires an empty verified pending inventory.
+
 ## 6. Failure isolation
 
 A failure in derived research persistence should not unnecessarily stop healthy raw capture.
@@ -163,7 +173,11 @@ Initial:
 | Query | DuckDB |
 | CI | GitHub Actions |
 
-Future live control state may add embedded SQLite only at the execution-engineering gate.
+Future authoritative live control state may add embedded SQLite WAL only at the
+execution-engineering gate. ADR-0057's Phase-1 verifier may use a bounded
+command-owned temporary SQLite index solely as derived exact-uniqueness scratch;
+it is non-WAL, non-authoritative, never shared with runtime owners, and removed
+when verification closes.
 
 ## 8. Rejected premature complexity
 

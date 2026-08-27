@@ -41,6 +41,8 @@ from multi_market_arbitrage.core.time import (  # noqa: E402
 from multi_market_arbitrage.ingestion import RawEventEnvelope  # noqa: E402
 from multi_market_arbitrage.journal import JournalMetricsSnapshot  # noqa: E402
 from multi_market_arbitrage.observability import (  # noqa: E402
+    MAXIMUM_AVAILABILITY_CONTRIBUTION_QUEUE_CAPACITY,
+    MAXIMUM_AVAILABILITY_INTERVAL_QUEUE_CAPACITY,
     AvailabilityCause,
     AvailabilityEvidenceRuntimeSnapshot,
     AvailabilityInterval,
@@ -90,6 +92,7 @@ from multi_market_arbitrage.venues.polymarket import (  # noqa: E402
 SCHEMA_VERSION = "gate1-health-benchmark-v2"
 PROJECTED_SECONDS = 21_600
 CADENCES_SECONDS = (1, 5, 10, 30)
+HEALTH_EVIDENCE_MAXIMUM_BYTES = 68 * 1024 * 1024
 FIXTURES = REPOSITORY / "tests" / "golden" / "fixtures"
 
 
@@ -407,24 +410,90 @@ def _production_checkpoint_builder(
             last_frame_received_monotonic_ns=4_999_000_000,
         ),
     )
+    journal_events = 12_288_000 if capacity_telemetry else 1_006
+    durability_watermark = journal_events - 1
+    completed_segments = 68 if capacity_telemetry else 1
+    pending_segments = 0 if terminal else config.storage.journal_seal_queue_capacity
+    source_removed_segments = completed_segments
+    segment_handoffs = source_removed_segments + pending_segments
+    seal_jobs_started = completed_segments + (1 if pending_segments else 0)
+    manifest_watermark = (
+        durability_watermark
+        if terminal
+        else max(0, durability_watermark - config.storage.journal_segment_max_events)
+    )
     journal = JournalMetricsSnapshot(
-        received=1_006,
-        enqueued=1_006,
-        appended=1_006,
-        durable=1_006,
-        sealed=0,
-        verified=0,
+        received=journal_events,
+        enqueued=journal_events,
+        appended=journal_events,
+        durable=journal_events,
+        sealed=completed_segments,
+        verified=completed_segments,
         queue_depth=0,
-        queue_high_water=8,
-        backpressure_failures=0,
-        writer_failures=0,
+        queue_high_water=config.system.queue_capacity,
+        backpressure_failures=(9_999_999 if capacity_telemetry else 0),
+        writer_failures=(9_999_999 if capacity_telemetry else 0),
         recovered_records=0,
         truncated_tails=0,
-        durability_groups=100,
-        data_fsyncs=100,
-        durability_group_size_high_water=16,
-        run_uncompressed_bytes=1_000_000,
-        durability_watermark_sequence=1_005,
+        durability_groups=journal_events // config.storage.journal_group_commit_max_events,
+        data_fsyncs=journal_events // config.storage.journal_group_commit_max_events,
+        durability_group_size_high_water=config.storage.journal_group_commit_max_events,
+        run_uncompressed_bytes=(
+            config.storage.journal_run_max_uncompressed_bytes if capacity_telemetry else 1_000_000
+        ),
+        durability_watermark_sequence=durability_watermark,
+        queue_capacity=config.system.queue_capacity,
+        active_segment_events=(0 if terminal else config.storage.journal_segment_max_events),
+        active_segment_uncompressed_bytes=(
+            0 if terminal else config.storage.journal_segment_max_uncompressed_bytes
+        ),
+        maximum_segment_events=config.storage.journal_segment_max_events,
+        maximum_segment_uncompressed_bytes=(config.storage.journal_segment_max_uncompressed_bytes),
+        seal_queue_depth=max(0, pending_segments - int(pending_segments > 0)),
+        seal_queue_high_water=config.storage.journal_seal_queue_capacity,
+        seal_queue_capacity=config.storage.journal_seal_queue_capacity,
+        pending_segments=pending_segments,
+        pending_segments_high_water=config.storage.journal_seal_queue_capacity,
+        total_unverified_segments=pending_segments,
+        maximum_unverified_segments=config.storage.journal_seal_queue_capacity,
+        pending_uncompressed_bytes=(
+            0 if terminal else config.storage.journal_pending_seal_max_uncompressed_bytes
+        ),
+        pending_uncompressed_bytes_high_water=(
+            config.storage.journal_pending_seal_max_uncompressed_bytes
+        ),
+        maximum_pending_uncompressed_bytes=(
+            config.storage.journal_pending_seal_max_uncompressed_bytes
+        ),
+        oldest_pending_seal_age_nanoseconds=(
+            0
+            if terminal
+            else int(config.storage.journal_pending_seal_max_age_seconds * 1_000_000_000) - 1
+        ),
+        maximum_pending_seal_age_nanoseconds=int(
+            config.storage.journal_pending_seal_max_age_seconds * 1_000_000_000
+        ),
+        active_seal_jobs=int(pending_segments > 0),
+        active_seal_jobs_high_water=1,
+        maximum_active_seal_jobs=1,
+        segment_handoffs=segment_handoffs,
+        seal_jobs_started=seal_jobs_started,
+        sealed_bytes_durable_transitions=completed_segments,
+        manifest_durable_transitions=completed_segments,
+        verified_transitions=completed_segments,
+        source_partial_removed_transitions=source_removed_segments,
+        sealer_failures=(9_999_999 if capacity_telemetry else 0),
+        seal_backpressure_failures=(9_999_999 if capacity_telemetry else 0),
+        seal_latency_nanoseconds_max=5_999_999_999,
+        compression_latency_nanoseconds_max=4_999_999_999,
+        manifest_latency_nanoseconds_max=999_999_999,
+        verification_latency_nanoseconds_max=5_999_999_999,
+        cleanup_latency_nanoseconds_max=999_999_999,
+        rotation_handoff_latency_nanoseconds_max=999_999_999,
+        append_owner_seal_wait_nanoseconds=0,
+        rotation_durability_latency_nanoseconds_max=999_999_999,
+        manifest_durable_watermark_sequence=manifest_watermark,
+        verified_watermark_sequence=manifest_watermark,
     )
     analytical = AnalyticalRuntimeSnapshot(
         healthy=True,
@@ -602,6 +671,7 @@ def _production_checkpoint_builder(
             emitted_at=UtcTimestamp(1_787_198_410_000_000_000),
             monotonic_now_ns=5_000_000_000,
             terminal=terminal,
+            raw_journal_completion_sha256=("c" * 64 if terminal else None),
         )
         if not capacity_telemetry:
             return checkpoint
@@ -771,6 +841,7 @@ def _measure_sync(
 async def _measure_actual_writes(
     root: Path,
     checkpoint: HealthCheckpoint,
+    terminal_checkpoint: HealthCheckpoint,
     *,
     repetitions: int,
 ) -> tuple[dict[str, int | float], int]:
@@ -779,14 +850,14 @@ async def _measure_actual_writes(
         collector_run_id=checkpoint.collector_run_id,
         queue_capacity=8,
         maximum_checkpoints=repetitions,
-        maximum_file_bytes=64 * 1024 * 1024,
+        maximum_file_bytes=HEALTH_EVIDENCE_MAXIMUM_BYTES,
     )
     await writer.start()
     samples: list[int] = []
     cpu_started = time.process_time_ns()
     for expected in range(1, repetitions + 1):
         current_checkpoint = replace(
-            checkpoint,
+            terminal_checkpoint if expected == repetitions else checkpoint,
             emitted_monotonic=MonotonicTimestamp(
                 checkpoint.collector_run_id.value,
                 checkpoint.emitted_monotonic.nanoseconds + expected,
@@ -862,7 +933,13 @@ async def _run(output: Path) -> dict[str, object]:
         run_id=run_id,
         git_commit=git_commit,
     )
+    build_terminal_checkpoint = _production_checkpoint_builder(
+        run_id=run_id,
+        git_commit=git_commit,
+        terminal=True,
+    )
     checkpoint = build_checkpoint()
+    terminal_checkpoint = build_terminal_checkpoint()
     serialized = canonical_json_bytes(checkpoint.to_record(), allow_floats=True) + b"\n"
     construction = _measure_sync(
         build_checkpoint,
@@ -879,7 +956,7 @@ async def _run(output: Path) -> dict[str, object]:
         collector_run_id=run_id,
         queue_capacity=5_000,
         maximum_checkpoints=5_000,
-        maximum_file_bytes=64 * 1024 * 1024,
+        maximum_file_bytes=HEALTH_EVIDENCE_MAXIMUM_BYTES,
     )
     enqueue_checkpoints = iter(
         tuple(
@@ -901,6 +978,7 @@ async def _run(output: Path) -> dict[str, object]:
     writes, written_bytes = await _measure_actual_writes(
         output / "actual-writes",
         checkpoint,
+        terminal_checkpoint,
         repetitions=64,
     )
     availability_interval = _availability_interval(run_id, 0)
@@ -920,14 +998,19 @@ async def _run(output: Path) -> dict[str, object]:
     availability_enqueue_writer = SupervisedAvailabilityIntervalWriter(
         root=output / "unused-availability-enqueue-root",
         collector_run_id=run_id,
-        queue_capacity=5_000,
+        queue_capacity=MAXIMUM_AVAILABILITY_INTERVAL_QUEUE_CAPACITY,
+        contribution_queue_capacity=MAXIMUM_AVAILABILITY_CONTRIBUTION_QUEUE_CAPACITY,
         maximum_intervals=5_000,
         maximum_file_bytes=64 * 1024 * 1024,
     )
+    availability_enqueue_repetitions = MAXIMUM_AVAILABILITY_INTERVAL_QUEUE_CAPACITY
     availability_enqueue_bundles = iter(
         tuple(
             (interval, (_availability_contribution(interval),))
-            for interval in (_availability_interval(run_id, index) for index in range(1, 5_001))
+            for interval in (
+                _availability_interval(run_id, index)
+                for index in range(1, availability_enqueue_repetitions + 1)
+            )
         )
     )
 
@@ -942,7 +1025,7 @@ async def _run(output: Path) -> dict[str, object]:
     availability_enqueue = _measure_sync(
         enqueue_availability_interval,
         warmups=0,
-        repetitions=5_000,
+        repetitions=availability_enqueue_repetitions,
     )
     (
         availability_writes,
@@ -1027,7 +1110,8 @@ async def _run(output: Path) -> dict[str, object]:
         "selection_rationale": (
             "10s gives six reconstruction points per minute plus the mandatory final "
             "checkpoint; bounded public calibration rejected 5s because its conservative "
-            "six-hour health-evidence projection exceeded 64MiB, while 1s exceeds the "
+            "six-hour health-evidence projection exceeded the bounded file limit, while "
+            "1s exceeds the "
             "configured count bound"
         ),
         "process_peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,

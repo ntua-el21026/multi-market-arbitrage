@@ -22,8 +22,46 @@ No microservices are required.
 
 Recommended ownership:
 
-### Raw journal writer
-Sole owner of active segment files and durability watermarks.
+### Raw journal append/durability owner
+
+Sole owner of ingest ordering, the bounded append queue, active partial path and
+handle, subgroup append/data `fsync`, durable receipts/watermark, run-byte
+accounting, and rotation handoff. Before creating a new run/stream active
+partial, it durably publishes the immutable self-hashed source-authority
+sidecar binding provenance and all identity/bounded-recovery writer policy.
+After establishing subgroup durability it
+closes the active source and durably publishes its self-hashed write-ahead
+handoff intent. The intent alone leaves lifecycle and ownership unchanged. The
+owner then commits transfer by active-to-pending rename plus directory `fsync`,
+admits the descriptor to the ordered sealer, creates/syncs the successor active
+partial, and resumes service. It never awaits ordinary compression, manifest
+publication, full verification, or verified-source cleanup.
+
+### Raw journal ordered seal/verify owner
+
+Sole owner of closed pending intent/source pairs after committed handoff,
+streaming compression and hashes, atomic sealed/manifest publication, complete
+streaming verification, predecessor-digest advancement, cleanup, and manifest-
+durable/verified progress. It processes exact segment order through one
+dedicated single-worker executor distinct from the append executor and shared
+default executor. It never accesses the active partial.
+
+The immutable handoff and current result use one bounded count/byte credit
+authority covering queued plus in-service work. Pending age, active-job count,
+total unverified segments, and disk reserve are also bounded. Any exhaustion or
+sealer failure faults raw persistence, stops new authority, preserves durable
+sources, and prevents completion.
+
+Compression and complete validation run only in a detachable worker that reads
+authoritative inputs and writes private scratch. It has no authority to rename
+sealed output, publish a manifest, or remove a source/descriptor. Those
+namespace transitions run on the joined ordered publication owner, with an
+age/authority check before and after each finite filesystem transaction and
+before the next transition. A transaction that returns after expiry completes
+only its exact recoverable crash window; no later transition is authorized.
+A native filesystem call that never returns cannot be safely preempted inside
+the process, so close can remain blocked under that host failure just as it can
+for an append `fsync`; native-host qualification and monitoring are required.
 
 ### Venue connection task
 Owns one connection/socket generation. A dedicated acquisition coroutine stamps
@@ -209,11 +247,14 @@ its monotonically increasing per-connection admission ordinal describes the
 exact contiguous successfully admitted prefix. Overflow makes the watermark
 ambiguous, journals `BACKPRESSURE_DATA_LOSS`, invalidates affected state, and
 requires a new REST baseline/socket generation. The journal and analytical
-queues are separately bounded. The two-slot binary-leg audit handoff cannot accumulate
-responses, and the health queue degrades health evidence instead of applying
-backpressure to acquisition. Logical interval and contribution queues are also
-independently bounded even when a composite derived-evidence owner implements
-both streams.
+queues are separately bounded. The journal seal queue is additionally bounded
+by total queued-plus-in-service descriptors, pending uncompressed bytes, oldest
+age, one active job, and total unverified inventory; its capacity is not merely
+an `asyncio.Queue` waiting-item count. The two-slot binary-leg audit handoff
+cannot accumulate responses, and the health queue degrades health evidence
+instead of applying backpressure to acquisition. Logical interval and
+contribution queues are also independently bounded even when a composite
+derived-evidence owner implements both streams.
 
 ## 5. Overflow
 
@@ -278,24 +319,30 @@ Locks are allowed when a simpler transactional boundary genuinely requires them,
 
 Shutdown is structured:
 1. stop new subscriptions/work creation;
-2. freeze the exact acquisition cutoff and stop periodic health emission;
+2. freeze the exact acquisition cutoff, including capture/book/public/resource
+   state, and stop periodic health emission;
 3. drain bounded work that was accepted before that cutoff;
 4. freeze every still-active availability contributor with explicit open-at-
    shutdown evidence, bound its interval at that same cutoff, and retain
    unresolved Gate-sticky/ineligible state;
-5. build and enqueue the terminal health checkpoint paired to the frozen
-   cutoff, after the accepted audit classifications are reflected;
-6. construct any full terminal processor summary outside the active capture
-   path, then drain/close producers and consumers, flush writers, and finalize
-   manifests;
-7. close the health owner, then publish the complete health evidence or retain
-   an explicit partial-health artifact;
-8. emit the health/shutdown result.
+5. construct any full terminal processor summary outside the active capture
+   path, hand off the final nonempty active raw segment, join ordered
+   publication, require zero pending/unverified inventory, reconcile every
+   verified manifest, and publish/reload the source-bound raw completion head;
+6. close and snapshot analytical and availability owners;
+7. build and enqueue exactly one terminal v5 checkpoint from those final owner
+   snapshots while retaining the capture-boundary timestamp and frozen
+   capture/book/public/resource state;
+8. close the health owner, requiring that terminal record to be written last,
+   then publish the complete health evidence or retain an explicit partial
+   artifact; and
+9. emit the health/shutdown result.
 
-The terminal checkpoint is a capture-boundary record, not a post-finalization
-record. Its timestamp is the frozen acquisition cutoff. No periodic checkpoint
-may be emitted after that cutoff, even while already accepted audit work is
-draining, and publication occurs only after all relevant owners are closed.
+The terminal checkpoint is paired to the capture boundary but is also a
+post-drain owner-completion record. No periodic checkpoint may be emitted after
+the cutoff. A terminal v5 without the exact raw completion SHA-256, with
+pending/active/unverified journal work, or admitted before an owner closes is
+fail-closed and cannot qualify Gate evidence.
 
 Future live shutdown follows the stricter operations runbook.
 

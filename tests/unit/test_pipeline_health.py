@@ -34,12 +34,18 @@ from multi_market_arbitrage.core.ids import (
     InstrumentId,
     MarketId,
     SubscriptionId,
+    WriterId,
 )
 from multi_market_arbitrage.core.provenance import RawSourceRef
 from multi_market_arbitrage.core.serialization import canonical_sha256
 from multi_market_arbitrage.core.time import MonotonicTimestamp, UtcTimestamp
 from multi_market_arbitrage.ingestion import RawEventEnvelope
-from multi_market_arbitrage.journal import JournalMetricsSnapshot
+from multi_market_arbitrage.journal import (
+    JournalMetricsSnapshot,
+    JournalWriteError,
+    JournalWriterConfig,
+    RawJournalWriter,
+)
 from multi_market_arbitrage.observability import (
     AvailabilityCausalFamily,
     AvailabilityCause,
@@ -685,6 +691,7 @@ def _checkpoint(
     history_saturation_recorder: Callable[[int], None] | None = None,
     analytical: AnalyticalRuntimeSnapshot | None = None,
     availability_writer: AvailabilityEvidenceRuntimeSnapshot | None = None,
+    journal_snapshot: JournalMetricsSnapshot | None = None,
     terminal: bool = False,
 ) -> HealthCheckpoint:
     test_audit_contributions = empty_audit_availability_contribution_snapshot()
@@ -750,19 +757,37 @@ def _checkpoint(
         target=target,
         runtime=runtime_snapshot,
         processor=processor,
-        journal=JournalMetricsSnapshot(
-            received=0,
-            enqueued=0,
-            appended=0,
-            durable=0,
-            sealed=0,
-            verified=0,
-            queue_depth=0,
-            queue_high_water=0,
-            backpressure_failures=0,
-            writer_failures=0,
-            recovered_records=0,
-            truncated_tails=0,
+        journal=(
+            JournalMetricsSnapshot(
+                received=0,
+                enqueued=0,
+                appended=0,
+                durable=0,
+                sealed=0,
+                verified=0,
+                queue_depth=0,
+                queue_high_water=0,
+                backpressure_failures=0,
+                writer_failures=0,
+                recovered_records=0,
+                truncated_tails=0,
+                queue_capacity=config.system.queue_capacity,
+                maximum_segment_events=config.storage.journal_segment_max_events,
+                maximum_segment_uncompressed_bytes=(
+                    config.storage.journal_segment_max_uncompressed_bytes
+                ),
+                seal_queue_capacity=config.storage.journal_seal_queue_capacity,
+                maximum_unverified_segments=config.storage.journal_seal_queue_capacity,
+                maximum_pending_uncompressed_bytes=(
+                    config.storage.journal_pending_seal_max_uncompressed_bytes
+                ),
+                maximum_pending_seal_age_nanoseconds=int(
+                    config.storage.journal_pending_seal_max_age_seconds * 1_000_000_000
+                ),
+                maximum_active_seal_jobs=1,
+            )
+            if journal_snapshot is None
+            else journal_snapshot
         ),
         journal_failure_type=None,
         analytical=(
@@ -889,6 +914,7 @@ def _checkpoint(
         monotonic_now_ns=monotonic_now_ns,
         history_saturation_recorder=history_saturation_recorder,
         terminal=terminal,
+        raw_journal_completion_sha256=("d" * 64 if terminal else None),
     )
 
 
@@ -914,6 +940,76 @@ def _target_receive_times(
         ): received_monotonic_ns
         for native_token_id in (target.yes_token_id, target.no_token_id)
     }
+
+
+@pytest.mark.asyncio
+async def test_recovered_pending_journal_lifecycle_is_healthy_in_v5_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = CollectorRunId("health-recovered-pending")
+    journal_config = JournalWriterConfig(
+        root=tmp_path,
+        collector_run_id=run_id,
+        venue_id=POLYMARKET_VENUE_ID,
+        stream="market",
+        writer_id=WriterId("health-recovery-writer"),
+        writer_software_version="health-recovery-v1",
+        git_commit="a" * 40,
+        max_events_per_segment=1,
+        max_uncompressed_bytes_per_segment=1024 * 1024,
+        max_uncompressed_bytes_per_run=4 * 1024 * 1024,
+        seal_queue_capacity=4,
+        max_pending_seal_uncompressed_bytes=4 * 1024 * 1024,
+        max_pending_seal_age_seconds=30.0,
+    )
+    initial = RawJournalWriter(journal_config)
+
+    def fail_private_seal(_descriptor: object, _previous_digest: str | None) -> None:
+        raise OSError("injected retained pending segment")
+
+    monkeypatch.setattr(initial, "_seal_pending_segment", fail_private_seal)
+    await initial.start()
+    event = _raw_envelope(
+        run_id,
+        0,
+        "market",
+        b'{"kind":"health-recovery"}',
+        received_at=UtcTimestamp(1_800_000_000_000_000_000),
+    )
+    assert (await initial.submit(event)).ingest_seq == 0
+    with pytest.raises(JournalWriteError, match="retained pending"):
+        await initial.close(completed=False)
+
+    recovered = RawJournalWriter(journal_config)
+    await recovered.start()
+    try:
+        journal = recovered.metrics
+        assert journal.segment_handoffs == 1
+        assert journal.sealed_bytes_durable_transitions == 1
+        assert journal.manifest_durable_transitions == 1
+        assert journal.verified_transitions == 1
+        assert journal.source_partial_removed_transitions == 1
+        assert journal.durability_watermark_sequence == 0
+        assert journal.manifest_durable_watermark_sequence == 0
+        assert journal.verified_watermark_sequence == 0
+
+        config = load_phase1_config(Path("config/phase1.toml"))
+        updated_at = UtcTimestamp(1_800_000_000_000_000_000)
+        processor, target = _healthy_target_processor(config, updated_at=updated_at)
+        checkpoint = _checkpoint(
+            config=config,
+            target=target,
+            processor=processor,
+            book_last_valid_receive_monotonic_ns=_target_receive_times(target, 20),
+            emitted_at=updated_at,
+            monotonic_now_ns=20,
+            journal_snapshot=journal,
+        )
+
+        assert checkpoint.journal["healthy"] is True
+    finally:
+        await recovered.close(completed=False)
 
 
 def test_checkpoint_current_external_fault_is_nonsticky_until_terminal_and_recovers() -> None:

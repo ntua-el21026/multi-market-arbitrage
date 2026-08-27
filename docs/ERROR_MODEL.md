@@ -159,6 +159,8 @@ Invalid price/spread relationships remain schema/normalization failures.
 race-free divergence lifecycle governed by ADR-0054 and evidence dimensions,
 fault lifecycle, and refined Gate treatment governed by ADR-0055. ADR-0056
 governs availability-contributor ownership and bounded replacement recovery.
+ADR-0057 governs non-blocking ordered raw-journal rotation, pending-seal
+backpressure, and seal/recovery failure.
 
 Before PREPARE freezes the decision, the response-boundary admission watermark
 must be durably and canonically processed. Relevant mutation across the window
@@ -437,7 +439,86 @@ still active, union/count/digest/sequence/hash mismatch, or partial evidence
 claimed as complete fails closed for Gate evidence without contaminating raw
 capture.
 
-## 10. Error identity
+## 10. Raw-journal seal and recovery failure
+
+Append/data-`fsync` durability and ordered seal/verify publication are separate
+authorities. A receipt already established as `DURABLE` remains true if later
+compression, manifest publication, verification, cleanup, or recovery fails.
+That later failure nevertheless makes the journal unhealthy, stops new
+authoritative admission, preserves every durable active/pending source, and
+prevents clean completion.
+
+Expected typed families are:
+
+- handoff-intent publication or active-to-pending commit failure: rotation
+  infrastructure fault retaining the last exact recoverable state;
+- pending descriptor/count/byte/age or disk exhaustion: bounded resource/
+  backpressure fault;
+- compression, file/directory `fsync`, rename, manifest, verification, or
+  cleanup failure: seal infrastructure fault with exact lifecycle stage;
+- range, chain, hash, scope, provenance, path, or completed-inventory conflict:
+  corruption/recovery ambiguity; and
+- impossible owner transition, unknown result, or out-of-order publication:
+  programming invariant violation.
+
+No family permits dropping or reordering a pending source, revoking a durable
+receipt, silently enlarging a bound, treating an incomplete inventory as
+completed, or retrying ambiguous mutation of authoritative raw evidence.
+Recovery may resume an expected crash window only after exact streaming
+identity validation. Otherwise it fails closed without source mutation.
+
+Prepared handoff intent is not a lifecycle transition. Recovery may complete
+the declared active-to-pending rename only when the self-hashed intent, exact
+active source, absent pending destination, and all identities agree. A pending
+source with its exact intent is revalidated and the directory re-`fsync`ed
+before committed recognition. A pending source without intent is rejected; the
+descriptor is never reconstructed from the pending bytes.
+
+Intent without active or pending source is recovery ambiguity unless exact
+matching sealed bytes and manifest completely reverify against that intent as a
+verified-cleanup crash window. Only that exact case permits durable orphan-
+intent cleanup.
+
+Recovered pending work retains the original age budget. Startup initializes
+age from the intent's validated, nonfuture handoff UTC and thereafter advances
+it with the current process's monotonic clock. Invalid/future wall chronology,
+or age already at or above the hard bound, is typed fail-closed exhaustion;
+restart, persisted cross-process monotonic values, and filesystem timestamps
+cannot renew or redefine the budget.
+
+The handoff UTC is sampled before its same-process monotonic origin. Therefore
+a deschedule between those calls is charged to the live monotonic age and
+cannot be omitted from recovered UTC age after restart.
+
+New writers require the durable self-hashed run/stream source-authority
+sidecar before active bytes exist. Missing or conflicting authority,
+publication temporaries, source/config mismatch, or an unsealed legacy source
+without authority is recovery ambiguity before mutation. Historical unbound
+partials remain forensic-reader input only; a writer does not relabel their
+provenance. Completion v2 binds the exact authority SHA-256, so later sidecar
+removal or replacement cannot downgrade a completed run to legacy semantics.
+
+The detachable seal worker owns only read-only validation and private scratch.
+It can be revoked at the pending-age boundary without later authoritative
+mutation. Sealed rename, manifest publication, and each source/descriptor
+cleanup transition belong to the joined ordered publication owner. Authority
+is checked before and after each finite transaction and before entering the
+next. If an entered syscall returns after expiry, only that transaction's exact
+documented crash window survives and the remainder is prohibited. A syscall
+that never returns cannot be safely preempted in-process; close may remain
+blocked under that native host/filesystem failure, as with append `fsync`, and
+must be handled by host qualification and external monitoring rather than a
+false in-process completion.
+
+The offline exact ingest-ID index is derived verification scratch. A confirmed
+duplicate ID is raw corruption. SQLite creation/page-limit/query/cleanup failure
+is `JournalVerificationResourceError`, a typed verification infrastructure or
+capacity failure: it blocks replay,
+rebuild and Gate acceptance without mutating raw authority or falsely claiming
+that the raw bytes themselves are corrupt. The temporary index is never an
+ADR-0030 operational-state database.
+
+## 11. Error identity
 
 Operational errors carry where relevant:
 
@@ -472,7 +553,7 @@ evidence that supplies no supported initiating route.
 
 Primary invariant errors and cascading consequences must be distinguishable. Post-run analysis must not count one root failure as many independent causes.
 
-## 11. Health interaction
+## 12. Health interaction
 
 Repeated transient errors may degrade scope according to explicit policy.
 
@@ -493,7 +574,7 @@ failed recovery, or evidence inconsistency remains sticky. Recoverable current
 audit/HTTP reasons are visible but nonsticky at periodic checkpoints; if still
 current at terminal cutoff they are promoted to sticky unresolved reasons.
 
-## 12. Test requirements
+## 13. Test requirements
 
 Fault/adversarial coverage includes:
 
@@ -501,6 +582,23 @@ Fault/adversarial coverage includes:
 - HTTP/WS metric isolation;
 - duplicate/malformed/unsupported payloads;
 - queue and disk faults;
+- pending-seal descriptor, byte and age exhaustion, including queued-plus-
+  in-service accounting and no false completion;
+- compression, sealed-file `fsync`/rename, manifest, verification and cleanup
+  failures with authoritative pending-source preservation;
+- crash recovery at handoff-intent prepare, active-to-pending commit, sealed-
+  publication, manifest-publication, verification and cleanup boundaries,
+  including intent-plus-active completion, pending-without-intent rejection,
+  multiple pending segments and a later active suffix;
+- delayed authoritative rename/source-unlink/descriptor-unlink calls that cross
+  pending expiry, proving the entered transaction is joined and no subsequent
+  namespace transition or false completion occurs;
+- source-authority publication crash windows, active-only source/config
+  laundering rejection, completion-v2 binding, and historical unbound reader-
+  only compatibility;
+- an ordinary seal deliberately held longer than the freshness guard while a
+  later response and PREPARE become durable/processed before their unchanged
+  hard expiry;
 - audit watermark/deadline/epoch/generation ambiguity;
 - response before deadline with PREPARE durability/processing at or after expiry,
   which remains `FAILED/BOOK_FRESHNESS_EXPIRED`, plus a delayed exact attestation

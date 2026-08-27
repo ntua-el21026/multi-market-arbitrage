@@ -20,15 +20,24 @@ that failed result. ADR-0056 implementation and offline validation were
 complete for candidate `40acc02c...`; its later exact-SHA public smoke passed,
 but its 7,200-second stability observation failed the mandatory post-saturation
 RSS net-growth criterion, as
-recorded in `GATE_1_PUBLIC_PREFLIGHT_FAILURE_20260826.md`. A bounded
-storage-finalization transient correction and complete exact-SHA
-requalification remain pending.
+recorded in `GATE_1_PUBLIC_PREFLIGHT_FAILURE_20260826.md`. The bounded storage-
+finalization correction produced the subsequent exact-SHA candidate; its
+qualification exposed the additional rotation defect below.
 
-A fresh six-hour run is mandatory after ADR-0053 through ADR-0056 and
+The subsequent exact-SHA candidate `e6203e19...` passed its smoke and completed
+a 7,200-second public observation, but failed when its append owner awaited
+approximately 5.9 seconds of seal/verify work at the 10,000-event rotation. Two
+PREPARE controls missed their unchanged hard expiries, producing permanent
+internal faults and failed replacement recovery. ADR-0057 separates bounded
+append durability from ordered sealing. That run remains failed evidence and
+does not qualify the corrected successor.
+
+A fresh six-hour run is mandatory after ADR-0053 through ADR-0057 and
 `GATE_1_REMEDIATION_SPEC.md` are implemented and independently approved through
 failed-run replay, a new post-fix 60-second smoke and a new 5,400- to 7,200-
-second stability observation. Candidate `40acc02c...` did not satisfy this
-precondition, and its passing smoke cannot qualify a source-modified successor.
+second stability observation. Candidates `40acc02c...` and `e6203e19...` did
+not satisfy this precondition, and neither passing smoke can qualify a source-
+modified successor.
 The remediation task does not run that six-hour soak.
 
 ## 2. Objective
@@ -51,22 +60,25 @@ Before another soak:
 5. ADR-0056 unresolved-only contributor ownership, independent contributor
    closure/publication, interval-union reconciliation and bounded replacement
    recovery are implemented.
-6. Exact quantity-bearing L2 remains authoritative; reported BBO never fabricates depth.
-7. Unresolved reported-top transitions block audit and scanner/research eligibility.
-8. Transition bounds/convergence/supersession/failure are deterministic and replayable.
-9. Public HTTP and WebSocket failures remain separate typed domains.
-10. Safe public-read retry remains bounded, observable, rate-aware and deadline-constrained.
-11. New audit starts carry a v2 trigger; historical v1 controls remain replayable as `UNKNOWN_LEGACY`.
-12. Health checkpoint v4 includes UTC plus monotonic epoch/time, operational-
-    snapshot/retention/fault/contribution evidence and separate current versus
-    Gate-sticky reasons; v1-v3 remain historical-reader compatible.
-13. Every unavailable interval has typed start/end/cause/recovery evidence and
+6. ADR-0057 non-blocking append durability, ordered sealing, pending bounds,
+   crash recovery, independent watermarks, and verified-drain completion are
+   implemented without changing PREPARE/ATTEST deadlines.
+7. Exact quantity-bearing L2 remains authoritative; reported BBO never fabricates depth.
+8. Unresolved reported-top transitions block audit and scanner/research eligibility.
+9. Transition bounds/convergence/supersession/failure are deterministic and replayable.
+10. Public HTTP and WebSocket failures remain separate typed domains.
+11. Safe public-read retry remains bounded, observable, rate-aware and deadline-constrained.
+12. New audit starts carry a v2 trigger; historical v1 controls remain replayable as `UNKNOWN_LEGACY`.
+13. Health checkpoint v5 includes UTC plus monotonic epoch/time, operational-
+    snapshot/retention/fault/contribution/journal-seal evidence and separate
+    current versus Gate-sticky reasons; v1-v4 remain historical-reader compatible.
+14. Every unavailable interval has typed start/end/cause/recovery evidence and
     every new mismatch has exactly one direct contribution.
-14. Explicit target selection and identity remain required.
-15. Long-run `scan-report` is incremental/column-selective and succeeds within existing resource bounds.
-16. Full CI, static analysis, SCA, tests, package build, replay, rebuild, validation and no-live checks pass on the exact candidate SHA.
-17. The failed six-hour raw run replays twice deterministically under corrected code without the identified primary invariant failures.
-18. A new 60-second smoke and 5,400–7,200 second post-saturation stability observation pass before the rerun.
+15. Explicit target selection and identity remain required.
+16. Long-run `scan-report` is incremental/column-selective and succeeds within existing resource bounds.
+17. Full CI, static analysis, SCA, tests, package build, replay, rebuild, validation and no-live checks pass on the exact candidate SHA.
+18. The failed six-hour raw run replays twice deterministically under corrected code without the identified primary invariant failures.
+19. A new 60-second smoke and 5,400–7,200 second post-saturation stability observation pass before the rerun.
 
 ## 4. Target selection
 
@@ -95,7 +107,10 @@ Measure:
 - durable records and uncompressed bytes per second;
 - canonical events/scans;
 - journal groups/fsyncs;
-- queue HWMs;
+- rotation handoff and seal/compression/manifest/verification/cleanup timing;
+- append and seal queue HWMs, pending count/bytes/age, active seal jobs,
+  independent durable/manifest/verified progress and maximum rotation-period
+  raw-durability latency;
 - T_obs p50/p95/p99/max;
 - audit starts/outcomes/retries by trigger;
 - divergence observed/resolved/pending/unresolved/unknown/local-defect counts;
@@ -105,6 +120,32 @@ Measure:
 - scan-report peak memory/throughput.
 
 Project 21,600-second storage with conservative headroom. Do not start if raw/file/path/disk/queue/memory bounds are threatened.
+
+The exact-source calibration report is
+`phase1-pre-soak-calibration-v3`. It binds the configured journal seal-queue
+capacity and pending-seal byte limit. The disk projection separately reports
+one maximum active segment, the complete configured pending-source byte
+allowance, worst-case compressed scratch for one maximum segment, bounded
+manifest/descriptor/completion metadata plus atomic-write scratch, and bounded
+recovery-tail evidence plus the bounded compact crash-evidence ledger. These are respectively
+`temporary_sealing_active_bytes`, `temporary_sealing_pending_bytes`,
+`temporary_sealing_compressed_scratch_bytes`,
+`temporary_sealing_metadata_scratch_bytes`, and
+`temporary_sealing_recovery_bytes`; the recovery component is exactly one
+maximum tail plus 262,144 compact-ledger bytes. `temporary_sealing_bytes` must equal their
+exact sum and enter disk workload once. It does not assume a favorable
+compression ratio. A v1-v2 report or a missing component cannot qualify a new
+ADR-0057 candidate.
+
+The replay/rebuild disk allowance additionally covers one temporary exact
+ingest-ID index capped at the selected uncompressed raw bytes, with a 1 MiB
+minimum, fixed 2 MiB SQLite cache and mmap disabled. Preflight uses a fresh
+native temporary directory. Index creation/capacity/query/cleanup failure makes
+post-run validation incomplete and blocks acceptance. Abrupt process death may
+leave non-authoritative scratch only in that isolated directory; no retry may
+reuse it. The two required replays and rebuild/validation steps run sequentially
+under this capacity profile; concurrent verifier commands require additive disk
+reservation and do not qualify under the single-index projection.
 
 Do not raise a safety bound merely to make the run fit.
 
@@ -162,6 +203,28 @@ freshness/current eligibility. A body without timely PREPARE, or a missing,
 malformed, mismatched, or unreconciled attestation, fails closed as permanent
 internal `FAILED/BOOK_FRESHNESS_EXPIRED`. This is not a historical-boundary
 classification path; the guard and deadline remain unchanged.
+
+ADR-0057 additionally requires later raw response and PREPARE records to reach
+data-`fsync` durability while an earlier segment is undergoing ordinary ordered
+seal/verify work. The append owner may spend only its measured bounded rotation
+handoff on close, intent publication, pending rename, directory sync, and
+successor open; it does not await compression, manifest publication, full
+verification, or cleanup. Seal work deliberately longer than the four-second
+guard must not cause a PREPARE deadline miss. No deadline or guard is enlarged
+for this test.
+
+The bounded self-hashed descriptor is a write-ahead handoff intent published
+while the active source remains append-owned; it is not a lifecycle transition.
+Only active-to-pending rename plus directory `fsync` commits pending ownership,
+and runtime queue admission follows that commit. Recovery must validate and may
+complete exact intent-plus-active state, while pending without intent or an
+ambiguous intent/source pair is a hard failure.
+
+Recovery initializes oldest-pending age from the original persisted nonfuture
+handoff UTC and then advances it by same-process monotonic elapsed time. A
+restart never grants a new 120-second budget. Invalid or future chronology is a
+hard failure; cross-process monotonic comparison and filesystem-time age
+authority are forbidden.
 
 Every new mismatch separately records exact observation fact, independent
 received-prefix reconstruction integrity, external causal attribution and
@@ -264,9 +327,18 @@ missing coverage or inconsistent evidence remains Gate-sticky.
 
 ## 10. Periodic health evidence
 
-Use `gate1-health-checkpoint-v4` on a documented bounded cadence plus final
-checkpoint. Historical v1-v3 evidence remains readable without inferred
-chronology, trigger, evidence-dimension, fault-closure or contribution fields.
+Use `gate1-health-checkpoint-v5` on a documented bounded cadence plus final
+checkpoint. Historical v1-v4 evidence remains readable without inferred
+chronology, trigger, evidence-dimension, fault-closure, contribution, or
+journal-seal fields.
+
+The ten-second cadence and 8,192-checkpoint count bound remain fixed. Measured
+v5 maxima are 30,819 bytes periodic and 44,463 bytes terminal, producing a
+66,613,503-byte conservative six-hour projection. The exact configuration uses
+a 68 MiB (71,303,168-byte) file cap, leaving 4,689,665 bytes and exceeding the
+required 2 MiB headroom. Reaching the file/count bound, missing a checkpoint, or
+emitting incomplete health evidence still fails closed; the provisioned cap is
+not permission to lower cadence or completeness.
 
 Each checkpoint includes:
 
@@ -274,11 +346,15 @@ Each checkpoint includes:
 - UTC emission time;
 - monotonic epoch and nanoseconds;
 - `capture_healthy`, `research_eligible`, `gate1_eligible_so_far`, and the
-  schema-tagged exact v4 `reason_mask` and finite `gate1_sticky_reason_mask`;
+  schema-tagged exact v5 `reason_mask` and finite `gate1_sticky_reason_mask`;
 - socket state/frame age;
 - per-book health/generation/freshness/references;
 - reported-top transition state;
 - ingress/journal/analytical/health-writer queues and failures;
+- journal append/seal queue current/HWM/capacity, pending count/bytes/age and
+  bounds, active seal jobs, lifecycle transitions/failures, durable/manifest/
+  verified progress, stage latency, append-owner seal wait, and maximum
+  rotation-period raw-durability latency;
 - HTTP, audit trigger/outcome and divergence-lifecycle evidence;
 - nested `audit.fault_lifecycles` observed/current/resolved/permanent counts,
   reconciliation, lifecycle-chain identity, and bounded current/representative
@@ -307,7 +383,7 @@ The deterministic post-run mismatch-lineage report, rather than the periodic
 checkpoint, emits the orthogonal observation/internal-prefix/external-
 attribution/recovery dimensions for every mismatch.
 
-Both v4 decision masks use `gate1-health-decision-reason-mask-v1`; its fixed,
+Both v5 decision masks use `gate1-health-decision-reason-mask-v1`; its fixed,
 append-only bit mapping is documented in `OBSERVABILITY.md`. Readers reject
 unknown high bits rather than inferring a future reason.
 
@@ -421,7 +497,15 @@ The run cannot pass if any occurs:
 
 - ingress overflow or `BACKPRESSURE_DATA_LOSS`;
 - journal write/durability/seal/verification failure;
+- pending-seal count/byte/age/job or disk bound exhaustion, sealer failure, an
+  in-service job omitted from bound accounting, or ordinary seal work blocking
+  later raw durability;
+- overlap/gap/duplicate/provenance/hash-chain recovery ambiguity, a pending
+  source without its exact handoff intent, a pending source removed before
+  verification, or a clean completion head with pending/active source state;
 - non-contiguous authoritative ingest sequence;
+- duplicate ingest ID, skipped exact cross-segment uniqueness, bounded-index
+  exhaustion, or failure to remove its command-owned scratch;
 - required schema failure;
 - silent required-event loss;
 - pending or terminally unresolved race-free REST divergence, including pending
@@ -533,6 +617,10 @@ unknown, local-defect, inconsistent, or unevidenced mismatch to pass.
   response-to-PREPARE-decision and response-to-attestation latency;
 - events/scans per second;
 - journal groups/fsyncs;
+- journal rotation count; append/seal queue occupancy; pending count/bytes/age;
+  active jobs; durable/manifest/verified progress; handoff, seal, compression,
+  manifest, verification and cleanup p50/p95/p99/max; append-owner seal wait;
+  and maximum rotation-period raw-durability latency;
 - CPU;
 - current/peak RSS and slope;
 - Python/PyArrow/native allocation attribution and post-saturation slope;
@@ -570,6 +658,17 @@ After clean exit:
 6. run bounded incremental scan report on original and rebuild;
 7. compare deterministic semantic content;
 8. prove raw inventory unchanged.
+
+Raw validation must find zero active/pending sources in the completed run,
+verify every sealed payload and manifest, reconcile contiguous ranges and the
+predecessor chain against the completion head, and prove the post-run inventory
+is identical to the pre-audit inventory. Replay never treats an interrupted
+sealed/pending/active prefix as clean completion.
+
+Raw validation also exhausts the exact disk-backed ingest-ID index and proves
+its scratch directory is removed. A duplicate is a raw-integrity failure;
+index infrastructure/capacity failure is incomplete validation rather than a
+fabricated corruption finding, but either blocks Gate acceptance.
 
 New-schema replay additionally requires identical observation/internal-prefix/
 external-attribution/recovery dimensions, fault-lifecycle and contribution

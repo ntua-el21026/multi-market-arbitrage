@@ -59,7 +59,12 @@ Phase-1 Polymarket additionally records:
 - socket generations, disconnects, reconnects and unavailable time;
 - exact typed unavailable intervals;
 - receive→ingress, ingress dwell and receive→durable latency;
-- journal group/fsync behavior;
+- journal group/`fsync`, rotation handoff, ordered seal, and verified-drain
+  behavior;
+- append/seal queue current/high-water/capacity, pending count/bytes/age,
+  active seal job, segment lifecycle transitions, independent durability/
+  manifest/verification progress, stage failures, and maximum rotation-period
+  raw durability latency;
 - parse/protocol/invariant failures;
 - book and reported-top transition state;
 - audit barrier lag, explicit current audit eligibility, versioned trigger,
@@ -141,18 +146,19 @@ UNSAFE
 
 A healthy process does not imply healthy capture, books, persistence, research, risk authority or future live readiness.
 
-## 8. Gate-1 health checkpoint v4
+## 8. Gate-1 health checkpoint v5
 
-The observer emits `gate1-health-checkpoint-v4`. Historical v1-v3 records remain
+The observer emits `gate1-health-checkpoint-v5`. Historical v1-v4 records remain
 readable as the schemas that produced them. The compatibility validator never
 upgrades their content or synthesizes missing chronology, trigger, divergence-
-dimension, fault-closure, contribution, retention, or lifecycle evidence. In
-particular, the first soak's v1 chronology remains explicitly unavailable.
+dimension, fault-closure, contribution, retention, lifecycle, or journal-seal
+evidence. In particular, the first soak's v1 chronology and every pre-v5
+checkpoint's seal ownership/lifecycle remain explicitly unavailable.
 
-Every v4 record contains:
+Every v5 record contains:
 
 ```text
-schema_version = gate1-health-checkpoint-v4
+schema_version = gate1-health-checkpoint-v5
 collector_run_id
 emitted_at_utc_ns
 emitted_monotonic_epoch_id
@@ -175,6 +181,44 @@ resources
 decisions
 ```
 
+ADR-0057 retains every v4 group and decision meaning. The `journal` group adds
+mandatory compact state for:
+
+```text
+append queue depth / high-water / capacity
+seal queue depth / high-water / capacity
+pending segment count / high-water / capacity
+pending uncompressed bytes / high-water / capacity
+oldest pending age / maximum age
+active seal jobs / high-water / maximum
+segment handoff / lifecycle-transition counts
+sealer / pending-backpressure failures
+durable / manifest-durable / verified progress
+rotation handoff / compression / manifest / verification / cleanup latency
+append-owner wait attributable to ordinary seal work
+maximum raw-durability latency while a prior segment is pending
+```
+
+Pending counts and bytes include the in-service job, not only queue waiters.
+Recovered oldest age includes elapsed UTC since the original validated handoff
+at the recovery sample and thereafter advances from the current process's
+monotonic clock; restart never resets it, and filesystem time is not authority.
+The compact checkpoint never serializes pending raw records or segment-sized
+inventories. Clean terminal evidence requires zero pending/in-service work and
+exact completion-head reconciliation. V5 explicitly distinguishes periodic
+from terminal records and binds a successfully drained terminal record to the
+exact raw completion-head SHA-256. Capture, book, public-read, and resource
+clocks remain frozen at the acquisition cutoff, but the one terminal record is
+built only after raw completion and analytical/availability owner closure. It
+must be durably written last; missing, duplicate, non-last, pre-drain, or
+completion-unbound terminal evidence is ineligible.
+
+Maximum measured v5 serialization is 30,819 bytes for a periodic checkpoint and
+44,463 bytes for the terminal checkpoint. The unchanged ten-second six-hour
+schedule projects 66,613,503 bytes. A 68 MiB (71,303,168-byte) file cap leaves
+4,689,665 bytes of headroom, above the required 2 MiB. Checkpoint count, cadence,
+completeness, and fail-closed writer semantics are unchanged.
+
 Each book record includes health, generation, freshness, reference versions and any unresolved `ReportedTopTransition` identity/status/bounds.
 
 Each checkpoint distinguishes:
@@ -189,7 +233,7 @@ reason_mask_schema = gate1-health-decision-reason-mask-v1
 ```
 
 The in-memory `reason_codes` set is the complete decision state at that
-checkpoint; v4 serializes it exactly as `reason_mask`. The in-memory
+checkpoint; v5 serializes it exactly as `reason_mask`. The in-memory
 `gate1_sticky_reason_codes` set is serialized as `gate1_sticky_reason_mask` and
 carries only reasons whose occurrence is a
 permanent blocker for the candidate run. A socket/book outage, pending
@@ -239,7 +283,7 @@ The audit group separately exposes:
 
 The deterministic offline mismatch-lineage report separately emits typed
 observation facts, independent received-prefix integrity results, external
-causal attribution, and recovery states. Periodic checkpoint v4 does not
+causal attribution, and recovery states. Periodic checkpoint v5 does not
 synthesize those post-run dimensions.
 
 Within `audit`, the nested `fault_lifecycles` group separately exposes observed,
@@ -270,7 +314,7 @@ This removes repeated JSON keys without dropping any per-domain value. These
 are O(1) projections of incrementally maintained state, not serialized
 histories.
 
-Other repeated finite v4 families use schema-tagged positional tables as well:
+Other repeated finite v5 families use schema-tagged positional tables as well:
 analytical fragment retention, audit/public HTTP endpoints, audit-stage timing,
 RSS discontinuities, audit mismatch representatives, audit-fault lifecycle
 representatives, and processor history chains. Reported-top transitions use a
@@ -799,7 +843,7 @@ cutoff-bounded terminal health checkpoint. Failure of this required terminal
 diagnostic degrades health evidence and is explicit in
 `terminal_process_resource_failure_type`. Offline capacity evidence separately
 reports full terminal-summary p50/p95/p99/max latency and deep retained bytes.
-The v4 analytical group reports current/high-water buffered records and bytes,
+The v5 analytical group reports current/high-water buffered records and bytes,
 flush count, flushed-record count, and process-wide PyArrow current/peak
 allocated bytes. It also reports exactly three bounded fragment-retention
 records (`reference`, `canonical_events`, and `complete_set_scans`): current-run

@@ -103,6 +103,9 @@ class StorageConfig(_StrictFrozenModel):
     journal_submit_timeout_seconds: PositiveFiniteFloat
     journal_group_commit_max_events: PositiveStrictInt = 1
     journal_group_commit_max_delay_seconds: NonNegativeFiniteFloat = 0.0
+    journal_seal_queue_capacity: PositiveStrictInt = 4
+    journal_pending_seal_max_uncompressed_bytes: PositiveStrictInt = 256 * 1024 * 1024
+    journal_pending_seal_max_age_seconds: PositiveFiniteFloat = 120.0
     parquet_batch_size: PositiveStrictInt
     analytical_queue_capacity: PositiveStrictInt = 1_024
     analytical_record_max_bytes: PositiveStrictInt = 8 * 1024 * 1024
@@ -153,6 +156,22 @@ class StorageConfig(_StrictFrozenModel):
             raise ValueError("single-event journal commits cannot configure a batching delay")
         if self.journal_run_max_uncompressed_bytes > 4 * 1024 * 1024 * 1024:
             raise ValueError("journal run byte limit cannot exceed the 4 GiB replay safety cap")
+        if self.journal_seal_queue_capacity > 64:
+            raise ValueError("journal_seal_queue_capacity cannot exceed 64")
+        if not (
+            self.journal_segment_max_uncompressed_bytes
+            <= self.journal_pending_seal_max_uncompressed_bytes
+            <= self.journal_run_max_uncompressed_bytes
+        ):
+            raise ValueError(
+                "journal pending-seal bytes must cover one segment and remain within the run cap"
+            )
+        if self.journal_pending_seal_max_uncompressed_bytes > (
+            self.journal_seal_queue_capacity * self.journal_segment_max_uncompressed_bytes
+        ):
+            raise ValueError(
+                "journal pending-seal bytes cannot exceed queue capacity times segment size"
+            )
         if self.analytical_record_max_bytes > self.analytical_buffer_max_bytes:
             raise ValueError(
                 "analytical record byte limit cannot exceed the analytical buffer byte limit"
@@ -355,7 +374,7 @@ class HealthConfig(_StrictFrozenModel):
     checkpoint_interval_seconds: PositiveFiniteFloat = 10.0
     queue_capacity: PositiveStrictInt = 64
     maximum_checkpoints: PositiveStrictInt = 8_192
-    maximum_file_bytes: PositiveStrictInt = 64 * 1024 * 1024
+    maximum_file_bytes: PositiveStrictInt = 68 * 1024 * 1024
     availability_queue_capacity: PositiveStrictInt = 64
     maximum_availability_intervals: PositiveStrictInt = 8_192
     maximum_availability_file_bytes: PositiveStrictInt = 64 * 1024 * 1024

@@ -680,6 +680,352 @@ async def test_pre_response_update_queued_in_ingress_is_inside_audit_fence(
 
 
 @pytest.mark.asyncio
+async def test_prepare_attest_remains_timely_while_prior_journal_seal_exceeds_four_seconds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prior slow seal cannot consume later response/PREPARE durability time."""
+
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("audit-prepare-attest-during-slow-prior-seal")
+    writer = RawJournalWriter(
+        JournalWriterConfig(
+            root=tmp_path / "raw",
+            collector_run_id=run_id,
+            venue_id=POLYMARKET_VENUE_ID,
+            stream="polymarket-public",
+            writer_id=WriterId("writer-audit-prepare-attest-during-slow-prior-seal"),
+            writer_software_version="test",
+            git_commit="fixture",
+            queue_capacity=config.system.queue_capacity,
+            max_events_per_segment=5,
+            max_uncompressed_bytes_per_segment=(
+                config.storage.journal_segment_max_uncompressed_bytes
+            ),
+            max_uncompressed_bytes_per_run=(config.storage.journal_run_max_uncompressed_bytes),
+            submit_timeout_seconds=config.storage.journal_submit_timeout_seconds,
+            group_commit_max_events=config.storage.journal_group_commit_max_events,
+            group_commit_max_delay_seconds=(config.storage.journal_group_commit_max_delay_seconds),
+            seal_queue_capacity=config.storage.journal_seal_queue_capacity,
+            max_pending_seal_uncompressed_bytes=(
+                config.storage.journal_pending_seal_max_uncompressed_bytes
+            ),
+            max_pending_seal_age_seconds=(config.storage.journal_pending_seal_max_age_seconds),
+        )
+    )
+    processor = CanonicalProcessor(config)
+    metrics = InMemoryMetrics()
+    capture = observe_module._RawCaptureBoundary(  # pyright: ignore[reportPrivateUsage]
+        collector_run_id=run_id,
+        writer=writer,
+        processor=processor,
+        metrics=metrics,
+    )
+    service = PolymarketObservationService(
+        config,
+        workspace_root=tmp_path,
+        code_commit="fixture",
+        metrics=metrics,
+    )
+    connection_id = ConnectionId("audit-prepare-attest-during-slow-prior-seal")
+    subscription_id = SubscriptionId("audit-prepare-attest-during-slow-prior-seal-subscription")
+    ingress = BoundedRawIngress(
+        max_items=config.system.queue_capacity,
+        max_bytes=config.polymarket.maximum_ingress_queue_bytes,
+        connection_id=connection_id,
+    )
+
+    slow_seal_guard_ns = 4_000_000_000
+    slow_seal_release_margin_ns = 50_000_000
+    seal_entered = threading.Event()
+    release_seal = threading.Event()
+    seal_completed = threading.Event()
+    seal_timing_ns: dict[str, int] = {}
+    seal_gate_used = False
+    original_seal = cast(
+        Callable[[object, str | None], object],
+        writer.__getattribute__("_seal_pending_segment"),
+    )
+
+    def slow_first_seal(descriptor: object, previous_segment_digest: str | None) -> object:
+        nonlocal seal_gate_used
+        gated = not seal_gate_used
+        if gated:
+            seal_gate_used = True
+            seal_timing_ns["entered"] = time.monotonic_ns()
+            seal_entered.set()
+            if not release_seal.wait(timeout=15.0):
+                raise TimeoutError("slow prior journal seal gate timed out")
+            seal_timing_ns["released"] = time.monotonic_ns()
+        result = original_seal(descriptor, previous_segment_digest)
+        if gated:
+            seal_timing_ns["completed"] = time.monotonic_ns()
+            seal_completed.set()
+        return result
+
+    monkeypatch.setattr(  # pyright: ignore[reportPrivateUsage]
+        writer,
+        "_seal_pending_segment",
+        slow_first_seal,
+    )
+
+    audited_channels = frozenset(
+        {
+            REST_BOOK_AUDIT,
+            CONTROL_REST_AUDIT_CLASSIFY_PREPARE,
+            CONTROL_REST_AUDIT_CLASSIFY,
+        }
+    )
+    durable_ns_by_channel: dict[str, int] = {}
+    processed_ns_by_channel: dict[str, int] = {}
+    prepare_results: list[ProcessedEnvelope] = []
+    prepare_state_pairs: list[tuple[object, object]] = []
+    original_record_durable = capture._record_durable_receipt  # pyright: ignore[reportPrivateUsage]
+    original_record_processed = capture._record_processed  # pyright: ignore[reportPrivateUsage]
+    original_process_durable = processor.process_durable
+
+    def record_durable(envelope: RawEventEnvelope, receipt: JournalReceipt) -> None:
+        original_record_durable(envelope, receipt)
+        if envelope.channel not in audited_channels:
+            return
+        durable = receipt.durable_monotonic
+        assert durable is not None
+        assert envelope.channel not in durable_ns_by_channel
+        durable_ns_by_channel[envelope.channel] = durable.nanoseconds
+
+    def record_processed(
+        envelope: RawEventEnvelope,
+        result: ProcessedEnvelope,
+        *,
+        scan_completed_monotonic_ns: int,
+    ) -> None:
+        original_record_processed(
+            envelope,
+            result,
+            scan_completed_monotonic_ns=scan_completed_monotonic_ns,
+        )
+        if envelope.channel in audited_channels:
+            assert envelope.channel not in processed_ns_by_channel
+            processed_ns_by_channel[envelope.channel] = scan_completed_monotonic_ns
+
+    def record_process_durable(
+        envelope: RawEventEnvelope,
+        receipt: JournalReceipt,
+    ) -> ProcessedEnvelope:
+        before = (
+            processor.snapshots(),
+            processor.audit_ineligible_instruments,
+            processor.audit_outcomes,
+        )
+        processed = original_process_durable(envelope, receipt)
+        if envelope.channel == CONTROL_REST_AUDIT_CLASSIFY_PREPARE:
+            prepare_results.append(processed)
+            prepare_state_pairs.append(
+                (
+                    before,
+                    (
+                        processor.snapshots(),
+                        processor.audit_ineligible_instruments,
+                        processor.audit_outcomes,
+                    ),
+                )
+            )
+        return processed
+
+    monkeypatch.setattr(  # pyright: ignore[reportPrivateUsage]
+        capture,
+        "_record_durable_receipt",
+        record_durable,
+    )
+    monkeypatch.setattr(  # pyright: ignore[reportPrivateUsage]
+        capture,
+        "_record_processed",
+        record_processed,
+    )
+    monkeypatch.setattr(processor, "process_durable", record_process_durable)
+
+    await writer.start()
+    try:
+        await _initialize_books(capture)
+        assert writer.metrics.durable == 4
+        assert writer.metrics.segment_handoffs == 0
+        instrument_id = processor.audit_book_identity("token-yes").instrument_id
+        hard_expiry_ns = capture.book_freshness_receive_ns_by_instrument[instrument_id] + int(
+            config.scanner.maximum_book_age_seconds * 1_000_000_000
+        )
+        start, start_result = await service._stage_audit_start(  # pyright: ignore[reportPrivateUsage]
+            capture=capture,
+            ingress=ingress,
+            native_asset_id="token-yes",
+            attempt=1,
+            connection_id=connection_id,
+            subscription_id=subscription_id,
+            hard_expiry_monotonic_ns=hard_expiry_ns,
+            run_deadline_monotonic_ns=hard_expiry_ns,
+        )
+        assert start_result.success
+        assert await asyncio.to_thread(seal_entered.wait, 2.0)
+        assert writer.metrics.segment_handoffs == 1
+        assert writer.metrics.pending_segments == 1
+        assert writer.metrics.verified == 0
+
+        response_ns = time.monotonic_ns()
+        assert response_ns < hard_expiry_ns
+        response = AuditHttpResponseHandoff(
+            request_id=start.request_id,
+            connection_id=connection_id,
+            payload_bytes=_fixture("polymarket_rest_book_yes.json"),
+            received_wall_time=UtcTimestamp.now(),
+            received_monotonic_ns=response_ns,
+            response_boundary_watermark=WebSocketAdmissionWatermark(
+                connection_id=connection_id,
+                ordinal=0,
+            ),
+        )
+        result = await service._preserve_audit_response(  # pyright: ignore[reportPrivateUsage]
+            capture=capture,
+            response=response,
+            start=start,
+            barrier_ordinal=0,
+            subscription_id=subscription_id,
+            hard_expiry_monotonic_ns=hard_expiry_ns,
+        )
+        result_completed_ns = time.monotonic_ns()
+
+        assert result_completed_ns < hard_expiry_ns
+        assert not seal_completed.is_set()
+        assert result.success
+        assert tuple(outcome.outcome for outcome in result.audit_outcomes) == (AuditOutcome.MATCH,)
+        assert result.audit_outcomes[0].requires_resync is False
+        assert result.audit_divergences_opened == ()
+        assert len(prepare_results) == 1
+        assert prepare_results[0].success
+        assert prepare_results[0].audit_outcomes == ()
+        assert prepare_results[0].scan_count == 0
+        assert prepare_results[0].book_freshness_updates == ()
+        assert prepare_results[0].audit_divergences_opened == ()
+        assert prepare_state_pairs[0][0] == prepare_state_pairs[0][1]
+        snapshots_after_attest = processor.snapshots()
+        assert set(durable_ns_by_channel) == audited_channels
+        assert set(processed_ns_by_channel) == audited_channels
+        assert (
+            response_ns
+            <= durable_ns_by_channel[REST_BOOK_AUDIT]
+            <= processed_ns_by_channel[REST_BOOK_AUDIT]
+            <= durable_ns_by_channel[CONTROL_REST_AUDIT_CLASSIFY_PREPARE]
+            <= processed_ns_by_channel[CONTROL_REST_AUDIT_CLASSIFY_PREPARE]
+            <= durable_ns_by_channel[CONTROL_REST_AUDIT_CLASSIFY]
+            <= processed_ns_by_channel[CONTROL_REST_AUDIT_CLASSIFY]
+            < hard_expiry_ns
+        )
+        assert writer.metrics.durable == 8
+        assert writer.metrics.verified == 0
+        assert writer.metrics.durability_watermark_sequence == 7
+        assert writer.metrics.verified_watermark_sequence is None
+        assert writer.metrics.rotation_durability_latency_nanoseconds_max > 0
+        assert writer.metrics.append_owner_seal_wait_nanoseconds == 0
+
+        seal_release_target_ns = (
+            seal_timing_ns["entered"] + slow_seal_guard_ns + slow_seal_release_margin_ns
+        )
+        await asyncio.sleep(max(0.0, (seal_release_target_ns - time.monotonic_ns()) / 1e9))
+        assert time.monotonic_ns() >= seal_release_target_ns
+        assert writer.metrics.active_seal_jobs == 1
+        assert writer.metrics.oldest_pending_seal_age_nanoseconds > slow_seal_guard_ns
+        assert processor.snapshots() == snapshots_after_attest
+        assert tuple(outcome.outcome for outcome in processor.audit_outcomes) == (
+            AuditOutcome.MATCH,
+        )
+        release_seal.set()
+    except BaseException:
+        release_seal.set()
+        with suppress(Exception):
+            await writer.close(completed=False)
+        raise
+    else:
+        await writer.close()
+
+    assert seal_completed.is_set()
+    assert seal_timing_ns["released"] - seal_timing_ns["entered"] > slow_seal_guard_ns
+    assert seal_timing_ns["completed"] - seal_timing_ns["entered"] > slow_seal_guard_ns
+    assert writer.metrics.durable == writer.metrics.verified == 8
+    assert writer.metrics.manifest_durable_watermark_sequence == 7
+    assert writer.metrics.verified_watermark_sequence == 7
+
+    records = JournalReader(tmp_path / "raw", run_id).read_all()
+    assert tuple(record.channel for record in records) == (
+        GAMMA_MARKETS_KEYSET,
+        f"{CLOB_MARKET_PREFIX}0xcondition",
+        REST_BOOK,
+        REST_BOOK,
+        CONTROL_REST_AUDIT_START,
+        REST_BOOK_AUDIT,
+        CONTROL_REST_AUDIT_CLASSIFY_PREPARE,
+        CONTROL_REST_AUDIT_CLASSIFY,
+    )
+    response_record = records[5]
+    prepare_record = records[6]
+    attest_record = records[7]
+    prepare_payload = cast(dict[str, object], json.loads(prepare_record.payload_bytes))
+    attest_payload = cast(dict[str, object], json.loads(attest_record.payload_bytes))
+    assert response_record.received_monotonic.nanoseconds == response_ns
+    assert prepare_payload["request_id"] == start.request_id
+    assert prepare_payload["response_ingest_seq"] == response_record.ingest_seq
+    assert prepare_payload["hard_expiry_monotonic_ns"] == hard_expiry_ns
+    assert attest_payload["request_id"] == start.request_id
+    assert attest_payload["response_ingest_seq"] == response_record.ingest_seq
+    assert attest_payload["hard_expiry_monotonic_ns"] == hard_expiry_ns
+    assert (
+        attest_payload["classification_monotonic_ns"]
+        == processed_ns_by_channel[CONTROL_REST_AUDIT_CLASSIFY_PREPARE]
+    )
+    assert attest_record.transport_metadata == {
+        "classification_prepare_durable_monotonic_ns": durable_ns_by_channel[
+            CONTROL_REST_AUDIT_CLASSIFY_PREPARE
+        ],
+        "classification_prepare_ingest_id": prepare_record.ingest_id.value,
+        "classification_prepare_payload_sha256": prepare_record.payload_sha256,
+        "classification_prepare_processed_monotonic_ns": processed_ns_by_channel[
+            CONTROL_REST_AUDIT_CLASSIFY_PREPARE
+        ],
+        "request_id": start.request_id,
+    }
+
+    live = processor.summary()
+    assert live.rest_audits == 1
+    assert live.rest_audit_matches == 1
+    assert live.rest_audit_mismatches == 0
+    assert live.rest_audit_raced == 0
+    assert live.rest_audit_failed == 0
+    assert live.pending_rest_audits == 0
+    assert live.audit_faults_observed == 0
+    assert live.audit_faults_current == 0
+    assert live.audit_faults_resolved == 0
+    assert live.audit_faults_permanent == 0
+    assert live.audit_http_retry_exhaustions_observed == 0
+    assert live.audit_http_retry_exhaustions_resolved == 0
+    assert live.audit_http_retry_exhaustions_permanent == 0
+    assert processor.operational_snapshot().audit_race_budget_exhaustions == 0
+    assert live.audit_replacement_captures_pending == 0
+    assert live.audit_replacement_capture_authority == ()
+    assert live.audit_divergences_pending == 0
+    assert live.audit_ineligible_books == 0
+    assert live.healthy_books == 2
+    assert live.audit_fault_lifecycle_reconciled
+
+    replayed = replay_journal(tmp_path / "raw", run_id, config).processor
+    assert replayed.audit_outcomes == live.audit_outcomes
+    assert replayed.audit_fault_lifecycle_records == live.audit_fault_lifecycle_records
+    assert replayed.audit_replacement_capture_authority == live.audit_replacement_capture_authority
+    assert replayed.audit_ineligible_books == live.audit_ineligible_books
+    assert (
+        replayed.audit_classification_attestation_chain_sha256
+        == live.audit_classification_attestation_chain_sha256
+    )
+    assert replayed.terminal_hash == live.terminal_hash
+
+
+@pytest.mark.asyncio
 async def test_response_durable_before_expiry_but_classified_after_expiry_fails_replayably(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

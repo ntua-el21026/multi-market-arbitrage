@@ -34,7 +34,87 @@ TARGET_PATTERN = re.compile(r"[1-9][0-9]*")
 RUN_SEAL_SCHEMA = "mma-gate1-run-completion-seal-v1"
 RUN_COMMAND_SCHEMA = "mma-gate1-observer-command-v1"
 HOST_RUNTIME_IDENTITY_SCHEMA = "gate1-host-runtime-identity-v1"
-RAW_SOURCE_IDENTITY_SCHEMA = "mma-gate1-raw-source-identity-v1"
+RAW_SOURCE_IDENTITY_SCHEMA = "mma-gate1-raw-source-identity-v2"
+JOURNAL_MANIFEST_VERSION = "raw-journal-manifest-v1"
+JOURNAL_RUN_COMPLETION_VERSION = "raw-journal-run-completion-v2"
+JOURNAL_SOURCE_AUTHORITY_VERSION = "raw-journal-source-authority-v1"
+JOURNAL_SOURCE_AUTHORITY_MAX_BYTES = 64 * 1024
+JOURNAL_COMPLETION_MAX_BYTES = 8 * 1024 * 1024
+SAFE_COMPONENT_PATTERN = re.compile(r"[A-Za-z0-9_.-]+")
+SOURCE_AUTHORITY_FIELDS = frozenset(
+    {
+        "authority_origin",
+        "authority_sha256",
+        "authority_version",
+        "collector_run_id",
+        "git_commit",
+        "group_commit_max_delay_seconds_hex",
+        "group_commit_max_events",
+        "max_events_per_segment",
+        "max_pending_seal_age_nanoseconds",
+        "max_pending_seal_age_seconds_hex",
+        "max_pending_seal_uncompressed_bytes",
+        "max_uncompressed_bytes_per_run",
+        "max_uncompressed_bytes_per_segment",
+        "predecessor_manifest_sha256",
+        "queue_capacity",
+        "seal_queue_capacity",
+        "stream",
+        "submit_timeout_seconds_hex",
+        "venue_id",
+        "writer_id",
+        "writer_software_version",
+        "zstd_level",
+    }
+)
+MANIFEST_FIELDS = frozenset(
+    {
+        "collector_run_id",
+        "compressed_bytes",
+        "created_at_utc_ns",
+        "end_time_utc_ns",
+        "event_count",
+        "first_ingest_seq",
+        "git_commit",
+        "hash_algorithm",
+        "journal_format_version",
+        "last_ingest_seq",
+        "manifest_sha256",
+        "payload_digest",
+        "previous_segment_digest",
+        "recovery_evidence",
+        "segment_digest",
+        "start_time_utc_ns",
+        "stream",
+        "uncompressed_bytes",
+        "venue",
+        "writer_id",
+        "writer_software_version",
+    }
+)
+COMPLETION_V2_FIELDS = frozenset(
+    {
+        "collector_run_id",
+        "completed_at_utc_ns",
+        "completion_sha256",
+        "completion_version",
+        "expected_event_count",
+        "expected_segment_count",
+        "expected_uncompressed_bytes",
+        "first_ingest_seq",
+        "git_commit",
+        "hash_algorithm",
+        "last_ingest_seq",
+        "max_uncompressed_bytes_per_run",
+        "max_uncompressed_bytes_per_segment",
+        "source_authority_sha256",
+        "stream",
+        "terminal_manifest_sha256",
+        "venue",
+        "writer_id",
+        "writer_software_version",
+    }
+)
 SOURCE_IDENTITY_FIELDS = frozenset(
     {
         "code_commit",
@@ -176,6 +256,15 @@ def _sha256_file(path: Path) -> str:
     ):
         raise AuditFailure(f"artifact changed while hashing: {path}")
     return digest.hexdigest()
+
+
+def _fingerprint(path: Path) -> dict[str, object]:
+    resolved = path.resolve(strict=True)
+    return {
+        "bytes": resolved.stat().st_size,
+        "path": str(resolved),
+        "sha256": _sha256_file(resolved),
+    }
 
 
 def _inventory(root: Path) -> Inventory:
@@ -350,6 +439,98 @@ def _numeric_duration(value: object, *, label: str) -> float:
     return duration
 
 
+def _strict_text(record: dict[str, Any], field: str, *, label: str) -> str:
+    value = record.get(field)
+    if not isinstance(value, str) or not value:
+        raise AuditFailure(f"{label} {field} is invalid")
+    return value
+
+
+def _strict_integer(record: dict[str, Any], field: str, *, label: str) -> int:
+    value = record.get(field)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise AuditFailure(f"{label} {field} is invalid")
+    return value
+
+
+def _verify_canonical_record_hash(
+    record: dict[str, Any],
+    *,
+    hash_field: str,
+    label: str,
+) -> str:
+    claimed = _strict_text(record, hash_field, label=label)
+    if SHA256_PATTERN.fullmatch(claimed) is None:
+        raise AuditFailure(f"{label} {hash_field} is malformed")
+    content = dict(record)
+    del content[hash_field]
+    observed = hashlib.sha256(_canonical_bytes(content)).hexdigest()
+    if claimed != observed:
+        raise AuditFailure(f"{label} {hash_field} differs from canonical content")
+    return claimed
+
+
+def _verify_canonical_json_file(path: Path, record: dict[str, Any], *, label: str) -> None:
+    if path.read_bytes() != _canonical_bytes(record) + b"\n":
+        raise AuditFailure(f"{label} bytes are non-canonical")
+
+
+def _expected_source_authority_values(config: Path) -> dict[str, object]:
+    try:
+        with config.open("rb") as handle:
+            document = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise AuditFailure("cannot load the strict Phase-1 configuration") from error
+    system_value = document.get("system")
+    storage_value = document.get("storage")
+    if not isinstance(system_value, dict) or not isinstance(storage_value, dict):
+        raise AuditFailure("configuration omits system or storage authority")
+    system = cast(dict[str, object], system_value)
+    storage = cast(dict[str, object], storage_value)
+
+    def integer(mapping: dict[str, object], field: str) -> int:
+        value = mapping.get(field)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise AuditFailure(f"configuration {field} is not an integer")
+        return value
+
+    def finite_float(mapping: dict[str, object], field: str) -> float:
+        value = mapping.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise AuditFailure(f"configuration {field} is not numeric")
+        result = float(value)
+        if not math.isfinite(result):
+            raise AuditFailure(f"configuration {field} is non-finite")
+        return result
+
+    code_version = system.get("code_version")
+    if not isinstance(code_version, str) or not code_version:
+        raise AuditFailure("configuration system.code_version is invalid")
+    submit_timeout = finite_float(storage, "journal_submit_timeout_seconds")
+    group_delay = finite_float(storage, "journal_group_commit_max_delay_seconds")
+    pending_age = finite_float(storage, "journal_pending_seal_max_age_seconds")
+    return {
+        "group_commit_max_delay_seconds_hex": group_delay.hex(),
+        "group_commit_max_events": integer(storage, "journal_group_commit_max_events"),
+        "max_events_per_segment": integer(storage, "journal_segment_max_events"),
+        "max_pending_seal_age_nanoseconds": int(pending_age * 1_000_000_000),
+        "max_pending_seal_age_seconds_hex": pending_age.hex(),
+        "max_pending_seal_uncompressed_bytes": integer(
+            storage, "journal_pending_seal_max_uncompressed_bytes"
+        ),
+        "max_uncompressed_bytes_per_run": integer(storage, "journal_run_max_uncompressed_bytes"),
+        "max_uncompressed_bytes_per_segment": integer(
+            storage, "journal_segment_max_uncompressed_bytes"
+        ),
+        "queue_capacity": integer(system, "queue_capacity"),
+        "seal_queue_capacity": integer(storage, "journal_seal_queue_capacity"),
+        "submit_timeout_seconds_hex": submit_timeout.hex(),
+        "writer_software_version": code_version,
+        # Phase-1 observe does not override JournalWriterConfig's frozen default.
+        "zstd_level": 9,
+    }
+
+
 def _verify_host_runtime_identity(
     summary: dict[str, Any],
     *,
@@ -406,6 +587,7 @@ def _verify_raw_source_identity(
     *,
     collector_run_id: str,
     expected_sha: str,
+    config: Path,
 ) -> dict[str, object]:
     run_key = _run_key(collector_run_id)
     prefix = f"run-{run_key}."
@@ -417,42 +599,172 @@ def _verify_raw_source_identity(
     partial_paths = tuple(sorted(raw_root.glob(f"{prefix}*.jsonl.partial")))
     if partial_paths:
         raise AuditFailure("selected completed run retains a partial journal segment")
+    pending_paths = tuple(sorted(raw_root.glob(f"{prefix}*.jsonl.seal-pending*")))
+    if pending_paths:
+        raise AuditFailure("selected completed run retains seal-pending journal evidence")
+    authority_temps = tuple(sorted(raw_root.glob(f".{prefix}*.source-authority.json.*.tmp")))
+    if authority_temps:
+        raise AuditFailure("selected run source-authority publication is incomplete")
+    completion_temps = tuple(sorted(raw_root.glob(f".{prefix}*.completed.json.*.tmp")))
+    if completion_temps:
+        raise AuditFailure("selected run completion publication is incomplete")
+
+    authority_paths = tuple(sorted(raw_root.glob(f"{prefix}*.source-authority.json")))
+    if not authority_paths:
+        raise AuditFailure("selected run has no exact source-authority artifact")
     completion_paths = tuple(sorted(raw_root.glob(f"{prefix}*.completed.json")))
     if not completion_paths:
         raise AuditFailure("selected run has no journal completion header")
 
+    expected_authority_values = _expected_source_authority_values(config)
+    authorities: dict[str, dict[str, Any]] = {}
+    authority_records: list[dict[str, object]] = []
+    for path in authority_paths:
+        if path.stat().st_size > JOURNAL_SOURCE_AUTHORITY_MAX_BYTES:
+            raise AuditFailure("selected run source authority exceeds its byte bound")
+        record = _read_json(path)
+        if set(record) != set(SOURCE_AUTHORITY_FIELDS):
+            raise AuditFailure("selected run source authority fields differ from v1")
+        stream = _strict_text(record, "stream", label="selected run source authority")
+        if SAFE_COMPONENT_PATTERN.fullmatch(stream) is None:
+            raise AuditFailure("selected run source authority stream is invalid")
+        if path.name != f"{prefix}{stream}.source-authority.json":
+            raise AuditFailure("selected run source-authority filename differs")
+        if record.get("authority_version") != JOURNAL_SOURCE_AUTHORITY_VERSION:
+            raise AuditFailure("selected run source-authority version differs")
+        if record.get("collector_run_id") != collector_run_id:
+            raise AuditFailure("selected run source-authority scope differs")
+        if record.get("git_commit") != expected_sha:
+            raise AuditFailure("selected run source-authority git_commit differs")
+        if record.get("venue_id") != "polymarket":
+            raise AuditFailure("selected run source-authority venue differs")
+        _strict_text(record, "writer_id", label="selected run source authority")
+        if record.get("authority_origin") != "NEW_RUN":
+            raise AuditFailure("new qualification run source authority is not NEW_RUN")
+        if record.get("predecessor_manifest_sha256") is not None:
+            raise AuditFailure("new qualification run source authority claims a predecessor")
+        for field, expected in expected_authority_values.items():
+            observed = record.get(field)
+            if isinstance(expected, int) and (
+                isinstance(observed, bool) or not isinstance(observed, int)
+            ):
+                raise AuditFailure(f"selected run source-authority {field} is invalid")
+            if observed != expected:
+                raise AuditFailure(
+                    f"selected run source-authority {field} differs from configuration"
+                )
+        authority_sha256 = _verify_canonical_record_hash(
+            record,
+            hash_field="authority_sha256",
+            label="selected run source authority",
+        )
+        _verify_canonical_json_file(path, record, label="selected run source authority")
+        if stream in authorities:
+            raise AuditFailure("selected run repeats a source-authority stream")
+        authorities[stream] = record
+        authority_records.append(
+            {
+                **_fingerprint(path),
+                "authority_sha256": authority_sha256,
+                "git_commit": expected_sha,
+                "stream": stream,
+            }
+        )
+
     manifest_records: list[dict[str, object]] = []
-    manifest_streams: set[str] = set()
+    manifests_by_stream: dict[str, list[tuple[dict[str, Any], Path]]] = {
+        stream: [] for stream in authorities
+    }
     for path in manifest_paths:
         record = _read_json(path)
-        stream = record.get("stream")
-        first_sequence = record.get("first_ingest_seq")
-        last_sequence = record.get("last_ingest_seq")
-        if (
-            not isinstance(stream, str)
-            or not stream
-            or isinstance(first_sequence, bool)
-            or not isinstance(first_sequence, int)
-            or isinstance(last_sequence, bool)
-            or not isinstance(last_sequence, int)
-            or first_sequence < 0
-            or last_sequence < first_sequence
-        ):
+        if record.get("git_commit") != expected_sha:
+            raise AuditFailure("selected run segment manifest git_commit differs")
+        if set(record) != set(MANIFEST_FIELDS):
+            raise AuditFailure("selected run segment manifest fields differ")
+        stream = _strict_text(record, "stream", label="selected run segment manifest")
+        first_sequence = _strict_integer(
+            record, "first_ingest_seq", label="selected run segment manifest"
+        )
+        last_sequence = _strict_integer(
+            record, "last_ingest_seq", label="selected run segment manifest"
+        )
+        event_count = _strict_integer(record, "event_count", label="selected run segment manifest")
+        uncompressed_bytes = _strict_integer(
+            record, "uncompressed_bytes", label="selected run segment manifest"
+        )
+        compressed_bytes = _strict_integer(
+            record, "compressed_bytes", label="selected run segment manifest"
+        )
+        if first_sequence < 0 or last_sequence < first_sequence or event_count <= 0:
             raise AuditFailure("selected run segment manifest identity is malformed")
         expected_name = (
             f"{prefix}{stream}.{first_sequence:020d}-{last_sequence:020d}.jsonl.zst.manifest.json"
         )
         if path.name != expected_name or record.get("collector_run_id") != collector_run_id:
             raise AuditFailure("selected run segment manifest scope differs")
-        if record.get("git_commit") != expected_sha:
-            raise AuditFailure("selected run segment manifest git_commit differs")
-        manifest_streams.add(stream)
+        authority = authorities.get(stream)
+        if authority is None:
+            raise AuditFailure("selected run segment has no source authority")
+        if (
+            record.get("journal_format_version") != JOURNAL_MANIFEST_VERSION
+            or record.get("hash_algorithm") != "sha256"
+        ):
+            raise AuditFailure("selected run segment manifest version differs")
+        if (
+            record.get("venue") != authority["venue_id"]
+            or record.get("writer_id") != authority["writer_id"]
+            or record.get("writer_software_version") != authority["writer_software_version"]
+        ):
+            raise AuditFailure("selected run segment provenance differs from source authority")
+        if event_count != last_sequence - first_sequence + 1:
+            raise AuditFailure("selected run segment event count differs from its range")
+        if (
+            event_count > cast(int, authority["max_events_per_segment"])
+            or uncompressed_bytes <= 0
+            or uncompressed_bytes > cast(int, authority["max_uncompressed_bytes_per_segment"])
+        ):
+            raise AuditFailure("selected run segment exceeds source-authority bounds")
+        segment_path = path.with_name(path.name.removesuffix(".manifest.json"))
+        if segment_path not in segment_paths:
+            raise AuditFailure("selected run segment manifest has no exact segment")
+        if compressed_bytes != segment_path.stat().st_size:
+            raise AuditFailure("selected run segment compressed byte count differs")
+        segment_digest = _strict_text(
+            record, "segment_digest", label="selected run segment manifest"
+        )
+        payload_digest = _strict_text(
+            record, "payload_digest", label="selected run segment manifest"
+        )
+        if (
+            SHA256_PATTERN.fullmatch(segment_digest) is None
+            or SHA256_PATTERN.fullmatch(payload_digest) is None
+            or segment_digest != _sha256_file(segment_path)
+        ):
+            raise AuditFailure("selected run segment digest identity differs")
+        manifest_sha256 = _verify_canonical_record_hash(
+            record,
+            hash_field="manifest_sha256",
+            label="selected run segment manifest",
+        )
+        _verify_canonical_json_file(path, record, label="selected run segment manifest")
+        recovery_evidence = record.get("recovery_evidence")
+        if not isinstance(recovery_evidence, list) or not all(
+            isinstance(item, str) for item in cast(list[object], recovery_evidence)
+        ):
+            raise AuditFailure("selected run segment recovery evidence is malformed")
+        for timestamp_field in (
+            "created_at_utc_ns",
+            "end_time_utc_ns",
+            "start_time_utc_ns",
+        ):
+            if _strict_integer(record, timestamp_field, label="selected run segment manifest") < 0:
+                raise AuditFailure("selected run segment timestamp is invalid")
+        manifests_by_stream[stream].append((record, path))
         manifest_records.append(
             {
-                "bytes": path.stat().st_size,
+                **_fingerprint(path),
                 "git_commit": expected_sha,
-                "path": str(path.resolve(strict=True)),
-                "sha256": _sha256_file(path),
+                "manifest_sha256": manifest_sha256,
                 "stream": stream,
             }
         )
@@ -460,30 +772,109 @@ def _verify_raw_source_identity(
     completion_records: list[dict[str, object]] = []
     completion_streams: set[str] = set()
     for path in completion_paths:
+        if path.stat().st_size > JOURNAL_COMPLETION_MAX_BYTES:
+            raise AuditFailure("selected run completion header exceeds its byte bound")
         record = _read_json(path)
-        stream = record.get("stream")
-        if not isinstance(stream, str) or not stream:
-            raise AuditFailure("selected run completion header stream is malformed")
+        if record.get("completion_version") != JOURNAL_RUN_COMPLETION_VERSION:
+            raise AuditFailure("new qualification run requires journal completion v2")
+        if record.get("git_commit") != expected_sha:
+            raise AuditFailure("selected run completion header git_commit differs")
+        if set(record) != set(COMPLETION_V2_FIELDS):
+            raise AuditFailure("selected run completion-v2 fields differ")
+        stream = _strict_text(record, "stream", label="selected run completion header")
         if path.name != f"{prefix}{stream}.completed.json":
             raise AuditFailure("selected run completion header filename differs")
         if record.get("collector_run_id") != collector_run_id:
             raise AuditFailure("selected run completion header scope differs")
-        if record.get("git_commit") != expected_sha:
-            raise AuditFailure("selected run completion header git_commit differs")
+        authority = authorities.get(stream)
+        if authority is None:
+            raise AuditFailure("selected run completion has no source authority")
+        if (
+            record.get("source_authority_sha256") != authority["authority_sha256"]
+            or record.get("venue") != authority["venue_id"]
+            or record.get("writer_id") != authority["writer_id"]
+            or record.get("writer_software_version") != authority["writer_software_version"]
+            or record.get("max_uncompressed_bytes_per_segment")
+            != authority["max_uncompressed_bytes_per_segment"]
+            or record.get("max_uncompressed_bytes_per_run")
+            != authority["max_uncompressed_bytes_per_run"]
+        ):
+            raise AuditFailure("selected run completion provenance differs from source authority")
+        if record.get("hash_algorithm") != "sha256":
+            raise AuditFailure("selected run completion hash algorithm differs")
+        completion_sha256 = _verify_canonical_record_hash(
+            record,
+            hash_field="completion_sha256",
+            label="selected run completion header",
+        )
+        _verify_canonical_json_file(path, record, label="selected run completion header")
         if stream in completion_streams:
             raise AuditFailure("selected run repeats a completion stream")
         completion_streams.add(stream)
+
+        ordered = sorted(
+            manifests_by_stream[stream],
+            key=lambda item: cast(int, item[0]["first_ingest_seq"]),
+        )
+        next_sequence = 0
+        previous_digest: str | None = None
+        total_events = 0
+        total_uncompressed_bytes = 0
+        for manifest, _manifest_path in ordered:
+            if manifest["first_ingest_seq"] != next_sequence:
+                raise AuditFailure("selected run segment sequence is gapped or reordered")
+            if manifest["previous_segment_digest"] != previous_digest:
+                raise AuditFailure("selected run segment digest chain differs")
+            next_sequence = cast(int, manifest["last_ingest_seq"]) + 1
+            previous_digest = cast(str, manifest["segment_digest"])
+            total_events += cast(int, manifest["event_count"])
+            total_uncompressed_bytes += cast(int, manifest["uncompressed_bytes"])
+        if total_uncompressed_bytes > cast(int, authority["max_uncompressed_bytes_per_run"]):
+            raise AuditFailure("selected run exceeds source-authority run bytes")
+        expected_segment_count = _strict_integer(
+            record, "expected_segment_count", label="selected run completion header"
+        )
+        expected_event_count = _strict_integer(
+            record, "expected_event_count", label="selected run completion header"
+        )
+        expected_uncompressed_bytes = _strict_integer(
+            record, "expected_uncompressed_bytes", label="selected run completion header"
+        )
+        if (
+            expected_segment_count != len(ordered)
+            or expected_event_count != total_events
+            or expected_uncompressed_bytes != total_uncompressed_bytes
+        ):
+            raise AuditFailure("selected run completion inventory differs from manifests")
+        if (
+            _strict_integer(record, "completed_at_utc_ns", label="selected run completion header")
+            < 0
+        ):
+            raise AuditFailure("selected run completion timestamp is invalid")
+        if ordered:
+            if (
+                record.get("first_ingest_seq") != 0
+                or record.get("last_ingest_seq") != total_events - 1
+                or record.get("terminal_manifest_sha256") != ordered[-1][0]["manifest_sha256"]
+            ):
+                raise AuditFailure("selected run completion terminal inventory differs")
+        elif any(
+            record.get(field) is not None
+            for field in ("first_ingest_seq", "last_ingest_seq", "terminal_manifest_sha256")
+        ):
+            raise AuditFailure("empty selected run completion has non-null terminal inventory")
         completion_records.append(
             {
-                "bytes": path.stat().st_size,
+                **_fingerprint(path),
+                "completion_sha256": completion_sha256,
+                "completion_version": JOURNAL_RUN_COMPLETION_VERSION,
                 "git_commit": expected_sha,
-                "path": str(path.resolve(strict=True)),
-                "sha256": _sha256_file(path),
+                "source_authority_sha256": authority["authority_sha256"],
                 "stream": stream,
             }
         )
-    if not manifest_streams.issubset(completion_streams):
-        raise AuditFailure("selected run segment stream has no completion header")
+    if completion_streams != set(authorities):
+        raise AuditFailure("selected run completion/source-authority stream sets differ")
     return {
         "collector_run_id": collector_run_id,
         "completion_headers": completion_records,
@@ -491,6 +882,7 @@ def _verify_raw_source_identity(
         "run_key": run_key,
         "schema_version": RAW_SOURCE_IDENTITY_SCHEMA,
         "segment_manifests": manifest_records,
+        "source_authorities": authority_records,
     }
 
 
@@ -677,6 +1069,7 @@ def _verify_run_seal(
         raw_root,
         collector_run_id=collector_run_id,
         expected_sha=expected_sha,
+        config=config,
     )
     if _canonical_bytes(seal.get("raw_source_identity")) != _canonical_bytes(raw_source_identity):
         raise AuditFailure("run completion seal raw source identity differs")

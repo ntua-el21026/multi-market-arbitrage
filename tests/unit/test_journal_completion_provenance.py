@@ -114,5 +114,8 @@ async def test_reader_rejects_completion_provenance_that_differs_from_segments(
     mismatched = replace(completion, **{field_name: replacement_value})
     _rewrite_completion(tmp_path, mismatched)
 
-    with pytest.raises(JournalCorruptionError, match="writer provenance differs"):
+    with pytest.raises(
+        JournalCorruptionError,
+        match="source authority differs from run-completion provenance",
+    ):
         JournalReader(tmp_path, run_id, stream="market").read_all()

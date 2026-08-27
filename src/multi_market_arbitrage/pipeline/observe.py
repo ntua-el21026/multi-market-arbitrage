@@ -380,6 +380,20 @@ class _HealthCheckpointMoment:
     resources: ProcessResourceSnapshot | None
     resource_trend: ProcessResourceTrendSnapshot
     book_last_valid_receive_monotonic_ns: tuple[tuple[InstrumentId, int], ...]
+    raw_journal_completion_sha256: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _TerminalHealthCutoffSnapshot:
+    """Capture-owned state frozen before post-cutoff owner drain begins."""
+
+    emitted_at: UtcTimestamp
+    monotonic_now_ns: int
+    runtime: ObservationRuntimeHealthSnapshot
+    public_reads: PublicReadMetricsSnapshot
+    resources: ProcessResourceSnapshot | None
+    resource_trend: ProcessResourceTrendSnapshot
+    book_last_valid_receive_monotonic_ns: tuple[tuple[InstrumentId, int], ...]
 
 
 @dataclass(slots=True)
@@ -1412,7 +1426,18 @@ class PolymarketObservationService:
                 group_commit_max_delay_seconds=(
                     self._config.storage.journal_group_commit_max_delay_seconds
                 ),
-            )
+                seal_queue_capacity=self._config.storage.journal_seal_queue_capacity,
+                max_pending_seal_uncompressed_bytes=(
+                    self._config.storage.journal_pending_seal_max_uncompressed_bytes
+                ),
+                max_pending_seal_age_seconds=(
+                    self._config.storage.journal_pending_seal_max_age_seconds
+                ),
+            ),
+            stage_latency_observer=lambda stage, elapsed_ns: self._metrics.observe_histogram(
+                f"mma_journal_{stage}_ns",
+                elapsed_ns,
+            ),
         )
         selected: tuple[GammaMarket, ...] = ()
         selected_assets: tuple[str, ...] = ()
@@ -1465,6 +1490,7 @@ class PolymarketObservationService:
         latest_health_decision: HealthDecision | None = None
         health_checkpoint_builder: Callable[[], HealthCheckpoint] | None = None
         terminal_health_moment: _HealthCheckpointMoment | None = None
+        terminal_health_cutoff_snapshot: _TerminalHealthCutoffSnapshot | None = None
         terminal_capture_cutoff: _CaptureCutoffMoment | None = None
         terminal_active_causal_keys: tuple[str, ...] | None = None
         terminal_resource_snapshot: ProcessResourceSamplerSnapshot | None = None
@@ -1593,6 +1619,9 @@ class PolymarketObservationService:
                         emitted_at=(UtcTimestamp.now() if moment is None else moment.emitted_at),
                         monotonic_now_ns=monotonic_now_ns,
                         terminal=moment is not None,
+                        raw_journal_completion_sha256=(
+                            None if moment is None else moment.raw_journal_completion_sha256
+                        ),
                         history_saturation_recorder=(
                             resource_sampler.mark_history_saturated if moment is None else None
                         ),
@@ -1638,12 +1667,12 @@ class PolymarketObservationService:
                     health_emitter.stop_periodic_emission_nowait()
 
                 async def emit_terminal_health_checkpoint() -> None:
-                    """Freeze capture state, then admit exactly one terminal checkpoint."""
+                    """Freeze capture-owned state without admitting terminal evidence yet."""
 
-                    nonlocal terminal_capture_cutoff, terminal_health_moment
+                    nonlocal terminal_capture_cutoff, terminal_health_cutoff_snapshot
                     nonlocal terminal_active_causal_keys
                     nonlocal terminal_resource_snapshot
-                    if terminal_health_moment is not None:
+                    if terminal_health_cutoff_snapshot is not None:
                         return
                     if terminal_capture_cutoff is None:
                         # Read the sampler cache before sampling the fallback
@@ -1679,19 +1708,7 @@ class PolymarketObservationService:
                         raise RuntimeError(
                             "availability active authority changed after terminal freeze"
                         )
-                    if target is None or not health_started:
-                        return
-                    if health_emitter is None:
-                        raise RuntimeError("started health evidence has no emitter")
-
                     cutoff_runtime = runtime_health.snapshot(now_ns=cutoff_monotonic_ns)
-                    cutoff_journal = writer.metrics
-                    cutoff_journal_failure_type = (
-                        None if writer.failure is None else type(writer.failure).__name__
-                    )
-                    cutoff_analytical = outputs.runtime_snapshot
-                    cutoff_health_writer = health_writer.runtime_snapshot
-                    cutoff_availability_writer = availability_writer.runtime_snapshot
                     cutoff_public_reads = client.public_read_metrics_snapshot()
                     cutoff_book_receive_times = tuple(
                         sorted(
@@ -1704,31 +1721,28 @@ class PolymarketObservationService:
                     cutoff_resources = terminal_resource_snapshot.latest
                     cutoff_resource_trend = terminal_resource_snapshot.trend
 
-                    # Cancel the periodic producer at the capture boundary.  The
-                    # writer remains open so raw/analytical owners may close and
-                    # the health file may be published later without rebuilding.
-                    await health_emitter.stop_periodic_emission()
+                    if health_started:
+                        if health_emitter is None:
+                            raise RuntimeError("started health evidence has no emitter")
+                        # Cancel the periodic producer at the capture boundary.
+                        # The health writer remains open through every final
+                        # data/evidence owner drain.
+                        await health_emitter.stop_periodic_emission()
                     if cutoff_resources is None:
                         health_writer.record_failure(
                             RuntimeError(
                                 "no resource sample existed at the terminal capture cutoff"
                             )
                         )
-                    terminal_health_moment = _HealthCheckpointMoment(
+                    terminal_health_cutoff_snapshot = _TerminalHealthCutoffSnapshot(
                         emitted_at=cutoff_emitted_at,
                         monotonic_now_ns=cutoff_monotonic_ns,
                         runtime=cutoff_runtime,
-                        journal=cutoff_journal,
-                        journal_failure_type=cutoff_journal_failure_type,
-                        analytical=cutoff_analytical,
-                        health_writer=cutoff_health_writer,
-                        availability_writer=cutoff_availability_writer,
                         public_reads=cutoff_public_reads,
                         resources=cutoff_resources,
                         resource_trend=cutoff_resource_trend,
                         book_last_valid_receive_monotonic_ns=(cutoff_book_receive_times),
                     )
-                    health_emitter.emit_terminal_now()
 
                 terminal_health_finalizer = emit_terminal_health_checkpoint
 
@@ -1828,6 +1842,13 @@ class PolymarketObservationService:
             raise
         finally:
             raw_completion_sha256: str | None = None
+            if terminal_health_finalizer is not None:
+                try:
+                    await terminal_health_finalizer()
+                except BaseException as error:
+                    if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                        raise
+                    health_writer.record_failure(error)
             try:
                 await writer.close(completed=run_completed)
                 if run_completed:
@@ -1909,6 +1930,42 @@ class PolymarketObservationService:
                         if health_emitter is None:
                             raise RuntimeError("started health evidence has no emitter")
                         try:
+                            if target is not None:
+                                cutoff_snapshot = terminal_health_cutoff_snapshot
+                                if cutoff_snapshot is None:
+                                    raise RuntimeError(
+                                        "terminal health capture state was not frozen"
+                                    )
+                                terminal_health_moment = _HealthCheckpointMoment(
+                                    emitted_at=cutoff_snapshot.emitted_at,
+                                    monotonic_now_ns=cutoff_snapshot.monotonic_now_ns,
+                                    runtime=cutoff_snapshot.runtime,
+                                    journal=journal_metrics,
+                                    journal_failure_type=(
+                                        None
+                                        if writer.failure is None
+                                        else type(writer.failure).__name__
+                                    ),
+                                    analytical=outputs.runtime_snapshot,
+                                    health_writer=health_writer.runtime_snapshot,
+                                    availability_writer=(
+                                        replace(
+                                            availability_writer.runtime_snapshot,
+                                            healthy=(
+                                                availability_evidence.completed
+                                                and availability_evidence.gate1_evidence_eligible
+                                            ),
+                                        )
+                                    ),
+                                    public_reads=cutoff_snapshot.public_reads,
+                                    resources=cutoff_snapshot.resources,
+                                    resource_trend=cutoff_snapshot.resource_trend,
+                                    book_last_valid_receive_monotonic_ns=(
+                                        cutoff_snapshot.book_last_valid_receive_monotonic_ns
+                                    ),
+                                    raw_journal_completion_sha256=(raw_completion_sha256),
+                                )
+                                health_emitter.emit_terminal_now()
                             health_evidence = await health_emitter.close(
                                 completed=(
                                     run_completed

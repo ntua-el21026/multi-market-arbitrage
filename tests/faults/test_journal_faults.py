@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import os
 import threading
@@ -33,10 +34,12 @@ from multi_market_arbitrage.journal import (
     recover_partial_file,
     verify_sealed_segment,
 )
+from multi_market_arbitrage.journal import recovery as recovery_module
 from multi_market_arbitrage.journal.models import JournalCorruptionError
 from multi_market_arbitrage.journal.reader import (
     DEFAULT_MAX_UNCOMPRESSED_SEGMENT_BYTES,
     completion_path_for_run,
+    run_key_for,
 )
 from multi_market_arbitrage.journal.recovery import atomic_write_bytes
 from multi_market_arbitrage.research import validate_data
@@ -109,6 +112,11 @@ def writer_config(
         max_uncompressed_bytes_per_segment=max_uncompressed_bytes_per_segment,
         max_uncompressed_bytes_per_run=max_uncompressed_bytes_per_run,
         submit_timeout_seconds=submit_timeout_seconds,
+        seal_queue_capacity=4,
+        max_pending_seal_uncompressed_bytes=min(
+            max_uncompressed_bytes_per_run,
+            4 * max_uncompressed_bytes_per_segment,
+        ),
         zstd_level=3,
     )
 
@@ -117,7 +125,7 @@ def test_truncated_partial_tail_is_preserved_as_explicit_evidence(tmp_path: Path
     run = CollectorRunId("recovery-run")
     records = envelope(run, 0).to_json_line() + envelope(run, 1).to_json_line()
     truncated = b'{"incomplete":'
-    partial = tmp_path / "crashed.jsonl.partial"
+    partial = tmp_path / f"run-{run_key_for(run)}.market.00000000000000000000.jsonl.partial"
     partial.write_bytes(records + truncated)
 
     report = recover_partial_file(partial)
@@ -164,12 +172,14 @@ async def test_fsync_failure_propagates_and_never_claims_durable(
     writer = RawJournalWriter(writer_config(tmp_path, run))
     await writer.start()
     original_fsync = os.fsync
-    fsync_calls = 0
 
     def failing_fsync(descriptor: int) -> None:
-        nonlocal fsync_calls
-        fsync_calls += 1
-        if fsync_calls == 2:
+        try:
+            target = os.readlink(f"/proc/self/fd/{descriptor}")
+            is_data_fsync = target.endswith(".jsonl.partial") and os.fstat(descriptor).st_size > 0
+        except OSError:
+            is_data_fsync = False
+        if is_data_fsync:
             raise OSError("injected disk failure")
         original_fsync(descriptor)
 
@@ -319,12 +329,11 @@ async def test_startup_completes_orphan_sealed_segment_after_manifest_crash(
             await first_writer.close()
 
     assert len(await asyncio.to_thread(matching_paths, tmp_path, "*.jsonl.zst")) == 1
-    assert len(await asyncio.to_thread(matching_paths, tmp_path, "*.jsonl.partial")) == 1
+    assert len(await asyncio.to_thread(matching_paths, tmp_path, "*.jsonl.seal-pending")) == 1
+    assert len(await asyncio.to_thread(matching_paths, tmp_path, "*.descriptor.json")) == 1
     assert not await asyncio.to_thread(matching_paths, tmp_path, "*.manifest.json")
 
-    recovered_writer = RawJournalWriter(
-        replace(writer_config(tmp_path, run), writer_id=WriterId("recovery-writer"))
-    )
+    recovered_writer = RawJournalWriter(writer_config(tmp_path, run))
     await recovered_writer.start()
     await recovered_writer.submit(envelope(run, 1, b'{"book":2}'))
     await recovered_writer.close()
@@ -332,9 +341,9 @@ async def test_startup_completes_orphan_sealed_segment_after_manifest_crash(
     restored = JournalReader(tmp_path, run, stream="market").read_all()
     assert [item.payload_bytes for item in restored] == [b'{"book":1}', b'{"book":2}']
     manifests = JournalReader(tmp_path, run, stream="market").manifests()
-    assert "manifest_reconstructed_after_seal_crash" in manifests[0].recovery_evidence
+    assert "manifest_reconstructed_from_pending_descriptor" in manifests[0].recovery_evidence
     assert manifests[1].previous_segment_digest == manifests[0].segment_digest
-    assert all(manifest.writer_id == WriterId("recovery-writer") for manifest in manifests)
+    assert all(manifest.writer_id == WriterId("writer") for manifest in manifests)
 
 
 @pytest.mark.parametrize(
@@ -576,3 +585,49 @@ def test_atomic_write_uses_unpredictable_exclusive_temporary_file(tmp_path: Path
     assert not target.is_symlink()
     assert victim.read_bytes() == b"do-not-touch"
     assert formerly_predictable.is_symlink()
+
+
+@pytest.mark.parametrize("error_number", [errno.EIO, errno.EMFILE, errno.EACCES])
+def test_directory_fsync_open_failure_is_not_reported_as_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_number: int,
+) -> None:
+    def fail_open(path: os.PathLike[str] | str, flags: int) -> int:
+        del path, flags
+        raise OSError(error_number, os.strerror(error_number))
+
+    monkeypatch.setattr(recovery_module.os, "open", fail_open)
+
+    with pytest.raises(OSError, match=os.strerror(error_number)) as caught:
+        recovery_module.fsync_directory(tmp_path)
+
+    assert caught.value.errno == error_number
+
+
+def test_directory_fsync_failure_propagates_and_closes_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened_descriptor: int | None = None
+    original_open = os.open
+
+    def record_open(path: os.PathLike[str] | str, flags: int) -> int:
+        nonlocal opened_descriptor
+        opened_descriptor = original_open(path, flags)
+        return opened_descriptor
+
+    def fail_fsync(descriptor: int) -> None:
+        assert descriptor == opened_descriptor
+        raise OSError(errno.EIO, os.strerror(errno.EIO))
+
+    monkeypatch.setattr(recovery_module.os, "open", record_open)
+    monkeypatch.setattr(recovery_module.os, "fsync", fail_fsync)
+
+    with pytest.raises(OSError, match="Input/output error"):
+        recovery_module.fsync_directory(tmp_path)
+
+    assert opened_descriptor is not None
+    with pytest.raises(OSError, match="Bad file descriptor") as caught:
+        os.fstat(opened_descriptor)
+    assert caught.value.errno == errno.EBADF

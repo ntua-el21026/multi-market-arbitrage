@@ -24,6 +24,64 @@ Identity of one subscription instance, including a hash/reference to parameters 
 ## RawEventEnvelope
 Exact application payload plus transport/provenance metadata captured before semantic decoding.
 
+## JournalDurabilityWatermark
+
+Latest raw record whose exact complete JSONL bytes survived data `fsync` within
+one collector run/stream. It is independent of manifest-durable and verified
+segment progress; verification of an earlier segment never promotes later
+durable active records.
+
+## SealPendingSegment
+
+Immutable closed, data-`fsync`-durable raw segment handed from the append/
+durability owner to the ordered seal/verify owner. Its versioned self-hashed
+handoff intent binds exact run, stream, writer, active source, pending
+destination, range, count, bytes, times, ingest IDs, Git, and path identity.
+Pending count, uncompressed bytes, oldest age, concurrent jobs, and total
+unverified inventory are bounded.
+
+## JournalHandoffIntent
+
+Bounded self-hashed write-ahead sidecar durably published before an active raw
+segment is renamed to its declared pending destination. Preparing the intent is
+not a segment-lifecycle or ownership transition. The rename plus parent-
+directory `fsync` commits the pending state; runtime ordered-queue admission
+occurs only afterward. Recovery may complete a fully validated intent-plus-
+active rename or re-`fsync` a validated intent-plus-pending directory entry,
+and may finish an exactly reverified sealed/manifest cleanup. It rejects
+pending-without-intent and ambiguous source pairs.
+
+## JournalSourceAuthority
+
+Immutable canonical `run-<run-key>.<stream>.source-authority.json` sidecar that
+is atomically published and file/directory-`fsync`ed before a new active source
+exists or receives bytes. Its self-hash binds run/venue/stream,
+writer/software/Git provenance, queue/segment/run/group-commit/compression
+policy, and pending count/byte/age authority. It remains present after
+completion, reconciles every descriptor/manifest/source, and is bound by the
+new completion-head SHA-256 field. Authority-only and authority plus an exact
+zero-byte active source are valid interrupted zero-event states. Historical
+unsealed bytes without authority remain reader-only under unbound replay-source
+semantics and cannot be adopted by a writer.
+
+## OrderedJournalSealer
+
+Single supervised owner that processes `SealPendingSegment` descriptors in
+exact ingest-sequence order, streams compression, durably publishes sealed
+bytes and manifests, advances the predecessor digest chain, verifies content,
+and removes the pending source only after verification. It never owns or blocks
+the active append handle.
+
+## ReplayIngestIdIndex
+
+Command-owned temporary SQLite `WITHOUT ROWID` primary-key index used only to
+prove exact cross-segment ingest-ID uniqueness while streaming a selected raw
+run or interrupted prefix. Disk pages are capped at selected uncompressed raw
+bytes with a 1 MiB minimum, cache is fixed at 2 MiB, mmap is disabled, and all
+scratch is removed when the iterator closes. It is derived verification state,
+not raw evidence, persistent Phase-1 storage, or the future ADR-0030
+`OperationalStateStore`.
+
 ## CanonicalEvent
 Venue-independent typed event derived from one or more raw observations.
 

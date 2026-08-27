@@ -120,13 +120,45 @@ Introducing Rust/C++ requires:
 ## 11. Storage benchmarking
 
 Measure:
-- raw journal append latency;
-- compression cost;
-- segment sealing;
+- raw journal append/data-`fsync` latency, including while a prior segment is
+  pending seal;
+- rotation handoff latency;
+- streaming compression and compressed-file publication;
+- manifest publication;
+- complete verification and verified-source cleanup;
+- ordered seal total latency and pending count/bytes/age;
 - Parquet batch write;
 - DuckDB query performance.
 
 Do not over-optimize canonical analytics at the expense of raw capture reliability.
+
+ADR-0057 journal benchmarks report p50/p95/p99/max for every stage, append and
+seal queue high-water marks, total queued-plus-in-service pending occupancy,
+active seal jobs, independent durable/manifest/verified progress, and maximum
+raw-durability latency during rotation. A forced seal longer than the audit
+freshness guard must not delay later response/PREPARE durability or canonical
+processing past the unchanged hard expiry.
+
+Pending capacity is justified from measured segment fill time, seal p95/p99/max,
+conservative six-hour raw rate, byte-threshold bursts, and disk headroom. The
+accepted Phase-1 values remain four outstanding segments including the active
+job, 256 MiB pending uncompressed bytes, 120 seconds oldest age, and one worker.
+Benchmarks fail rather than enlarge those values.
+
+The current pre-soak report schema is `phase1-pre-soak-calibration-v3`. It binds
+the seal-queue capacity and pending-seal byte limit and exposes active-segment,
+full pending-source, worst-case compressed scratch, metadata/atomic-write
+scratch, and aggregate recovery-evidence reserve bytes. The last component
+covers one maximum recovery tail plus the 64-record/256-KiB compact
+crash-evidence ledger. The reported
+`temporary_sealing_bytes` equals those five components exactly and enters the
+disk projection once. A missing component, favorable compression assumption,
+or historical v1-v2 report fails current ADR-0057 capacity qualification.
+
+At least 100 consecutive rotations exercise steady-state handoff/seal overlap.
+The report proves that compression and complete verification remain streaming,
+that append-owner wait attributable to ordinary seal work is zero, and that
+clean completion drains and reconciles all pending work.
 
 ## 12. Performance report
 
@@ -330,8 +362,9 @@ must benchmark and report:
   control construction, canonical serialization, durable-route processing,
   validation, state release and the first permitted recovery scan;
 - v2 audit trigger encoding and trigger/outcome reconciliation;
-- health decision and checkpoint-v4 operational construction/serialization,
-  with explicit v1-v3 compatibility;
+- health decision and checkpoint-v5 operational construction/serialization,
+  including compact ordered-journal seal evidence and explicit v1-v4
+  compatibility;
 - deterministic selection/serialization of every bounded current compact
   pending representative and the one latest compact resolution representative,
   including truncated-resolution-history behavior;
@@ -391,7 +424,7 @@ Retain `gate1_audit_divergence_results.json`,
 `gate1_audit_divergence_artifacts.sha256` together with the exact source
 identity. This section intentionally records no unexecuted benchmark result.
 
-## 18. ADR-0055/ADR-0056 operational-snapshot and saturation gate
+## 18. ADR-0055/ADR-0056/ADR-0057 operational-snapshot and saturation gate
 
 Before the next public candidate is accepted, the exact implementation SHA must
 run the `mma-gate1-final-pre-soak-capacity-v4` deterministic offline saturation
@@ -430,7 +463,10 @@ Measure and retain:
 - global active-period union and cross-stream count/digest/sequence/hash
   reconciliation for composite-owner and separately supervised-owner fixtures;
 - replacement-capture attempt/next-retry/hard/run deadlines, connection churn
-  under one recovery/contributor identity, typed exhaustion and shutdown cost.
+  under one recovery/contributor identity, typed exhaustion and shutdown cost;
+- ordered journal handoff/seal overlap, pending count/bytes/age including the
+  in-service job, independent durable/manifest/verified progress, stage timing,
+  append-owner seal wait, and verified-drain completion.
 
 Operational-snapshot cost must remain approximately constant as diagnostic
 history grows. It may not construct/copy full recent histories, compute terminal
@@ -488,6 +524,15 @@ scheduled-callback delay distributions. Every timing collector has fixed
 capacity at the saturation checkpoint, so benchmark instrumentation does not
 create a false post-saturation Python-memory slope.
 
+For health v5, capacity acceptance uses the maximum across known/unknown-host
+and current/replacement-capture periodic and terminal fixtures. The measured
+maxima are 30,819 bytes periodic and 44,463 bytes terminal. At ten-second
+cadence the six-hour projection is 66,613,503 bytes. The exact 68 MiB
+(71,303,168-byte) file cap leaves 4,689,665 bytes, above the fixed 2 MiB minimum
+headroom; the 8,192 checkpoint-count bound and cadence remain unchanged.
+Exceeding any projected record/file/count predicate fails rather than truncates
+or omits v5 evidence.
+
 Acceptance is not a pass-through. The synchronous budget is one quarter of the
 tighter configured health cadence and audit-freshness guard, reserving equal
 shares for acquisition, audit, health and persistence. The constancy factor is
@@ -510,6 +555,20 @@ manifest/completion cross-binding and zero active PyArrow allocation after
 analytical close. These offline predicates strengthen storage-transient
 coverage; they do not replace or relax the separate public post-saturation RSS
 formula.
+
+Verified replay no longer retains a Python ingest-ID mapping proportional to
+event count. Exact uniqueness uses a temporary SQLite primary-key index capped
+at selected uncompressed raw bytes, with a fixed 2 MiB page cache and mmap
+disabled. This converts event-count growth from process memory into bounded
+command scratch already represented by the raw-sized replay/rebuild disk
+allowance. Cleanup is mandatory after exhaustion, error, and early iterator
+close; index resource exhaustion is verification failure rather than a reason
+to skip uniqueness.
+
+Calibration v3 reports `replay_rebuild_bytes` as projected uncompressed raw
+bytes plus projected analytical bytes, reserving one sequential exact-ID index
+and one rebuild/staging output. Concurrent full-run verification is not covered
+without additive reservation.
 
 After offline gates, the exact SHA must pass a new 60-second explicit-target
 smoke and a 5,400- to 7,200-second post-fix stability observation, preferring 7,200
@@ -547,6 +606,8 @@ passed. The retained result is
 
 This is authoritative correction evidence before source freeze, not final
 exact-SHA qualification: it was not run from a new clean successor commit. The
-frozen successor SHA must reproduce the v4 pass and independently pass the
-exact-SHA smoke and stability observation. Neither offline result can claim a
-six-hour soak or Gate-1 pass.
+later e620 candidate's smoke passed, but its stability observation exposed the
+ordered-rotation ownership defect governed by ADR-0057. The source-modified
+successor must repeat the v4 pass, the new journal stress/fault gates, and the
+exact-SHA smoke and stability observation. No offline result can claim a six-
+hour soak or Gate-1 pass.

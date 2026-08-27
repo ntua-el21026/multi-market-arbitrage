@@ -21,6 +21,7 @@ The first six-hour run completed but failed independent acceptance. Evidence is 
 - ADR-0054;
 - ADR-0055;
 - ADR-0056;
+- ADR-0057;
 - retained local raw/analysis manifests.
 
 The following foundation evidence passed:
@@ -49,14 +50,22 @@ RSS net-growth criterion (`535,859,200 B` versus `134,217,728 B`). The
 source-modified bounded-storage successor must repeat all affected offline and
 public qualification; Gate-1 rerun authorization remains pending.
 
+The later exact-SHA successor `e6203e19...` passed its smoke and completed a
+7,200-second observation, but awaited approximately 5.9 seconds of seal/verify
+work at the 10,000-event rotation. Two PREPARE controls crossed their unchanged
+hard expiries, creating permanent internal faults and exhausted replacement
+recovery. ADR-0057 governs the required non-blocking ordered rotation; its
+source-modified successor requires full requalification.
+
 Before a rerun:
 
 - implement bounded reported-top transition semantics;
 - replay the failed raw run deterministically without identified primary failures;
 - make reporting incremental within existing limits;
-- emit monotonic checkpoint v4 from a bounded operational snapshot with
+- emit monotonic checkpoint v5 from a bounded operational snapshot with
   versioned trigger/divergence/fault/retention evidence, typed availability
-  intervals and direct contributions;
+  intervals, direct contributions, and mandatory compact ordered-journal seal
+  evidence, with explicit v1-v4 compatibility;
 - prove ADR-0054 immediate authoritative-resnapshot lifecycle and current versus
   Gate-sticky health semantics;
 - prove ADR-0055 orthogonal divergence evidence, independent received-prefix
@@ -65,6 +74,10 @@ Before a rerun:
 - prove ADR-0056 unresolved-only active contributors, independent completion,
   separate active/cumulative bounds, interval-union/cross-stream reconciliation
   and bounded replacement retry/deadline/exhaustion;
+- prove ADR-0057 append/seal owner separation, pending count/byte/age/job bounds,
+  exact ordered manifest/replay identity, crash recovery, independent progress,
+  and verified-drain completion; a forced slow seal must not cause a PREPARE
+  deadline miss under the unchanged timing contract;
 - pass the v4 production-scale storage-finalization workload, including two
   post-saturation analytical batches, eight completed full journal-segment
   samples and all RSS/Python/native-residual net-growth bounds;
@@ -72,7 +85,7 @@ Before a rerun:
   stability observation.
 
 A fresh six-hour run and full independent post-run audit are mandatory.
-Neither has been run for the implemented ADR-0056 remediation.
+Neither has been run for the ADR-0057 remediation.
 
 No later production phase may be promoted while G1 is failed.
 

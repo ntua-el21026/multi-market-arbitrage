@@ -40,8 +40,8 @@ GATE 1: FAIL
 ```
 
 The failure is documented in `GATE_1_FAILURE_20260822.md`; its remediation is
-governed by `GATE_1_REMEDIATION_SPEC.md`, ADR-0053, ADR-0054, ADR-0055 and
-ADR-0056. The first result is not
+governed by `GATE_1_REMEDIATION_SPEC.md`, ADR-0053, ADR-0054, ADR-0055,
+ADR-0056, and ADR-0057. The first result is not
 rewritten: Gate 1 remains `FAIL` until a new authorized six-hour run passes.
 
 Exact candidate `40acc02c3e6499a38675c3f8368fab3399488279` passed a public
@@ -49,6 +49,14 @@ Exact candidate `40acc02c3e6499a38675c3f8368fab3399488279` passed a public
 failed the unchanged post-saturation RSS net-growth requirement, so it is not
 eligible for six-hour authorization. The result is recorded in
 `GATE_1_PUBLIC_PREFLIGHT_FAILURE_20260826.md`.
+
+Exact successor `e6203e19dd3cd0a1d4e00a8abfae1df3df9778c6` then passed its
+smoke and completed a 7,200-second observation, but failed at the 10,000-event
+journal rotation. Approximately 5.9 seconds of awaited seal/verify work delayed
+two PREPARE controls beyond their unchanged hard expiries, producing permanent
+internal faults and exhausted replacement recovery. ADR-0057 governs the
+non-blocking ordered-rotation correction. A source-modified successor requires
+fresh exact-SHA qualification.
 
 The raw journal, deterministic replay, rebuild, data validation, immutability
 and no-live boundary passed. The first-soak defects were concentrated in:
@@ -64,14 +72,18 @@ fail-closed authoritative resnapshot, v2 audit triggers and checkpoint-v3 Gate
 semantics. Its exact-SHA 45-minute observation exposed remaining operational-
 summary/history-memory, external-attribution, public-read fault-lifecycle,
 direct-interval-contribution, typed-resync and local classification-latency
-defects. ADR-0055 governs checkpoint v4 and strict pre-expiry PREPARE plus exact
+defects. ADR-0055 governed checkpoint v4 and strict pre-expiry PREPARE plus exact
 attestation. A later stability attempt exposed cumulative completed contributors
 retained as active and replacement recovery without bounded exhaustion. ADR-0056
 reconciles that governance. Forensics on the later public failure identified
 allocator-retentive journal sealing/verification and analytical batch hashing
 as narrow storage-finalization correction targets. A source-modified successor
 must pass the strengthened v4 offline capacity gate and new exact-SHA smoke and
-stability observations. No six-hour rerun was run for this remediation task.
+stability observations. The e620 successor removed segment-sized finalization
+retention but exposed the awaited journal-owner rotation stall; ADR-0057 now
+requires health checkpoint v5, two bounded journal ownership domains, exact
+crash recovery and verified-drain completion. No six-hour rerun was run for this
+remediation task.
 
 ## 3. Phase A — Design foundation — COMPLETE
 
@@ -125,7 +137,7 @@ Implementation presence is not acceptance.
 - retain versioned v2 audit triggers and replay historical v1 as
   `UNKNOWN_LEGACY`;
 - replace periodic full-summary/checkpoint-v3 production with a bounded
-  immutable operational snapshot and checkpoint v4 with v1-v3 compatibility
+  immutable operational snapshot and checkpoint v5 with v1-v4 compatibility
   and separate current versus Gate-sticky reasons;
 - separate exact observation, independently proven received-prefix integrity,
   external causal attribution and recovery state;
@@ -139,7 +151,15 @@ Implementation presence is not acceptance.
 - bound replacement-capture attempts, retry/hard/run deadlines and typed
   exhaustion under one stable recovery/contributor identity;
 - make diagnostic retention capacity independent of new-schema semantic
-  identity while preserving durable evidence, totals, chains and current state.
+  identity while preserving durable evidence, totals, chains and current state;
+- separate append/data-`fsync` ownership from ordered seal/manifest/verify
+  ownership, with bounded immutable rotation handoff and no ordinary seal wait
+  on later durability;
+- bound pending segments, bytes, oldest age, active job, unverified inventory
+  and disk reserve; preserve durable sources and fail completion closed on
+  exhaustion or sealer failure; and
+- validate active/pending/sealed/manifest crash windows, independent durability/
+  manifest/verified progress and exact verified-drain completion under ADR-0057.
 
 ### C3. Regression replay
 
@@ -152,6 +172,8 @@ Replay the failed six-hour raw run twice with corrected code and require:
 - successful rebuild and validation;
 - exact active/completed contributor, interval-union/cross-stream and bounded
   replacement-recovery/exhaustion replay equality;
+- exact sealed/pending/active prefix recovery, ordered manifest chain and clean
+  completion reconciliation under ADR-0057;
 - raw immutability.
 
 The retained causal reporter must also classify all 20 corrected-stability and
@@ -171,7 +193,11 @@ recovery-generation match is recovery evidence, not natural convergence.
   behavior, fault lifecycles, active/cumulative contributor bounds, independent
   completion, direct interval attribution, bounded replacement exhaustion,
   monotonic chronology, operational/terminal latency, memory attribution/
-  plateau, queues, tails and storage projection.
+  plateau, queues, tails and storage projection;
+- forced seal longer than the four-second guard with later response/PREPARE
+  durability and processing before the unchanged hard expiry;
+- at least 100 rotations plus pending count/byte/age/job bounds, stage timing,
+  independent journal progress and zero pending work at completion.
 
 ### C5. Fresh Gate-1 rerun
 
@@ -180,7 +206,7 @@ recovery-generation match is recovery evidence, not natural convergence.
 - accept only `PASS` under `GATE_1_SOAK_SPEC.md`.
 
 This step requires later independent authorization and is not part of the
-ADR-0055/ADR-0056 remediation.
+ADR-0055/ADR-0056/ADR-0057 remediation.
 
 **Gate:** G1 — currently failed; rerun required.
 

@@ -3830,12 +3830,15 @@ def build_observation_health_checkpoint(
     emitted_at: UtcTimestamp,
     monotonic_now_ns: int,
     terminal: bool = False,
+    raw_journal_completion_sha256: str | None = None,
     history_saturation_recorder: Callable[[int], None] | None = None,
 ) -> HealthCheckpoint:
     """Build one immutable checkpoint without performing I/O or blocking owners."""
 
     if monotonic_now_ns < 0:
         raise ValueError("health-checkpoint monotonic time cannot be negative")
+    if not terminal and raw_journal_completion_sha256 is not None:
+        raise ValueError("periodic health checkpoint cannot claim raw completion")
     resource_evidence_monotonic_ns = (
         resources.sampled_monotonic_ns,
         resource_trend.first_sample_monotonic_ns,
@@ -4182,6 +4185,112 @@ def build_observation_health_checkpoint(
         for endpoint_class, count in public_retry_exhaustions_by_endpoint.items()
     )
     ingress_data_loss = max(runtime.data_loss_count, runtime.ingress.overflows)
+    journal_watermarks_valid = not (
+        (
+            journal.manifest_durable_watermark_sequence is not None
+            and (
+                journal.durability_watermark_sequence is None
+                or journal.manifest_durable_watermark_sequence
+                > journal.durability_watermark_sequence
+            )
+        )
+        or (
+            journal.verified_watermark_sequence is not None
+            and (
+                journal.manifest_durable_watermark_sequence is None
+                or journal.verified_watermark_sequence > journal.manifest_durable_watermark_sequence
+            )
+        )
+    )
+    journal_bounds_valid = (
+        journal.queue_capacity > 0
+        and journal.seal_queue_capacity > 0
+        and journal.maximum_unverified_segments > 0
+        and journal.maximum_pending_uncompressed_bytes > 0
+        and journal.maximum_pending_seal_age_nanoseconds > 0
+        and journal.maximum_active_seal_jobs > 0
+        and journal.maximum_segment_events > 0
+        and journal.maximum_segment_uncompressed_bytes > 0
+        and journal.queue_depth <= journal.queue_high_water <= journal.queue_capacity
+        and journal.seal_queue_depth <= journal.seal_queue_high_water <= journal.seal_queue_capacity
+        and journal.pending_segments
+        <= journal.pending_segments_high_water
+        <= journal.seal_queue_capacity
+        and journal.total_unverified_segments <= journal.maximum_unverified_segments
+        and journal.total_unverified_segments == journal.pending_segments
+        and journal.maximum_unverified_segments == journal.seal_queue_capacity
+        and journal.pending_uncompressed_bytes
+        <= journal.pending_uncompressed_bytes_high_water
+        <= journal.maximum_pending_uncompressed_bytes
+        and journal.active_seal_jobs
+        <= journal.active_seal_jobs_high_water
+        <= journal.maximum_active_seal_jobs
+        and journal.active_seal_jobs <= journal.pending_segments
+        and journal.seal_queue_depth + journal.active_seal_jobs <= journal.pending_segments
+        and journal.active_segment_events <= journal.maximum_segment_events
+        and journal.active_segment_uncompressed_bytes <= journal.maximum_segment_uncompressed_bytes
+        and (
+            (journal.active_segment_events == 0) == (journal.active_segment_uncompressed_bytes == 0)
+        )
+        and ((journal.pending_segments == 0) == (journal.pending_uncompressed_bytes == 0))
+        and (journal.pending_segments > 0 or journal.oldest_pending_seal_age_nanoseconds == 0)
+        and journal.durability_group_size_high_water <= journal.queue_capacity
+    )
+    journal_transitions_valid = (
+        journal.source_partial_removed_transitions
+        <= journal.verified_transitions
+        <= journal.manifest_durable_transitions
+        <= journal.sealed_bytes_durable_transitions
+        <= journal.seal_jobs_started
+        <= journal.segment_handoffs
+        and journal.segment_handoffs
+        == journal.source_partial_removed_transitions + journal.pending_segments
+        and (
+            (journal.manifest_durable_transitions == 0)
+            == (journal.manifest_durable_watermark_sequence is None)
+        )
+        and ((journal.verified_transitions == 0) == (journal.verified_watermark_sequence is None))
+    )
+    journal_pending_age_exhausted = (
+        journal.pending_segments > 0
+        and journal.maximum_pending_seal_age_nanoseconds > 0
+        and journal.oldest_pending_seal_age_nanoseconds
+        >= journal.maximum_pending_seal_age_nanoseconds
+    )
+    journal_healthy = (
+        journal_failure_type is None
+        and journal.writer_failures == 0
+        and journal.sealer_failures == 0
+        and journal.backpressure_failures == 0
+        and journal.seal_backpressure_failures == 0
+        and journal_watermarks_valid
+        and journal_bounds_valid
+        and journal_transitions_valid
+        and journal.append_owner_seal_wait_nanoseconds == 0
+        and not journal_pending_age_exhausted
+        and (
+            not terminal
+            or (
+                raw_journal_completion_sha256 is not None
+                and journal.queue_depth == 0
+                and journal.seal_queue_depth == 0
+                and journal.pending_segments == 0
+                and journal.total_unverified_segments == 0
+                and journal.pending_uncompressed_bytes == 0
+                and journal.active_seal_jobs == 0
+                and journal.active_segment_events == 0
+                and journal.active_segment_uncompressed_bytes == 0
+                and journal.durability_watermark_sequence
+                == journal.manifest_durable_watermark_sequence
+                == journal.verified_watermark_sequence
+                and journal.source_partial_removed_transitions
+                == journal.verified_transitions
+                == journal.manifest_durable_transitions
+                == journal.sealed_bytes_durable_transitions
+                == journal.segment_handoffs
+            )
+        )
+    )
     decision = evaluate_health_decision(
         HealthDecisionInputs(
             explicit_target=target is not None and target.gate1_explicit,
@@ -4189,8 +4298,10 @@ def build_observation_health_checkpoint(
             all_required_books_healthy=all_required_books_healthy,
             ingress_data_loss=ingress_data_loss,
             ingress_saturated=ingress_saturated,
-            journal_healthy=journal_failure_type is None and journal.writer_failures == 0,
-            journal_backpressure_failures=journal.backpressure_failures,
+            journal_healthy=journal_healthy,
+            journal_backpressure_failures=(
+                journal.backpressure_failures + journal.seal_backpressure_failures
+            ),
             analytical_healthy=analytical.healthy,
             analytical_saturated=analytical_saturated,
             health_writer_healthy=health_writer.healthy,
@@ -4329,19 +4440,60 @@ def build_observation_health_checkpoint(
         journal={
             "active_segment_events": journal.active_segment_events,
             "active_segment_uncompressed_bytes": journal.active_segment_uncompressed_bytes,
+            "active_seal_jobs": journal.active_seal_jobs,
+            "active_seal_jobs_high_water": journal.active_seal_jobs_high_water,
+            "append_owner_seal_wait_nanoseconds": (journal.append_owner_seal_wait_nanoseconds),
             "backpressure_failures": journal.backpressure_failures,
+            "cleanup_latency_nanoseconds_max": journal.cleanup_latency_nanoseconds_max,
+            "compression_latency_nanoseconds_max": (journal.compression_latency_nanoseconds_max),
             "data_fsyncs": journal.data_fsyncs,
             "durability_group_size_high_water": journal.durability_group_size_high_water,
             "durability_groups": journal.durability_groups,
             "durability_watermark_sequence": journal.durability_watermark_sequence,
             "durable": journal.durable,
             "failure_type": journal_failure_type,
-            "healthy": journal_failure_type is None and journal.writer_failures == 0,
+            "healthy": journal_healthy,
+            "manifest_durable_transitions": journal.manifest_durable_transitions,
+            "manifest_durable_watermark_sequence": (journal.manifest_durable_watermark_sequence),
+            "manifest_latency_nanoseconds_max": journal.manifest_latency_nanoseconds_max,
+            "maximum_active_seal_jobs": journal.maximum_active_seal_jobs,
+            "maximum_pending_seal_age_nanoseconds": (journal.maximum_pending_seal_age_nanoseconds),
+            "maximum_pending_uncompressed_bytes": (journal.maximum_pending_uncompressed_bytes),
+            "maximum_unverified_segments": journal.maximum_unverified_segments,
             "queue_depth": journal.queue_depth,
             "queue_high_water": journal.queue_high_water,
             "queue_capacity": journal.queue_capacity,
             "maximum_segment_events": journal.maximum_segment_events,
             "maximum_segment_uncompressed_bytes": (journal.maximum_segment_uncompressed_bytes),
+            "oldest_pending_seal_age_nanoseconds": (journal.oldest_pending_seal_age_nanoseconds),
+            "pending_segments": journal.pending_segments,
+            "pending_segments_high_water": journal.pending_segments_high_water,
+            "pending_uncompressed_bytes": journal.pending_uncompressed_bytes,
+            "pending_uncompressed_bytes_high_water": (
+                journal.pending_uncompressed_bytes_high_water
+            ),
+            "rotation_durability_latency_nanoseconds_max": (
+                journal.rotation_durability_latency_nanoseconds_max
+            ),
+            "rotation_handoff_latency_nanoseconds_max": (
+                journal.rotation_handoff_latency_nanoseconds_max
+            ),
+            "run_completion_sha256": raw_journal_completion_sha256,
+            "seal_backpressure_failures": journal.seal_backpressure_failures,
+            "seal_jobs_started": journal.seal_jobs_started,
+            "seal_latency_nanoseconds_max": journal.seal_latency_nanoseconds_max,
+            "seal_queue_capacity": journal.seal_queue_capacity,
+            "seal_queue_depth": journal.seal_queue_depth,
+            "seal_queue_high_water": journal.seal_queue_high_water,
+            "sealed_bytes_durable_transitions": (journal.sealed_bytes_durable_transitions),
+            "sealer_failures": journal.sealer_failures,
+            "segment_handoffs": journal.segment_handoffs,
+            "source_partial_removed_transitions": (journal.source_partial_removed_transitions),
+            "total_unverified_segments": journal.total_unverified_segments,
+            "terminal": terminal,
+            "verification_latency_nanoseconds_max": (journal.verification_latency_nanoseconds_max),
+            "verified_transitions": journal.verified_transitions,
+            "verified_watermark_sequence": journal.verified_watermark_sequence,
             "writer_failures": journal.writer_failures,
         },
         analytical={

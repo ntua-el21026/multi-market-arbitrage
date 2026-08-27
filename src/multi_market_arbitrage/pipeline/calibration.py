@@ -494,6 +494,10 @@ async def run_polymarket_calibration(
         journal_segment_max_uncompressed_bytes=(
             config.storage.journal_segment_max_uncompressed_bytes
         ),
+        journal_seal_queue_capacity=config.storage.journal_seal_queue_capacity,
+        journal_pending_seal_max_uncompressed_bytes=(
+            config.storage.journal_pending_seal_max_uncompressed_bytes
+        ),
         free_disk_bytes=free_disk_bytes,
         minimum_free_disk_reserve_bytes=config.health.minimum_free_disk_bytes,
         health_checkpoint_interval_nanoseconds=int(

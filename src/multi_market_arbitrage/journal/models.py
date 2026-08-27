@@ -20,11 +20,48 @@ from multi_market_arbitrage.core.serialization import canonical_sha256
 from multi_market_arbitrage.core.time import MonotonicTimestamp, UtcTimestamp
 
 JOURNAL_MANIFEST_VERSION: Final = "raw-journal-manifest-v1"
-JOURNAL_RUN_COMPLETION_VERSION: Final = "raw-journal-run-completion-v1"
+LEGACY_JOURNAL_RUN_COMPLETION_VERSION: Final = "raw-journal-run-completion-v1"
+JOURNAL_RUN_COMPLETION_VERSION: Final = "raw-journal-run-completion-v2"
 ABSOLUTE_MAX_UNCOMPRESSED_SEGMENT_BYTES: Final = 512 * 1024 * 1024
 DEFAULT_MAX_UNCOMPRESSED_SEGMENT_BYTES: Final = 64 * 1024 * 1024
 DEFAULT_MAX_UNCOMPRESSED_RUN_BYTES: Final = 4 * 1024 * 1024 * 1024
+JOURNAL_SEAL_STREAM_CHUNK_BYTES: Final = 1024 * 1024
+JOURNAL_COMPRESSED_MINIMUM_HEADROOM_BYTES: Final = 1024 * 1024
+JOURNAL_CRASH_EVIDENCE_MAX_RECORDS: Final = 64
+JOURNAL_CRASH_EVIDENCE_MAX_BYTES: Final = 256 * 1024
+JOURNAL_CRASH_EVIDENCE_MAX_RECORD_BYTES: Final = 4 * 1024
+JOURNAL_PENDING_DESCRIPTOR_MAX_BYTES: Final = 64 * 1024
+JOURNAL_SOURCE_AUTHORITY_MAX_BYTES: Final = 64 * 1024
+JOURNAL_MANIFEST_MAX_BYTES: Final = 8 * 1024 * 1024
+JOURNAL_COMPLETION_MAX_BYTES: Final = 8 * 1024 * 1024
+JOURNAL_SOURCE_AUTHORITY_VERSION: Final = "raw-journal-source-authority-v1"
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def maximum_zstd_stream_compressed_bytes(uncompressed_bytes: int) -> int:
+    """Return a conservative bound for this writer's fixed-chunk zstd stream.
+
+    Zstandard's ``ZSTD_COMPRESSBOUND`` formula is applied independently to
+    every possible writer chunk. Summing those bounds remains safe even if a
+    streaming implementation introduces a block boundary at every write. The
+    established one-MiB operational reserve is retained for smaller segments.
+    """
+
+    if not 0 < uncompressed_bytes <= ABSOLUTE_MAX_UNCOMPRESSED_SEGMENT_BYTES:
+        raise ValueError("zstd stream input is outside the journal segment bound")
+
+    def one_pass_bound(source_bytes: int) -> int:
+        small_input_margin = ((128 * 1024 - source_bytes) >> 11) if source_bytes < 128 * 1024 else 0
+        return source_bytes + (source_bytes >> 8) + small_input_margin
+
+    full_chunks, remainder = divmod(uncompressed_bytes, JOURNAL_SEAL_STREAM_CHUNK_BYTES)
+    chunked_bound = full_chunks * one_pass_bound(JOURNAL_SEAL_STREAM_CHUNK_BYTES)
+    if remainder:
+        chunked_bound += one_pass_bound(remainder)
+    return max(
+        chunked_bound,
+        uncompressed_bytes + JOURNAL_COMPRESSED_MINIMUM_HEADROOM_BYTES,
+    )
 
 
 class JournalError(RuntimeError):
@@ -43,8 +80,20 @@ class JournalWriteError(JournalError):
     """The journal writer failed before establishing requested durability."""
 
 
+class JournalSealBackpressureError(JournalWriteError):
+    """A closed durable segment cannot enter the bounded sealing backlog."""
+
+
+class JournalSealError(JournalWriteError):
+    """The ordered seal/verify owner failed to publish verified evidence."""
+
+
 class JournalCorruptionError(JournalError):
     """Persisted journal content fails its declared schema or integrity metadata."""
+
+
+class JournalVerificationResourceError(JournalError):
+    """Derived verification scratch or capacity prevented a complete verdict."""
 
 
 class JournalRecoveryError(JournalError):
@@ -148,6 +197,39 @@ class JournalMetricsSnapshot:
     active_segment_uncompressed_bytes: int = 0
     maximum_segment_events: int = 0
     maximum_segment_uncompressed_bytes: int = 0
+    seal_queue_depth: int = 0
+    seal_queue_high_water: int = 0
+    seal_queue_capacity: int = 0
+    pending_segments: int = 0
+    pending_segments_high_water: int = 0
+    total_unverified_segments: int = 0
+    maximum_unverified_segments: int = 0
+    pending_uncompressed_bytes: int = 0
+    pending_uncompressed_bytes_high_water: int = 0
+    maximum_pending_uncompressed_bytes: int = 0
+    oldest_pending_seal_age_nanoseconds: int = 0
+    maximum_pending_seal_age_nanoseconds: int = 0
+    active_seal_jobs: int = 0
+    active_seal_jobs_high_water: int = 0
+    maximum_active_seal_jobs: int = 1
+    segment_handoffs: int = 0
+    seal_jobs_started: int = 0
+    sealed_bytes_durable_transitions: int = 0
+    manifest_durable_transitions: int = 0
+    verified_transitions: int = 0
+    source_partial_removed_transitions: int = 0
+    sealer_failures: int = 0
+    seal_backpressure_failures: int = 0
+    seal_latency_nanoseconds_max: int = 0
+    compression_latency_nanoseconds_max: int = 0
+    manifest_latency_nanoseconds_max: int = 0
+    verification_latency_nanoseconds_max: int = 0
+    cleanup_latency_nanoseconds_max: int = 0
+    rotation_handoff_latency_nanoseconds_max: int = 0
+    append_owner_seal_wait_nanoseconds: int = 0
+    rotation_durability_latency_nanoseconds_max: int = 0
+    manifest_durable_watermark_sequence: int | None = None
+    verified_watermark_sequence: int | None = None
 
 
 @dataclass(slots=True)
@@ -170,6 +252,29 @@ class JournalMetrics:
     group_delay_flushes: int = 0
     group_rotation_splits: int = 0
     group_shutdown_flushes: int = 0
+    seal_queue_high_water: int = 0
+    pending_segments_high_water: int = 0
+    pending_uncompressed_bytes_high_water: int = 0
+    active_seal_jobs: int = 0
+    active_seal_jobs_high_water: int = 0
+    segment_handoffs: int = 0
+    seal_jobs_started: int = 0
+    sealed_bytes_durable_transitions: int = 0
+    manifest_durable_transitions: int = 0
+    verified_transitions: int = 0
+    source_partial_removed_transitions: int = 0
+    sealer_failures: int = 0
+    seal_backpressure_failures: int = 0
+    seal_latency_nanoseconds_max: int = 0
+    compression_latency_nanoseconds_max: int = 0
+    manifest_latency_nanoseconds_max: int = 0
+    verification_latency_nanoseconds_max: int = 0
+    cleanup_latency_nanoseconds_max: int = 0
+    rotation_handoff_latency_nanoseconds_max: int = 0
+    append_owner_seal_wait_nanoseconds: int = 0
+    rotation_durability_latency_nanoseconds_max: int = 0
+    manifest_durable_watermark_sequence: int | None = None
+    verified_watermark_sequence: int | None = None
 
     def snapshot(
         self,
@@ -220,6 +325,9 @@ class JournalWriterConfig:
     zstd_level: int = 9
     group_commit_max_events: int = 1
     group_commit_max_delay_seconds: float = 0.0
+    seal_queue_capacity: int = 4
+    max_pending_seal_uncompressed_bytes: int = 256 * 1024 * 1024
+    max_pending_seal_age_seconds: float = 120.0
 
     def __post_init__(self) -> None:
         if not self.stream or _SAFE_COMPONENT.fullmatch(self.stream) is None:
@@ -265,8 +373,290 @@ class JournalWriterConfig:
             raise JournalConfigurationError(
                 "group commit maximum delay must be finite and non-negative"
             )
+        if not 0 < self.seal_queue_capacity <= 64:
+            raise JournalConfigurationError(
+                "seal queue capacity must be positive and no greater than 64"
+            )
+        if not (
+            self.max_uncompressed_bytes_per_segment
+            <= self.max_pending_seal_uncompressed_bytes
+            <= self.max_uncompressed_bytes_per_run
+        ):
+            raise JournalConfigurationError(
+                "pending-seal byte limit must cover one segment and remain within the run cap"
+            )
+        if self.max_pending_seal_uncompressed_bytes > (
+            self.seal_queue_capacity * self.max_uncompressed_bytes_per_segment
+        ):
+            raise JournalConfigurationError(
+                "pending-seal byte limit exceeds the bounded segment inventory"
+            )
+        if (
+            not math.isfinite(self.max_pending_seal_age_seconds)
+            or self.max_pending_seal_age_seconds <= 0
+        ):
+            raise JournalConfigurationError("pending-seal maximum age must be finite and positive")
+        if int(self.max_pending_seal_age_seconds * 1_000_000_000) <= 0:
+            raise JournalConfigurationError(
+                "pending-seal maximum age must be representable in nanoseconds"
+            )
         if not -131_072 <= self.zstd_level <= 22:
             raise JournalConfigurationError("zstd compression level is outside supported range")
+
+    @property
+    def pending_policy(self) -> JournalPendingPolicy:
+        """Return the exact self-hashed authority persisted at every handoff."""
+
+        return JournalPendingPolicy(
+            maximum_pending_segments=self.seal_queue_capacity,
+            maximum_pending_uncompressed_bytes=self.max_pending_seal_uncompressed_bytes,
+            maximum_pending_age_nanoseconds=int(self.max_pending_seal_age_seconds * 1_000_000_000),
+            maximum_segment_uncompressed_bytes=self.max_uncompressed_bytes_per_segment,
+            maximum_run_uncompressed_bytes=self.max_uncompressed_bytes_per_run,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class JournalPendingPolicy:
+    """Exact bounded authority carried by a seal-pending handoff descriptor."""
+
+    maximum_pending_segments: int
+    maximum_pending_uncompressed_bytes: int
+    maximum_pending_age_nanoseconds: int
+    maximum_segment_uncompressed_bytes: int
+    maximum_run_uncompressed_bytes: int
+
+    def __post_init__(self) -> None:
+        values = (
+            self.maximum_pending_segments,
+            self.maximum_pending_uncompressed_bytes,
+            self.maximum_pending_age_nanoseconds,
+            self.maximum_segment_uncompressed_bytes,
+            self.maximum_run_uncompressed_bytes,
+        )
+        if any(type(value) is not int for value in values):
+            raise ValueError("journal pending policy values must be integers")
+        if not 0 < self.maximum_pending_segments <= 64:
+            raise ValueError("journal pending segment bound must be within 1..64")
+        if not self.maximum_pending_age_nanoseconds > 0:
+            raise ValueError("journal pending age bound must be positive")
+        if not (
+            0 < self.maximum_segment_uncompressed_bytes <= ABSOLUTE_MAX_UNCOMPRESSED_SEGMENT_BYTES
+        ):
+            raise ValueError("journal pending segment byte authority exceeds the absolute cap")
+        if not (
+            self.maximum_segment_uncompressed_bytes
+            <= self.maximum_pending_uncompressed_bytes
+            <= self.maximum_run_uncompressed_bytes
+            <= DEFAULT_MAX_UNCOMPRESSED_RUN_BYTES
+        ):
+            raise ValueError("journal pending byte authority is inconsistent")
+        if self.maximum_pending_uncompressed_bytes > (
+            self.maximum_pending_segments * self.maximum_segment_uncompressed_bytes
+        ):
+            raise ValueError("journal pending byte authority exceeds its segment inventory")
+
+
+@dataclass(frozen=True, slots=True)
+class JournalSourceAuthority:
+    """Immutable per-run writer provenance established before active raw bytes."""
+
+    collector_run_id: CollectorRunId
+    venue_id: VenueId
+    stream: str
+    writer_id: WriterId
+    writer_software_version: str
+    git_commit: str
+    queue_capacity: int
+    max_events_per_segment: int
+    max_uncompressed_bytes_per_segment: int
+    max_uncompressed_bytes_per_run: int
+    submit_timeout_seconds_hex: str
+    zstd_level: int
+    group_commit_max_events: int
+    group_commit_max_delay_seconds_hex: str
+    seal_queue_capacity: int
+    max_pending_seal_uncompressed_bytes: int
+    max_pending_seal_age_seconds_hex: str
+    max_pending_seal_age_nanoseconds: int
+    authority_origin: str
+    predecessor_manifest_sha256: str | None
+
+    @classmethod
+    def from_writer_config(
+        cls,
+        config: JournalWriterConfig,
+        *,
+        authority_origin: str,
+        predecessor_manifest_sha256: str | None,
+    ) -> Self:
+        return cls(
+            collector_run_id=config.collector_run_id,
+            venue_id=config.venue_id,
+            stream=config.stream,
+            writer_id=config.writer_id,
+            writer_software_version=config.writer_software_version,
+            git_commit=config.git_commit,
+            queue_capacity=config.queue_capacity,
+            max_events_per_segment=config.max_events_per_segment,
+            max_uncompressed_bytes_per_segment=config.max_uncompressed_bytes_per_segment,
+            max_uncompressed_bytes_per_run=config.max_uncompressed_bytes_per_run,
+            submit_timeout_seconds_hex=float(config.submit_timeout_seconds).hex(),
+            zstd_level=config.zstd_level,
+            group_commit_max_events=config.group_commit_max_events,
+            group_commit_max_delay_seconds_hex=(float(config.group_commit_max_delay_seconds).hex()),
+            seal_queue_capacity=config.seal_queue_capacity,
+            max_pending_seal_uncompressed_bytes=(config.max_pending_seal_uncompressed_bytes),
+            max_pending_seal_age_seconds_hex=float(config.max_pending_seal_age_seconds).hex(),
+            max_pending_seal_age_nanoseconds=(
+                config.pending_policy.maximum_pending_age_nanoseconds
+            ),
+            authority_origin=authority_origin,
+            predecessor_manifest_sha256=predecessor_manifest_sha256,
+        )
+
+    @property
+    def pending_policy(self) -> JournalPendingPolicy:
+        return JournalPendingPolicy(
+            maximum_pending_segments=self.seal_queue_capacity,
+            maximum_pending_uncompressed_bytes=self.max_pending_seal_uncompressed_bytes,
+            maximum_pending_age_nanoseconds=self.max_pending_seal_age_nanoseconds,
+            maximum_segment_uncompressed_bytes=self.max_uncompressed_bytes_per_segment,
+            maximum_run_uncompressed_bytes=self.max_uncompressed_bytes_per_run,
+        )
+
+    def _unsigned_record(self) -> dict[str, object]:
+        return {
+            "authority_origin": self.authority_origin,
+            "authority_version": JOURNAL_SOURCE_AUTHORITY_VERSION,
+            "collector_run_id": self.collector_run_id.value,
+            "git_commit": self.git_commit,
+            "group_commit_max_delay_seconds_hex": self.group_commit_max_delay_seconds_hex,
+            "group_commit_max_events": self.group_commit_max_events,
+            "max_events_per_segment": self.max_events_per_segment,
+            "max_pending_seal_age_nanoseconds": self.max_pending_seal_age_nanoseconds,
+            "max_pending_seal_age_seconds_hex": self.max_pending_seal_age_seconds_hex,
+            "max_pending_seal_uncompressed_bytes": self.max_pending_seal_uncompressed_bytes,
+            "max_uncompressed_bytes_per_run": self.max_uncompressed_bytes_per_run,
+            "max_uncompressed_bytes_per_segment": self.max_uncompressed_bytes_per_segment,
+            "predecessor_manifest_sha256": self.predecessor_manifest_sha256,
+            "queue_capacity": self.queue_capacity,
+            "seal_queue_capacity": self.seal_queue_capacity,
+            "stream": self.stream,
+            "submit_timeout_seconds_hex": self.submit_timeout_seconds_hex,
+            "venue_id": self.venue_id.value,
+            "writer_id": self.writer_id.value,
+            "writer_software_version": self.writer_software_version,
+            "zstd_level": self.zstd_level,
+        }
+
+    @property
+    def authority_sha256(self) -> str:
+        return canonical_sha256(self._unsigned_record())
+
+    def to_record(self) -> dict[str, object]:
+        record = self._unsigned_record()
+        record["authority_sha256"] = self.authority_sha256
+        return record
+
+    @classmethod
+    def from_record(cls, value: object) -> Self:
+        if not isinstance(value, dict):
+            raise JournalCorruptionError("journal source authority must be an object")
+        record = cast(dict[object, object], value)
+
+        def text(name: str) -> str:
+            field = record.get(name)
+            if not isinstance(field, str) or not field:
+                raise JournalCorruptionError(f"journal source authority {name} is invalid")
+            return field
+
+        def integer(name: str) -> int:
+            field = record.get(name)
+            if isinstance(field, bool) or not isinstance(field, int):
+                raise JournalCorruptionError(f"journal source authority {name} is invalid")
+            return field
+
+        def exact_hex_float(name: str) -> float:
+            encoded = text(name)
+            try:
+                decoded = float.fromhex(encoded)
+            except ValueError as exc:
+                raise JournalCorruptionError(f"journal source authority {name} is invalid") from exc
+            if decoded.hex() != encoded:
+                raise JournalCorruptionError(f"journal source authority {name} is non-canonical")
+            return decoded
+
+        predecessor = record.get("predecessor_manifest_sha256")
+        if predecessor is not None and (
+            not isinstance(predecessor, str) or not is_sha256_hex(predecessor)
+        ):
+            raise JournalCorruptionError(
+                "journal source authority predecessor manifest identity is invalid"
+            )
+        origin = text("authority_origin")
+        if origin == "NEW_RUN":
+            if predecessor is not None:
+                raise JournalCorruptionError(
+                    "new-run source authority cannot claim a predecessor manifest"
+                )
+        elif origin == "RECOVERED_SEALED_PREFIX":
+            if predecessor is None:
+                raise JournalCorruptionError(
+                    "recovered source authority requires a predecessor manifest"
+                )
+        else:
+            raise JournalCorruptionError("journal source authority origin is invalid")
+        try:
+            authority = cls.from_writer_config(
+                JournalWriterConfig(
+                    root=Path("."),
+                    collector_run_id=CollectorRunId(text("collector_run_id")),
+                    venue_id=VenueId(text("venue_id")),
+                    stream=text("stream"),
+                    writer_id=WriterId(text("writer_id")),
+                    writer_software_version=text("writer_software_version"),
+                    git_commit=text("git_commit"),
+                    queue_capacity=integer("queue_capacity"),
+                    max_events_per_segment=integer("max_events_per_segment"),
+                    max_uncompressed_bytes_per_segment=integer(
+                        "max_uncompressed_bytes_per_segment"
+                    ),
+                    max_uncompressed_bytes_per_run=integer("max_uncompressed_bytes_per_run"),
+                    submit_timeout_seconds=exact_hex_float("submit_timeout_seconds_hex"),
+                    zstd_level=integer("zstd_level"),
+                    group_commit_max_events=integer("group_commit_max_events"),
+                    group_commit_max_delay_seconds=exact_hex_float(
+                        "group_commit_max_delay_seconds_hex"
+                    ),
+                    seal_queue_capacity=integer("seal_queue_capacity"),
+                    max_pending_seal_uncompressed_bytes=integer(
+                        "max_pending_seal_uncompressed_bytes"
+                    ),
+                    max_pending_seal_age_seconds=exact_hex_float(
+                        "max_pending_seal_age_seconds_hex"
+                    ),
+                ),
+                authority_origin=origin,
+                predecessor_manifest_sha256=predecessor,
+            )
+        except (TypeError, ValueError, JournalConfigurationError) as exc:
+            raise JournalCorruptionError("journal source authority policy is invalid") from exc
+        if authority.max_pending_seal_age_nanoseconds != integer(
+            "max_pending_seal_age_nanoseconds"
+        ):
+            raise JournalCorruptionError(
+                "journal source authority pending age representations differ"
+            )
+        expected_keys = set(authority.to_record())
+        if set(record) != expected_keys:
+            raise JournalCorruptionError(
+                "journal source authority contains missing or unsupported fields"
+            )
+        claimed_sha256 = text("authority_sha256")
+        if claimed_sha256 != authority.authority_sha256:
+            raise JournalCorruptionError("journal source authority SHA-256 mismatch")
+        return authority
 
 
 @dataclass(frozen=True, slots=True)
@@ -428,13 +818,28 @@ class RunCompletionHead:
     first_ingest_seq: int | None
     last_ingest_seq: int | None
     terminal_manifest_sha256: str | None
+    source_authority_sha256: str | None
     writer_software_version: str
     git_commit: str
     completed_at: UtcTimestamp
 
     def __post_init__(self) -> None:
-        if self.completion_version != JOURNAL_RUN_COMPLETION_VERSION:
+        if self.completion_version not in {
+            LEGACY_JOURNAL_RUN_COMPLETION_VERSION,
+            JOURNAL_RUN_COMPLETION_VERSION,
+        }:
             raise JournalCorruptionError("unsupported journal run completion version")
+        if self.completion_version == JOURNAL_RUN_COMPLETION_VERSION:
+            if self.source_authority_sha256 is None or not is_sha256_hex(
+                self.source_authority_sha256
+            ):
+                raise JournalCorruptionError(
+                    "journal run completion source authority must be SHA-256 hex"
+                )
+        elif self.source_authority_sha256 is not None:
+            raise JournalCorruptionError(
+                "legacy journal run completion cannot claim source-authority identity"
+            )
         if not self.stream or _SAFE_COMPONENT.fullmatch(self.stream) is None:
             raise JournalCorruptionError("journal run completion stream is invalid")
         if (
@@ -495,7 +900,7 @@ class RunCompletionHead:
             )
 
     def content_record(self) -> dict[str, object]:
-        return {
+        record: dict[str, object] = {
             "collector_run_id": self.collector_run_id.value,
             "completed_at_utc_ns": self.completed_at.nanoseconds_since_epoch,
             "completion_version": self.completion_version,
@@ -514,6 +919,9 @@ class RunCompletionHead:
             "writer_id": self.writer_id.value,
             "writer_software_version": self.writer_software_version,
         }
+        if self.completion_version == JOURNAL_RUN_COMPLETION_VERSION:
+            record["source_authority_sha256"] = self.source_authority_sha256
+        return record
 
     @property
     def completion_sha256(self) -> str:
@@ -555,8 +963,12 @@ class RunCompletionHead:
             raise JournalCorruptionError(
                 "journal run completion terminal manifest identity is invalid"
             )
+        completion_version = text("completion_version")
+        source_authority_sha256: str | None = None
+        if completion_version == JOURNAL_RUN_COMPLETION_VERSION:
+            source_authority_sha256 = text("source_authority_sha256")
         completion = cls(
-            completion_version=text("completion_version"),
+            completion_version=completion_version,
             writer_id=WriterId(text("writer_id")),
             collector_run_id=CollectorRunId(text("collector_run_id")),
             venue_id=VenueId(text("venue")),
@@ -569,6 +981,7 @@ class RunCompletionHead:
             first_ingest_seq=optional_integer("first_ingest_seq"),
             last_ingest_seq=optional_integer("last_ingest_seq"),
             terminal_manifest_sha256=terminal,
+            source_authority_sha256=source_authority_sha256,
             writer_software_version=text("writer_software_version"),
             git_commit=text("git_commit"),
             completed_at=UtcTimestamp(integer("completed_at_utc_ns")),
@@ -606,8 +1019,17 @@ __all__ = [
     "ABSOLUTE_MAX_UNCOMPRESSED_SEGMENT_BYTES",
     "DEFAULT_MAX_UNCOMPRESSED_RUN_BYTES",
     "DEFAULT_MAX_UNCOMPRESSED_SEGMENT_BYTES",
+    "JOURNAL_COMPLETION_MAX_BYTES",
+    "JOURNAL_CRASH_EVIDENCE_MAX_BYTES",
+    "JOURNAL_CRASH_EVIDENCE_MAX_RECORDS",
+    "JOURNAL_CRASH_EVIDENCE_MAX_RECORD_BYTES",
+    "JOURNAL_MANIFEST_MAX_BYTES",
     "JOURNAL_MANIFEST_VERSION",
+    "JOURNAL_PENDING_DESCRIPTOR_MAX_BYTES",
     "JOURNAL_RUN_COMPLETION_VERSION",
+    "JOURNAL_SEAL_STREAM_CHUNK_BYTES",
+    "JOURNAL_SOURCE_AUTHORITY_MAX_BYTES",
+    "JOURNAL_SOURCE_AUTHORITY_VERSION",
     "DurabilityWatermark",
     "JournalBackpressureError",
     "JournalConfigurationError",
@@ -616,8 +1038,13 @@ __all__ = [
     "JournalError",
     "JournalMetrics",
     "JournalMetricsSnapshot",
+    "JournalPendingPolicy",
     "JournalReceipt",
     "JournalRecoveryError",
+    "JournalSealBackpressureError",
+    "JournalSealError",
+    "JournalSourceAuthority",
+    "JournalVerificationResourceError",
     "JournalWriteError",
     "JournalWriterConfig",
     "RecoveryReport",

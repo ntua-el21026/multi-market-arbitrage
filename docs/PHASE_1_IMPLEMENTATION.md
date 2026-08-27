@@ -129,9 +129,13 @@ record above 64 KiB. Active causal concurrency remains independently capped at
 accepted frames and two monotonic seconds by `[polymarket]`; configuration
 rejects a time bound longer than the five-second maximum book age. A bounded
 live calibration rejected the initial five-second checkpoint choice because its
-conservative six-hour projection
-threatened the 64 MiB health-evidence limit; the ten-second cadence preserves
-incident reconstruction while retaining strict file and count headroom.
+conservative six-hour projection threatened the then-64 MiB health-evidence
+limit. Health v5 retains the ten-second cadence and 8,192-checkpoint bound. Its
+measured 30,819-byte periodic maximum and 44,463-byte terminal maximum project
+to 66,613,503 bytes over six hours; the committed 68 MiB (71,303,168-byte) cap
+leaves 4,689,665 bytes, above the required 2 MiB headroom. This preserves
+incident reconstruction and fail-closed file/count enforcement without
+omitting v5 fields.
 `snapshot_audit_freshness_guard_seconds` is a four-second audit-launch guard,
 strictly smaller than the unchanged five-second hard book-age limit. It creates
 time for both bounded binary-leg public reads, their independent receive fences,
@@ -217,17 +221,31 @@ headroom. The journal latency distribution is explicitly commit-start to
 durable-receipt time: it includes subgroup selection/serialization, possible
 segment creation and directory sync, append/flush, and the data `fsync`; it is
 not mislabeled as syscall-only `fsync` latency. Disk accounting includes raw,
-analytical, health, logs, temporary
-sealing, replay/rebuild, reserve, and an additional safety factor. Threatening
-the fixed 4 GiB raw cap, disk reserve, path ceiling, queue bounds, configured
-health-checkpoint count, or configured health-evidence file size fails
-calibration; the tool does not enlarge a limit. The `phase1-pre-soak-calibration-v2`
-report binds the configured checkpoint cadence/count/file bounds and includes
-the mandatory final checkpoint in its count projection. Phase 1 does not create
+analytical, health, logs, replay/rebuild, reserve, and an additional safety
+factor. Its temporary-sealing subtotal separately exposes one maximum active
+segment, the complete configured pending-source allowance, worst-case
+compressed scratch for one maximum segment, bounded manifest/descriptor/
+completion metadata plus atomic-write scratch, and bounded recovery-tail plus
+compact crash-evidence records. Threatening the fixed 4 GiB raw cap, disk reserve, path ceiling, queue
+bounds, configured health-checkpoint count, or configured health-evidence file
+size fails calibration; the tool does not enlarge a limit. The
+`phase1-pre-soak-calibration-v3` report binds the configured checkpoint
+cadence/count/file bounds, journal seal-queue capacity, and pending-seal byte
+limit and includes the mandatory final checkpoint in its count projection. It
+reports `temporary_sealing_active_bytes`, `temporary_sealing_pending_bytes`,
+`temporary_sealing_compressed_scratch_bytes`,
+`temporary_sealing_metadata_scratch_bytes`, and
+`temporary_sealing_recovery_bytes`; `temporary_sealing_bytes` is exactly their
+sum and is counted once in disk workload. Historical v1-v2 reports remain
+strict historical evidence and cannot qualify the current candidate by
+synthesizing these fields. Under the accepted profile, the five components are
+67,108,864; 268,435,456; 68,157,440; 25,427,968; and 67,371,008 bytes, totaling
+496,500,736 bytes. The last value covers one 64-MiB recovery tail plus the
+262,144-byte compact crash-evidence ledger. Phase 1 does not create
 an application-managed log file: logging is stdout/stderr only, so calibration
-binds `log_storage_model=STDIO_STREAM_ONLY_UNMANAGED` and `log_bytes=0`. An operator
-who redirects process output to a file must budget and record that external file
-separately. A fresh successful publication contains
+binds `log_storage_model=STDIO_STREAM_ONLY_UNMANAGED` and `log_bytes=0`. An
+operator who redirects process output to a file must budget and record that
+external file separately. A fresh successful publication contains
 `calibration.json`, `calibration.md`, and `calibration.bindings.json`, with
 SHA-256 bindings between the report, code, config, and target.
 
@@ -274,6 +292,62 @@ or uncompressed-byte boundary. The writer:
 6. seals, hashes, manifests, and verifies segments independently of that
    already-established record durability.
 
+ADR-0057 makes step 6 operationally independent. One append/durability owner
+uses a dedicated single-worker executor for ordered append and data `fsync`.
+At rotation it closes the exact clean segment and durably publishes a bounded,
+self-hashed `raw-journal-seal-pending-v1` write-ahead intent that names the
+active source and range-bearing `.jsonl.seal-pending` destination. That prepare
+does not transfer lifecycle or ownership. The owner then renames the active
+source to pending and syncs the directory, thereby committing
+`CLOSED_DURABLE_PENDING_SEAL`, admits the descriptor, creates/syncs the
+successor active partial, and resumes append service. It does not await ordinary
+compression, manifest publication, full verification, or pending-source
+cleanup.
+
+One separately supervised ordered seal/verify owner uses a distinct dedicated
+single-worker executor. It processes exact segment order and owns streaming
+compression/hashes, sealed-file publication, manifest publication, complete
+verification, predecessor-chain advancement, cleanup, and final verified
+inventory. Neither journal owner uses the shared default executor or accesses a
+file still owned by the other.
+
+The physical lifecycle is:
+
+```text
+ACTIVE_PARTIAL
+→ CLOSED_DURABLE_PENDING_SEAL
+→ COMPRESSING
+→ SEALED_BYTES_DURABLE
+→ MANIFEST_DURABLE
+→ VERIFIED
+→ SOURCE_PARTIAL_REMOVED
+```
+
+The production bounds are four total outstanding descriptors including the
+in-service job, 256 MiB pending uncompressed bytes, 120 seconds oldest pending
+age, one active seal job, and four total unverified segments. Count and bytes
+cover queued plus in-service work. Exhaustion faults raw persistence, stops new
+authority, preserves all durable active/pending sources, and publishes no clean
+completion. It never silently enlarges a limit.
+
+On recovery, pending age begins at the exact elapsed UTC since the original
+validated nonfuture handoff and then advances with the new process's monotonic
+clock. Invalid/future chronology fails closed. Restart never resets the age
+budget, persisted monotonic values are not compared across processes, and file
+timestamps are not age authority.
+
+The bound-bearing configuration is:
+
+```toml
+journal_seal_queue_capacity = 4
+journal_pending_seal_max_uncompressed_bytes = 268435456
+journal_pending_seal_max_age_seconds = 120.0
+```
+
+`journal_seal_queue_capacity` is the total outstanding credit bound despite its
+historical name; a separate pending inventory enforces it across queue dequeue
+and the active job. Seal concurrency is fixed at one in Phase 1.
+
 The seal path does not read the complete active file into a Python byte string
 or retain all decoded envelopes. It hashes the exact uncompressed JSONL in
 fixed-size chunks, streams Zstandard output to an atomically published sibling
@@ -284,13 +358,38 @@ compressed file. The compressed output is deterministic for the exact
 implementation, compressor configuration and payload, but byte identity with a
 legacy one-shot-compressor frame is not required or claimed.
 
-The watermark never advances for bytes that did not survive the successful
-`fsync`. A write/fsync failure faults the writer, closes the active handle
-without claiming additional durability, and fails all unresolved tickets. A
-restart recovers only complete contiguous records, truncates an incomplete
-tail, and never turns an ambiguous tail into a durable claim. Rotation and
-shutdown remain bounded flush reasons; metrics distinguish size, delay,
-shutdown, and rotation-split groups.
+The durable watermark never advances for bytes that did not survive the
+successful data `fsync`. Manifest-durable and verified progress are independent
+and never promote later active records. A write/`fsync` failure faults the
+writer, closes the active handle without claiming additional durability, and
+fails all unresolved tickets. A later seal/manifest/verify/cleanup failure does
+not revoke an established durable receipt, but it faults journal health, stops
+admission, preserves the source, and prevents completion.
+
+Startup inventories sealed/manifests, zero or more pending sources/descriptors,
+compression temporaries, and the optional active partial. It validates exact
+regular-file/scope/provenance/range/count/byte/hash/chain identity, resumes
+expected crash windows in order within the live bounds, preserves later active
+records, and rejects overlap, gap, conflict, manifest-without-sealed, or a
+completion head with unfinished source state. A restart recovers only complete
+contiguous active records, truncates an incomplete tail with evidence, and never
+turns ambiguity into a durable or completed claim.
+
+Specifically, a valid intent plus its exact active source is an uncommitted
+prepare that recovery may finish by rename plus directory `fsync`; only then is
+it admitted as pending. Intent plus exact pending source is validated and the
+directory is re-`fsync`ed before committed recognition and ordered resume.
+Pending without intent or both source names present is rejected without
+descriptor reconstruction or guessed authority. Intent without either source
+is accepted only when exact matching sealed bytes and manifest completely
+reverify against it as interrupted verified cleanup; otherwise it is rejected.
+
+Clean close drains append work, hands off the final nonempty active segment,
+drains the sealer, requires zero pending count/bytes, verifies every manifest and
+source cleanup, reconciles chain/count/byte/range identity, and only then writes
+and rereads the existing completion head. Rotation and shutdown remain bounded
+flush reasons; metrics distinguish size, delay, shutdown, and rotation-split
+groups.
 
 The measured candidate matrix and the zero-delay decision are recorded in
 [`PHASE_1_PERFORMANCE_BASELINE.md`](PHASE_1_PERFORMANCE_BASELINE.md).
@@ -849,11 +948,24 @@ byte-identical relative inventories and fragment/completion hashes.
 Normal replay first verifies the clean completion head, exact segment/manifest
 inventory, one unambiguous stream, contiguous ranges, and manifest hash chain.
 It then verifies compressed identity and streams one decompressed JSONL record
-at a time, retaining exact ingest-ID uniqueness while enforcing the same 64 MiB
-segment and 4 GiB run ceilings. A terminal `ReplayResult` exists only after the
+at a time while enforcing the same 64 MiB segment and 4 GiB run ceilings. Exact
+cross-segment ingest-ID uniqueness is maintained in a command-owned temporary
+SQLite `WITHOUT ROWID` index. Its page count is capped at the selected
+uncompressed raw byte count, with a 1 MiB minimum for SQLite metadata; its page
+cache is fixed at 2 MiB, memory mapping is disabled, and the directory is
+removed after exhaustion, corruption, or early iterator close. The scratch
+index is not authoritative evidence and is covered by the existing raw-sized
+replay/rebuild disk allowance. Failure to create, extend, query, or clean it up
+fails verification closed. A terminal `ReplayResult` exists only after the
 iterator is exhausted and all payload counts/hashes match. `--include-partial`
 is the explicit interrupted-run recovery path and accepts only an
 integrity-checked contiguous prefix.
+
+Calibration v3 defines `replay_rebuild_bytes` as projected uncompressed raw
+bytes plus projected analytical bytes. Acceptance commands are sequential: the
+raw term reserves one exact-ID index and the analytical term reserves one fresh
+rebuild/staging output. Concurrent full-run verifiers require additive disk
+headroom and are outside that projection.
 
 Data validation classifies recognized artifacts in one traversal and enforces
 one aggregate 65,536-path ceiling per validation root. Raw journal verification
@@ -899,19 +1011,23 @@ economic state.
 
 ## Supervised Gate-1 health evidence
 
-The observer emits versioned `gate1-health-checkpoint-v4` JSONL evidence at the
+The observer emits versioned `gate1-health-checkpoint-v5` JSONL evidence at the
 configured ten-second cadence and once for the terminal capture boundary. Every
 record carries `emitted_at_utc_ns`, `emitted_monotonic_epoch_id` equal to the
 collector run ID, and `emitted_monotonic_ns`. Writer admission requires the
 run-scoped monotonic value to increase strictly; UTC may regress without being
-used for causal ordering. Historical v1-v3 files remain distinguishable and
+used for causal ordering. Historical v1-v4 files remain distinguishable and
 readable as their original schemas. Compatibility never invents missing
 monotonic, audit-trigger, divergence-dimension, fault-closure, contribution,
-retention, lifecycle, or sticky-reason evidence.
+retention, lifecycle, sticky-reason, or journal-seal evidence.
 
 At the exact acquisition cutoff the observer synchronously cancels periodic
-production before draining already accepted audit work; after that drain it
-emits one checkpoint timestamped with the frozen paired UTC/monotonic cutoff.
+production and freezes capture/book/public/resource state before draining
+already accepted audit work. It retains that paired UTC/monotonic cutoff while
+raw completion and analytical and availability owner closure finish, then
+builds and admits exactly one terminal checkpoint from the final owner
+snapshots. That checkpoint binds the exact raw completion SHA-256 and is written
+last before health-owner close.
 This prevents a later periodic record from preceding a backdated terminal
 record while still including classifications for exact response bodies
 completed before the cutoff. The producer creates an immutable lightweight
@@ -926,6 +1042,10 @@ The queue, checkpoint count, and file bytes are bounded. Output starts as a
 run-scoped `.jsonl.partial` and is atomically renamed to `.jsonl` with a
 directory sync only after clean completion; the summary records counts,
 high-water, bytes, SHA-256, completion/evidence eligibility, and failure type.
+The exact Gate-1 bounds are ten-second cadence, 8,192 checkpoints, and a 68 MiB
+(71,303,168-byte) health-evidence file. The measured v5 six-hour projection is
+66,613,503 bytes, leaving 4,689,665 bytes of file headroom; overflow or missing
+evidence remains a hard failure.
 
 Checkpoint groups are `target`, `capture`, per-book `books`, `ingress`,
 `journal`, `analytical`, `http`, `audit`, `scanner`, `recovery`, and `resources`,
@@ -944,6 +1064,15 @@ socket/book outage or pending divergence blocks current eligibility while
 present but is not retained as sticky merely because it existed before a later
 fully evidenced recovery. Historical mismatch count is not used as a proxy for
 current unresolved state.
+
+The v5 `journal` group adds append/seal queue current/high-water/capacity;
+queued-plus-in-service pending count/bytes/age and bounds; active seal jobs;
+segment transition and failure counts; independent durable/manifest/verified
+progress; rotation handoff, seal, compression, manifest, verification and
+cleanup timing; append-owner wait attributable to ordinary seal work; and
+maximum raw durability latency while a prior segment is pending. The checkpoint
+contains compact state only, never raw pending records or segment-sized
+inventory.
 
 Data loss, terminal unresolved divergence, unsupported generic/new-contract
 unknown, internal reconstruction indeterminacy/defect, local-book defect,
@@ -1019,10 +1148,10 @@ sample.
 
 The deterministic offline mismatch-lineage report separately emits each
 mismatch's observation fact, independent received-prefix integrity, external
-causal attribution, and recovery state. Periodic checkpoint v4 does not invent
+causal attribution, and recovery state. Periodic checkpoint v5 does not invent
 those post-run dimensions.
 
-The v4 `resources.processor_operational.retention` projection reports per-domain
+The v5 `resources.processor_operational.retention` projection reports per-domain
 occupancy/capacity/total/truncation. Operational evidence additionally reports
 operational-snapshot latency, retained bytes, Python allocation groups, native/
 allocator residual and post-saturation slope.
@@ -1151,6 +1280,8 @@ state and is not permitted to block socket acquisition or raw durability.
 data/
 ├── raw/
 │   ├── run-<run-hash>.*.jsonl.partial
+│   ├── run-<run-hash>.*.jsonl.seal-pending
+│   ├── run-<run-hash>.*.jsonl.seal-pending.descriptor.json
 │   ├── run-<run-hash>.*.jsonl.zst
 │   ├── run-<run-hash>.*.jsonl.zst.manifest.json
 │   └── run-<run-hash>.<stream>.completed.json

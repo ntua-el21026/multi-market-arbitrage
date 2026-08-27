@@ -16,10 +16,18 @@ from pathlib import Path
 from multi_market_arbitrage.core.ids import is_sha256_hex
 from multi_market_arbitrage.core.limits import MAX_ARTIFACT_PATHS_PER_ROOT
 from multi_market_arbitrage.core.serialization import canonical_json_bytes, canonical_sha256
-from multi_market_arbitrage.journal import DEFAULT_MAX_UNCOMPRESSED_RUN_BYTES
+from multi_market_arbitrage.journal import (
+    DEFAULT_MAX_UNCOMPRESSED_RUN_BYTES,
+    JOURNAL_COMPLETION_MAX_BYTES,
+    JOURNAL_CRASH_EVIDENCE_MAX_BYTES,
+    JOURNAL_MANIFEST_MAX_BYTES,
+    JOURNAL_PENDING_DESCRIPTOR_MAX_BYTES,
+    JOURNAL_SOURCE_AUTHORITY_MAX_BYTES,
+    maximum_zstd_stream_compressed_bytes,
+)
 from multi_market_arbitrage.journal.recovery import atomic_write_bytes, fsync_directory
 
-CALIBRATION_SCHEMA_VERSION = "phase1-pre-soak-calibration-v2"
+CALIBRATION_SCHEMA_VERSION = "phase1-pre-soak-calibration-v3"
 CALIBRATION_BINDINGS_VERSION = "phase1-pre-soak-calibration-bindings-v1"
 GATE1_PROJECTION_SECONDS = 21_600
 DEFAULT_HEADROOM_BASIS_POINTS = 20_000  # 2.0x measured workload.
@@ -395,11 +403,13 @@ class CalibrationLimits:
     raw_run_cap_bytes: int = DEFAULT_MAX_UNCOMPRESSED_RUN_BYTES
     journal_segment_max_events: int = 10_000
     journal_segment_max_uncompressed_bytes: int = 64 * 1024 * 1024
+    journal_seal_queue_capacity: int = 4
+    journal_pending_seal_max_uncompressed_bytes: int = 256 * 1024 * 1024
     free_disk_bytes: int = 0
     minimum_free_disk_reserve_bytes: int = 0
     health_checkpoint_interval_nanoseconds: int = 10_000_000_000
     health_maximum_checkpoints: int = 8_192
-    health_maximum_file_bytes: int = 64 * 1024 * 1024
+    health_maximum_file_bytes: int = 68 * 1024 * 1024
     artifact_path_limit: int = MAX_ARTIFACT_PATHS_PER_ROOT
     headroom_basis_points: int = DEFAULT_HEADROOM_BASIS_POINTS
     disk_safety_basis_points: int = DEFAULT_DISK_SAFETY_BASIS_POINTS
@@ -409,6 +419,8 @@ class CalibrationLimits:
             self.raw_run_cap_bytes,
             self.journal_segment_max_events,
             self.journal_segment_max_uncompressed_bytes,
+            self.journal_seal_queue_capacity,
+            self.journal_pending_seal_max_uncompressed_bytes,
             self.artifact_path_limit,
             self.headroom_basis_points,
             self.health_checkpoint_interval_nanoseconds,
@@ -423,6 +435,22 @@ class CalibrationLimits:
             raise ValueError("calibration disk safety factor cannot be negative")
         if self.raw_run_cap_bytes > DEFAULT_MAX_UNCOMPRESSED_RUN_BYTES:
             raise ValueError("calibration cannot enlarge the Phase 1 raw-run cap")
+        if self.journal_seal_queue_capacity > 64:
+            raise ValueError("calibration seal queue capacity cannot exceed 64")
+        if not (
+            self.journal_segment_max_uncompressed_bytes
+            <= self.journal_pending_seal_max_uncompressed_bytes
+            <= self.raw_run_cap_bytes
+        ):
+            raise ValueError(
+                "calibration pending-seal bytes must cover one segment and remain in the run cap"
+            )
+        if self.journal_pending_seal_max_uncompressed_bytes > (
+            self.journal_seal_queue_capacity * self.journal_segment_max_uncompressed_bytes
+        ):
+            raise ValueError(
+                "calibration pending-seal bytes exceed the bounded descriptor inventory"
+            )
         if self.artifact_path_limit > MAX_ARTIFACT_PATHS_PER_ROOT:
             raise ValueError("calibration cannot enlarge the Phase 1 artifact-path cap")
 
@@ -437,6 +465,10 @@ class CalibrationLimits:
             "health_maximum_file_bytes": self.health_maximum_file_bytes,
             "journal_segment_max_events": self.journal_segment_max_events,
             "journal_segment_max_uncompressed_bytes": (self.journal_segment_max_uncompressed_bytes),
+            "journal_seal_queue_capacity": self.journal_seal_queue_capacity,
+            "journal_pending_seal_max_uncompressed_bytes": (
+                self.journal_pending_seal_max_uncompressed_bytes
+            ),
             "minimum_free_disk_reserve_bytes": self.minimum_free_disk_reserve_bytes,
             "raw_run_cap_bytes": self.raw_run_cap_bytes,
         }
@@ -458,6 +490,11 @@ class CalibrationProjection:
     health_bytes: int
     health_checkpoints: int
     log_bytes: int
+    temporary_sealing_active_bytes: int
+    temporary_sealing_pending_bytes: int
+    temporary_sealing_compressed_scratch_bytes: int
+    temporary_sealing_metadata_scratch_bytes: int
+    temporary_sealing_recovery_bytes: int
     temporary_sealing_bytes: int
     replay_rebuild_bytes: int
     disk_safety_bytes: int
@@ -482,6 +519,15 @@ class CalibrationProjection:
             "minimum_free_disk_reserve_bytes": self.minimum_free_disk_reserve_bytes,
             "replay_rebuild_bytes": self.replay_rebuild_bytes,
             "scans": self.scans,
+            "temporary_sealing_active_bytes": self.temporary_sealing_active_bytes,
+            "temporary_sealing_compressed_scratch_bytes": (
+                self.temporary_sealing_compressed_scratch_bytes
+            ),
+            "temporary_sealing_metadata_scratch_bytes": (
+                self.temporary_sealing_metadata_scratch_bytes
+            ),
+            "temporary_sealing_pending_bytes": self.temporary_sealing_pending_bytes,
+            "temporary_sealing_recovery_bytes": self.temporary_sealing_recovery_bytes,
             "temporary_sealing_bytes": self.temporary_sealing_bytes,
             "total_required_disk_bytes": self.total_required_disk_bytes,
             "uncompressed_raw_bytes": self.uncompressed_raw_bytes,
@@ -664,7 +710,30 @@ def build_calibration_report(
         + 1
     )
     log_bytes = projection(measurements.log_bytes)
-    temporary_sealing_bytes = limits.journal_segment_max_uncompressed_bytes * 2
+    temporary_sealing_active_bytes = limits.journal_segment_max_uncompressed_bytes
+    temporary_sealing_pending_bytes = limits.journal_pending_seal_max_uncompressed_bytes
+    temporary_sealing_compressed_scratch_bytes = maximum_zstd_stream_compressed_bytes(
+        limits.journal_segment_max_uncompressed_bytes
+    )
+    temporary_sealing_metadata_scratch_bytes = (
+        limits.journal_seal_queue_capacity * JOURNAL_PENDING_DESCRIPTOR_MAX_BYTES
+        + JOURNAL_SOURCE_AUTHORITY_MAX_BYTES
+        + JOURNAL_MANIFEST_MAX_BYTES
+        + JOURNAL_COMPLETION_MAX_BYTES
+        + JOURNAL_MANIFEST_MAX_BYTES
+    )
+    temporary_sealing_recovery_bytes = (
+        limits.journal_segment_max_uncompressed_bytes + JOURNAL_CRASH_EVIDENCE_MAX_BYTES
+    )
+    temporary_sealing_bytes = sum(
+        (
+            temporary_sealing_active_bytes,
+            temporary_sealing_pending_bytes,
+            temporary_sealing_compressed_scratch_bytes,
+            temporary_sealing_metadata_scratch_bytes,
+            temporary_sealing_recovery_bytes,
+        )
+    )
     replay_rebuild_bytes = raw_bytes + analytical_bytes
     disk_workload = (
         raw_bytes
@@ -696,6 +765,11 @@ def build_calibration_report(
         health_bytes=health_bytes,
         health_checkpoints=health_checkpoints,
         log_bytes=log_bytes,
+        temporary_sealing_active_bytes=temporary_sealing_active_bytes,
+        temporary_sealing_pending_bytes=temporary_sealing_pending_bytes,
+        temporary_sealing_compressed_scratch_bytes=(temporary_sealing_compressed_scratch_bytes),
+        temporary_sealing_metadata_scratch_bytes=temporary_sealing_metadata_scratch_bytes,
+        temporary_sealing_recovery_bytes=temporary_sealing_recovery_bytes,
         temporary_sealing_bytes=temporary_sealing_bytes,
         replay_rebuild_bytes=replay_rebuild_bytes,
         disk_safety_bytes=disk_safety_bytes,
@@ -779,6 +853,16 @@ def render_calibration_markdown(report: CalibrationReport) -> str:
             f"- Health-checkpoint count bound: {report.limits.health_maximum_checkpoints}",
             f"- Projected health evidence: {projection.health_bytes} bytes",
             f"- Health-evidence file bound: {report.limits.health_maximum_file_bytes} bytes",
+            (
+                "- Temporary journal sealing allowance "
+                "(active/pending/compressed/metadata/recovery/total): "
+                f"{projection.temporary_sealing_active_bytes} / "
+                f"{projection.temporary_sealing_pending_bytes} / "
+                f"{projection.temporary_sealing_compressed_scratch_bytes} / "
+                f"{projection.temporary_sealing_metadata_scratch_bytes} / "
+                f"{projection.temporary_sealing_recovery_bytes} / "
+                f"{projection.temporary_sealing_bytes} bytes"
+            ),
             (
                 f"- Log storage model: `{measurement.log_storage_model}` "
                 f"({measurement.log_bytes} managed bytes)"

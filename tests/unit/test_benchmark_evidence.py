@@ -85,7 +85,7 @@ def test_health_benchmark_uses_production_checkpoint_builder() -> None:
     checkpoint = build()
 
     assert HEALTH_RESULT_SCHEMA == "gate1-health-benchmark-v2"
-    assert checkpoint.schema_version == "gate1-health-checkpoint-v4"
+    assert checkpoint.schema_version == "gate1-health-checkpoint-v5"
     assert checkpoint.gate1_eligible_so_far
     assert checkpoint.target["mode"] == "EXPLICIT_GATE1"
     assert len(checkpoint.books) == 2
@@ -219,7 +219,7 @@ def test_audit_divergence_benchmark_covers_changed_paths_and_capacity() -> None:
     )
     assert capacity["checkpoint_count"] == SIX_HOUR_CHECKPOINT_COUNT == 2_161
     assert capacity["maximum_records"] == HEALTH_EVIDENCE_MAXIMUM_RECORDS == 8_192
-    assert capacity["maximum_file_bytes"] == HEALTH_EVIDENCE_MAXIMUM_BYTES == 67_108_864
+    assert capacity["maximum_file_bytes"] == HEALTH_EVIDENCE_MAXIMUM_BYTES == 71_303_168
     assert capacity["projected_file_bytes"] <= HEALTH_EVIDENCE_MAXIMUM_BYTES
     assert (
         maximum_periodic_checkpoint_bytes_acceptance
@@ -230,7 +230,7 @@ def test_audit_divergence_benchmark_covers_changed_paths_and_capacity() -> None:
         )
         // capacity["periodic_checkpoint_count"]
     )
-    assert maximum_periodic_checkpoint_bytes_acceptance == 30_078
+    assert maximum_periodic_checkpoint_bytes_acceptance == 32_019
     assert (
         capacity["maximum_periodic_checkpoint_bytes"]
         <= maximum_periodic_checkpoint_bytes_acceptance

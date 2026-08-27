@@ -1651,6 +1651,7 @@ def _capacity_health_checkpoint(
     host_identity: HostRuntimeIdentity,
     emitted_monotonic_ns: int,
     history_saturation_recorder: Callable[[int], None],
+    terminal: bool = False,
 ) -> HealthCheckpoint:
     ingress = RawIngressMetricsSnapshot(
         received=0,
@@ -1699,6 +1700,20 @@ def _capacity_health_checkpoint(
             writer_failures=0,
             recovered_records=0,
             truncated_tails=0,
+            queue_capacity=config.system.queue_capacity,
+            maximum_segment_events=config.storage.journal_segment_max_events,
+            maximum_segment_uncompressed_bytes=(
+                config.storage.journal_segment_max_uncompressed_bytes
+            ),
+            seal_queue_capacity=config.storage.journal_seal_queue_capacity,
+            maximum_unverified_segments=config.storage.journal_seal_queue_capacity,
+            maximum_pending_uncompressed_bytes=(
+                config.storage.journal_pending_seal_max_uncompressed_bytes
+            ),
+            maximum_pending_seal_age_nanoseconds=int(
+                config.storage.journal_pending_seal_max_age_seconds * 1_000_000_000
+            ),
+            maximum_active_seal_jobs=1,
         ),
         journal_failure_type=None,
         analytical=_analytical_runtime_snapshot(outputs),
@@ -1724,6 +1739,8 @@ def _capacity_health_checkpoint(
         book_last_valid_receive_monotonic_ns={},
         emitted_at=UtcTimestamp(_BASE_WALL_NS + emitted_monotonic_ns),
         monotonic_now_ns=emitted_monotonic_ns,
+        terminal=terminal,
+        raw_journal_completion_sha256=("d" * 64 if terminal else None),
         history_saturation_recorder=history_saturation_recorder,
     )
 
@@ -3312,12 +3329,44 @@ async def run_capacity_benchmark(
     audit_final = audit_window_points[-1]
     await resource_sampler.close()
     resource_sampler_snapshot = resource_sampler.snapshot
+    if resource_sampler_snapshot.latest is None:
+        raise RuntimeError("production resource sampler lost its terminal cached sample")
+    terminal_monotonic_ns = max(
+        time.monotonic_ns(),
+        resource_sampler_snapshot.latest.sampled_monotonic_ns,
+    )
+    terminal_health_started_ns = time.perf_counter_ns()
+    terminal_checkpoint = _capacity_health_checkpoint(
+        config=config,
+        processor=processor,
+        outputs=outputs,
+        writer_runtime=health_writer.runtime_snapshot,
+        metrics=health_metrics,
+        resources=resource_sampler_snapshot.latest,
+        resource_trend=resource_sampler_snapshot.trend,
+        host_identity=host_identity,
+        emitted_monotonic_ns=terminal_monotonic_ns,
+        history_saturation_recorder=(resource_sampler.mark_history_saturated),
+        terminal=True,
+    )
+    health_checkpoint_build_samples.observe(time.perf_counter_ns() - terminal_health_started_ns)
+    health_enqueue_attempts += 1
+    if not health_writer.enqueue_nowait(terminal_checkpoint):
+        health_enqueue_failures += 1
     health_writer_completed = (
         not resource_sampler_failures
         and health_enqueue_attempts > 0
         and health_enqueue_failures == 0
     )
     health_evidence = await health_writer.close(completed=health_writer_completed)
+    health_records = tuple(
+        json.loads(line) for line in health_evidence.path.read_text(encoding="utf-8").splitlines()
+    )
+    terminal_health_records = tuple(
+        record
+        for record in health_records
+        if cast(dict[str, object], record["journal"])["terminal"] is True
+    )
 
     terminal_summary = processor.summary()
     if terminal_summary.scans <= saturation_threshold:
@@ -3547,7 +3596,7 @@ async def run_capacity_benchmark(
         health_metrics,
         "mma_processor_operational_snapshot_latency_ns",
     )
-    expected_health_checkpoints = math.ceil(audit_outcomes / HEALTH_CLASSIFICATION_PERIOD)
+    expected_health_checkpoints = math.ceil(audit_outcomes / HEALTH_CLASSIFICATION_PERIOD) + 1
     benchmark_process_elapsed_ns = time.process_time_ns() - benchmark_process_started_ns
     benchmark_wall_elapsed_ns = time.perf_counter_ns() - benchmark_wall_started_ns
 
@@ -3675,6 +3724,13 @@ async def run_capacity_benchmark(
                 "content_sha256": health_evidence.content_sha256,
                 "path": str(health_evidence.path.relative_to(artifact_root)),
                 "failure_type": health_evidence.failure_type,
+                "terminal_accepted": health_evidence.terminal_accepted,
+                "terminal_written": health_evidence.terminal_written,
+                "terminal_record_count": len(terminal_health_records),
+                "last_record_terminal": bool(
+                    health_records
+                    and cast(dict[str, object], health_records[-1]["journal"])["terminal"] is True
+                ),
             },
             "resource_trend": _resource_trend_record(resource_sampler_snapshot.trend),
             "terminal_post_cutoff_resources": {
@@ -4032,6 +4088,11 @@ async def run_capacity_benchmark(
             "production_health_writer_bounded_and_healthy": (
                 health_evidence.completed
                 and health_evidence.gate1_evidence_eligible
+                and health_evidence.terminal_accepted == 1
+                and health_evidence.terminal_written == 1
+                and len(terminal_health_records) == 1
+                and bool(health_records)
+                and cast(dict[str, object], health_records[-1]["journal"])["terminal"] is True
                 and health_evidence.rejected == 0
                 and health_evidence.queue_high_water <= config.health.queue_capacity
                 and not resource_sampler_failures

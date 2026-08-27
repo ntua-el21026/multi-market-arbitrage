@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -23,6 +25,7 @@ from multi_market_arbitrage.journal import (
     DEFAULT_MAX_UNCOMPRESSED_RUN_BYTES,
     JournalCorruptionError,
     JournalReader,
+    JournalVerificationResourceError,
     JournalWriterConfig,
     RawJournalWriter,
     SegmentManifest,
@@ -88,6 +91,8 @@ async def _write_completed(
             writer_software_version="test",
             git_commit=git_commit,
             max_events_per_segment=max_events_per_segment,
+            seal_queue_capacity=64,
+            max_pending_seal_uncompressed_bytes=4 * 1024 * 1024 * 1024,
             zstd_level=3,
         )
     )
@@ -136,6 +141,106 @@ async def test_verified_iterator_has_only_one_active_segment_verifier(
     assert verifier_calls == 5
     assert high_water == 1
     assert active == 0
+
+
+@pytest.mark.asyncio
+async def test_exact_ingest_id_index_is_removed_after_exhaustion_and_early_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = CollectorRunId("bounded-ingest-index-cleanup")
+    await _write_completed(tmp_path, run, count=5, max_events_per_segment=2)
+    original = (
+        reader_module._bounded_ingest_id_index  # pyright: ignore[reportPrivateUsage]
+    )
+    created_directories: list[Path] = []
+
+    @contextmanager
+    def tracked_index(
+        *, selected_uncompressed_bytes: int
+    ) -> Generator[reader_module._ExactIngestIdIndex]:  # pyright: ignore[reportPrivateUsage]
+        with original(selected_uncompressed_bytes=selected_uncompressed_bytes) as index:
+            created_directories.append(index.path.parent)
+            yield index
+
+    monkeypatch.setattr(reader_module, "_bounded_ingest_id_index", tracked_index)
+
+    assert len(tuple(JournalReader(tmp_path, run).iter_verified())) == 5
+    exhausted_directory = created_directories[-1]
+    assert not exhausted_directory.exists()
+
+    iterator = cast(
+        Generator[RawEventEnvelope],
+        JournalReader(tmp_path, run).iter_verified(),
+    )
+    assert next(iterator).ingest_seq == 0
+    early_close_directory = created_directories[-1]
+    assert early_close_directory.exists()
+    iterator.close()
+
+    assert not early_close_directory.exists()
+
+
+def test_exact_ingest_id_index_detects_duplicates_and_cleans_up_after_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = CollectorRunId("bounded-ingest-index-duplicate")
+    first = _envelope(run, 0)
+    duplicate = replace(_envelope(run, 1), ingest_id=first.ingest_id)
+    partial_path = tmp_path / (
+        f"run-{run_key_for(run)}.polymarket-public.00000000000000000000.jsonl.partial"
+    )
+    partial_path.write_bytes(first.to_json_line() + duplicate.to_json_line())
+    original = (
+        reader_module._bounded_ingest_id_index  # pyright: ignore[reportPrivateUsage]
+    )
+    created_directories: list[Path] = []
+
+    @contextmanager
+    def tracked_index(
+        *, selected_uncompressed_bytes: int
+    ) -> Generator[reader_module._ExactIngestIdIndex]:  # pyright: ignore[reportPrivateUsage]
+        with original(selected_uncompressed_bytes=selected_uncompressed_bytes) as index:
+            created_directories.append(index.path.parent)
+            yield index
+
+    monkeypatch.setattr(reader_module, "_bounded_ingest_id_index", tracked_index)
+
+    with pytest.raises(
+        JournalCorruptionError,
+        match="ingest ID is reused at sequences 0 and 1",
+    ):
+        tuple(JournalReader(tmp_path, run).iter_verified(include_partial=True))
+
+    assert len(created_directories) == 1
+    assert not created_directories[0].exists()
+
+
+def test_exact_ingest_id_index_fails_closed_at_its_disk_page_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page_bytes = reader_module._INGEST_ID_INDEX_PAGE_BYTES  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(
+        reader_module,
+        "_MIN_INGEST_ID_INDEX_BYTES",
+        page_bytes * 3,
+    )
+
+    with reader_module._bounded_ingest_id_index(  # pyright: ignore[reportPrivateUsage]
+        selected_uncompressed_bytes=1
+    ) as index:
+        assert index.maximum_bytes == page_bytes * 3
+
+        def exhaust_page_limit() -> None:
+            for sequence in range(1_000):
+                index.add(f"{sequence:04d}-{'x' * 1_000}", sequence)
+
+        with pytest.raises(
+            JournalVerificationResourceError,
+            match="cannot accept another record",
+        ):
+            exhaust_page_limit()
 
 
 @pytest.mark.asyncio

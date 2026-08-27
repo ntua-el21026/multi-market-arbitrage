@@ -24,11 +24,19 @@ criterion. That result is recorded in
 transient correction has passed the strengthened dual-book v4 capacity workload
 in the pre-freeze working tree, with all 65 acceptance predicates true; the
 retained result is recorded in `GATE_1_PUBLIC_PREFLIGHT_FAILURE_20260826.md`.
-Because that run did not use a new clean successor commit, it is correction
-evidence rather than exact-SHA qualification. The frozen successor SHA must
-repeat all affected offline gates plus a fresh smoke and stability observation
-before independent pre-soak review. No six-hour rerun was performed; the first
-soak remains `FAIL`.
+Because that run did not use a new clean successor commit, it was correction
+evidence rather than exact-SHA qualification. The frozen e620 successor repeated
+the affected qualification gates and exposed the additional journal-rotation
+defect below. No six-hour rerun was performed; the first soak remains `FAIL`.
+
+The later exact-SHA candidate
+`e6203e19dd3cd0a1d4e00a8abfae1df3df9778c6` passed its smoke and completed a
+7,200-second public observation, but failed at the 10,000-event journal rotation.
+The append owner awaited approximately 5.9 seconds of ordinary seal/verify work,
+causing two otherwise timely REST responses to produce late PREPARE controls and
+permanent internal faults. ADR-0057 governs the required non-blocking ordered
+rotation correction. That evidence remains failed evidence; a new exact SHA must
+repeat all affected gates. The PREPARE guard and hard expiry are unchanged.
 
 Design Freeze v0.1 remains locked.
 
@@ -198,9 +206,9 @@ Do not raise DuckDB/PyArrow materialization limits to make the failed run pass.
 
 ## 6. Track C — complete clock and availability evidence
 
-### 6.1 Health checkpoint v4
+### 6.1 Health checkpoint v5
 
-The rerun requires `gate1-health-checkpoint-v4`, containing both:
+The rerun requires `gate1-health-checkpoint-v5`, containing both:
 
 - UTC emission timestamp; and
 - monotonic timestamp with explicit clock epoch/run identity.
@@ -216,7 +224,7 @@ emitted_monotonic_ns
 Chronology validation must use monotonic evidence. UTC remains for operator correlation.
 
 The checkpoint must also separate the current reason set from the finite sticky
-reason set. In v4 these are serialized exactly as the schema-tagged
+reason set. In v5 these are serialized exactly as the schema-tagged
 `reason_mask` and `gate1_sticky_reason_mask`; earlier schemas retain their
 historical string arrays. It must expose cumulative, pending, resolved,
 unresolved, unsupported-unknown and local-defect audit-divergence counts plus
@@ -224,8 +232,8 @@ fault lifecycles, retention occupancy and contribution reconciliation. The
 orthogonal observation/internal-prefix/external-attribution/recovery dimensions
 are emitted by the deterministic offline mismatch-lineage report, not invented
 as periodic-checkpoint fields.
-Historical v1-v3 checkpoints remain readable without inferred trigger,
-dimension, lifecycle, fault-closure or contribution evidence.
+Historical v1-v4 checkpoints remain readable without inferred trigger,
+dimension, lifecycle, fault-closure, contribution, or journal-seal evidence.
 
 The nested `audit.fault_lifecycles` object reports observed/current/resolved/
 permanent counts, reconciliation, lifecycle-chain identity, and bounded current
@@ -242,10 +250,18 @@ current pending object as a compact raw-linked
 `gate1-audit-divergence-pending-representative-v1` and at most one latest compact
 `gate1-audit-divergence-resolution-representative-v1`. Complete current pending
 and recovery objects remain in processor-summary and terminal-hash authority;
-cumulative totals and the lifecycle chain remain authoritative. Periodic v4
+cumulative totals and the lifecycle chain remain authoritative. Periodic v5
 construction consumes the immutable lightweight processor operational snapshot;
 it cannot call full summary/terminal-hash construction or copy complete recent
 histories.
+
+The maximum measured v5 record sizes are 30,819 bytes periodic and 44,463 bytes
+terminal. At the unchanged ten-second cadence the six-hour projection is
+66,613,503 bytes. The committed health-evidence bound is 68 MiB (71,303,168
+bytes), leaving 4,689,665 bytes and satisfying the unchanged 2 MiB minimum
+headroom. The 8,192-checkpoint count bound, cadence, complete-field contract,
+and fail-closed health-writer requirements remain unchanged. This is explicit
+capacity provisioning for v5, not acceptance-criterion weakening.
 
 ### 6.2 Typed unavailable intervals
 
@@ -324,6 +340,42 @@ the fixed 4,096-fragment dataset ceiling, and bounded O(1) shallow byte
 estimates. The producer rejects before an over-bound fragment write; terminal
 authority is never truncated. Terminal-summary latency and deep retained sizes are post-cutoff final/
 offline evidence, never periodic checkpoint work.
+
+### 6.4 Non-blocking ordered journal rotation
+
+ADR-0057 separates one append/data-`fsync` owner from one ordered
+seal/manifest/verify owner. Rotation must hand off one immutable durable pending
+source and descriptor, create/sync the successor active partial, and resume
+durability service without waiting for compression, manifest publication,
+complete verification, or source cleanup.
+
+The descriptor is first durably published as a bounded self-hashed write-ahead
+intent while the closed active source remains append-owned. Intent preparation
+is not a lifecycle transition. Active-to-pending rename plus directory `fsync`
+commits transfer; runtime queue admission occurs only afterward. Recovery may
+complete an exact validated intent-plus-active rename, but pending without
+intent and ambiguous intent/source inventories fail closed.
+
+The accepted bounds are four outstanding descriptors including the in-service
+job, 256 MiB pending uncompressed bytes, 120 seconds oldest pending age, one
+seal job, and four total unverified segments. Health v5 reports all current,
+high-water, bound, transition, failure, independent-watermark, stage-latency,
+append-owner-wait, and rotation-period durability evidence. Bound, worker,
+publication, verification, cleanup, or recovery failure preserves durable
+sources, stops new authority, and prevents completion.
+
+Recovery does not restart the 120-second budget. It derives initial recovered
+age from the intent's original nonfuture handoff UTC sampled against startup
+UTC, then advances age by the new process's monotonic elapsed time. Invalid or
+future chronology is a hard failure; persisted monotonic values are not
+compared across processes, and filesystem timestamps are not age authority.
+
+Startup validates and resumes expected intent/active/pending/sealed/manifest
+crash windows in exact order. It completes only an exact intent-plus-active
+rename and rejects pending without intent. Overlap, gap, identity conflict,
+manifest without sealed bytes, or completion with unfinished sources fails
+closed. Clean completion requires an empty verified pending inventory and exact
+range/count/byte/hash-chain reconciliation.
 
 ## 7. Track D/E — audit mismatch causality, lifecycle and long-run diagnosis
 
@@ -497,6 +549,10 @@ Long-run validation must report:
   remaining freshness budget, request load, freshness safety margin and
   research-eligible coverage by v2 trigger;
 - transition counts/durations;
+- journal rotation count; append/seal queue occupancy; pending count, bytes and
+  age; active jobs; independent durable/manifest/verified progress; handoff,
+  compression, manifest, verification and cleanup p50/p95/p99/max; append-owner
+  seal wait; and maximum rotation-period raw durability latency;
 - scan-report peak memory and throughput.
 
 ### 7.5 Lightweight operational snapshot and retention
@@ -507,7 +563,7 @@ current divergence/capture/fault state, compact latest representatives,
 incremental chain identities and retention occupancy/capacity/truncation. Its
 work cannot grow with recent diagnostic-history occupancy.
 
-Checkpoint v4 encodes those exact retention values as the compact,
+Checkpoint v5 encodes those exact retention values as the compact,
 schema-defined `mma-processor-retention-telemetry-table-v1`; the shared byte
 estimation method and positional row schema avoid repeating identical field
 names for every bounded domain. No occupancy, bound, total, truncation, or byte
@@ -527,7 +583,7 @@ new-schema replay semantic identity.
 Current producer caps are 256 scan results, 256 audit outcomes, 64 mismatch
 diagnostics, 64 completed divergence resolutions, 64 audit-fault lifecycle
 records, 256 reported-top outcomes, 1,024 validated-opportunity hashes, and 256
-reference-refresh requests. V4 reports each domain's occupancy, capacity,
+reference-refresh requests. V5 reports each domain's occupancy, capacity,
 cumulative total, and truncation.
 These are implementation defaults subject to the deterministic post-saturation
 benchmark, not evidence-proven final capacities.
@@ -709,8 +765,9 @@ If corrected semantics intentionally change terminal hashes, bind and explain th
 
 ### 8.4 Observability
 
-- checkpoint v4 chronology, operational snapshot, fault/retention/contribution
-  evidence, and explicit v1-v3 compatibility;
+- checkpoint v5 chronology, operational snapshot, fault/retention/contribution/
+  journal-seal evidence, and explicit v1-v4 compatibility without synthesized
+  seal fields;
 - exact `audit.current_eligibility` field shape and reconciliation;
 - bounded compact pending representatives, one compact latest resolution
   representative, resolution truncation, and complete processor/terminal
@@ -821,6 +878,28 @@ If corrected semantics intentionally change terminal hashes, bind and explain th
 - clean and failed shutdown with pending divergence;
 - exact live/replay terminal equality.
 
+### 8.7 Non-blocking journal rotation
+
+- continued append/data-`fsync` work while the prior segment is deliberately
+  held in sealing or complete verification;
+- a seal longer than four seconds with later response/PREPARE durability and
+  processing strictly before the unchanged original hard expiry, plus an exact
+  possibly later attestation;
+- at least 100 consecutive rotations and deterministic compressed/payload/
+  manifest-chain identity;
+- count, byte, age, active-job and total-unverified saturation including the
+  in-service descriptor;
+- compression, sealed-file `fsync`/rename, manifest, verification and cleanup
+  failures;
+- every handoff-intent prepare, active-to-pending commit, sealed/manifest/
+  verification/cleanup crash window, multiple pending recovery and a later
+  active suffix, including rejection of pending without intent, restart without
+  age-budget renewal, and future/invalid handoff UTC;
+- source-pending retention through verified publication, constant-memory
+  streaming, and no tuple/list of all envelopes; and
+- zero pending work plus exact inventory reconciliation before completion, with
+  no false durable receipt or completion on failure.
+
 ## 9. Validation sequence before rerun
 
 1. Full lock/SCA/Ruff/format/Pyright/pytest/pre-commit/build/no-live gates.
@@ -839,6 +918,12 @@ If corrected semantics intentionally change terminal hashes, bind and explain th
    - public-read/audit fault lifecycles and classification-stage timing;
    - unavailable-interval attribution and direct contributions;
    - monotonic checkpoint chronology;
+   - ordered journal rotation, pending bounds, stage timing, independent
+     watermarks, crash recovery and verified-drain completion;
+   - `phase1-pre-soak-calibration-v3` seal-queue/pending-byte bindings and exact
+     active, pending, compressed-scratch, metadata/atomic-scratch,
+     recovery-tail plus bounded compact crash-evidence ledger,
+     and summed temporary-sealing disk reserves;
    - operational/full-summary latency and post-saturation memory attribution/
      slope;
    - storage projection;
@@ -853,8 +938,8 @@ The rerun is not authorized until:
 - all primary failed-run windows have regression coverage;
 - corrected replay is deterministic and free of the identified primary invariant failures;
 - scan-report succeeds within current bounds;
-- health v4 operational snapshot, fault lifecycle, retention and contribution
-  evidence validate with v1-v3 compatibility;
+- health v5 operational snapshot, fault lifecycle, retention, contribution and
+  journal-seal evidence validate with v1-v4 compatibility;
 - no unresolved no-pending transition assumption remains;
 - no terminal pending/unresolved divergence, pending/unresolved replacement
   capture, unsupported generic unknown, internal reconstruction
@@ -868,6 +953,14 @@ The rerun is not authorized until:
 - ADR-0056 active and cumulative contributor bounds, independent closure,
   interval-union/cross-stream reconciliation, replacement retry/deadline/
   exhaustion, and shutdown evidence all pass offline tests;
+- ADR-0057 rotation handoff, ordered sealing, pending count/byte/age/job bounds,
+  constant-memory per-segment verification, bounded disk-backed full-run
+  ingest-ID uniqueness, crash recovery, independent watermarks, and
+  verified-drain completion pass; a forced slow seal causes no PREPARE deadline
+  miss under the unchanged timing contract;
+- exact-source `phase1-pre-soak-calibration-v3` passes with every temporary-
+  sealing reserve component present, its exact sum reconciled once into disk
+  workload, and no synthesized v3 fields from historical v1-v2 evidence;
 - the final exact SHA passes the v4 production-scale dual-book analytical and
   journal capacity workload, including all exact-zero phase-equivalent slopes,
   eight full-segment samples and unchanged RSS/Python/native-residual bounds;

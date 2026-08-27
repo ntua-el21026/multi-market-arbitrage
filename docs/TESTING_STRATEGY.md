@@ -22,7 +22,13 @@ long-run evidence
 
 ## 3. Unit tests
 
-Cover exact arithmetic, quantization, costs, book application, reported-top transitions, semantic relations, capacity, lifecycle, typed transport faults, retry/rate policy, versioned audit triggers, audit-divergence evidence dimensions/lifecycle, public-read fault lifecycle, target validation, operational health snapshots, availability intervals/contributions, typed resync reasons, calibration and bounded reporting.
+Cover exact arithmetic, quantization, costs, book application, reported-top
+transitions, semantic relations, capacity, lifecycle, typed transport faults,
+retry/rate policy, versioned audit triggers, audit-divergence evidence
+dimensions/lifecycle, public-read fault lifecycle, target validation,
+operational health snapshots, availability intervals/contributions, ordered
+raw-journal rotation/recovery, typed resync reasons, calibration and bounded
+reporting.
 
 ## 4. Property-based testing
 
@@ -44,7 +50,11 @@ Examples:
 - external causal unattribution cannot substitute for independent internal-
   prefix proof or complete recovery;
 - every new mismatch has exactly one interval contribution;
-- diagnostic-sample capacity cannot change new-schema semantic identity.
+- diagnostic-sample capacity cannot change new-schema semantic identity;
+- later durable records cannot be promoted to verified by an earlier segment;
+- pending count/bytes include the in-service seal job;
+- seal scheduling cannot change manifest-chain or replay identity; and
+- no crash interleaving can produce a false completion head.
 
 The optimized complete-set solver remains differentially tested against the exhaustive oracle across randomized and targeted fee/depth/minimum/threshold cases.
 
@@ -122,6 +132,24 @@ Same raw data, commit, config, reference interpretation and model versions must 
 
 Replay covers audit starts/responses/failures/classification, watermarks, barriers, transition state/bounds, availability evidence and terminal hash inputs without repeating external I/O or depending on current scheduler time.
 
+The raw replay reader's exact ingest-ID uniqueness index is tested across
+segment boundaries and interrupted prefixes. Tests require exact prior/current
+sequence reporting for duplicates, a hard failure at the SQLite page limit,
+fixed-cache/no-mmap configuration, and removal of command-owned scratch after
+normal exhaustion, detected corruption, and explicit early generator close.
+No Python set or mapping may retain one entry per run event.
+
+Recovery-plan tests place a valid earlier orphan/pending action before a later
+invalid pending or active source and require byte-identical authoritative
+inventory after startup rejects it. This proves validation of the complete
+sealed/pending/active plan precedes manifest publication, rename, deletion, and
+partial repair/evidence.
+
+The recovery-plan test distinguishes structural mutation safety from terminal
+uniqueness: physical recovery may proceed after exact source/sealed equivalence,
+but a cross-segment duplicate ingest ID must still block completion through the
+disk-backed full-run verifier.
+
 New replay also covers the ADR-0055 observation/internal-prefix/external-cause/
 recovery dimensions, public-read fault lifecycles, and the ADR-0056 active-
 versus-completed contributor lifecycle, interval-union/cross-stream identities,
@@ -174,6 +202,12 @@ Inject:
 - HTTP/WS faults and rate limits;
 - queue saturation;
 - journal/analytical/health storage failures;
+- pending-seal count/byte/age exhaustion and ordered-sealer failure;
+- compression, compressed-file `fsync`/rename, manifest, verification and
+  verified-source cleanup failure;
+- every active-close, handoff-intent prepare, active-to-pending commit, sealed-
+  publication, manifest-publication, verification, cleanup and completion crash
+  window;
 - malformed reference/schema;
 - clock-quality/UTC regression;
 - reported-top transition conflict/expiry;
@@ -202,7 +236,57 @@ Inject:
 
 Expected response is explicit fail-closed/quarantine/resync, not silent continuation.
 
-## 12. Incremental scan-report tests
+## 12. Non-blocking raw-journal rotation tests
+
+ADR-0057 requires:
+
+- continued append/data-`fsync` durability while a prior segment is held in
+  compression or complete verification;
+- a seal held longer than the four-second audit freshness guard while the later
+  raw response and inert PREPARE become durable and canonically processed
+  strictly before their original hard expiry;
+- exact final attestation of that unchanged timely PREPARE, with no new decision
+  or freshness promotion;
+- at least 100 consecutive event- and byte-bound rotations;
+- one ordered sealer, predecessor-digest order, contiguous sequences, and
+  deterministic compressed/payload identities;
+- count, pending-byte, oldest-age, active-job and total-unverified saturation,
+  all counting the in-service descriptor;
+- recovery immediately below, at, and above the age bound, repeated restart
+  without age-budget renewal, future/invalid handoff UTC rejection, and
+  same-process monotonic advancement after the recovery sample;
+- multiple pending recovery plus a later active suffix;
+- exact recovery completion of intent plus active source, and fail-closed
+  rejection of pending without intent and simultaneous active/pending sources;
+- intent without source rejected unless exact sealed bytes and manifest fully
+  reverify as interrupted verified cleanup;
+- authoritative pending-source retention through verified publication;
+- streaming chunk/record boundaries, variable event sizes and crash points under
+  Hypothesis;
+- rejection of overlap, gap, duplicate range, wrong scope/provenance,
+  conflicting output, manifest-without-sealed, and completion-with-pending
+  inventory;
+- shutdown with pending work, zero pending inventory before clean completion,
+  and no false durable receipt or completion under any injected failure;
+- exact replay, raw inventory and completion identity after successful recovery;
+  and
+- no full uncompressed/compressed segment object or tuple/list of all envelopes
+  in the live seal/verify path.
+
+Calibration tests require `phase1-pre-soak-calibration-v3`, validate the
+seal-queue/pending-byte cross-fields, and assert exact independent active,
+pending, worst-case compressed-scratch, metadata/atomic-scratch, and
+aggregate recovery-evidence reserves, including the 64-record/256-KiB compact
+crash ledger. Their sum must equal `temporary_sealing_bytes` and must
+appear exactly once in total disk workload. Boundary tests reject a missing,
+negative, inconsistent, double-counted, or legacy-synthesized component.
+
+The compressed-byte fixture compares the new ordered path with the existing
+synchronous helper for identical payload and compressor configuration. Expected
+manifest timestamps and new Git identity are compared semantically rather than
+mistaken for compressed-payload drift.
+
+## 13. Incremental scan-report tests
 
 Required:
 
@@ -216,14 +300,20 @@ Required:
 
 Do not test success by raising the resource limit.
 
-## 13. Health, audit-divergence and availability tests
+## 14. Health, audit-divergence and availability tests
 
 Required:
 
-- checkpoint v4 UTC plus monotonic epoch/ns, operational-snapshot evidence,
+- checkpoint v5 UTC plus monotonic epoch/ns, operational-snapshot evidence,
+  mandatory compact journal pending/lifecycle/watermark/timing evidence,
   nested `audit.fault_lifecycles` observed/current/resolved/permanent counts and
   chain/reconciliation, contribution reconciliation, and separate current/
-  sticky reasons; explicit v1-v3 historical compatibility;
+  sticky reasons; explicit v1-v4 historical compatibility without synthesized
+  seal fields;
+- maximum periodic/terminal v5 serialization of 30,819/44,463 bytes, exact
+  66,613,503-byte six-hour projection, 68 MiB file cap, at least 2 MiB remaining
+  headroom, unchanged ten-second cadence/8,192 count bound, and injected
+  count/file overflow failure;
 - exact `audit.current_eligibility` shape and reconciliation against processor
   ineligible books, required-ineligible instruments, divergence pending and
   replacement-capture pending;
@@ -234,9 +324,9 @@ Required:
 - complete current pending/recovery processor-summary and terminal-hash authority,
   with checkpoint totals and lifecycle chain unchanged by representative
   projection;
-- explicit v1-v3 compatibility without synthesized chronology, trigger,
+- explicit v1-v4 compatibility without synthesized chronology, trigger,
   evidence dimensions, fault closure, contribution or divergence-lifecycle
-  evidence;
+  evidence, and without synthesized journal ownership/lifecycle evidence;
 - monotonic chronology under UTC regression;
 - final cutoff consistency;
 - interval start/end/cause/recovery;
@@ -365,7 +455,7 @@ The paired health benchmark regression covers availability-interval
 construction/serialization, non-blocking producer enqueue and CPU, actual
 enqueue-through-`fsync` latency, and exact file growth as well as checkpoints.
 
-## 14. Causal lineage tests
+## 15. Causal lineage tests
 
 The offline reporter must cover:
 
@@ -421,7 +511,7 @@ prove production/oracle exact equality, deliberate production mutation-defect
 detection, insufficient-evidence indeterminacy, external unattribution with
 known observation, and prohibition on relabeling a local defect as external.
 
-## 15. Audit trigger tests
+## 16. Audit trigger tests
 
 Test every v2 trigger (`PERIODIC`, `FRESHNESS_GUARD`, `RACE_RETRY`,
 `RESYNC_VERIFICATION`, `STARTUP_BASELINE`, `OTHER_TYPED_REASON`), v1
@@ -432,9 +522,9 @@ recovery is pending, and the suppression reason must be counted. Effective-
 interval, HTTP-latency and remaining-freshness-budget observations retain their
 initiating v2 trigger.
 
-## 16. Storage-finalization and long-run stability tests
+## 17. Storage-finalization and long-run stability tests
 
-### 16.1 Offline storage-finalization workload
+### 17.1 Offline storage-finalization workload
 
 The exact public candidate runs the v4 capacity benchmark with production
 storage scale and settings. Gate-minimum mode requires:
@@ -460,9 +550,11 @@ Unit and fault tests prove that journal sealing never uses whole-file
 `Path.read_bytes`, verifies without retaining a segment-sized decoded tuple,
 rejects an incomplete payload, closes temporary descriptors on failure and
 publishes only through sync plus atomic replace. They compare exact
-uncompressed/replayed content and manifest-bound output identity. They do not
-assert that streaming compressed frames are byte-identical to legacy one-shot
-frames.
+uncompressed/replayed content and manifest-bound output identity. A fixed
+manifest-v1 fixture also binds the complete ordered-sealer compressed frame and
+segment digest to the retained synchronous writer at exact SHA
+`e6203e19dd3cd0a1d4e00a8abfae1df3df9778c6`; compressed-frame semantics may
+change only with an explicit versioned identity and compatibility reader.
 
 Analytical tests require incremental ordered-sequence hashing to equal the
 canonical-array digest exactly. Repeated production-sized flush probes must
@@ -474,7 +566,7 @@ retained-byte slopes must both be exactly zero. The workload must align the
 compared phases; allocator release does not authorize a weaker acceptance
 relation.
 
-### 16.2 Public stability observation
+### 17.2 Public stability observation
 
 Before another six-hour soak, run 5,400–7,200 seconds against the intended
 target, preferring 7,200 seconds, and materially beyond retained-history
@@ -503,6 +595,9 @@ saturation. Report:
 - replacement-recovery attempts, deadlines, last typed failure, exhaustion and
   deterministic evidence chain;
 - raw/analytical growth;
+- rotation count, handoff/seal stage p50/p95/p99/max, pending count/bytes/age,
+  independent journal progress, append-owner seal wait, and maximum
+  rotation-period raw durability latency;
 - incremental report resource usage.
 
 This is a preflight, not Gate-1 acceptance.
@@ -516,19 +611,19 @@ final exact candidate SHA in fresh output directories. Until those runs and
 their replay/rebuild/report checks complete, public pre-soak acceptance remains
 pending.
 
-## 17. Simulation and research-integrity tests
+## 18. Simulation and research-integrity tests
 
 Future simulator tests preserve post-latency books, own depth consumption, partial fills, conservative passive fills, cancel races, independent legs and residual exposure.
 
 Research integrity tests preserve OOS isolation, experiment manifests/search history, coverage and invalidated-run demotion.
 
-## 18. Regression policy
+## 19. Regression policy
 
 Every fixed defect receives a regression test where practical.
 
 Research results affected by a defect are invalidated and rerun under new experiment identity.
 
-## 19. CI and external evidence gates
+## 20. CI and external evidence gates
 
 CI uses the frozen ordinary-GIL CPython environment and runs lint, strict typing, unit/property/golden/integration/replay tests, schemas, SCA, pre-commit and package build.
 

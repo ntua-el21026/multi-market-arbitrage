@@ -12,9 +12,9 @@ Every stage ends with tests, reproducible evidence and an explicit gate. Code pr
 |---|---|
 | F0 — Repository/tooling foundation | Implemented |
 | F1 — Canonical core | Implemented |
-| F2 — Immutable raw journal | Implemented |
+| F2 — Immutable raw journal | Implemented baseline; ADR-0057 ordered-rotation correction under qualification |
 | F3 — Canonical analytical storage | Implemented; incremental long-run report path present |
-| P1 — Polymarket read-only vertical slice | Implemented baseline; ADR-0053 through ADR-0056 present; bounded storage-finalization correction under exact-SHA qualification |
+| P1 — Polymarket read-only vertical slice | Implemented baseline; ADR-0053 through ADR-0057 remediation under exact-SHA qualification |
 | P2 — Ordinary-binary complete-set scanner | Implemented |
 | P3 — Deterministic replay/rebuild | Implemented and passed first-soak review |
 | P4 — First six-hour Polymarket soak | Executed; `GATE 1: FAIL` |
@@ -36,9 +36,16 @@ and completed a 7,200-second stability observation, but failed the mandatory
 post-saturation RSS net-growth predicate (`535,859,200 B` observed versus
 `134,217,728 B` allowed). The retained result is documented in
 `GATE_1_PUBLIC_PREFLIGHT_FAILURE_20260826.md`. A narrow bounded
-storage-finalization transient correction is under requalification; its new
-exact SHA must repeat all affected offline gates, smoke and stability evidence.
+storage-finalization transient correction produced the later e620 candidate.
 No six-hour rerun was performed.
+
+The later exact-SHA successor `e6203e19...` passed its smoke and completed a
+7,200-second observation, but failed at the 10,000-event rotation because the
+append owner awaited approximately 5.9 seconds of seal/verify work. Two PREPARE
+controls crossed their unchanged hard expiries, permanent internal faults
+opened, and replacement recovery exhausted. ADR-0057 governs the new bounded
+non-blocking ordered-rotation correction. The e620 evidence cannot qualify its
+source-modified successor.
 
 ## 2. Completed foundation
 
@@ -61,8 +68,10 @@ No six-hour rerun was performed.
 
 - bounded queue/group durability;
 - `.partial` and sealed Zstandard segments;
+- self-hashed write-ahead handoff intents, immutable `.seal-pending` sources,
+  and ordered asynchronous sealing;
 - manifests/hash chains;
-- durability watermark;
+- independent durable/manifest-durable/verified progress;
 - recovery/fault injection;
 - bounded storage.
 
@@ -113,7 +122,7 @@ The evidence remains useful and must be preserved as a permanent regression corp
 ## 5. Current slice P4R — Gate-1 remediation
 
 The normative contract is `GATE_1_REMEDIATION_SPEC.md`, ADR-0053, ADR-0054,
-ADR-0055 and ADR-0056.
+ADR-0055, ADR-0056 and ADR-0057.
 
 ### R1 — Failure-window analysis
 
@@ -144,15 +153,15 @@ ADR-0055 and ADR-0056.
 - retain the 512 MiB limit;
 - prove identical summaries on small data and success on >512 MiB materialized-size fixtures.
 
-### R4 — Observability v4
+### R4 — Observability v5
 
 - add checkpoint monotonic epoch/nanoseconds;
 - add typed availability-interval ledger with cause/recovery evidence;
 - reconcile interval ledger with aggregates;
 - record CPU model/logical cores/total memory;
-- record current and peak RSS.
-- emit checkpoint v4 from a lightweight immutable operational snapshot with
-  v1-v3 historical compatibility;
+- record current and peak RSS;
+- emit checkpoint v5 from a lightweight immutable operational snapshot with
+  v1-v4 historical compatibility and mandatory compact journal-seal evidence;
 - emit a separate direct interval-contribution stream and typed resync reasons;
 - retain only unresolved causal keys in active contributor authority, close and
   publish completed contributors independently, enforce separate active and
@@ -174,19 +183,39 @@ ADR-0055 and ADR-0056.
 - retain pending, authoritative-resnapshot resolution, terminal unresolved,
   unsupported generic unknown and local-book-defect state;
 - emit v2 audit triggers while replaying v1 controls as `UNKNOWN_LEGACY`;
-- make current and Gate-sticky health reasons explicit in checkpoint v4;
-- measure RSS slope, latency tails and queue HWMs.
+- make current and Gate-sticky health reasons explicit in checkpoint v5;
+- measure RSS slope, latency tails and queue HWMs;
 - preserve strict pre-expiry PREPARE durability/processing plus possibly later
   exact unchanged attestation, remove the demonstrated
   socket-acquisition cleanup wait from mismatch classification, and remove the
   independently unbounded operational-summary/history work from the
   latency-critical path;
 - make recent full-object retention diagnostic-only while preserving durable
-  analytical output, exact totals/chains and current pending/recovery authority.
+  analytical output, exact totals/chains and current pending/recovery authority;
 - bound replacement-capture attempts, next-retry/hard/run deadlines and typed
   exhaustion under one stable recovery/contributor identity.
 
-### R6 — Failed-run regression replay
+### R6 — Non-blocking ordered journal rotation
+
+- give active append/data-`fsync` state and immutable pending seal/verify state
+  distinct supervised single owners and dedicated one-worker executors;
+- publish a bounded self-hashed handoff intent before rename without transferring
+  lifecycle/ownership, commit transfer through active-to-pending rename plus
+  directory `fsync`, and admit the runtime descriptor only afterward;
+- create/sync the successor partial and resume durability without awaiting
+  ordinary seal work;
+- enforce four total pending descriptors including in-service, 256 MiB pending
+  bytes, 120 seconds oldest age, one job and four unverified segments;
+- stream compression and verification with exact payload/compressed/manifest-
+  chain identity;
+- recover every intent/active/pending/sealed/manifest crash window in order,
+  complete only an exact intent-plus-active rename, and reject pending without
+  intent or other ambiguity without false completion;
+- require zero pending work and exact verified inventory before completion; and
+- prove a seal longer than four seconds does not cause a later PREPARE to miss
+  its unchanged hard expiry.
+
+### R7 — Failed-run regression replay
 
 - replay the full failed raw run twice;
 - require deterministic corrected identities;
@@ -203,7 +232,7 @@ ADR-0055 and ADR-0056.
   bounded replacement-recovery/exhaustion regression coverage;
 - verify raw immutability.
 
-### R7 — Short preflight
+### R8 — Short preflight
 
 - full lock/SCA/lint/type/test/pre-commit/build/no-live gates;
 - v4 full-capacity evidence with two production post-saturation analytical
@@ -215,14 +244,16 @@ ADR-0055 and ADR-0056.
   orthogonal divergence state, fault lifecycles, interval contributions,
   active/cumulative contributor saturation, independent contributor closure,
   replacement retry/exhaustion, chronology, operational/terminal latency,
-  memory attribution/plateau, queues, tails and storage.
+  memory attribution/plateau, queues, tails and storage;
+- 100-rotation stress/fault/recovery coverage plus journal pending occupancy,
+  stage timing, independent progress and verified-drain completion evidence.
 
-Candidate `40acc02c...` passed the final-SHA smoke but failed the stability RSS
-net-growth bound. The source-modified bounded-storage successor must repeat the
-full v4 capacity workload, final-SHA smoke and stability runs. Retained public
-runs are forensic inputs, not acceptance of the successor.
+Candidates `40acc02c...` and `e6203e19...` remain failed forensic inputs. The
+source-modified ADR-0057 successor must repeat the full v4 capacity workload,
+all affected journal stress/recovery gates, final-SHA smoke and stability runs.
+Neither retained public run accepts the successor.
 
-### R8 — Fresh six-hour soak
+### R9 — Fresh six-hour soak
 
 Run only after independent pre-soak approval. Perform the complete post-soak audit again.
 

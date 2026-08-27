@@ -254,6 +254,21 @@ def test_calibration_under_cap_passes_with_all_disk_workloads() -> None:
     assert report.projection.health_checkpoints == 2_161
     assert report.projection.health_checkpoints < report.limits.health_maximum_checkpoints
     assert report.projection.health_bytes < report.limits.health_maximum_file_bytes
+    assert report.projection.temporary_sealing_active_bytes == 64 * 1024 * 1024
+    assert report.projection.temporary_sealing_pending_bytes == 256 * 1024 * 1024
+    assert report.projection.temporary_sealing_compressed_scratch_bytes == 65 * 1024 * 1024
+    assert report.projection.temporary_sealing_metadata_scratch_bytes == 25_493_504
+    assert report.projection.temporary_sealing_recovery_bytes == 67_371_008
+    assert report.projection.temporary_sealing_bytes == 496_566_272
+    assert report.projection.temporary_sealing_bytes == sum(
+        (
+            report.projection.temporary_sealing_active_bytes,
+            report.projection.temporary_sealing_pending_bytes,
+            report.projection.temporary_sealing_compressed_scratch_bytes,
+            report.projection.temporary_sealing_metadata_scratch_bytes,
+            report.projection.temporary_sealing_recovery_bytes,
+        )
+    )
     assert report.projection.total_required_disk_bytes < report.projection.free_disk_bytes
 
 
@@ -263,7 +278,7 @@ def test_calibration_binds_health_bounds_and_stdio_stream_log_model() -> None:
     measurement_record = report.measurements.to_record()
     limits_record = report.limits.to_record()
     queue_record = report.measurements.queues[0].to_record()
-    assert report.schema_version == "phase1-pre-soak-calibration-v2"
+    assert report.schema_version == "phase1-pre-soak-calibration-v3"
     assert measurement_record["log_bytes"] == 0
     assert measurement_record["log_storage_model"] == STDIO_STREAM_LOG_STORAGE_MODEL
     assert measurement_record["journal_commit_to_durable"] == {
@@ -276,7 +291,9 @@ def test_calibration_binds_health_bounds_and_stdio_stream_log_model() -> None:
     }
     assert limits_record["health_checkpoint_interval_nanoseconds"] == 10_000_000_000
     assert limits_record["health_maximum_checkpoints"] == 8_192
-    assert limits_record["health_maximum_file_bytes"] == 64 * 1024 * 1024
+    assert limits_record["health_maximum_file_bytes"] == 68 * 1024 * 1024
+    assert limits_record["journal_seal_queue_capacity"] == 4
+    assert limits_record["journal_pending_seal_max_uncompressed_bytes"] == 256 * 1024 * 1024
     assert set(queue_record) == {"capacity", "high_water", "name", "threat_basis_points"}
 
 
