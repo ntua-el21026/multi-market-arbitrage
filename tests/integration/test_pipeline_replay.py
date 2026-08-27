@@ -1324,6 +1324,8 @@ async def test_continuous_audit_fences_response_without_replacing_socket_generat
             self.admitted = 0
             self.emit_economic_update = False
             self.frame_admitted = asyncio.Event()
+            self.frame_requested = asyncio.Event()
+            self.emit_through = 0
             self.subscription_semantics_sha256 = hashlib.sha256(
                 b"continuous-audit-fixture"
             ).hexdigest()
@@ -1335,28 +1337,27 @@ async def test_continuous_audit_fences_response_without_replacing_socket_generat
             ready: asyncio.Event,
         ) -> None:
             ready.set()
-            # Keep frames available throughout the widened run budget.  The
-            # response-fence scenario must end by its typed deadline, not by a
-            # finite synthetic frame source starving the race retry.
-            for _ in range(500):
-                await asyncio.sleep(0.003)
-                payload = (
-                    _fixture("polymarket_ws_price_change.json")
-                    if self.emit_economic_update
-                    else _fixture("polymarket_ws_last_trade.json")
-                )
-                self.emit_economic_update = False
-                admit(
-                    ReceivedWebSocketMessage(
-                        payload_bytes=payload,
-                        received_wall_time=UtcTimestamp.now(),
-                        received_monotonic_ns=observe_module.time.monotonic_ns(),
-                        message_type="TEXT",
+            while True:
+                await self.frame_requested.wait()
+                self.frame_requested.clear()
+                while self.admitted < self.emit_through:
+                    await asyncio.sleep(0)
+                    payload = (
+                        _fixture("polymarket_ws_price_change.json")
+                        if self.emit_economic_update
+                        else _fixture("polymarket_ws_last_trade.json")
                     )
-                )
-                self.admitted += 1
-                self.frame_admitted.set()
-            await asyncio.Event().wait()
+                    self.emit_economic_update = False
+                    admit(
+                        ReceivedWebSocketMessage(
+                            payload_bytes=payload,
+                            received_wall_time=UtcTimestamp.now(),
+                            received_monotonic_ns=observe_module.time.monotonic_ns(),
+                            message_type="TEXT",
+                        )
+                    )
+                    self.admitted += 1
+                    self.frame_admitted.set()
 
     class _AuditClient:
         def __init__(self) -> None:
@@ -1380,6 +1381,8 @@ async def test_continuous_audit_fences_response_without_replacing_socket_generat
             if asset_id == "token-yes" and asset_attempt == 1:
                 socket.emit_economic_update = True
             before = socket.admitted
+            socket.emit_through = max(socket.emit_through, before + 2)
+            socket.frame_requested.set()
             while socket.admitted < before + 2:
                 socket.frame_admitted.clear()
                 if socket.admitted < before + 2:
@@ -1457,7 +1460,11 @@ async def test_continuous_audit_fences_response_without_replacing_socket_generat
     client = _AuditClient()
     runtime_health = ObservationRuntimeHealth()
     loop = asyncio.get_running_loop()
-    remaining_seconds = 0.75
+    # The contract under test is the ordered FAILED -> RACED -> MATCH audit
+    # lifecycle, not completion within a sub-second host-performance budget.
+    # Leave enough wall-clock headroom for the journal fsyncs on slower CI
+    # runners while retaining the exact typed run-deadline exit.
+    remaining_seconds = 5.0
     deadline = loop.time() + remaining_seconds
     generation = await service._run_generation(  # pyright: ignore[reportPrivateUsage]
         client=cast(PolymarketPublicClient, client),
