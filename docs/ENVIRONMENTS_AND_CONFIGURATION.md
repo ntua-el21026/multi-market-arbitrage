@@ -185,8 +185,11 @@ either exact binding remains historical and cannot qualify. Generic stochastic r
 integer arithmetic, the WebSocket observation duration as their denominator,
 and 2.0x workload headroom. Health v5 is instead a fixed-cardinality projection:
 2,160 periodic checkpoints plus one terminal checkpoint, using the
-capacity-qualified 30,819-byte periodic and 44,463-byte terminal maxima. The
-producer opens the current v5 health file once without following links, requires
+capacity-qualified 31,319-byte periodic and 44,963-byte terminal maxima. The
+derived 32,019-byte periodic file-budget ceiling leaves an exact 700-byte
+capacity-qualification margin; it is not an observed-record acceptance bound.
+The producer opens the current v5 health file once without
+following links, requires
 a single-link stable regular-file identity, streams and matches the writer's
 SHA-256, reconciles its observed byte and record counts, binds that digest plus
 the observed periodic/terminal counts and maxima, and
@@ -206,8 +209,12 @@ Gate replay/rebuild commands run sequentially so only one raw-sized index is
 live at once; concurrency requires separately additive disk reservation.
 
 The Gate-1 health profile retains its ten-second cadence and checkpoint-count
-bound; calibration rejects any different cadence, count cap, or file cap. The fixed six-hour shape is exactly 2,160 periodic records plus one
-terminal record, so `2,160 * 30,819 + 1 * 44,463 = 66,613,503` bytes. The
-health-evidence file cap is 68 MiB (71,303,168 bytes), leaving 4,689,665 bytes
-and exceeding the required 2 MiB projection headroom. The writer still rejects
+bound; calibration rejects any different cadence, count cap, or file cap. The
+fixed six-hour shape is exactly 2,160 periodic records plus one terminal
+record, so `2,160 * 31,319 + 1 * 44,963 = 67,694,003` bytes. The
+health-evidence file cap is 68 MiB (71,303,168 bytes), leaving 3,609,165 bytes
+and exceeding the required 2 MiB projection headroom. The derived 32,019-byte
+periodic file-budget ceiling retains an exact 700-byte capacity-qualification
+margin without relaxing the 31,319-byte observed-record maximum. The writer
+still rejects
 before overflow, and missing or partial health evidence still fails closed.

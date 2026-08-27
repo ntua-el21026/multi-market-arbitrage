@@ -501,17 +501,30 @@ ADR-0055's requirement that new producers emit v4; all other ADR-0055 health
 semantics remain authoritative. The existing decision-mask mapping remains
 unchanged unless a later explicit schema decision adds a reason.
 
-Measured maximum v5 records are 30,819 bytes periodic and 44,463 bytes terminal.
-At the unchanged ten-second cadence, the six-hour projection is 66,613,503
+Measured maximum v5 records are 31,319 bytes periodic and 44,963 bytes terminal.
+At the unchanged ten-second cadence, the six-hour projection is 67,694,003
 bytes. The configured health-evidence cap is therefore 68 MiB (71,303,168
-bytes), leaving 4,689,665 bytes of headroom and preserving the existing 2 MiB
-minimum. This is bounded capacity provisioning for the additive schema, not a
-weaker cadence, checkpoint-count, completeness, or writer-failure predicate.
+bytes), leaving 3,609,165 bytes of headroom and preserving the existing 2 MiB
+minimum. The derived 32,019-byte periodic file-budget ceiling leaves an exact
+700-byte capacity-qualification margin above the 31,319-byte qualified maximum;
+it is not an observed-record acceptance bound. This is bounded capacity
+provisioning for the additive schema, not a weaker cadence,
+checkpoint-count, completeness, or writer-failure predicate.
 
 ### 11. Preserve PREPARE/ATTEST semantics exactly
 
 ADR-0057 changes no audit guard, response deadline, hard expiry, barrier,
 freshness, classification, recovery, or eligibility requirement.
+
+Health v5 publishes the exact 17-row
+`mma-audit-stage-timing-telemetry-table-v2`. In addition to the separately
+measured component stages, it requires
+`mma_rest_audit_stage_response_to_prepare_decision_ns` from response receipt
+through canonical PREPARE processing completion and
+`mma_rest_audit_stage_response_to_attestation_ns` from response receipt through
+canonical final-attestation processing completion. These end-to-end rows are
+not reconstructed from percentiles or substituted by the retained legacy
+response-to-classification total.
 
 The HTTP body and exact response watermark must still arrive strictly before
 the response deadline. Every admitted WebSocket frame through that watermark

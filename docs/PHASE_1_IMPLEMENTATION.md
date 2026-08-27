@@ -131,9 +131,12 @@ rejects a time bound longer than the five-second maximum book age. A bounded
 live calibration rejected the initial five-second checkpoint choice because its
 conservative six-hour projection threatened the then-64 MiB health-evidence
 limit. Health v5 retains the ten-second cadence and 8,192-checkpoint bound. Its
-measured 30,819-byte periodic maximum and 44,463-byte terminal maximum project
-to 66,613,503 bytes over six hours; the committed 68 MiB (71,303,168-byte) cap
-leaves 4,689,665 bytes, above the required 2 MiB headroom. This preserves
+measured 31,319-byte periodic maximum and 44,963-byte terminal maximum project
+to 67,694,003 bytes over six hours; the committed 68 MiB (71,303,168-byte) cap
+leaves 3,609,165 bytes, above the required 2 MiB headroom. The derived
+32,019-byte periodic file-budget ceiling leaves an exact 700-byte capacity-
+qualification margin above the 31,319-byte maximum; it is not an observed-
+record acceptance bound. This preserves
 incident reconstruction and fail-closed file/count enforcement without
 omitting v5 fields.
 `snapshot_audit_freshness_guard_seconds` is a four-second audit-launch guard,
@@ -244,9 +247,12 @@ matches and binds the writer SHA-256, reconciles reported bytes and records,
 binds the observed periodic/terminal counts and record-size
 maxima, and requires exactly one terminal checkpoint last. Health is not
 rate-scaled from that mixed file: the six-hour projection has exactly 2,160
-periodic checkpoints at the capacity-qualified 30,819-byte maximum plus one
-terminal checkpoint at the capacity-qualified 44,463-byte maximum, totaling
-66,613,503 bytes and leaving 4,689,665 bytes under the 68 MiB cap. An observed
+periodic checkpoints at the capacity-qualified 31,319-byte maximum plus one
+terminal checkpoint at the capacity-qualified 44,963-byte maximum, totaling
+67,694,003 bytes and leaving 3,609,165 bytes under the 68 MiB cap. The derived
+32,019-byte periodic file-budget ceiling therefore retains an exact 700-byte
+capacity-qualification margin without relaxing the 31,319-byte observed-record
+maximum. An observed
 record maximum above its qualified bound, a count/file overrun, an incomplete
 requested duration, or less than 2 MiB remaining health-file margin fails
 closed. The report includes `temporary_sealing_active_bytes`,
@@ -568,6 +574,16 @@ Each audit is an ordered, replayable protocol:
    attestation may itself become durable or be processed later because it can
    commit only the already completed pre-expiry preparation; this is not a second
    historical-boundary outcome path.
+
+Health v5 emits audit timing as the exact ordered 17-row
+`mma-audit-stage-timing-telemetry-table-v2`. Two mandatory end-to-end rows are
+`response_to_prepare_decision`, sourced from
+`mma_rest_audit_stage_response_to_prepare_decision_ns`, and
+`response_to_attestation`, sourced from
+`mma_rest_audit_stage_response_to_attestation_ns`. Their endpoints are the
+canonical processing completions of PREPARE and final ATTEST respectively;
+neither row is inferred from component percentiles or the retained legacy
+response-to-classification series.
 
 At each cycle the two explicit binary legs are ordered by their independent
 accepted-receive hard expiry and then stable asset order. Both starts are
@@ -1064,8 +1080,10 @@ directory sync only after clean completion; the summary records counts,
 high-water, bytes, SHA-256, completion/evidence eligibility, and failure type.
 The exact Gate-1 bounds are ten-second cadence, 8,192 checkpoints, and a 68 MiB
 (71,303,168-byte) health-evidence file. The measured v5 six-hour projection is
-exactly 2,160 periodic records at 30,819 bytes plus one terminal-last record at
-44,463 bytes, or 66,613,503 bytes, leaving 4,689,665 bytes of file headroom;
+exactly 2,160 periodic records at 31,319 bytes plus one terminal-last record at
+44,963 bytes, or 67,694,003 bytes, leaving 3,609,165 bytes of file headroom and
+an exact 700-byte capacity-qualification margin below the derived 32,019-byte
+periodic file-budget ceiling, not a relaxed observed-record bound;
 overflow or missing evidence remains a hard failure.
 
 Checkpoint groups are `target`, `capture`, per-book `books`, `ingress`,

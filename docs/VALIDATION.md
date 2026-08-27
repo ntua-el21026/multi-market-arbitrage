@@ -244,10 +244,13 @@ records to the file, and bind the digest plus observed periodic/terminal counts
 and maximum record sizes, and find exactly one terminal record last. Producer
 role/version, exact target record, and terminal cutoff identity must reconcile
 to the observation summary. Observed
-periodic or terminal maxima above 30,819 or 44,463 bytes fail. The accepted
+periodic or terminal maxima above 31,319 or 44,963 bytes fail. The accepted
 six-hour projection is fixed at 2,160 periodic records plus one terminal record,
-or exactly 66,613,503 bytes, leaving exactly 4,689,665 bytes under the
-71,303,168-byte cap. Other stochastic rate-derived fields retain 2.0x headroom
+or exactly 67,694,003 bytes, leaving exactly 3,609,165 bytes under the
+71,303,168-byte cap. The derived periodic file-budget ceiling is 32,019 bytes,
+preserving an exact 700-byte capacity-qualification margin above the 31,319-byte
+maximum; it is not an observed-record acceptance bound. Other stochastic rate-
+derived fields retain 2.0x headroom
 and the WebSocket observation duration denominator. The report must bind the
 exact requested duration and exact completed monotonic duration; a completed
 duration shorter than requested, a health count/record/file overrun, or less
@@ -257,6 +260,14 @@ bounds for the requested duration; a faster apparent producer cannot use the
 fixed-cardinality projection.
 The validator rejects any calibration limit other than the fixed ten-second
 cadence, 8,192-record bound, and 68 MiB file bound.
+
+Current health validation also requires the exact 17-row
+`mma-audit-stage-timing-telemetry-table-v2`, including independently populated
+`response_to_prepare_decision` and `response_to_attestation` rows sourced from
+their respective response-to-PREPARE-decision and response-to-final-ATTEST-
+processing histograms. A v1 row order, missing/extra row, substituted legacy
+total, or completed-run omission of either required end-to-end sample fails
+closed.
 
 ## 11. V8 — Opportunity coherence
 

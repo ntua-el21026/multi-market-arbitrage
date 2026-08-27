@@ -92,6 +92,8 @@ from multi_market_arbitrage.pipeline.health import (
     ANALYTICAL_FRAGMENT_RETENTION_TELEMETRY_SCHEMA,
     AUDIT_MISMATCH_REPRESENTATIVE_TELEMETRY_ROW_FIELDS,
     AUDIT_MISMATCH_REPRESENTATIVE_TELEMETRY_SCHEMA,
+    AUDIT_STAGE_TIMING_TELEMETRY_SCHEMA,
+    AUDIT_STAGE_TIMING_TELEMETRY_STAGES,
     MAXIMUM_OPEN_AVAILABILITY_CONTRIBUTIONS,
     PROCESSOR_RETENTION_TELEMETRY_ROW_FIELDS,
     PROCESSOR_RETENTION_TELEMETRY_SCHEMA,
@@ -1428,6 +1430,83 @@ def test_slow_operational_health_projection_is_measured_explicitly() -> None:
     assert latency["sample_count"] == latency["total_count"] == 1
     assert cast(int, latency["latest_periodic_ns"]) >= int(injected_delay_seconds * 1e9)
     assert checkpoint.resources["processor_operational"]
+
+
+def test_checkpoint_reports_explicit_prepare_and_attestation_stage_timings() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    updated_at = UtcTimestamp(1_800_000_000_000_000_000)
+    processor, target = _healthy_target_processor(config, updated_at=updated_at)
+    expected_stages = (
+        ("barrier_wait", "mma_rest_audit_stage_barrier_wait_ns"),
+        (
+            "prepare_construction",
+            "mma_rest_audit_stage_classification_construction_ns",
+        ),
+        ("prepare_durability", "mma_rest_audit_stage_classification_durability_ns"),
+        (
+            "prepare_durable_to_processed",
+            "mma_rest_audit_stage_classification_durable_to_processed_ns",
+        ),
+        ("prepare_processing", "mma_rest_audit_stage_classification_processing_ns"),
+        ("handoff_delay", "mma_rest_audit_stage_handoff_delay_ns"),
+        ("network", "mma_rest_audit_http_latency_ns"),
+        ("raw_durability", "mma_rest_audit_stage_raw_durability_ns"),
+        (
+            "raw_response_durable_to_processed",
+            "mma_rest_audit_stage_raw_response_durable_to_processed_ns",
+        ),
+        ("raw_response_processing", "mma_rest_audit_stage_raw_response_processing_ns"),
+        ("response_cleanup", "mma_rest_audit_stage_response_cleanup_ns"),
+        (
+            "response_to_prepare_decision",
+            "mma_rest_audit_stage_response_to_prepare_decision_ns",
+        ),
+        (
+            "attestation_durability",
+            "mma_rest_audit_stage_classification_attestation_durability_ns",
+        ),
+        (
+            "attestation_durable_to_processed",
+            "mma_rest_audit_stage_classification_attestation_durable_to_processed_ns",
+        ),
+        (
+            "attestation_processing",
+            "mma_rest_audit_stage_classification_attestation_processing_ns",
+        ),
+        (
+            "response_to_attestation",
+            "mma_rest_audit_stage_response_to_attestation_ns",
+        ),
+        (
+            "legacy_total_response_to_classification",
+            "mma_rest_audit_classification_latency_ns",
+        ),
+    )
+    assert AUDIT_STAGE_TIMING_TELEMETRY_SCHEMA == "mma-audit-stage-timing-telemetry-table-v2"
+    assert expected_stages == AUDIT_STAGE_TIMING_TELEMETRY_STAGES
+
+    metrics = InMemoryMetrics()
+    expected_maxima: list[float] = []
+    for index, (_stage, metric_name) in enumerate(expected_stages, start=1):
+        value = float(index * 1_000)
+        expected_maxima.append(value)
+        metrics.observe_histogram(metric_name, value)
+    checkpoint = _checkpoint(
+        config=config,
+        target=target,
+        processor=processor,
+        book_last_valid_receive_monotonic_ns=_target_receive_times(target, 10_000),
+        emitted_at=updated_at,
+        monotonic_now_ns=10_000,
+        metrics=metrics,
+    )
+
+    timing = cast(dict[str, object], checkpoint.audit["stage_timing_nanoseconds"])
+    assert timing["schema"] == AUDIT_STAGE_TIMING_TELEMETRY_SCHEMA
+    rows = cast(tuple[tuple[object, ...], ...], timing["rows"])
+    assert len(rows) == len(expected_stages)
+    assert tuple(row[0] for row in rows) == tuple(expected_maxima)
+    assert all(row[5] == row[6] == 1 for row in rows)
 
 
 @pytest.mark.parametrize("occupancy", ["zero", "half", "full"])

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import platform
 import resource
@@ -48,6 +49,11 @@ from multi_market_arbitrage.research import (
     write_calibration_artifacts,
 )
 
+from .health import (
+    AUDIT_STAGE_TIMING_TELEMETRY_HISTOGRAM_FIELDS,
+    AUDIT_STAGE_TIMING_TELEMETRY_SCHEMA,
+    AUDIT_STAGE_TIMING_TELEMETRY_STAGES,
+)
 from .observe import ObservationSummary, PolymarketObservationService
 
 
@@ -79,6 +85,18 @@ class _HealthCheckpointSizes:
     maximum_terminal_bytes: int
     total_bytes: int
     content_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedAuditStageHistogram:
+    maximum: float | None
+    minimum: float | None
+    p50: float | None
+    p95: float | None
+    p99: float | None
+    sample_count: int
+    total_count: int
+    total_sum: float
 
 
 _HEALTH_V5_TOP_LEVEL_FIELDS = frozenset(
@@ -131,6 +149,181 @@ _HEALTH_V5_DECISION_FIELDS = frozenset(
         "research_eligible",
     }
 )
+
+_AUDIT_STAGE_INDEX = {
+    stage: index for index, (stage, _metric_name) in enumerate(AUDIT_STAGE_TIMING_TELEMETRY_STAGES)
+}
+_AUDIT_CLASSIFICATION_PIPELINE_STAGES = (
+    "barrier_wait",
+    "raw_durability",
+    "raw_response_durable_to_processed",
+    "raw_response_processing",
+    "prepare_construction",
+    "prepare_durability",
+    "prepare_durable_to_processed",
+    "prepare_processing",
+    "response_to_prepare_decision",
+    "attestation_durability",
+    "attestation_durable_to_processed",
+    "attestation_processing",
+    "response_to_attestation",
+    "legacy_total_response_to_classification",
+)
+_AUDIT_CUMULATIVE_RESPONSE_STAGES = (
+    "response_to_prepare_decision",
+    "response_to_attestation",
+    "legacy_total_response_to_classification",
+)
+
+if len(_AUDIT_STAGE_INDEX) != len(AUDIT_STAGE_TIMING_TELEMETRY_STAGES):
+    raise RuntimeError("audit-stage timing schema contains a duplicate stage")
+if not set(_AUDIT_CLASSIFICATION_PIPELINE_STAGES).issubset(_AUDIT_STAGE_INDEX):
+    raise RuntimeError("audit-stage timing schema omits required classification stages")
+
+
+def _finite_nonnegative_number(value: object, *, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise RuntimeError(f"calibration audit-stage {field} is not numeric")
+    converted = float(value)
+    if not math.isfinite(converted) or converted < 0:
+        raise RuntimeError(f"calibration audit-stage {field} is not finite and non-negative")
+    return converted
+
+
+def _validate_audit_stage_histogram_row(
+    row: object,
+    *,
+    stage: str,
+) -> _ValidatedAuditStageHistogram:
+    if not isinstance(row, list):
+        raise RuntimeError("calibration audit-stage timing row shape is invalid")
+    raw_row = cast(list[object], row)
+    if len(raw_row) != len(AUDIT_STAGE_TIMING_TELEMETRY_HISTOGRAM_FIELDS):
+        raise RuntimeError("calibration audit-stage timing row shape is invalid")
+    values: dict[str, object] = dict(
+        zip(AUDIT_STAGE_TIMING_TELEMETRY_HISTOGRAM_FIELDS, raw_row, strict=True)
+    )
+    sample_count = values["sample_count"]
+    total_count = values["total_count"]
+    if (
+        isinstance(sample_count, bool)
+        or not isinstance(sample_count, int)
+        or sample_count < 0
+        or isinstance(total_count, bool)
+        or not isinstance(total_count, int)
+        or total_count < sample_count
+    ):
+        raise RuntimeError("calibration audit-stage histogram counts are invalid")
+    total_sum = _finite_nonnegative_number(
+        values["total_sum"],
+        field=f"{stage} total_sum",
+    )
+    quantile_names = ("minimum", "p50", "p95", "p99", "maximum")
+    raw_quantiles: tuple[object, ...] = tuple(values[name] for name in quantile_names)
+    if sample_count == 0:
+        if total_count != 0 or total_sum != 0 or any(value is not None for value in raw_quantiles):
+            raise RuntimeError("calibration empty audit-stage histogram is inconsistent")
+        quantiles: tuple[float | None, ...] = (None, None, None, None, None)
+    else:
+        if total_count == 0 or any(value is None for value in raw_quantiles):
+            raise RuntimeError("calibration populated audit-stage histogram is incomplete")
+        populated = tuple(
+            _finite_nonnegative_number(value, field=f"{stage} {name}")
+            for name, value in zip(quantile_names, raw_quantiles, strict=True)
+        )
+        if tuple(sorted(populated)) != populated:
+            raise RuntimeError("calibration audit-stage histogram quantiles are unordered")
+        quantiles = populated
+    minimum, p50, p95, p99, maximum = quantiles
+    return _ValidatedAuditStageHistogram(
+        maximum=maximum,
+        minimum=minimum,
+        p50=p50,
+        p95=p95,
+        p99=p99,
+        sample_count=sample_count,
+        total_count=total_count,
+        total_sum=total_sum,
+    )
+
+
+def _validate_health_v5_audit_stage_timing(
+    audit: dict[str, object],
+    *,
+    previous: tuple[_ValidatedAuditStageHistogram, ...] | None,
+    terminal: bool,
+) -> tuple[_ValidatedAuditStageHistogram, ...]:
+    table_value = audit.get("stage_timing_nanoseconds")
+    if not isinstance(table_value, dict):
+        raise RuntimeError("calibration health-v5 audit-stage timing table is missing or malformed")
+    table = cast(dict[object, object], table_value)
+    if set(table) != {"rows", "schema"}:
+        raise RuntimeError("calibration health-v5 audit-stage timing table is missing or malformed")
+    if table.get("schema") != AUDIT_STAGE_TIMING_TELEMETRY_SCHEMA:
+        raise RuntimeError("calibration health-v5 audit-stage timing schema differs")
+    raw_rows_value = table.get("rows")
+    if not isinstance(raw_rows_value, list):
+        raise RuntimeError("calibration health-v5 audit-stage timing row inventory differs")
+    raw_rows = cast(list[object], raw_rows_value)
+    if len(raw_rows) != len(AUDIT_STAGE_TIMING_TELEMETRY_STAGES):
+        raise RuntimeError("calibration health-v5 audit-stage timing row inventory differs")
+    rows = tuple(
+        _validate_audit_stage_histogram_row(row, stage=stage)
+        for row, (stage, _metric_name) in zip(
+            raw_rows,
+            AUDIT_STAGE_TIMING_TELEMETRY_STAGES,
+            strict=True,
+        )
+    )
+    if previous is not None:
+        for prior, current in zip(previous, rows, strict=True):
+            if (
+                current.sample_count < prior.sample_count
+                or current.total_count < prior.total_count
+                or current.total_sum < prior.total_sum
+            ):
+                raise RuntimeError("calibration audit-stage cumulative histogram regressed")
+            if prior.minimum is not None and (
+                current.minimum is None or current.minimum > prior.minimum
+            ):
+                raise RuntimeError("calibration audit-stage cumulative minimum regressed")
+            if prior.maximum is not None and (
+                current.maximum is None or current.maximum < prior.maximum
+            ):
+                raise RuntimeError("calibration audit-stage cumulative maximum regressed")
+            if current.total_count == prior.total_count and current != prior:
+                raise RuntimeError("calibration unchanged audit-stage count changed its histogram")
+    if not terminal:
+        return rows
+
+    pipeline = tuple(
+        rows[_AUDIT_STAGE_INDEX[stage]] for stage in _AUDIT_CLASSIFICATION_PIPELINE_STAGES
+    )
+    required_count = pipeline[0].total_count
+    if required_count <= 0:
+        raise RuntimeError("calibration terminal audit-stage timing lacks required samples")
+    if any(row.total_count != required_count for row in pipeline):
+        raise RuntimeError("calibration terminal audit-stage timing counts do not reconcile")
+    prepare, attestation, legacy = tuple(
+        rows[_AUDIT_STAGE_INDEX[stage]] for stage in _AUDIT_CUMULATIVE_RESPONSE_STAGES
+    )
+    if not prepare.total_sum < attestation.total_sum <= legacy.total_sum:
+        raise RuntimeError("calibration cumulative audit-stage timing totals are not distinct")
+    for field in ("minimum", "p50", "p95", "p99", "maximum", "total_sum"):
+        prepare_value = getattr(prepare, field)
+        attestation_value = getattr(attestation, field)
+        legacy_value = getattr(legacy, field)
+        if (
+            prepare_value is None
+            or attestation_value is None
+            or legacy_value is None
+            or not prepare_value <= attestation_value <= legacy_value
+        ):
+            raise RuntimeError("calibration cumulative audit-stage timing order is invalid")
+    network = rows[_AUDIT_STAGE_INDEX["network"]]
+    if network.total_count < required_count:
+        raise RuntimeError("calibration audit-stage network count is below classified responses")
+    return rows
 
 
 def _sha256_file(path: Path) -> str:
@@ -433,6 +626,7 @@ def _health_checkpoint_sizes(
     total_bytes = 0
     terminal_seen = False
     previous_monotonic_ns: int | None = None
+    previous_audit_stage_timing: tuple[_ValidatedAuditStageHistogram, ...] | None = None
     digest = hashlib.sha256()
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -551,6 +745,11 @@ def _health_checkpoint_sizes(
                 terminal = journal.get("terminal")
                 if not isinstance(terminal, bool):
                     raise RuntimeError("calibration health evidence lacks typed terminal identity")
+                previous_audit_stage_timing = _validate_health_v5_audit_stage_timing(
+                    cast(dict[str, object], record["audit"]),
+                    previous=previous_audit_stage_timing,
+                    terminal=terminal,
+                )
                 line_bytes = len(line)
                 total_bytes += line_bytes
                 if terminal:

@@ -157,7 +157,11 @@ create a second post-expiry decision path. Network, raw-response durability,
 barrier, PREPARE construction/durability/processing, final-attestation
 durability/processing, analytical, health and queue latencies are measured
 separately so local scheduling work is corrected instead of hidden by a larger
-guard or a second post-expiry decision path.
+guard or a second post-expiry decision path. Health v5 binds these observations
+in the exact 17-row `mma-audit-stage-timing-telemetry-table-v2`, including
+independently observed response-receipt-to-canonical-PREPARE-processing and
+response-receipt-to-canonical-final-ATTEST-processing rows; neither end-to-end
+row is reconstructed from component percentiles or the legacy total.
 
 Post-boundary frames may continue to enter ingress, but no request, retry, or
 terminal exhaustion start is created after its leg expiry or the run deadline.

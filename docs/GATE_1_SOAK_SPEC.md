@@ -355,12 +355,15 @@ chronology, trigger, evidence-dimension, fault-closure, contribution, or
 journal-seal fields.
 
 The ten-second cadence and 8,192-checkpoint count bound remain fixed. The
-capacity-qualified v5 maxima are 30,819 bytes periodic and 44,463 bytes
+capacity-qualified v5 maxima are 31,319 bytes periodic and 44,963 bytes
 terminal. The fixed six-hour shape is 2,160 periodic records plus one terminal
-record, so `2,160 * 30,819 + 1 * 44,463 = 66,613,503` bytes. The exact
+record, so `2,160 * 31,319 + 1 * 44,963 = 67,694,003` bytes. The exact
 configuration uses
-a 68 MiB (71,303,168-byte) file cap, leaving 4,689,665 bytes and exceeding the
-required 2 MiB headroom. Reaching the file/count bound, missing a checkpoint, or
+a 68 MiB (71,303,168-byte) file cap, leaving 3,609,165 bytes and exceeding the
+required 2 MiB headroom. The derived 32,019-byte periodic file-budget ceiling
+leaves an exact 700-byte capacity-qualification margin above the 31,319-byte
+maximum; it is not an observed-record acceptance bound. Reaching the file/count
+bound, missing a checkpoint, or
 emitting incomplete health evidence still fails closed; the provisioned cap is
 not permission to lower cadence or completeness.
 
@@ -636,9 +639,11 @@ unknown, local-defect, inconsistent, or unevidenced mismatch to pass.
 - decode/normalize/book update;
 - scanner/T_obs;
 - audit latency/barrier lag;
-- network response, raw durability, barrier wait, PREPARE construction,
-  PREPARE durability/processing, final-attestation durability/processing,
-  response-to-PREPARE-decision and response-to-attestation latency;
+- exact 17-row `mma-audit-stage-timing-telemetry-table-v2`, including network
+  response, raw durability, barrier wait, PREPARE construction, PREPARE
+  durability/processing, final-attestation durability/processing, independently
+  observed response-to-PREPARE-decision and response-to-ATTEST-processing
+  latency, and the non-substituting legacy total;
 - events/scans per second;
 - journal groups/fsyncs;
 - journal rotation count; append/seal queue occupancy; pending count/bytes/age;

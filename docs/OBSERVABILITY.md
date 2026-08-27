@@ -213,11 +213,14 @@ built only after raw completion and analytical/availability owner closure. It
 must be durably written last; missing, duplicate, non-last, pre-drain, or
 completion-unbound terminal evidence is ineligible.
 
-Maximum measured v5 serialization is 30,819 bytes for a periodic checkpoint and
-44,463 bytes for the terminal checkpoint. The unchanged ten-second six-hour
-schedule projects 66,613,503 bytes. A 68 MiB (71,303,168-byte) file cap leaves
-4,689,665 bytes of headroom, above the required 2 MiB. Checkpoint count, cadence,
-completeness, and fail-closed writer semantics are unchanged.
+Maximum measured v5 serialization is 31,319 bytes for a periodic checkpoint and
+44,963 bytes for the terminal checkpoint. The unchanged ten-second six-hour
+schedule projects 67,694,003 bytes. A 68 MiB (71,303,168-byte) file cap leaves
+3,609,165 bytes of headroom, above the required 2 MiB. The derived periodic
+file-budget ceiling is 32,019 bytes, leaving an exact 700-byte capacity-
+qualification margin above the 31,319-byte measured maximum; it is not an
+observed-record acceptance bound. Checkpoint count, cadence, completeness, and
+fail-closed writer semantics are unchanged.
 
 Each book record includes health, generation, freshness, reference versions and any unresolved `ReportedTopTransition` identity/status/bounds.
 
@@ -321,6 +324,24 @@ representatives, and processor history chains. Reported-top transitions use a
 schema-tagged fixed vector. The authoritative field orders are immutable
 exported constants in `pipeline.health`; readers validate the schema and row
 length before decoding. Values are compacted, not omitted.
+
+The audit-stage table is exactly
+`mma-audit-stage-timing-telemetry-table-v2`, with 17 ordered rows:
+`barrier_wait`, `prepare_construction`, `prepare_durability`,
+`prepare_durable_to_processed`, `prepare_processing`, `handoff_delay`,
+`network`, `raw_durability`, `raw_response_durable_to_processed`,
+`raw_response_processing`, `response_cleanup`,
+`response_to_prepare_decision`, `attestation_durability`,
+`attestation_durable_to_processed`, `attestation_processing`,
+`response_to_attestation`, and `legacy_total_response_to_classification`.
+`response_to_prepare_decision` measures response receipt through canonical
+PREPARE processing completion using
+`mma_rest_audit_stage_response_to_prepare_decision_ns`;
+`response_to_attestation` measures response receipt through canonical final
+ATTEST processing completion using
+`mma_rest_audit_stage_response_to_attestation_ns`. Both are independently
+observed end-to-end histograms. They cannot be inferred from component
+percentiles or replaced by the legacy total.
 
 Periodic checkpoints project every bounded current pending divergence as a
 compact raw-linked `gate1-audit-divergence-pending-representative-v1` and retain

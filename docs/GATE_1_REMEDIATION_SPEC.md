@@ -255,12 +255,15 @@ construction consumes the immutable lightweight processor operational snapshot;
 it cannot call full summary/terminal-hash construction or copy complete recent
 histories.
 
-The capacity-qualified v5 record maxima are 30,819 bytes periodic and 44,463
+The capacity-qualified v5 record maxima are 31,319 bytes periodic and 44,963
 bytes terminal. At the unchanged ten-second cadence the fixed six-hour shape is
 2,160 periodic records plus one terminal record, so
-`2,160 * 30,819 + 1 * 44,463 = 66,613,503` bytes. The committed health-evidence
-bound is 68 MiB (71,303,168 bytes), leaving 4,689,665 bytes and satisfying the
-unchanged 2 MiB minimum headroom. The 8,192-checkpoint count bound, cadence,
+`2,160 * 31,319 + 1 * 44,963 = 67,694,003` bytes. The committed health-evidence
+bound is 68 MiB (71,303,168 bytes), leaving 3,609,165 bytes and satisfying the
+unchanged 2 MiB minimum headroom. The derived periodic file-budget ceiling is
+32,019 bytes, preserving an exact 700-byte capacity-qualification margin above
+the 31,319-byte maximum; it is not an observed-record acceptance bound. The
+8,192-checkpoint count bound, cadence,
 complete-field contract, and fail-closed health-writer requirements remain
 unchanged. This is explicit capacity provisioning for v5, not acceptance-
 criterion weakening.
@@ -659,9 +662,14 @@ mismatched or unreconciled attestation, is permanent internal
 First remove local operational-summary/history/scheduling work; neither the
 guard nor deadline is enlarged to hide the failure.
 
-Stage histograms separately measure network response, raw durability, barrier
-wait, PREPARE construction/durability/processing, final-attestation durability/
-processing, response-to-PREPARE-decision and response-to-attestation latency.
+Health v5 carries the exact 17-row
+`mma-audit-stage-timing-telemetry-table-v2`. Its stage histograms separately
+measure network response, raw durability, barrier wait, PREPARE construction/
+durability/processing, final-attestation durability/processing,
+response-to-PREPARE-decision and response-to-ATTEST-processing latency. The two
+end-to-end response rows are independently observed through the corresponding
+canonical processing completion; they are not reconstructed from component
+percentiles or replaced by the legacy response-to-classification total.
 
 ### 7.8 Interval contributions and typed resynchronization
 
@@ -973,9 +981,12 @@ The rerun is not authorized until:
 - exact-source `phase1-pre-soak-calibration-v3` passes with every temporary-
   sealing reserve component present, its exact sum reconciled once into disk
   workload, and no synthesized v3 fields from historical v1-v2 evidence; its
-  health projection uses exactly 2,160 periodic records at 30,819 bytes plus one
-  terminal-last record at 44,463 bytes, totaling 66,613,503 bytes and leaving
-  4,689,665 bytes under the 68 MiB cap; any observed record/count/file overrun,
+  health projection uses exactly 2,160 periodic records at 31,319 bytes plus one
+  terminal-last record at 44,963 bytes, totaling 67,694,003 bytes and leaving
+  3,609,165 bytes under the 68 MiB cap; its derived 32,019-byte periodic file-
+  budget ceiling leaves an exact 700-byte capacity-qualification margin without
+  relaxing the 31,319-byte observed-record maximum; any observed record/count/
+  file overrun,
   completed duration shorter than requested, or margin below 2 MiB fails closed;
   any different ten-second cadence, 8,192-record cap, or 68 MiB file cap is
   rejected, and pre-correction v3 reports lacking the required producer/

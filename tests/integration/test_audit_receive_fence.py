@@ -918,6 +918,35 @@ async def test_prepare_attest_remains_timely_while_prior_journal_seal_exceeds_fo
             <= processed_ns_by_channel[CONTROL_REST_AUDIT_CLASSIFY]
             < hard_expiry_ns
         )
+        response_to_prepare = metrics.histogram_snapshot(
+            "mma_rest_audit_stage_response_to_prepare_decision_ns"
+        )
+        response_to_attestation = metrics.histogram_snapshot(
+            "mma_rest_audit_stage_response_to_attestation_ns"
+        )
+        assert response_to_prepare is not None
+        assert response_to_attestation is not None
+        expected_response_to_prepare_ns = (
+            processed_ns_by_channel[CONTROL_REST_AUDIT_CLASSIFY_PREPARE] - response_ns
+        )
+        expected_response_to_attestation_ns = (
+            processed_ns_by_channel[CONTROL_REST_AUDIT_CLASSIFY] - response_ns
+        )
+        assert response_to_prepare.total_count == response_to_prepare.sample_count == 1
+        assert (
+            response_to_prepare.minimum
+            == response_to_prepare.maximum
+            == float(expected_response_to_prepare_ns)
+        )
+        assert response_to_prepare.total_sum == float(expected_response_to_prepare_ns)
+        assert response_to_attestation.total_count == response_to_attestation.sample_count == 1
+        assert (
+            response_to_attestation.minimum
+            == response_to_attestation.maximum
+            == float(expected_response_to_attestation_ns)
+        )
+        assert response_to_attestation.total_sum == float(expected_response_to_attestation_ns)
+        assert expected_response_to_prepare_ns <= expected_response_to_attestation_ns
         assert writer.metrics.durable == 8
         assert writer.metrics.verified == 0
         assert writer.metrics.durability_watermark_sequence == 7
@@ -1469,7 +1498,7 @@ async def test_timely_prepare_delayed_attestation_replays_without_freshness_prom
         max_bytes=config.polymarket.maximum_ingress_queue_bytes,
         connection_id=connection_id,
     )
-    original_preserve = capture.preserve_then_process
+    original_preserve = capture.preserve_then_process_with_evidence
     delay_used = False
     hard_expiry_ns = 0
 
@@ -1484,7 +1513,7 @@ async def test_timely_prepare_delayed_attestation_replays_without_freshness_prom
         transport_metadata: dict[str, str | int | bool] | None = None,
         received_wall_time: UtcTimestamp | None = None,
         received_monotonic_ns: int | None = None,
-    ) -> ProcessedEnvelope:
+    ) -> object:
         nonlocal delay_used
         if channel == CONTROL_REST_AUDIT_CLASSIFY:
             delay_used = True
@@ -1501,7 +1530,11 @@ async def test_timely_prepare_delayed_attestation_replays_without_freshness_prom
             received_monotonic_ns=received_monotonic_ns,
         )
 
-    monkeypatch.setattr(capture, "preserve_then_process", delay_final_attestation)
+    monkeypatch.setattr(
+        capture,
+        "preserve_then_process_with_evidence",
+        delay_final_attestation,
+    )
     await writer.start()
     try:
         await _initialize_books(capture)
@@ -1566,6 +1599,21 @@ async def test_timely_prepare_delayed_attestation_replays_without_freshness_prom
     )
     assert prepare_record.received_monotonic.nanoseconds < hard_expiry_ns
     assert classify_record.received_monotonic.nanoseconds > hard_expiry_ns
+    response_to_prepare = metrics.histogram_snapshot(
+        "mma_rest_audit_stage_response_to_prepare_decision_ns"
+    )
+    response_to_attestation = metrics.histogram_snapshot(
+        "mma_rest_audit_stage_response_to_attestation_ns"
+    )
+    assert response_to_prepare is not None
+    assert response_to_attestation is not None
+    assert response_to_prepare.total_count == response_to_prepare.sample_count == 1
+    assert response_to_attestation.total_count == response_to_attestation.sample_count == 1
+    expiry_offset_ns = hard_expiry_ns - response_ns
+    assert response_to_prepare.maximum is not None
+    assert response_to_attestation.minimum is not None
+    assert response_to_prepare.maximum < expiry_offset_ns
+    assert response_to_attestation.minimum > expiry_offset_ns
 
     live = processor.summary()
     replayed = replay_journal(tmp_path / "raw", run_id, config).processor
@@ -4622,6 +4670,30 @@ async def test_idle_books_launch_guarded_audit_before_future_periodic_deadline(
     )
     assert http_latency is not None
     assert http_latency.total_count == 2
+    aggregate_http_latency = metrics.histogram_snapshot("mma_rest_audit_http_latency_ns")
+    assert aggregate_http_latency is not None
+    assert aggregate_http_latency.total_count == 2
+    assert aggregate_http_latency.total_sum == http_latency.total_sum
+    response_to_prepare = metrics.histogram_snapshot(
+        "mma_rest_audit_stage_response_to_prepare_decision_ns"
+    )
+    response_to_attestation = metrics.histogram_snapshot(
+        "mma_rest_audit_stage_response_to_attestation_ns"
+    )
+    legacy_response_to_classification = metrics.histogram_snapshot(
+        "mma_rest_audit_classification_latency_ns"
+    )
+    assert response_to_prepare is not None
+    assert response_to_attestation is not None
+    assert legacy_response_to_classification is not None
+    assert response_to_prepare.total_count == 2
+    assert response_to_attestation.total_count == 2
+    assert legacy_response_to_classification.total_count == 2
+    assert (
+        response_to_prepare.total_sum
+        <= response_to_attestation.total_sum
+        <= legacy_response_to_classification.total_sum
+    )
     freshness_budget = metrics.histogram_snapshot(
         "mma_rest_audit_remaining_freshness_budget_ns",
         labels=trigger_labels,

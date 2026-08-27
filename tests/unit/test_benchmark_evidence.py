@@ -17,6 +17,7 @@ from multi_market_arbitrage.pipeline.health import (
     AUDIT_DIVERGENCE_PENDING_REPRESENTATIVE_SCHEMA,
     AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVE_SCHEMA,
     AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_CODEBOOKS,
+    AUDIT_STAGE_TIMING_TELEMETRY_STAGES,
     MAXIMUM_AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVES,
     PROCESSOR_HISTORY_CHAIN_TELEMETRY_FIELDS,
     PROCESSOR_RETENTION_TELEMETRY_SCHEMA,
@@ -227,14 +228,14 @@ def test_audit_divergence_benchmark_covers_changed_paths_and_capacity() -> None:
     assert (
         capacity["maximum_periodic_checkpoint_bytes"]
         == HEALTH_V5_CAPACITY_MAXIMUM_PERIODIC_CHECKPOINT_BYTES
-        == 30_819
+        == 31_319
     )
     assert (
         capacity["maximum_terminal_checkpoint_bytes"]
         == HEALTH_V5_CAPACITY_MAXIMUM_TERMINAL_CHECKPOINT_BYTES
-        == 44_463
+        == 44_963
     )
-    assert capacity["projected_file_bytes"] == 66_613_503
+    assert capacity["projected_file_bytes"] == 67_694_003
     assert capacity["projected_file_bytes"] <= HEALTH_EVIDENCE_MAXIMUM_BYTES
     assert (
         maximum_periodic_checkpoint_bytes_acceptance
@@ -318,7 +319,9 @@ def test_audit_divergence_benchmark_covers_changed_paths_and_capacity() -> None:
     assert capacity_shape["audit_fault_lifecycle_retention_truncated"] is True
     assert capacity_shape["audit_http_endpoint_row_count"] == 5
     assert capacity_shape["audit_http_endpoint_rows_exact"] is True
-    assert capacity_shape["audit_stage_timing_row_count"] == 12
+    assert capacity_shape["audit_stage_timing_row_count"] == len(
+        AUDIT_STAGE_TIMING_TELEMETRY_STAGES
+    )
     assert capacity_shape["audit_stage_timing_populated"] is True
     assert capacity_shape["audit_stage_timing_rows_exact"] is True
     assert capacity_shape["decision_reason_count"] == 33
@@ -418,7 +421,7 @@ def test_capacity_mismatch_rows_reject_duplicate_causes_and_wrong_types() -> Non
 
 def test_capacity_stage_rows_reject_duplicate_position_and_wrong_types() -> None:
     row = (5, 1, 2, 3, 4, 1, 1, 5.0)
-    rows: tuple[object, ...] = (row,) * 12
+    rows: tuple[object, ...] = (row,) * len(AUDIT_STAGE_TIMING_TELEMETRY_STAGES)
     assert _audit_stage_rows_exact(rows)
     assert not _audit_stage_rows_exact((*rows, row))
 

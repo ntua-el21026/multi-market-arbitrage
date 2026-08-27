@@ -22,6 +22,10 @@ from multi_market_arbitrage.pipeline.calibration import (
     _journal_commit_to_durable_distribution,  # pyright: ignore[reportPrivateUsage]
     _verify_clean_source_checkout,  # pyright: ignore[reportPrivateUsage]
 )
+from multi_market_arbitrage.pipeline.health import (
+    AUDIT_STAGE_TIMING_TELEMETRY_SCHEMA,
+    AUDIT_STAGE_TIMING_TELEMETRY_STAGES,
+)
 from multi_market_arbitrage.pipeline.observe import ObservationSummary
 from multi_market_arbitrage.research import (
     STDIO_STREAM_LOG_STORAGE_MODEL,
@@ -165,10 +169,35 @@ def _git(repository: Path, *arguments: str) -> str:
     return completed.stdout.strip()
 
 
+def _audit_stage_timing_table() -> dict[str, object]:
+    values = {
+        stage: index
+        for index, (stage, _metric) in enumerate(
+            AUDIT_STAGE_TIMING_TELEMETRY_STAGES,
+            start=1,
+        )
+    }
+    values.update(
+        {
+            "response_to_prepare_decision": 100,
+            "response_to_attestation": 200,
+            "legacy_total_response_to_classification": 300,
+        }
+    )
+    return {
+        "rows": [
+            [value, value, value, value, value, 1, 1, value]
+            for stage, _metric in AUDIT_STAGE_TIMING_TELEMETRY_STAGES
+            for value in (values[stage],)
+        ],
+        "schema": AUDIT_STAGE_TIMING_TELEMETRY_SCHEMA,
+    }
+
+
 def _health_record(*, terminal: bool, monotonic_ns: int) -> dict[str, object]:
     return {
         "analytical": {},
-        "audit": {},
+        "audit": {"stage_timing_nanoseconds": _audit_stage_timing_table()},
         "books": [],
         "capture": {},
         "collector_run_id": "run-1",
@@ -195,6 +224,20 @@ def _health_record(*, terminal: bool, monotonic_ns: int) -> dict[str, object]:
         "schema_version": "gate1-health-checkpoint-v5",
         "target": {},
     }
+
+
+def _audit_stage_rows(record: dict[str, object]) -> list[list[object]]:
+    audit = cast(dict[str, object], record["audit"])
+    table = cast(dict[str, object], audit["stage_timing_nanoseconds"])
+    return cast(list[list[object]], table["rows"])
+
+
+def _audit_stage_index(stage: str) -> int:
+    return next(
+        index
+        for index, (candidate, _metric) in enumerate(AUDIT_STAGE_TIMING_TELEMETRY_STAGES)
+        if candidate == stage
+    )
 
 
 def _health_file_sha256(path: Path) -> str:
@@ -267,6 +310,94 @@ def test_health_checkpoint_size_inventory_separates_periodic_and_terminal(
     assert sizes.maximum_periodic_bytes == max(map(len, lines[:2]))
     assert sizes.maximum_terminal_bytes == len(lines[2])
     assert sizes.total_bytes == path.stat().st_size
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        pytest.param("missing", "missing or malformed", id="missing-table"),
+        pytest.param("missing-row", "row inventory differs", id="missing-row"),
+        pytest.param("v1", "schema differs", id="obsolete-v1-schema"),
+        pytest.param("malformed", "row shape is invalid", id="malformed-row"),
+        pytest.param("duplicate", "row inventory differs", id="duplicate-row"),
+    ],
+)
+def test_health_checkpoint_inventory_rejects_invalid_audit_stage_table(
+    tmp_path: Path,
+    mutation: str,
+    error: str,
+) -> None:
+    record = _health_record(terminal=True, monotonic_ns=1)
+    audit = cast(dict[str, object], record["audit"])
+    table = cast(dict[str, object], audit["stage_timing_nanoseconds"])
+    rows = _audit_stage_rows(record)
+    if mutation == "missing":
+        audit.pop("stage_timing_nanoseconds")
+    elif mutation == "missing-row":
+        rows.pop()
+    elif mutation == "v1":
+        table["schema"] = "mma-audit-stage-timing-telemetry-table-v1"
+    elif mutation == "malformed":
+        rows[0] = rows[0][:-1]
+    else:
+        rows.append(list(rows[-1]))
+    path = tmp_path / "health.jsonl"
+    path.write_bytes(canonical_json_bytes(record) + b"\n")
+
+    with pytest.raises(RuntimeError, match=error):
+        _inventory(path, expected_records=1)
+
+
+def test_health_checkpoint_inventory_validates_every_periodic_audit_stage_table(
+    tmp_path: Path,
+) -> None:
+    periodic = _health_record(terminal=False, monotonic_ns=1)
+    cast(dict[str, object], periodic["audit"]).pop("stage_timing_nanoseconds")
+    terminal = _health_record(terminal=True, monotonic_ns=2)
+    path = tmp_path / "health.jsonl"
+    path.write_bytes(
+        canonical_json_bytes(periodic) + b"\n" + canonical_json_bytes(terminal) + b"\n"
+    )
+
+    with pytest.raises(RuntimeError, match="missing or malformed"):
+        _inventory(path, expected_records=2, expected_terminal_utc_ns=1_002)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        pytest.param("duplicate", "totals are not distinct", id="duplicate-cumulative-row"),
+        pytest.param("reordered", "totals are not distinct", id="reordered-cumulative-rows"),
+        pytest.param("empty", "counts do not reconcile", id="empty-required-cumulative-row"),
+        pytest.param("count", "counts do not reconcile", id="mismatched-required-count"),
+    ],
+)
+def test_health_checkpoint_inventory_reconciles_required_cumulative_audit_stages(
+    tmp_path: Path,
+    mutation: str,
+    error: str,
+) -> None:
+    record = _health_record(terminal=True, monotonic_ns=1)
+    rows = _audit_stage_rows(record)
+    prepare_index = _audit_stage_index("response_to_prepare_decision")
+    attestation_index = _audit_stage_index("response_to_attestation")
+    if mutation == "duplicate":
+        rows[attestation_index] = list(rows[prepare_index])
+    elif mutation == "reordered":
+        rows[prepare_index], rows[attestation_index] = (
+            rows[attestation_index],
+            rows[prepare_index],
+        )
+    elif mutation == "empty":
+        rows[prepare_index] = [None, None, None, None, None, 0, 0, 0]
+    else:
+        value = cast(int, rows[attestation_index][0])
+        rows[attestation_index] = [value, value, value, value, value, 2, 2, value * 2]
+    path = tmp_path / "health.jsonl"
+    path.write_bytes(canonical_json_bytes(record) + b"\n")
+
+    with pytest.raises(RuntimeError, match=error):
+        _inventory(path, expected_records=1)
 
 
 @pytest.mark.parametrize(
@@ -528,12 +659,12 @@ def test_calibration_under_cap_passes_with_all_disk_workloads() -> None:
     assert report.projection.health_checkpoints < report.limits.health_maximum_checkpoints
     assert report.projection.health_periodic_checkpoints == 2_160
     assert report.projection.health_terminal_checkpoints == 1
-    assert report.projection.health_periodic_checkpoint_bytes == 30_819
-    assert report.projection.health_terminal_checkpoint_bytes == 44_463
-    assert report.projection.health_periodic_bytes == 66_569_040
-    assert report.projection.health_terminal_bytes == 44_463
-    assert report.projection.health_bytes == 66_613_503
-    assert report.projection.health_remaining_file_bytes == 4_689_665
+    assert report.projection.health_periodic_checkpoint_bytes == 31_319
+    assert report.projection.health_terminal_checkpoint_bytes == 44_963
+    assert report.projection.health_periodic_bytes == 67_649_040
+    assert report.projection.health_terminal_bytes == 44_963
+    assert report.projection.health_bytes == 67_694_003
+    assert report.projection.health_remaining_file_bytes == 3_609_165
     assert report.projection.health_bytes < report.limits.health_maximum_file_bytes
     assert report.projection.temporary_sealing_active_bytes == 64 * 1024 * 1024
     assert report.projection.temporary_sealing_pending_bytes == 256 * 1024 * 1024
@@ -575,8 +706,8 @@ def test_calibration_binds_health_bounds_and_stdio_stream_log_model() -> None:
     assert limits_record["health_checkpoint_interval_nanoseconds"] == 10_000_000_000
     assert limits_record["health_maximum_checkpoints"] == 8_192
     assert limits_record["health_maximum_file_bytes"] == 68 * 1024 * 1024
-    assert limits_record["health_capacity_maximum_periodic_checkpoint_bytes"] == 30_819
-    assert limits_record["health_capacity_maximum_terminal_checkpoint_bytes"] == 44_463
+    assert limits_record["health_capacity_maximum_periodic_checkpoint_bytes"] == 31_319
+    assert limits_record["health_capacity_maximum_terminal_checkpoint_bytes"] == 44_963
     assert limits_record["health_minimum_file_headroom_bytes"] == 2 * 1024 * 1024
     assert limits_record["journal_seal_queue_capacity"] == 4
     assert limits_record["journal_pending_seal_max_uncompressed_bytes"] == 256 * 1024 * 1024
@@ -632,17 +763,17 @@ def test_calibration_uses_capacity_health_shape_instead_of_rate_scaling_mixed_fi
     report = build_calibration_report(_identity(), measured, _limits())
 
     assert report.decision.passed
-    assert report.projection.health_bytes == 66_613_503
-    assert report.projection.health_remaining_file_bytes == 4_689_665
+    assert report.projection.health_bytes == 67_694_003
+    assert report.projection.health_remaining_file_bytes == 3_609_165
     assert report.projection.health_periodic_checkpoints == 2_160
     assert report.projection.health_terminal_checkpoints == 1
-    assert report.projection.total_required_disk_bytes == 3_790_993_376
+    assert report.projection.total_required_disk_bytes == 3_792_344_001
 
 
 def test_calibration_fails_if_public_health_record_exceeds_capacity_qualification() -> None:
     measured = replace(
         _measurements(),
-        health_maximum_periodic_checkpoint_bytes=30_820,
+        health_maximum_periodic_checkpoint_bytes=31_320,
     )
 
     report = build_calibration_report(_identity(), measured, _limits())
@@ -701,9 +832,9 @@ def test_calibration_rejects_changed_health_profile() -> None:
     with pytest.raises(ValueError, match="qualified health-v5 profile"):
         _limits(health_maximum_file_bytes=256 * 1024 * 1024)
     with pytest.raises(ValueError, match="qualified health-v5 profile"):
-        _limits(health_capacity_maximum_periodic_checkpoint_bytes=30_820)
+        _limits(health_capacity_maximum_periodic_checkpoint_bytes=31_320)
     with pytest.raises(ValueError, match="qualified health-v5 profile"):
-        _limits(health_capacity_maximum_terminal_checkpoint_bytes=44_464)
+        _limits(health_capacity_maximum_terminal_checkpoint_bytes=44_964)
     with pytest.raises(ValueError, match="qualified health-v5 profile"):
         _limits(health_minimum_file_headroom_bytes=2 * 1024 * 1024 - 1)
 

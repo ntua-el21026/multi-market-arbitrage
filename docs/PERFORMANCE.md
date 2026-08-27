@@ -460,9 +460,12 @@ Measure and retain:
   full, and post-saturation diagnostic occupancy;
 - full terminal-summary construction p50/p95/p99/max after frozen capture
   cutoff;
-- event-loop blocking and audit network, raw-durability, barrier,
-  PREPARE construction/durability/processing, final-attestation durability/
-  processing, response-to-PREPARE-decision and response-to-attestation latency;
+- event-loop blocking and exact 17-row
+  `mma-audit-stage-timing-telemetry-table-v2` coverage: audit network,
+  raw-durability, barrier, PREPARE construction/durability/processing,
+  final-attestation durability/processing, independently observed
+  response-to-PREPARE-decision and response-to-ATTEST-processing latency, plus
+  the retained non-substituting legacy total;
 - occupancy and approximate/deep retained bytes for scan results, audit
   outcomes, mismatch diagnostics, divergence resolutions, reported-top
   outcomes, lifecycle state, journal/analytical buffers, metrics and health/
@@ -542,11 +545,14 @@ create a false post-saturation Python-memory slope.
 
 For health v5, capacity acceptance uses the maximum across known/unknown-host
 and current/replacement-capture periodic and terminal fixtures. The measured
-maxima are 30,819 bytes periodic and 44,463 bytes terminal. At ten-second
+maxima are 31,319 bytes periodic and 44,963 bytes terminal. At ten-second
 cadence the fixed projection is 2,160 periodic records plus one terminal record:
-`2,160 * 30,819 + 1 * 44,463 = 66,613,503` bytes. The exact 68 MiB
-(71,303,168-byte) file cap leaves 4,689,665 bytes, above the fixed 2 MiB minimum
-headroom; the 8,192 checkpoint-count bound and cadence remain unchanged.
+`2,160 * 31,319 + 1 * 44,963 = 67,694,003` bytes. The exact 68 MiB
+(71,303,168-byte) file cap leaves 3,609,165 bytes, above the fixed 2 MiB minimum
+headroom. The derived 32,019-byte periodic file-budget ceiling leaves an exact
+700-byte capacity-qualification margin above the 31,319-byte maximum; it is not
+an observed-record acceptance bound. The 8,192 checkpoint-count bound and
+cadence remain unchanged.
 Exceeding any projected record/file/count predicate fails rather than truncates
 or omits v5 evidence.
 

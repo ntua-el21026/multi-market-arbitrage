@@ -254,15 +254,15 @@ _EXPECTED_AUDIT_STAGE_HISTOGRAM_FIELDS = (
 _EXPECTED_AUDIT_STAGES = (
     ("barrier_wait", "mma_rest_audit_stage_barrier_wait_ns"),
     (
-        "classification_construction",
+        "prepare_construction",
         "mma_rest_audit_stage_classification_construction_ns",
     ),
-    ("classification_durability", "mma_rest_audit_stage_classification_durability_ns"),
+    ("prepare_durability", "mma_rest_audit_stage_classification_durability_ns"),
     (
-        "classification_durable_to_processed",
+        "prepare_durable_to_processed",
         "mma_rest_audit_stage_classification_durable_to_processed_ns",
     ),
-    ("classification_processing", "mma_rest_audit_stage_classification_processing_ns"),
+    ("prepare_processing", "mma_rest_audit_stage_classification_processing_ns"),
     ("handoff_delay", "mma_rest_audit_stage_handoff_delay_ns"),
     ("network", "mma_rest_audit_http_latency_ns"),
     ("raw_durability", "mma_rest_audit_stage_raw_durability_ns"),
@@ -272,7 +272,30 @@ _EXPECTED_AUDIT_STAGES = (
     ),
     ("raw_response_processing", "mma_rest_audit_stage_raw_response_processing_ns"),
     ("response_cleanup", "mma_rest_audit_stage_response_cleanup_ns"),
-    ("total_response_to_classification", "mma_rest_audit_classification_latency_ns"),
+    (
+        "response_to_prepare_decision",
+        "mma_rest_audit_stage_response_to_prepare_decision_ns",
+    ),
+    (
+        "attestation_durability",
+        "mma_rest_audit_stage_classification_attestation_durability_ns",
+    ),
+    (
+        "attestation_durable_to_processed",
+        "mma_rest_audit_stage_classification_attestation_durable_to_processed_ns",
+    ),
+    (
+        "attestation_processing",
+        "mma_rest_audit_stage_classification_attestation_processing_ns",
+    ),
+    (
+        "response_to_attestation",
+        "mma_rest_audit_stage_response_to_attestation_ns",
+    ),
+    (
+        "legacy_total_response_to_classification",
+        "mma_rest_audit_classification_latency_ns",
+    ),
 )
 _EXPECTED_AUDIT_HTTP_FIELDS = (
     "endpoint_class",

@@ -26,7 +26,6 @@ from multi_market_arbitrage.core.ids import CollectorRunId, VenueId  # noqa: E40
 from multi_market_arbitrage.research import (  # noqa: E402
     COMPLETE_SET_SCAN_SCHEMA_VERSION,
     SCAN_REPORT_SCHEMA_VERSION,
-    ScanReport,
     ScanReportLimits,
     ScanReportResourceError,
     build_scan_report,
@@ -205,23 +204,6 @@ def _old_report_oracle(root: Path) -> dict[str, object]:
         "dispositions": grouped,
         "terminal_hashes": tuple(str(row[0]) for row in hashes),
     }
-
-
-def _semantic_projection(report: ScanReport) -> tuple[object, ...]:
-    return (
-        report.total_scans,
-        report.candidates,
-        report.validated_opportunities,
-        report.unique_opportunity_observations,
-        report.unique_lifecycles,
-        report.dispositions,
-        report.terminal_hash_count,
-        report.terminal_hash_order,
-        report.terminal_hash_sequence_sha256,
-        report.terminal_hash_samples,
-        report.resources.row_count,
-        report.resources.selected_materialized_bytes,
-    )
 
 
 def test_streaming_report_matches_old_small_dataset_oracle_and_is_deterministic(
@@ -448,7 +430,7 @@ def test_streaming_report_exceeds_wide_materialization_bound_but_not_peak_rss(
     assert measured["temporary_storage"] == "NONE"
 
 
-def test_failed_soak_original_and_rebuild_reports_are_semantically_equal() -> None:
+def test_failed_soak_original_and_corrected_rebuild_reports_are_well_formed() -> None:
     original_value = os.environ.get("MMA_GATE1_FAILED_ANALYTICAL_ORIGINAL")
     rebuilt_value = os.environ.get("MMA_GATE1_FAILED_ANALYTICAL_REBUILT")
     if original_value is None or rebuilt_value is None:
@@ -456,9 +438,23 @@ def test_failed_soak_original_and_rebuild_reports_are_semantically_equal() -> No
 
     original = build_scan_report(Path(original_value))
     rebuilt = build_scan_report(Path(rebuilt_value))
+    rebuilt_again = build_scan_report(Path(rebuilt_value) / "complete_set_scans")
 
     assert original.resources.full_materialized_bytes > _MATERIALIZATION_LIMIT
     assert rebuilt.resources.full_materialized_bytes > _MATERIALIZATION_LIMIT
-    assert _semantic_projection(original) == _semantic_projection(rebuilt)
+    assert rebuilt == rebuilt_again
     assert original.total_scans == 44_032
+    assert rebuilt.total_scans == 43_277
+    assert tuple((item.disposition, item.count) for item in rebuilt.dispositions) == (
+        ("BLOCKED", 19_717),
+        ("NO_CANDIDATE", 23_560),
+    )
+    assert rebuilt.candidates == 0
+    assert rebuilt.validated_opportunities == 0
+    assert rebuilt.unique_opportunity_observations == 0
+    assert rebuilt.unique_lifecycles == 0
+    assert original.terminal_hash_count == original.total_scans
+    assert rebuilt.terminal_hash_count == rebuilt.total_scans
     assert not original.terminal_hashes_complete
+    assert not rebuilt.terminal_hashes_complete
+    assert original.terminal_hash_sequence_sha256 != rebuilt.terminal_hash_sequence_sha256

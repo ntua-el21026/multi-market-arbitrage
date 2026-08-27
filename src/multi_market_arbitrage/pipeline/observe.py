@@ -3511,6 +3511,10 @@ class PolymarketObservationService:
         if durable is None:
             raise RuntimeError("audit classification preparation lacks durability timing")
         completed_ns = prepared.processing_completed_monotonic_ns
+        capture.metrics.observe_histogram(
+            "mma_rest_audit_stage_response_to_prepare_decision_ns",
+            max(0, completed_ns - response.received_monotonic_ns),
+        )
         derived_failure = (
             AuditFailureReason.BOOK_FRESHNESS_EXPIRED
             if durable.nanoseconds >= hard_expiry_ns or completed_ns >= hard_expiry_ns
@@ -3524,7 +3528,7 @@ class PolymarketObservationService:
             classification_monotonic_ns=completed_ns,
             hard_expiry_monotonic_ns=hard_expiry_ns,
         )
-        return await capture.preserve_then_process(
+        attested = await capture.preserve_then_process_with_evidence(
             channel=CONTROL_REST_AUDIT_CLASSIFY,
             payload=decision.to_payload(),
             transport_type="CONTROL",
@@ -3539,6 +3543,14 @@ class PolymarketObservationService:
                 "request_id": response.request_id,
             },
         )
+        capture.metrics.observe_histogram(
+            "mma_rest_audit_stage_response_to_attestation_ns",
+            max(
+                0,
+                attested.processing_completed_monotonic_ns - response.received_monotonic_ns,
+            ),
+        )
+        return attested.result
 
     async def _handle_refresh_requests(
         self,
@@ -4646,13 +4658,18 @@ class PolymarketObservationService:
                     await pending.task
                     if isinstance(handoff, AuditHttpResponseHandoff):
                         trigger_labels = {"trigger": pending.start.trigger_reason.value}
+                        http_latency_ns = max(
+                            0,
+                            handoff.received_monotonic_ns
+                            - pending.start.request_started_monotonic_ns,
+                        )
                         self._metrics.observe_histogram(
                             "mma_rest_audit_http_latency_ns",
-                            max(
-                                0,
-                                handoff.received_monotonic_ns
-                                - pending.start.request_started_monotonic_ns,
-                            ),
+                            http_latency_ns,
+                        )
+                        self._metrics.observe_histogram(
+                            "mma_rest_audit_http_latency_ns",
+                            http_latency_ns,
                             labels=trigger_labels,
                         )
                         self._metrics.observe_histogram(

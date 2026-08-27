@@ -290,8 +290,11 @@ reconcile file bytes and record counts, require exactly one terminal record in
 the final position, and bind observed periodic/terminal counts and maxima.
 Regression coverage uses a short mixed file whose terminal record is larger
 than its periodic records and proves that health is projected as exactly 2,160
-periodic records at 30,819 bytes plus one terminal record at 44,463 bytes:
-66,613,503 bytes with 4,689,665 bytes remaining. Negative cases cover a missing,
+periodic records at 31,319 bytes plus one terminal record at 44,963 bytes:
+67,694,003 bytes with 3,609,165 bytes remaining. The derived periodic file-
+budget ceiling is 32,019 bytes, leaving 700 bytes of capacity-qualification
+margin above the qualified 31,319-byte maximum; it is not an observed-record
+acceptance bound. Negative cases cover a missing,
 duplicate or non-final terminal, malformed/partial/noncanonical/non-v5 or
 symlink evidence, inventory mismatch, either capacity-qualified record maximum
 exceeded, file/count overrun, mutated cadence/count/file limits, writer-digest
@@ -320,6 +323,14 @@ Required:
 - corrupt/missing/extra/symlink/schema failures;
 - original-versus-rebuild report equality.
 
+For a run produced and rebuilt by the same corrected candidate, report equality
+means full deterministic semantic content.  For an immutable corpus that
+predates corrected canonical semantics, Section 7 governs instead: independent
+corrected replays/rebuilds must equal one another, while the original output is
+retained as a historical baseline rather than used as an equality oracle.  Its
+row dispositions and terminal identities may differ under the corrected
+fail-closed semantics and are never rewritten to imitate the obsolete bug.
+
 Do not test success by raising the resource limit.
 
 ## 14. Health, audit-divergence and availability tests
@@ -332,11 +343,17 @@ Required:
   chain/reconciliation, contribution reconciliation, and separate current/
   sticky reasons; explicit v1-v4 historical compatibility without synthesized
   seal fields;
-- maximum periodic/terminal v5 serialization of 30,819/44,463 bytes, exact
+- maximum periodic/terminal v5 serialization of 31,319/44,963 bytes, exact
   fixed cardinality of 2,160 periodic records plus one terminal-last record,
-  66,613,503-byte six-hour projection, 68 MiB file cap, exact 4,689,665-byte
-  margin, at least 2 MiB remaining headroom, unchanged ten-second cadence/8,192
-  count bound, and injected record/count/file overflow failure;
+  67,694,003-byte six-hour projection, 68 MiB file cap, exact 3,609,165-byte
+  margin, at least 2 MiB remaining headroom, a 32,019-byte derived periodic
+  file-budget ceiling and exact 700-byte capacity-qualification margin that do
+  not relax the 31,319-byte observed-record maximum, unchanged ten-second
+  cadence/8,192 count bound, and injected record/count/file overflow failure;
+- exact `mma-audit-stage-timing-telemetry-table-v2` shape with 17 ordered rows,
+  including independently populated response-to-PREPARE-decision and
+  response-to-ATTEST-processing histograms, with rejection of v1 row order,
+  missing rows, or mismatched histogram identities;
 - exact `audit.current_eligibility` shape and reconciliation against processor
   ineligible books, required-ineligible instruments, divergence pending and
   replacement-capture pending;
