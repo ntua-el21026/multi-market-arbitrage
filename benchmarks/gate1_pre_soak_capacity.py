@@ -3,9 +3,9 @@
 The workload uses production envelope/processor, availability lifecycle,
 completed-contributor persistence, reconciliation, and replacement-recovery
 entry points. It deliberately runs beyond the historical 4,096-event plateau,
-persists enough analytical records to force several Parquet flushes, and seals
-a small raw journal across multiple segments. No network or venue credential is
-used.
+persists enough analytical records to force production-sized Parquet flushes,
+and seals production-sized raw-journal segments. No network or venue credential
+is used.
 
 Timing and allocator observations are host diagnostics.  The workload corpus,
 ordered processor chains, terminal hash, Parquet manifest hashes, and journal
@@ -29,6 +29,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass
 from decimal import Decimal
+from itertools import pairwise
 from pathlib import Path
 from typing import cast
 
@@ -67,6 +68,7 @@ from multi_market_arbitrage.ingestion import RawEventEnvelope  # noqa: E402
 from multi_market_arbitrage.journal import (  # noqa: E402
     JournalMetricsSnapshot,
     JournalReader,
+    JournalTicket,
     JournalWriterConfig,
     RawJournalWriter,
     RunCompletionHead,
@@ -146,22 +148,27 @@ from multi_market_arbitrage.venues.polymarket import (  # noqa: E402
     PublicReadMetricsSnapshot,
 )
 
-RESULT_SCHEMA = "mma-gate1-final-pre-soak-capacity-v3"
-WORKLOAD_SCHEMA = "mma-gate1-final-pre-soak-capacity-workload-v3"
+RESULT_SCHEMA = "mma-gate1-final-pre-soak-capacity-v4"
+WORKLOAD_SCHEMA = "mma-gate1-final-pre-soak-capacity-workload-v4"
 DEFAULT_SATURATION_THRESHOLD = 4_096
 GATE1_MINIMUM_SCAN_EVENTS = 4_096
 GATE1_MINIMUM_AUDIT_OUTCOMES = 4_096
 GATE1_MINIMUM_AVAILABILITY_WRITER_CONTRIBUTIONS = 4_096
-# One whole analytical batch beyond 4,096 compares equivalent buffer phases at
-# the saturation and final checkpoints instead of measuring a mid-batch sawtooth.
-DEFAULT_SCAN_EVENTS = 4_608
-DEFAULT_AUDIT_OUTCOMES = 4_608
+# Two production-sized analytical batches beyond 4,096 compare repeated equal
+# buffer phases and exercise post-saturation flush allocator behavior.
+DEFAULT_SCAN_EVENTS = 6_096
+DEFAULT_AUDIT_OUTCOMES = 6_096
 DEFAULT_LATENCY_SAMPLES = 128
 DEFAULT_SLOPE_LATENCY_SAMPLES = 16
-DEFAULT_ANALYTICAL_BATCH_SIZE = 256
+DEFAULT_ANALYTICAL_BATCH_SIZE = 1_000
 MAXIMUM_LATENCY_SAMPLES = 4_096
-JOURNAL_EVENT_COUNT = 7
-JOURNAL_EVENTS_PER_SEGMENT = 3
+JOURNAL_EVENT_COUNT = 80_001
+JOURNAL_EVENTS_PER_SEGMENT = 10_000
+JOURNAL_PAYLOAD_BYTES = 1_400
+JOURNAL_MINIMUM_FULL_SEGMENT_SAMPLES = 8
+JOURNAL_RSS_NET_GROWTH_LIMIT_BYTES = 128 * 1024 * 1024
+JOURNAL_PYTHON_NET_GROWTH_LIMIT_BYTES = 64 * 1024 * 1024
+JOURNAL_NATIVE_RESIDUAL_NET_GROWTH_LIMIT_BYTES = 128 * 1024 * 1024
 HEALTH_CLASSIFICATION_PERIOD = 64
 MISMATCH_RESOLUTION_CAPACITY_CYCLES = 80
 FAULT_LIFECYCLE_CAPACITY_CYCLES = 40
@@ -292,7 +299,13 @@ def _bootstrap() -> tuple[RawEventEnvelope, ...]:
 
 
 def _price_change_payload(index: int) -> bytes:
-    """Return a deterministic, economically relevant two-level mutation."""
+    """Return a deterministic, phase-equivalent four-level mutation.
+
+    The ten-event quantity cycle divides the 2,000-event post-saturation
+    analytical window. Saturation and final checkpoints therefore retain the
+    same fixed-capacity object-shape distribution while refreshing both sides
+    of both required books on every event.
+    """
 
     return canonical_json_bytes(
         {
@@ -306,7 +319,7 @@ def _price_change_payload(index: int) -> bytes:
                     "hash": f"capacity-bid-{index}",
                     "price": "0.45",
                     "side": "BUY",
-                    "size": str(10 + index % 17),
+                    "size": str(10 + index % 10),
                 },
                 {
                     "asset_id": "token-yes",
@@ -315,7 +328,25 @@ def _price_change_payload(index: int) -> bytes:
                     "hash": f"capacity-ask-{index}",
                     "price": "0.55",
                     "side": "SELL",
-                    "size": str(20 + index % 19),
+                    "size": str(20 + index % 10),
+                },
+                {
+                    "asset_id": "token-no",
+                    "best_ask": "0.50",
+                    "best_bid": "0.30",
+                    "hash": f"capacity-no-bid-{index}",
+                    "price": "0.30",
+                    "side": "BUY",
+                    "size": str(30 + index % 10),
+                },
+                {
+                    "asset_id": "token-no",
+                    "best_ask": "0.50",
+                    "best_bid": "0.30",
+                    "hash": f"capacity-no-ask-{index}",
+                    "price": "0.50",
+                    "side": "SELL",
+                    "size": str(40 + index % 10),
                 },
             ],
             "timestamp": str(1_787_284_810_000 + index),
@@ -703,13 +734,64 @@ def _semantic_memory_measurement(processor: CanonicalProcessor) -> dict[str, int
 def _allocator_measurement() -> dict[str, int | None]:
     python_current, python_peak = tracemalloc.get_traced_memory()
     memory_pool = pa.default_memory_pool()
+    rss_current = _current_rss_bytes()
+    pyarrow_current = memory_pool.bytes_allocated()
     return {
+        "sampled_monotonic_ns": time.monotonic_ns(),
         "python_current_bytes": python_current,
         "python_peak_bytes": python_peak,
-        "pyarrow_current_bytes": memory_pool.bytes_allocated(),
+        "python_tracemalloc_internal_bytes": tracemalloc.get_tracemalloc_memory(),
+        "pyarrow_current_bytes": pyarrow_current,
         "pyarrow_peak_bytes": memory_pool.max_memory(),
-        "rss_current_bytes": _current_rss_bytes(),
+        "rss_current_bytes": rss_current,
         "rss_process_lifetime_peak_bytes": _peak_rss_bytes(),
+        "native_residual_bytes": (
+            None if rss_current is None else rss_current - python_current - pyarrow_current
+        ),
+    }
+
+
+def _journal_allocator_trend(
+    samples: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    sealed_samples = tuple(
+        sample for sample in samples if str(sample.get("phase", "")).startswith("sealed_")
+    )
+
+    def metric(name: str) -> dict[str, object]:
+        values = tuple(
+            cast(int, sample[name])
+            for sample in sealed_samples
+            if isinstance(sample.get(name), int)
+        )
+        if len(values) != len(sealed_samples) or not values:
+            return {
+                "start_bytes": None,
+                "end_bytes": None,
+                "net_growth_bytes": None,
+                "positive_net_growth_bytes": None,
+                "consecutive_growth_bytes": (),
+            }
+        net_growth = values[-1] - values[0]
+        return {
+            "start_bytes": values[0],
+            "end_bytes": values[-1],
+            "net_growth_bytes": net_growth,
+            "positive_net_growth_bytes": max(0, net_growth),
+            "consecutive_growth_bytes": tuple(
+                current - previous for previous, current in pairwise(values)
+            ),
+        }
+
+    return {
+        "sample_count": len(sealed_samples),
+        "first_phase": sealed_samples[0]["phase"] if sealed_samples else None,
+        "last_phase": sealed_samples[-1]["phase"] if sealed_samples else None,
+        "rss": metric("rss_current_bytes"),
+        "python": metric("python_current_bytes"),
+        "pyarrow": metric("pyarrow_current_bytes"),
+        "native_residual": metric("native_residual_bytes"),
+        "tracemalloc_internal": metric("python_tracemalloc_internal_bytes"),
     }
 
 
@@ -1807,7 +1889,7 @@ def _diagnostic_retention_independence(
     }
 
 
-def _journal_recovery_proof(
+def _journal_recovery_proof(  # pyright: ignore[reportUnusedFunction]
     submitted: tuple[RawEventEnvelope, ...],
     recovered: tuple[RawEventEnvelope, ...],
     *,
@@ -1850,7 +1932,33 @@ def _journal_recovery_proof(
     }
 
 
-async def _journal_rotation(root: Path) -> dict[str, object]:
+def _journal_capacity_payload(sequence: int, payload_bytes: int) -> bytes:
+    prefix = f'{{"journal_rotation_sequence":{sequence},"padding":"'.encode()
+    suffix = b'"}'
+    if payload_bytes < len(prefix) + len(suffix):
+        raise ValueError("journal capacity payload byte count is too small")
+    padding = bytes((65 + sequence % 26,)) * (payload_bytes - len(prefix) - len(suffix))
+    return prefix + padding + suffix
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+async def _journal_rotation(
+    root: Path,
+    *,
+    config: Phase1Config,
+    event_count: int,
+    events_per_segment: int,
+    payload_bytes: int,
+) -> dict[str, object]:
+    if event_count <= events_per_segment:
+        raise ValueError("journal capacity workload must force at least one full rotation")
     run_id = CollectorRunId("gate1-final-pre-soak-journal-rotation")
     connection_id = ConnectionId("gate1-final-pre-soak-journal-connection")
     subscription_id = SubscriptionId("gate1-final-pre-soak-journal-subscription")
@@ -1863,62 +1971,217 @@ async def _journal_rotation(root: Path) -> dict[str, object]:
             writer_id=WriterId("gate1-capacity-writer"),
             writer_software_version=RESULT_SCHEMA,
             git_commit="offline-capacity-workload-v1",
-            queue_capacity=8,
-            max_events_per_segment=JOURNAL_EVENTS_PER_SEGMENT,
-            group_commit_max_events=1,
-            group_commit_max_delay_seconds=0.0,
+            queue_capacity=config.system.queue_capacity,
+            max_events_per_segment=events_per_segment,
+            max_uncompressed_bytes_per_segment=(
+                config.storage.journal_segment_max_uncompressed_bytes
+            ),
+            max_uncompressed_bytes_per_run=config.storage.journal_run_max_uncompressed_bytes,
+            submit_timeout_seconds=config.storage.journal_submit_timeout_seconds,
+            group_commit_max_events=config.storage.journal_group_commit_max_events,
+            group_commit_max_delay_seconds=(config.storage.journal_group_commit_max_delay_seconds),
         )
     )
-    envelopes = tuple(
-        _envelope(
+    submitted_chain = hashlib.sha256()
+    expected_segments: list[dict[str, object]] = []
+    segment_payload_digest = hashlib.sha256()
+    segment_uncompressed_bytes = 0
+    segment_first_sequence = 0
+    allocator_samples: list[dict[str, object]] = [
+        {"phase": "before_start", **_allocator_measurement()}
+    ]
+    pending_allocator_boundary: tuple[int, int] | None = None
+    await writer.start()
+    tickets: list[JournalTicket] = []
+    for sequence in range(event_count):
+        envelope = _envelope(
             sequence,
             WS_MARKET,
-            canonical_json_bytes({"journal_rotation_sequence": sequence}),
+            _journal_capacity_payload(sequence, payload_bytes),
             run_id=run_id,
             connection_id=connection_id,
             subscription_id=subscription_id,
             metadata={"websocket_admission_ordinal": sequence + 1},
         )
-        for sequence in range(JOURNAL_EVENT_COUNT)
-    )
-    await writer.start()
-    for envelope in envelopes:
-        await writer.submit(envelope)
+        line = envelope.to_json_line()
+        submitted_chain.update(b"[" if sequence == 0 else b",")
+        submitted_chain.update(canonical_json_bytes(envelope.to_record()))
+        segment_payload_digest.update(line)
+        segment_uncompressed_bytes += len(line)
+        ticket = await writer.enqueue(envelope)
+        if pending_allocator_boundary is not None:
+            sealed_records, sealed_segments = pending_allocator_boundary
+            await ticket.wait_durable()
+            if writer.metrics.sealed < sealed_records:
+                raise RuntimeError("journal advanced without publishing prior sealed records")
+            allocator_samples.append(
+                {
+                    "phase": f"sealed_{sealed_segments}",
+                    "sealed_records": writer.metrics.sealed,
+                    **_allocator_measurement(),
+                }
+            )
+            pending_allocator_boundary = None
+        else:
+            tickets.append(ticket)
+        submitted_count = sequence + 1
+        segment_complete = submitted_count % events_per_segment == 0
+        if tickets and (
+            len(tickets) == config.storage.journal_group_commit_max_events
+            or submitted_count == event_count
+            or segment_complete
+        ):
+            await asyncio.gather(*(ticket.wait_durable() for ticket in tickets))
+            tickets.clear()
+        if segment_complete:
+            expected_segments.append(
+                {
+                    "event_count": events_per_segment,
+                    "first_ingest_seq": segment_first_sequence,
+                    "last_ingest_seq": sequence,
+                    "payload_digest": segment_payload_digest.hexdigest(),
+                    "uncompressed_bytes": segment_uncompressed_bytes,
+                }
+            )
+            pending_allocator_boundary = (submitted_count, len(expected_segments))
+            segment_first_sequence = submitted_count
+            segment_payload_digest = hashlib.sha256()
+            segment_uncompressed_bytes = 0
     await writer.close()
+    if pending_allocator_boundary is not None:
+        sealed_records, sealed_segments = pending_allocator_boundary
+        if writer.metrics.sealed < sealed_records:
+            raise RuntimeError("journal close omitted expected sealed records")
+        allocator_samples.append(
+            {
+                "phase": f"sealed_{sealed_segments}",
+                "sealed_records": writer.metrics.sealed,
+                **_allocator_measurement(),
+            }
+        )
+    if segment_uncompressed_bytes:
+        expected_segments.append(
+            {
+                "event_count": event_count - segment_first_sequence,
+                "first_ingest_seq": segment_first_sequence,
+                "last_ingest_seq": event_count - 1,
+                "payload_digest": segment_payload_digest.hexdigest(),
+                "uncompressed_bytes": segment_uncompressed_bytes,
+            }
+        )
+    allocator_samples.append(
+        {
+            "phase": "after_close",
+            "sealed_records": writer.metrics.sealed,
+            **_allocator_measurement(),
+        }
+    )
+    submitted_chain.update(b"]")
+    submitted_sha256 = submitted_chain.hexdigest()
+    allocator_trend = _journal_allocator_trend(allocator_samples)
     reader = JournalReader(root, run_id, stream="capacity")
-    recovered = reader.read_all()
+    recovered_chain = hashlib.sha256()
+    recovered_count = 0
+    for recovered in reader.iter_verified():
+        expected = _envelope(
+            recovered_count,
+            WS_MARKET,
+            _journal_capacity_payload(recovered_count, payload_bytes),
+            run_id=run_id,
+            connection_id=connection_id,
+            subscription_id=subscription_id,
+            metadata={"websocket_admission_ordinal": recovered_count + 1},
+        )
+        if recovered.to_json_line() != expected.to_json_line():
+            raise RuntimeError("journal recovery differs from exact submitted envelope bytes")
+        recovered_chain.update(b"[" if recovered_count == 0 else b",")
+        recovered_chain.update(canonical_json_bytes(recovered.to_record()))
+        recovered_count += 1
+    recovered_chain.update(b"]")
+    recovered_sha256 = recovered_chain.hexdigest()
     completion_heads = reader.completion_heads()
     if len(completion_heads) != 1:
         raise RuntimeError("journal capacity workload lacks exactly one completion head")
     completion = completion_heads[0]
     manifests = reader.manifests()
     segment_paths = _sealed_journal_segments(root)
-    expected_segments = math.ceil(JOURNAL_EVENT_COUNT / JOURNAL_EVENTS_PER_SEGMENT)
-    if len(recovered) != JOURNAL_EVENT_COUNT or len(segment_paths) != expected_segments:
+    expected_segment_count = math.ceil(event_count / events_per_segment)
+    if recovered_count != event_count or len(segment_paths) != expected_segment_count:
         raise RuntimeError("journal capacity workload did not rotate as configured")
     if len(manifests) != len(segment_paths):
         raise RuntimeError("journal manifest and sealed-segment inventories differ")
-    recovery_proof = _journal_recovery_proof(
-        envelopes,
-        recovered,
-        completion=completion,
-        segment_count=len(segment_paths),
-        terminal_manifest_sha256=(manifests[-1].manifest_sha256 if manifests else None),
-        expected_run_id=run_id,
-        expected_stream="capacity",
+    previous_segment_digest: str | None = None
+    for expected, manifest, segment_path in zip(
+        expected_segments,
+        manifests,
+        segment_paths,
+        strict=True,
+    ):
+        if (
+            manifest.event_count != expected["event_count"]
+            or manifest.first_ingest_seq != expected["first_ingest_seq"]
+            or manifest.last_ingest_seq != expected["last_ingest_seq"]
+            or manifest.payload_digest != expected["payload_digest"]
+            or manifest.uncompressed_bytes != expected["uncompressed_bytes"]
+            or manifest.compressed_bytes != segment_path.stat().st_size
+            or manifest.segment_digest != _sha256_path(segment_path)
+            or manifest.previous_segment_digest != previous_segment_digest
+        ):
+            raise RuntimeError("journal segment manifest differs from incremental proof")
+        previous_segment_digest = manifest.segment_digest
+    expected_uncompressed_bytes = sum(
+        cast(int, segment["uncompressed_bytes"]) for segment in expected_segments
     )
+    completion_bound = (
+        completion.collector_run_id == run_id
+        and completion.venue_id == VenueId("polymarket")
+        and completion.stream == "capacity"
+        and completion.expected_event_count == event_count
+        and completion.expected_segment_count == len(segment_paths)
+        and completion.expected_uncompressed_bytes == expected_uncompressed_bytes
+        and completion.max_uncompressed_bytes_per_segment
+        == writer.config.max_uncompressed_bytes_per_segment
+        and completion.max_uncompressed_bytes_per_run
+        == writer.config.max_uncompressed_bytes_per_run
+        and completion.first_ingest_seq == 0
+        and completion.last_ingest_seq == event_count - 1
+        and completion.terminal_manifest_sha256
+        == (manifests[-1].manifest_sha256 if manifests else None)
+    )
+    if not completion_bound:
+        raise RuntimeError("journal completion head is not cross-bound to recovered inventory")
+    if recovered_sha256 != submitted_sha256:
+        raise RuntimeError("journal submitted and recovered envelope chains differ")
     return {
-        "events": len(recovered),
-        "events_per_segment_limit": JOURNAL_EVENTS_PER_SEGMENT,
+        "events": recovered_count,
+        "events_per_segment_limit": events_per_segment,
+        "payload_bytes_per_event": payload_bytes,
         "segment_count": len(segment_paths),
         "rotation_count": max(0, len(segment_paths) - 1),
         "queue_high_water": writer.metrics.queue_high_water,
+        "writer_config": {
+            "queue_capacity": writer.config.queue_capacity,
+            "group_commit_max_events": writer.config.group_commit_max_events,
+            "group_commit_max_delay_seconds": writer.config.group_commit_max_delay_seconds,
+            "max_uncompressed_bytes_per_segment": (
+                writer.config.max_uncompressed_bytes_per_segment
+            ),
+            "max_uncompressed_bytes_per_run": writer.config.max_uncompressed_bytes_per_run,
+            "submit_timeout_seconds": writer.config.submit_timeout_seconds,
+        },
         "data_fsyncs": writer.metrics.data_fsyncs,
         "sealed_records": writer.metrics.sealed,
         "completion_expected_segments": completion.expected_segment_count,
         "completion_expected_events": completion.expected_event_count,
-        "deterministic_envelope_chain_sha256": recovery_proof["recovered_envelope_chain_sha256"],
-        **recovery_proof,
+        "completion_expected_uncompressed_bytes": completion.expected_uncompressed_bytes,
+        "deterministic_envelope_chain_sha256": recovered_sha256,
+        "submitted_envelope_chain_sha256": submitted_sha256,
+        "recovered_envelope_chain_sha256": recovered_sha256,
+        "exact_ordered_envelopes_recovered": True,
+        "completion_inventory_cross_bound": True,
+        "incremental_segment_proofs": tuple(expected_segments),
+        "allocator_samples": tuple(allocator_samples),
+        "allocator_trend": allocator_trend,
     }
 
 
@@ -2727,6 +2990,9 @@ async def run_capacity_benchmark(
     latency_samples: int = DEFAULT_LATENCY_SAMPLES,
     slope_latency_samples: int = DEFAULT_SLOPE_LATENCY_SAMPLES,
     analytical_batch_size: int = DEFAULT_ANALYTICAL_BATCH_SIZE,
+    journal_event_count: int = JOURNAL_EVENT_COUNT,
+    journal_events_per_segment: int = JOURNAL_EVENTS_PER_SEGMENT,
+    journal_payload_bytes: int = JOURNAL_PAYLOAD_BYTES,
     sequential_contributor_lifecycles: int = DEFAULT_SEQUENTIAL_CONTRIBUTOR_LIFECYCLES,
     overlapping_contributor_groups: int = DEFAULT_OVERLAPPING_CONTRIBUTOR_GROUPS,
     availability_writer_contributions: int = DEFAULT_AVAILABILITY_WRITER_CONTRIBUTIONS,
@@ -2742,6 +3008,10 @@ async def run_capacity_benchmark(
         raise ValueError("scan and audit workloads must exceed the saturation threshold")
     if analytical_batch_size <= 0:
         raise ValueError("analytical batch size must be positive")
+    if journal_events_per_segment <= 0 or journal_event_count <= journal_events_per_segment:
+        raise ValueError("journal workload must exceed a positive segment event limit")
+    if journal_payload_bytes <= 0:
+        raise ValueError("journal payload byte count must be positive")
     if sequential_contributor_lifecycles <= 0:
         raise ValueError("sequential contributor lifecycle count must be positive")
     if overlapping_contributor_groups <= 0:
@@ -2750,6 +3020,19 @@ async def run_capacity_benchmark(
         raise ValueError("scan event count must exceed the Gate-1 minimum")
     if enforce_gate1_workload_minimums and audit_outcomes <= GATE1_MINIMUM_AUDIT_OUTCOMES:
         raise ValueError("audit outcome count must exceed the Gate-1 minimum")
+    if enforce_gate1_workload_minimums and saturation_threshold != DEFAULT_SATURATION_THRESHOLD:
+        raise ValueError("saturation threshold must equal the documented Gate-1 workload")
+    if enforce_gate1_workload_minimums and (
+        scan_events - saturation_threshold < 2 * analytical_batch_size
+        or audit_outcomes - saturation_threshold < 2 * analytical_batch_size
+    ):
+        raise ValueError(
+            "scan and audit workloads must include two production batches after saturation"
+        )
+    if enforce_gate1_workload_minimums and (
+        scan_events != DEFAULT_SCAN_EVENTS or audit_outcomes != DEFAULT_AUDIT_OUTCOMES
+    ):
+        raise ValueError("scan and audit counts must equal the documented Gate-1 workload")
     if enforce_gate1_workload_minimums and sequential_contributor_lifecycles <= (
         GATE1_MINIMUM_SEQUENTIAL_CONTRIBUTOR_LIFECYCLES
     ):
@@ -2766,6 +3049,23 @@ async def run_capacity_benchmark(
         raise ValueError("availability writer contribution count is below the Gate-1 minimum")
     if not 0 < reconciliation_latency_samples <= MAXIMUM_LATENCY_SAMPLES:
         raise ValueError("reconciliation latency samples are outside the supported bound")
+    config: Phase1Config = load_phase1_config(REPOSITORY / "config" / "phase1.toml")
+    if enforce_gate1_workload_minimums and (
+        analytical_batch_size != config.storage.parquet_batch_size
+    ):
+        raise ValueError("analytical batch size must equal the production configuration")
+    if enforce_gate1_workload_minimums and (
+        journal_events_per_segment != config.storage.journal_segment_max_events
+    ):
+        raise ValueError("journal segment event limit must equal the production configuration")
+    if enforce_gate1_workload_minimums and journal_payload_bytes != JOURNAL_PAYLOAD_BYTES:
+        raise ValueError("journal payload size must equal the production-scale workload")
+    if enforce_gate1_workload_minimums and (
+        journal_event_count < journal_events_per_segment * JOURNAL_MINIMUM_FULL_SEGMENT_SAMPLES + 1
+    ):
+        raise ValueError(
+            "journal workload must include eight full production segment samples and a tail"
+        )
     _prepare_artifact_root(artifact_root)
     benchmark_process_started_ns = time.process_time_ns()
     benchmark_wall_started_ns = time.perf_counter_ns()
@@ -2779,7 +3079,6 @@ async def run_capacity_benchmark(
     baseline_trace = tracemalloc.take_snapshot()
     baseline_rss = _current_rss_bytes()
 
-    config: Phase1Config = load_phase1_config(REPOSITORY / "config" / "phase1.toml")
     analytical_root = artifact_root / "analytical"
     outputs = Phase1AnalyticalOutputs(
         root=analytical_root,
@@ -3148,9 +3447,20 @@ async def run_capacity_benchmark(
     availability_saturation = await _availability_writer_saturation(
         artifact_root / "availability-saturation"
     )
-    journal = await _journal_rotation(artifact_root / "journal")
+    journal = await _journal_rotation(
+        artifact_root / "journal",
+        config=config,
+        event_count=journal_event_count,
+        events_per_segment=journal_events_per_segment,
+        payload_bytes=journal_payload_bytes,
+    )
     if cast(int, journal["rotation_count"]) < 1:
         raise RuntimeError("journal capacity workload did not force a segment rotation")
+    journal_allocator_trend = cast(dict[str, object], journal["allocator_trend"])
+    journal_rss_trend = cast(dict[str, object], journal_allocator_trend["rss"])
+    journal_python_trend = cast(dict[str, object], journal_allocator_trend["python"])
+    journal_native_trend = cast(dict[str, object], journal_allocator_trend["native_residual"])
+    journal_writer_config = cast(dict[str, object], journal["writer_config"])
     terminal_resources = await asyncio.to_thread(
         capture_terminal_process_resources,
         artifact_root,
@@ -3270,8 +3580,13 @@ async def run_capacity_benchmark(
             "overlapping_contributors_per_group": OVERLAPPING_CONTRIBUTORS_PER_GROUP,
             "availability_writer_contributions": availability_writer_contributions,
             "production_health_classification_period": (HEALTH_CLASSIFICATION_PERIOD),
-            "journal_events": JOURNAL_EVENT_COUNT,
-            "journal_events_per_segment": JOURNAL_EVENTS_PER_SEGMENT,
+            "journal_events": journal_event_count,
+            "journal_events_per_segment": journal_events_per_segment,
+            "journal_payload_bytes": journal_payload_bytes,
+            "production_storage_limits_aligned": (
+                analytical_batch_size == config.storage.parquet_batch_size
+                and journal_events_per_segment == config.storage.journal_segment_max_events
+            ),
         },
         "processor": {
             "processed_raw_messages": terminal_summary.processed_raw_messages,
@@ -3486,6 +3801,18 @@ async def run_capacity_benchmark(
             ),
             "scan": scan_capacity_policy,
             "audit": audit_capacity_policy,
+            "journal": {
+                "minimum_full_segment_samples": JOURNAL_MINIMUM_FULL_SEGMENT_SAMPLES,
+                "rss_positive_net_growth_limit_bytes": (JOURNAL_RSS_NET_GROWTH_LIMIT_BYTES),
+                "python_positive_net_growth_limit_bytes": (JOURNAL_PYTHON_NET_GROWTH_LIMIT_BYTES),
+                "native_residual_positive_net_growth_limit_bytes": (
+                    JOURNAL_NATIVE_RESIDUAL_NET_GROWTH_LIMIT_BYTES
+                ),
+                "measurement_window": (
+                    "first completed full production segment sample through the final "
+                    "completed full production segment sample"
+                ),
+            },
         },
         "acceptance": {
             "scans_exceed_threshold": terminal_summary.scans > saturation_threshold,
@@ -3505,12 +3832,67 @@ async def run_capacity_benchmark(
                 bool, retention_independence["reported_top_domain_covered"]
             ),
             "multiple_analytical_flushes": analytical_after_close.flushes >= 2,
+            "production_storage_limits_exercised": (
+                not enforce_gate1_workload_minimums
+                or (
+                    analytical_batch_size == config.storage.parquet_batch_size
+                    and journal_events_per_segment == config.storage.journal_segment_max_events
+                    and journal_payload_bytes == JOURNAL_PAYLOAD_BYTES
+                    and journal_event_count
+                    >= journal_events_per_segment * JOURNAL_MINIMUM_FULL_SEGMENT_SAMPLES + 1
+                )
+            ),
+            "analytical_allocator_current_zero_after_close": (
+                analytical_after_close.pyarrow_current_bytes == 0
+            ),
             "journal_segment_rotation": cast(int, journal["rotation_count"]) >= 1,
             "journal_exact_ordered_envelope_recovery": (
                 journal["exact_ordered_envelopes_recovered"] is True
             ),
             "journal_completion_inventory_cross_bound": (
                 journal["completion_inventory_cross_bound"] is True
+            ),
+            "journal_repeated_full_segment_samples": (
+                not enforce_gate1_workload_minimums
+                or cast(int, journal_allocator_trend["sample_count"])
+                >= JOURNAL_MINIMUM_FULL_SEGMENT_SAMPLES
+            ),
+            "journal_rss_net_growth_within_bound": (
+                not enforce_gate1_workload_minimums
+                or (
+                    isinstance(journal_rss_trend["positive_net_growth_bytes"], int)
+                    and journal_rss_trend["positive_net_growth_bytes"]
+                    <= JOURNAL_RSS_NET_GROWTH_LIMIT_BYTES
+                )
+            ),
+            "journal_python_net_growth_within_bound": (
+                not enforce_gate1_workload_minimums
+                or (
+                    isinstance(journal_python_trend["positive_net_growth_bytes"], int)
+                    and journal_python_trend["positive_net_growth_bytes"]
+                    <= JOURNAL_PYTHON_NET_GROWTH_LIMIT_BYTES
+                )
+            ),
+            "journal_native_residual_net_growth_within_bound": (
+                not enforce_gate1_workload_minimums
+                or (
+                    isinstance(journal_native_trend["positive_net_growth_bytes"], int)
+                    and journal_native_trend["positive_net_growth_bytes"]
+                    <= JOURNAL_NATIVE_RESIDUAL_NET_GROWTH_LIMIT_BYTES
+                )
+            ),
+            "journal_writer_settings_match_production": (
+                journal_writer_config["queue_capacity"] == config.system.queue_capacity
+                and journal_writer_config["group_commit_max_events"]
+                == config.storage.journal_group_commit_max_events
+                and journal_writer_config["group_commit_max_delay_seconds"]
+                == config.storage.journal_group_commit_max_delay_seconds
+                and journal_writer_config["max_uncompressed_bytes_per_segment"]
+                == config.storage.journal_segment_max_uncompressed_bytes
+                and journal_writer_config["max_uncompressed_bytes_per_run"]
+                == config.storage.journal_run_max_uncompressed_bytes
+                and journal_writer_config["submit_timeout_seconds"]
+                == config.storage.journal_submit_timeout_seconds
             ),
             "analytical_buffers_bounded": (
                 analytical_after_close.buffered_records_high_water <= 3 * analytical_batch_size

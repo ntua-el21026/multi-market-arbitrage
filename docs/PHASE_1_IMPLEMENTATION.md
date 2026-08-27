@@ -17,9 +17,12 @@ evidence and no replacement six-hour soak was run. The preserved candidate
 baseline. Its successor implements ADR-0056 unresolved-only contributor
 ownership, independent completed-contributor persistence, cross-stream interval
 reconciliation and bounded replacement-recovery exhaustion. Deterministic
-offline gates pass; a new exact-SHA 60-second smoke and 5,400- to 7,200-second
-post-saturation stability observation still require separate public-preflight
-authorization.
+offline gates and the exact-SHA smoke passed for candidate `40acc02c...`, but
+its 7,200-second stability observation failed the mandatory post-saturation RSS
+net-growth criterion. The retained result is documented in
+`GATE_1_PUBLIC_PREFLIGHT_FAILURE_20260826.md`. The bounded-storage successor
+must repeat affected offline gates plus a new exact-SHA smoke and stability
+observation before public-preflight authorization.
 
 ## Toolchain
 
@@ -270,6 +273,16 @@ or uncompressed-byte boundary. The writer:
    durability-group size; and
 6. seals, hashes, manifests, and verifies segments independently of that
    already-established record durability.
+
+The seal path does not read the complete active file into a Python byte string
+or retain all decoded envelopes. It hashes the exact uncompressed JSONL in
+fixed-size chunks, streams Zstandard output to an atomically published sibling
+temporary file, then verifies the sealed segment by exhausting the bounded
+record iterator. The manifest binds both identities: `payload_digest` covers
+the exact uncompressed replay bytes, while `segment_digest` covers the actual
+compressed file. The compressed output is deterministic for the exact
+implementation, compressor configuration and payload, but byte identity with a
+legacy one-shot-compressor frame is not required or claimed.
 
 The watermark never advances for bytes that did not survive the successful
 `fsync`. A write/fsync failure faults the writer, closes the active handle
@@ -799,6 +812,11 @@ non-blocking enqueue, not a synchronous Parquet write. Each dataset writer also
 enforces an 8 MiB canonical record limit and 64 MiB in-memory buffer limit; it
 flushes early before admitting a record that would exceed the latter.
 
+Fragment `records_sha256` retains the exact canonical ordered-array identity,
+but is computed incrementally from one canonical record at a time. This removes
+the second batch-sized canonical JSON allocation while preserving the digest
+used by fragment manifests, dataset completion, validation and rebuild.
+
 Parquet is derived and cannot weaken the raw-capture boundary. If an analytical
 queue saturates or a writer/flush fails, the analytical subsystem becomes
 unhealthy, rejects later derived commands, aborts unflushed records, and
@@ -1275,8 +1293,9 @@ Current protocol conclusions:
 - A passing bounded calibration is only a conservative resource projection for
   the selected target; it does not establish six-hour capture coverage or pass
   Gate 1.
-- The new final-SHA 60-second smoke and 5,400–7,200 second post-saturation
-  stability evidence remain required before independent pre-soak review; older
-  public runs do not validate the current ADR-0056 implementation.
+- Candidate `40acc02c...` passed its final-SHA 60-second smoke but failed the
+  7,200-second post-saturation RSS net-growth criterion. Fresh smoke and
+  stability evidence remain required for the source-modified bounded-storage
+  successor; the retained public runs do not validate that successor.
 - Long-duration data-quality soak evidence remains an independent Gate 1
   operator activity.

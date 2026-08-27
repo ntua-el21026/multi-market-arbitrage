@@ -432,7 +432,49 @@ recovery is pending, and the suppression reason must be counted. Effective-
 interval, HTTP-latency and remaining-freshness-budget observations retain their
 initiating v2 trigger.
 
-## 16. Long-run stability tests
+## 16. Storage-finalization and long-run stability tests
+
+### 16.1 Offline storage-finalization workload
+
+The exact public candidate runs the v4 capacity benchmark with production
+storage scale and settings. Gate-minimum mode requires:
+
+- 6,096 scan-driving WebSocket events, each refreshing both sides of both
+  required books, and 6,096 audit outcomes; relative to the 4,096 saturation
+  threshold, each phase includes two complete 1,000-record post-saturation
+  analytical batches;
+- exactly 1,000 records per analytical batch;
+- a 10,000-event journal segment limit and exactly 1,400 application-payload
+  bytes per generated journal record;
+- at least 80,001 journal records, so a tail record makes all eight full
+  production-segment samples observable before close;
+- exact submitted/recovered envelope-chain equality plus manifest, segment and
+  clean-completion cross-binding;
+- first-to-last full-segment positive net growth no greater than 128 MiB RSS,
+  64 MiB traced Python current and 128 MiB native/allocator residual;
+- production queue, group-commit, segment-byte, run-byte and submit-timeout
+  configuration; and
+- zero active PyArrow allocation after analytical close.
+
+Unit and fault tests prove that journal sealing never uses whole-file
+`Path.read_bytes`, verifies without retaining a segment-sized decoded tuple,
+rejects an incomplete payload, closes temporary descriptors on failure and
+publishes only through sync plus atomic replace. They compare exact
+uncompressed/replayed content and manifest-bound output identity. They do not
+assert that streaming compressed frames are byte-identical to legacy one-shot
+frames.
+
+Analytical tests require incremental ordered-sequence hashing to equal the
+canonical-array digest exactly. Repeated production-sized flush probes must
+validate every fragment and completion without explicit GC, allocator trimming
+or memory-pool release.
+
+At saturated scan/audit phase-equivalent endpoints, retained-record and deep
+retained-byte slopes must both be exactly zero. The workload must align the
+compared phases; allocator release does not authorize a weaker acceptance
+relation.
+
+### 16.2 Public stability observation
 
 Before another six-hour soak, run 5,400–7,200 seconds against the intended
 target, preferring 7,200 seconds, and materially beyond retained-history

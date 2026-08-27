@@ -28,6 +28,7 @@ from multi_market_arbitrage.journal import (
     SegmentManifest,
     completion_path_for_run,
     load_run_completion_head,
+    verify_sealed_segment_integrity,
 )
 from multi_market_arbitrage.journal import reader as reader_module
 from multi_market_arbitrage.journal.reader import run_key_for
@@ -134,6 +135,46 @@ async def test_verified_iterator_has_only_one_active_segment_verifier(
     assert restored == expected
     assert verifier_calls == 5
     assert high_water == 1
+    assert active == 0
+
+
+@pytest.mark.asyncio
+async def test_integrity_only_verifier_does_not_retain_decoded_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = CollectorRunId("integrity-only-bounded-retention")
+    await _write_completed(tmp_path, run, count=3, max_events_per_segment=3)
+    segment_path = await asyncio.to_thread(lambda: next(tmp_path.glob("*.jsonl.zst")))
+    active = 0
+    high_water = 0
+
+    class TrackedEnvelope:
+        def __init__(self) -> None:
+            nonlocal active, high_water
+            active += 1
+            high_water = max(high_water, active)
+
+        def __del__(self) -> None:
+            nonlocal active
+            active -= 1
+
+    def tracked_records(
+        _segment_path: Path,
+        _manifest: SegmentManifest,
+        *,
+        max_uncompressed_bytes: int,
+    ) -> Iterator[TrackedEnvelope]:
+        assert max_uncompressed_bytes > 0
+        for _ in range(10_000):
+            yield TrackedEnvelope()
+
+    monkeypatch.setattr(reader_module, "_iter_verified_segment_records", tracked_records)
+
+    manifest = verify_sealed_segment_integrity(segment_path)
+
+    assert manifest.event_count == 3
+    assert high_water <= 2
     assert active == 0
 
 

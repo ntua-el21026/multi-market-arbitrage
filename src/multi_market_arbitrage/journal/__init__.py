@@ -25,6 +25,7 @@ from .reader import (
     completion_path_for_run,
     load_run_completion_head,
     verify_sealed_segment,
+    verify_sealed_segment_integrity,
 )
 from .recovery import recover_partial_file, recover_partial_segments
 from .writer import JournalTicket, RawJournalWriter
@@ -56,4 +57,5 @@ __all__ = [
     "recover_partial_file",
     "recover_partial_segments",
     "verify_sealed_segment",
+    "verify_sealed_segment_integrity",
 ]

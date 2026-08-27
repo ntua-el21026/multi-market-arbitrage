@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ sys.path.insert(0, str(REPOSITORY))
 
 from benchmarks.gate1_pre_soak_capacity import (  # noqa: E402
     _RUN_ID,  # pyright: ignore[reportPrivateUsage]
+    DEFAULT_ANALYTICAL_BATCH_SIZE,
     DEFAULT_AUDIT_OUTCOMES,
     DEFAULT_AVAILABILITY_WRITER_CONTRIBUTIONS,
     DEFAULT_OVERLAPPING_CONTRIBUTOR_GROUPS,
@@ -23,11 +25,23 @@ from benchmarks.gate1_pre_soak_capacity import (  # noqa: E402
     GATE1_MINIMUM_OVERLAPPING_CONTRIBUTOR_GROUPS,
     GATE1_MINIMUM_SCAN_EVENTS,
     GATE1_MINIMUM_SEQUENTIAL_CONTRIBUTOR_LIFECYCLES,
+    JOURNAL_EVENT_COUNT,
+    JOURNAL_EVENTS_PER_SEGMENT,
+    JOURNAL_MINIMUM_FULL_SEGMENT_SAMPLES,
+    JOURNAL_NATIVE_RESIDUAL_NET_GROWTH_LIMIT_BYTES,
+    JOURNAL_PAYLOAD_BYTES,
+    JOURNAL_PYTHON_NET_GROWTH_LIMIT_BYTES,
+    JOURNAL_RSS_NET_GROWTH_LIMIT_BYTES,
+    _bootstrap,  # pyright: ignore[reportPrivateUsage]
+    _deep_size_bytes,  # pyright: ignore[reportPrivateUsage]
     _diagnostic_retention_independence,  # pyright: ignore[reportPrivateUsage]
     _envelope,  # pyright: ignore[reportPrivateUsage]
     _failed_acceptance_names,  # pyright: ignore[reportPrivateUsage]
+    _journal_allocator_trend,  # pyright: ignore[reportPrivateUsage]
     _journal_recovery_proof,  # pyright: ignore[reportPrivateUsage]
     _phase_plateau_acceptance,  # pyright: ignore[reportPrivateUsage]
+    _price_change_payload,  # pyright: ignore[reportPrivateUsage]
+    _require_success,  # pyright: ignore[reportPrivateUsage]
     latency_distribution,
     nearest_rank,
     run_capacity_benchmark,
@@ -39,6 +53,7 @@ from multi_market_arbitrage.pipeline.processor import ProcessorRetentionDomain  
 
 
 def test_gate1_capacity_defaults_exceed_historical_plateau() -> None:
+    config = load_phase1_config(REPOSITORY / "config" / "phase1.toml")
     assert DEFAULT_SCAN_EVENTS > DEFAULT_SATURATION_THRESHOLD == 4_096
     assert DEFAULT_AUDIT_OUTCOMES > DEFAULT_SATURATION_THRESHOLD
     assert (
@@ -54,11 +69,72 @@ def test_gate1_capacity_defaults_exceed_historical_plateau() -> None:
     assert DEFAULT_AVAILABILITY_WRITER_CONTRIBUTIONS >= 4_096
     assert DEFAULT_SCAN_EVENTS > GATE1_MINIMUM_SCAN_EVENTS == 4_096
     assert DEFAULT_AUDIT_OUTCOMES > GATE1_MINIMUM_AUDIT_OUTCOMES == 4_096
+    assert DEFAULT_ANALYTICAL_BATCH_SIZE == config.storage.parquet_batch_size == 1_000
+    assert JOURNAL_EVENTS_PER_SEGMENT == config.storage.journal_segment_max_events == 10_000
+    assert (
+        JOURNAL_EVENT_COUNT // JOURNAL_EVENTS_PER_SEGMENT
+        >= JOURNAL_MINIMUM_FULL_SEGMENT_SAMPLES
+        == 8
+    )
+    assert JOURNAL_EVENT_COUNT == 80_001
+    assert JOURNAL_EVENT_COUNT % JOURNAL_EVENTS_PER_SEGMENT == 1
+    assert DEFAULT_SCAN_EVENTS - DEFAULT_SATURATION_THRESHOLD >= 2 * DEFAULT_ANALYTICAL_BATCH_SIZE
+    assert (
+        DEFAULT_AUDIT_OUTCOMES - DEFAULT_SATURATION_THRESHOLD >= 2 * DEFAULT_ANALYTICAL_BATCH_SIZE
+    )
     assert (
         DEFAULT_AVAILABILITY_WRITER_CONTRIBUTIONS
         >= GATE1_MINIMUM_AVAILABILITY_WRITER_CONTRIBUTIONS
         == 4_096
     )
+
+
+def test_scan_payload_quantity_cycle_is_phase_equivalent_across_v4_window() -> None:
+    def quantities(index: int) -> tuple[str, ...]:
+        payload = cast(dict[str, object], json.loads(_price_change_payload(index)))
+        changes = cast(list[dict[str, object]], payload["price_changes"])
+        return tuple(cast(str, change["size"]) for change in changes)
+
+    threshold_window = tuple(quantities(index) for index in range(3_840, 4_096))
+    final_window = tuple(quantities(index) for index in range(5_840, 6_096))
+
+    assert threshold_window == final_window
+
+
+def test_scan_workload_retained_graph_is_exactly_phase_equivalent() -> None:
+    config = load_phase1_config(REPOSITORY / "config" / "phase1.toml")
+    processor = CanonicalProcessor(config)
+    bootstrap = _bootstrap()
+    for envelope in bootstrap:
+        _require_success(processor.process_replayed(envelope), label="phase probe bootstrap")
+    sequence = len(bootstrap)
+    checkpoints: dict[int, tuple[int, tuple[tuple[str, int], ...]]] = {}
+    for index in range(DEFAULT_SCAN_EVENTS):
+        result = processor.process_replayed(
+            _envelope(
+                sequence,
+                WS_MARKET,
+                _price_change_payload(index),
+                metadata={"websocket_admission_ordinal": index + 1},
+            )
+        )
+        _require_success(result, label=f"phase probe scan {index}")
+        sequence += 1
+        count = index + 1
+        if count in {DEFAULT_SATURATION_THRESHOLD, DEFAULT_SCAN_EVENTS}:
+            retained = processor.scan_results
+            checkpoints[count] = (
+                _deep_size_bytes(retained),
+                tuple(
+                    sorted(
+                        (item.disposition.value, len(item.validation_results)) for item in retained
+                    )
+                ),
+            )
+
+    assert len(checkpoints) == 2
+    assert checkpoints[DEFAULT_SATURATION_THRESHOLD] == checkpoints[DEFAULT_SCAN_EVENTS]
+    assert set(checkpoints[DEFAULT_SCAN_EVENTS][1]) == {("NO_CANDIDATE", 5)}
 
 
 @pytest.mark.asyncio
@@ -112,6 +188,50 @@ async def test_gate1_capacity_rejects_undersized_stream_workloads(tmp_path: Path
         )
 
 
+@pytest.mark.asyncio
+async def test_gate1_capacity_requires_production_storage_scale(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="saturation threshold"):
+        await run_capacity_benchmark(
+            tmp_path / "wrong-saturation-threshold",
+            saturation_threshold=DEFAULT_SATURATION_THRESHOLD - 1,
+        )
+    with pytest.raises(ValueError, match="scan and audit counts"):
+        await run_capacity_benchmark(
+            tmp_path / "wrong-scan-count",
+            scan_events=DEFAULT_SCAN_EVENTS + 1,
+        )
+    with pytest.raises(ValueError, match="scan and audit counts"):
+        await run_capacity_benchmark(
+            tmp_path / "wrong-audit-count",
+            audit_outcomes=DEFAULT_AUDIT_OUTCOMES + 1,
+        )
+    with pytest.raises(ValueError, match="two production batches"):
+        await run_capacity_benchmark(
+            tmp_path / "short-post-saturation",
+            scan_events=DEFAULT_SATURATION_THRESHOLD + DEFAULT_ANALYTICAL_BATCH_SIZE,
+        )
+    with pytest.raises(ValueError, match="analytical batch size"):
+        await run_capacity_benchmark(
+            tmp_path / "wrong-analytical-batch",
+            analytical_batch_size=DEFAULT_ANALYTICAL_BATCH_SIZE - 1,
+        )
+    with pytest.raises(ValueError, match="journal segment event limit"):
+        await run_capacity_benchmark(
+            tmp_path / "wrong-journal-segment",
+            journal_events_per_segment=JOURNAL_EVENTS_PER_SEGMENT - 1,
+        )
+    with pytest.raises(ValueError, match="journal payload size"):
+        await run_capacity_benchmark(
+            tmp_path / "small-journal-payload",
+            journal_payload_bytes=JOURNAL_PAYLOAD_BYTES - 1,
+        )
+    with pytest.raises(ValueError, match="eight full production segment samples and a tail"):
+        await run_capacity_benchmark(
+            tmp_path / "short-journal-window",
+            journal_event_count=(JOURNAL_EVENTS_PER_SEGMENT * JOURNAL_MINIMUM_FULL_SEGMENT_SAMPLES),
+        )
+
+
 def test_capacity_latency_distribution_uses_deterministic_nearest_rank() -> None:
     samples = (1, 2, 3, 4, 5, 100)
 
@@ -143,6 +263,9 @@ async def test_capacity_workload_saturates_production_histories_and_persistence(
         latency_samples=3,
         slope_latency_samples=4,
         analytical_batch_size=32,
+        journal_event_count=7,
+        journal_events_per_segment=3,
+        journal_payload_bytes=64,
         sequential_contributor_lifecycles=128,
         overlapping_contributor_groups=16,
         availability_writer_contributions=64,
@@ -336,6 +459,33 @@ def test_capacity_cli_failure_projection_is_sorted_and_fail_closed() -> None:
     assert _failed_acceptance_names(
         {"acceptance": {"zeta": True, "beta": False, "alpha": None}}
     ) == ("alpha", "beta")
+
+
+def test_journal_allocator_trend_exposes_fail_closed_rotation_growth() -> None:
+    samples: tuple[dict[str, object], ...] = tuple(
+        {
+            "phase": f"sealed_{index}",
+            "rss_current_bytes": index * 32 * 1024 * 1024,
+            "python_current_bytes": index * 16 * 1024 * 1024,
+            "pyarrow_current_bytes": 0,
+            "native_residual_bytes": index * 16 * 1024 * 1024,
+            "python_tracemalloc_internal_bytes": index * 1024,
+        }
+        for index in range(1, JOURNAL_MINIMUM_FULL_SEGMENT_SAMPLES + 1)
+    )
+
+    trend = _journal_allocator_trend(samples)
+    rss = cast(dict[str, object], trend["rss"])
+    python = cast(dict[str, object], trend["python"])
+    native = cast(dict[str, object], trend["native_residual"])
+
+    assert trend["sample_count"] == JOURNAL_MINIMUM_FULL_SEGMENT_SAMPLES
+    assert cast(int, rss["positive_net_growth_bytes"]) > JOURNAL_RSS_NET_GROWTH_LIMIT_BYTES
+    assert cast(int, python["positive_net_growth_bytes"]) > JOURNAL_PYTHON_NET_GROWTH_LIMIT_BYTES
+    assert (
+        cast(int, native["positive_net_growth_bytes"])
+        <= JOURNAL_NATIVE_RESIDUAL_NET_GROWTH_LIMIT_BYTES
+    )
 
 
 def test_journal_recovery_proof_rejects_reordering_and_completion_mismatch() -> None:

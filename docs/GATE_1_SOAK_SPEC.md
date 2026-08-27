@@ -16,14 +16,20 @@ between immutable mismatch history and current unresolved state; ADR-0055
 separates internal correctness from externally unattributable cause and adds
 fault/contribution/resource evidence; ADR-0056 separates active contributor
 authority from completed history and bounds replacement recovery. None rewrites
-that failed result. ADR-0056 implementation and offline validation are complete;
-independent authorization for a new public preflight remains pending.
+that failed result. ADR-0056 implementation and offline validation were
+complete for candidate `40acc02c...`; its later exact-SHA public smoke passed,
+but its 7,200-second stability observation failed the mandatory post-saturation
+RSS net-growth criterion, as
+recorded in `GATE_1_PUBLIC_PREFLIGHT_FAILURE_20260826.md`. A bounded
+storage-finalization transient correction and complete exact-SHA
+requalification remain pending.
 
 A fresh six-hour run is mandatory after ADR-0053 through ADR-0056 and
 `GATE_1_REMEDIATION_SPEC.md` are implemented and independently approved through
 failed-run replay, a new post-fix 60-second smoke and a new 5,400- to 7,200-
-second stability observation. The remediation task does not run that six-hour
-soak.
+second stability observation. Candidate `40acc02c...` did not satisfy this
+precondition, and its passing smoke cannot qualify a source-modified successor.
+The remediation task does not run that six-hour soak.
 
 ## 2. Objective
 

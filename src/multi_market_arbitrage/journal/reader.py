@@ -306,6 +306,23 @@ def verify_sealed_segment(
     )
 
 
+def verify_sealed_segment_integrity(
+    segment_path: Path,
+    *,
+    max_uncompressed_bytes: int = DEFAULT_MAX_UNCOMPRESSED_SEGMENT_BYTES,
+) -> SegmentManifest:
+    """Verify one sealed segment while retaining no decoded record inventory."""
+
+    manifest = load_segment_manifest(manifest_path_for_segment(segment_path))
+    for _ in _iter_verified_segment_records(
+        segment_path,
+        manifest,
+        max_uncompressed_bytes=max_uncompressed_bytes,
+    ):
+        pass
+    return manifest
+
+
 class JournalReader:
     """Read one collector run in its deterministic scoped ingest order."""
 
@@ -757,4 +774,5 @@ __all__ = [
     "manifest_path_for_segment",
     "run_key_for",
     "verify_sealed_segment",
+    "verify_sealed_segment_integrity",
 ]

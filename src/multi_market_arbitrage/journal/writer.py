@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import tempfile
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from itertools import pairwise
@@ -40,7 +41,7 @@ from .reader import (
     completion_path_for_run,
     manifest_path_for_segment,
     run_key_for,
-    verify_sealed_segment,
+    verify_sealed_segment_integrity,
 )
 from .recovery import atomic_write_bytes, fsync_directory, recover_partial_file
 
@@ -75,6 +76,88 @@ class _ActiveSegmentState:
 class _CommitResult:
     receipts: tuple[JournalReceipt, ...]
     seal_after: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _SealedPayloadIdentity:
+    uncompressed_bytes: int
+    compressed_bytes: int
+    payload_digest: str
+    segment_digest: str
+
+
+_SEAL_STREAM_CHUNK_BYTES = 1024 * 1024
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(_SEAL_STREAM_CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _stream_sealed_payload(
+    source_path: Path,
+    destination_path: Path,
+    *,
+    expected_uncompressed_bytes: int,
+    zstd_level: int,
+) -> _SealedPayloadIdentity:
+    """Hash and compress a segment with bounded buffers, then publish atomically."""
+
+    payload_digest = hashlib.sha256()
+    uncompressed_bytes = 0
+    final_byte = b""
+    if expected_uncompressed_bytes <= 0:
+        raise JournalWriteError("cannot seal a segment with non-positive byte accounting")
+    if source_path.stat().st_size != expected_uncompressed_bytes:
+        raise JournalWriteError("active segment byte accounting differs from file content")
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination_path.name}.",
+        suffix=".tmp",
+        dir=destination_path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        try:
+            destination_handle = os.fdopen(descriptor, "wb")
+        except BaseException:
+            with suppress(OSError):
+                os.close(descriptor)
+            raise
+        with destination_handle as destination, source_path.open("rb") as source:
+            with zstandard.ZstdCompressor(level=zstd_level).stream_writer(
+                destination,
+                size=expected_uncompressed_bytes,
+                closefd=False,
+            ) as compressor:
+                while chunk := source.read(_SEAL_STREAM_CHUNK_BYTES):
+                    uncompressed_bytes += len(chunk)
+                    payload_digest.update(chunk)
+                    final_byte = chunk[-1:]
+                    compressor.write(chunk)
+                if uncompressed_bytes != expected_uncompressed_bytes:
+                    raise JournalWriteError(
+                        "active segment byte accounting differs from file content"
+                    )
+                if final_byte != b"\n":
+                    raise JournalWriteError("cannot seal an empty or incomplete segment payload")
+            destination.flush()
+            os.fsync(destination.fileno())
+        compressed_bytes = temporary.stat().st_size
+        segment_digest = _sha256_file(temporary)
+        os.replace(temporary, destination_path)
+        fsync_directory(destination_path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return _SealedPayloadIdentity(
+        uncompressed_bytes=uncompressed_bytes,
+        compressed_bytes=compressed_bytes,
+        payload_digest=payload_digest.hexdigest(),
+        segment_digest=segment_digest,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -617,8 +700,7 @@ class RawJournalWriter:
         for sealed_path in sorted(self._config.root.glob(pattern)):
             manifest_path = manifest_path_for_segment(sealed_path)
             if manifest_path.exists():
-                segment = verify_sealed_segment(sealed_path)
-                manifest = segment.manifest
+                manifest = verify_sealed_segment_integrity(sealed_path)
                 if manifest.uncompressed_bytes > self._config.max_uncompressed_bytes_per_segment:
                     raise JournalConfigurationError(
                         f"sealed segment exceeds configured byte budget: {sealed_path}"
@@ -699,7 +781,7 @@ class RawJournalWriter:
                     manifest_path,
                     canonical_json_bytes(manifest.to_record()) + b"\n",
                 )
-                verify_sealed_segment(sealed_path)
+                verify_sealed_segment_integrity(sealed_path)
                 self._metrics.recovered_records += len(envelopes)
                 self._metrics.sealed += len(envelopes)
                 self._metrics.verified += len(envelopes)
@@ -904,16 +986,15 @@ class RawJournalWriter:
             raise JournalWriteError("cannot seal an active segment with uncommitted bytes")
         handle.close()
         self._handle = None
-        payload = active.path.read_bytes()
-        if len(payload) != active.uncompressed_bytes:
-            raise JournalWriteError("active segment byte accounting differs from file content")
-        if not payload.endswith(b"\n"):
-            raise JournalWriteError("cannot seal a segment with an incomplete record tail")
-        compressed = zstandard.ZstdCompressor(level=self._config.zstd_level).compress(payload)
         sealed_path = self._sealed_path(active.first_ingest_seq, active.last_ingest_seq)
         if sealed_path.exists() or manifest_path_for_segment(sealed_path).exists():
             raise JournalWriteError(f"refusing to overwrite sealed journal segment: {sealed_path}")
-        atomic_write_bytes(sealed_path, compressed)
+        payload_identity = _stream_sealed_payload(
+            active.path,
+            sealed_path,
+            expected_uncompressed_bytes=active.uncompressed_bytes,
+            zstd_level=self._config.zstd_level,
+        )
         manifest = SegmentManifest(
             journal_format_version=JOURNAL_MANIFEST_VERSION,
             writer_id=self._config.writer_id,
@@ -925,10 +1006,10 @@ class RawJournalWriter:
             start_time=active.start_time,
             end_time=active.end_time,
             event_count=active.event_count,
-            uncompressed_bytes=len(payload),
-            compressed_bytes=len(compressed),
-            payload_digest=hashlib.sha256(payload).hexdigest(),
-            segment_digest=hashlib.sha256(compressed).hexdigest(),
+            uncompressed_bytes=payload_identity.uncompressed_bytes,
+            compressed_bytes=payload_identity.compressed_bytes,
+            payload_digest=payload_identity.payload_digest,
+            segment_digest=payload_identity.segment_digest,
             previous_segment_digest=self._previous_segment_digest,
             writer_software_version=self._config.writer_software_version,
             git_commit=self._config.git_commit,
@@ -938,8 +1019,8 @@ class RawJournalWriter:
         manifest_path = manifest_path_for_segment(sealed_path)
         atomic_write_bytes(manifest_path, canonical_json_bytes(manifest.to_record()) + b"\n")
         self._metrics.sealed += active.event_count
-        verified = verify_sealed_segment(sealed_path)
-        if verified.manifest.manifest_sha256 != manifest.manifest_sha256:
+        verified_manifest = verify_sealed_segment_integrity(sealed_path)
+        if verified_manifest.manifest_sha256 != manifest.manifest_sha256:
             raise JournalWriteError("post-seal manifest verification changed content identity")
         self._metrics.verified += active.event_count
         self._previous_segment_digest = manifest.segment_digest

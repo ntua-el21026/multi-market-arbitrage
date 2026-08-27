@@ -7,6 +7,7 @@ import threading
 from pathlib import Path
 
 import pytest
+import zstandard
 
 from multi_market_arbitrage.core.ids import (
     CollectorRunId,
@@ -26,6 +27,9 @@ from multi_market_arbitrage.journal import (
     JournalWriteError,
     JournalWriterConfig,
     RawJournalWriter,
+)
+from multi_market_arbitrage.journal.writer import (
+    _stream_sealed_payload,  # pyright: ignore[reportPrivateUsage]
 )
 
 
@@ -579,3 +583,149 @@ async def test_clean_segment_seal_does_not_repeat_partial_file_fsync(
     await writer.close()
     assert partial_fsyncs == 1
     assert writer.metrics.data_fsyncs == 1
+
+
+@pytest.mark.asyncio
+async def test_normal_segment_seal_never_materializes_whole_segment_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = CollectorRunId("bounded-stream-seal-run")
+    writer = RawJournalWriter(
+        writer_config(
+            tmp_path,
+            run,
+            group_commit_max_events=2,
+            group_commit_max_delay_seconds=1.0,
+            max_events_per_segment=2,
+        )
+    )
+    original_read_bytes = Path.read_bytes
+
+    def reject_whole_segment_read(path: Path) -> bytes:
+        if path.name.endswith((".jsonl.partial", ".jsonl.zst")):
+            raise AssertionError(f"whole segment read attempted: {path}")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_whole_segment_read)
+    expected = tuple(envelope(run, sequence, payload=b"x" * (1024 * 1024)) for sequence in range(2))
+
+    await writer.start()
+    receipts = await asyncio.gather(*(writer.submit(item) for item in expected))
+    await writer.close()
+
+    assert [receipt.ingest_seq for receipt in receipts] == [0, 1]
+    assert JournalReader(tmp_path, run, stream="market").read_all() == expected
+    assert writer.metrics.sealed == 2
+    assert writer.metrics.verified == 2
+    segment_path = await asyncio.to_thread(lambda: next(tmp_path.glob("*.jsonl.zst")))
+    with segment_path.open("rb") as handle:
+        compressed = handle.read()
+    assert zstandard.ZstdDecompressor().decompress(compressed) == b"".join(
+        item.to_json_line() for item in expected
+    )
+
+
+def test_stream_seal_closes_descriptor_when_fdopen_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.partial"
+    source.write_bytes(b'{"event":1}\n')
+    destination = tmp_path / "destination.jsonl.zst"
+    original_fdopen = os.fdopen
+    closed_descriptors: list[int] = []
+
+    def reject_fdopen(descriptor: int, mode: str) -> object:
+        del mode
+        closed_descriptors.append(descriptor)
+        raise OSError("synthetic fdopen failure")
+
+    monkeypatch.setattr(os, "fdopen", reject_fdopen)
+    with pytest.raises(OSError, match="synthetic fdopen failure"):
+        _stream_sealed_payload(
+            source,
+            destination,
+            expected_uncompressed_bytes=source.stat().st_size,
+            zstd_level=3,
+        )
+    monkeypatch.setattr(os, "fdopen", original_fdopen)
+
+    assert len(closed_descriptors) == 1
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(closed_descriptors[0])
+    assert not destination.exists()
+    assert tuple(tmp_path.glob(".destination.jsonl.zst.*.tmp")) == ()
+
+
+@pytest.mark.parametrize("expected_bytes", [1, 10_000])
+def test_stream_seal_accounting_mismatch_never_publishes_destination(
+    tmp_path: Path,
+    expected_bytes: int,
+) -> None:
+    source = tmp_path / "source.partial"
+    source.write_bytes(b'{"event":1}\n')
+    destination = tmp_path / "destination.jsonl.zst"
+
+    with pytest.raises(JournalWriteError, match="byte accounting differs"):
+        _stream_sealed_payload(
+            source,
+            destination,
+            expected_uncompressed_bytes=expected_bytes,
+            zstd_level=3,
+        )
+
+    assert not destination.exists()
+    assert tuple(tmp_path.glob(".destination.jsonl.zst.*.tmp")) == ()
+
+
+def test_stream_seal_incomplete_tail_never_publishes_destination(tmp_path: Path) -> None:
+    source = tmp_path / "source.partial"
+    source.write_bytes(b'{"event":1}')
+    destination = tmp_path / "destination.jsonl.zst"
+
+    with pytest.raises(JournalWriteError, match="empty or incomplete"):
+        _stream_sealed_payload(
+            source,
+            destination,
+            expected_uncompressed_bytes=source.stat().st_size,
+            zstd_level=3,
+        )
+
+    assert not destination.exists()
+    assert tuple(tmp_path.glob(".destination.jsonl.zst.*.tmp")) == ()
+
+
+@pytest.mark.parametrize("failure_point", ["fsync", "replace"])
+def test_stream_seal_publication_failure_cleans_temporary_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    source = tmp_path / "source.partial"
+    source.write_bytes(b'{"event":1}\n')
+    destination = tmp_path / "destination.jsonl.zst"
+
+    if failure_point == "fsync":
+
+        def fail_fsync(_descriptor: int) -> None:
+            raise OSError("fsync")
+
+        monkeypatch.setattr(os, "fsync", fail_fsync)
+    else:
+
+        def fail_replace(_source: Path, _destination: Path) -> None:
+            raise OSError("replace")
+
+        monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match=failure_point):
+        _stream_sealed_payload(
+            source,
+            destination,
+            expected_uncompressed_bytes=source.stat().st_size,
+            zstd_level=3,
+        )
+
+    assert not destination.exists()
+    assert tuple(tmp_path.glob(".destination.jsonl.zst.*.tmp")) == ()

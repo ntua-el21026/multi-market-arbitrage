@@ -14,7 +14,7 @@ Every stage ends with tests, reproducible evidence and an explicit gate. Code pr
 | F1 — Canonical core | Implemented |
 | F2 — Immutable raw journal | Implemented |
 | F3 — Canonical analytical storage | Implemented; incremental long-run report path present |
-| P1 — Polymarket read-only vertical slice | Implemented baseline; ADR-0053/0054/0055 candidate preserved; ADR-0056 implementation and offline gates complete |
+| P1 — Polymarket read-only vertical slice | Implemented baseline; ADR-0053 through ADR-0056 present; bounded storage-finalization correction under exact-SHA qualification |
 | P2 — Ordinary-binary complete-set scanner | Implemented |
 | P3 — Deterministic replay/rebuild | Implemented and passed first-soak review |
 | P4 — First six-hour Polymarket soak | Executed; `GATE 1: FAIL` |
@@ -30,11 +30,15 @@ fault-lifecycle, interval-contribution, typed-resync and local classification-
 latency defects. The later pre-soak stability attempt exposed that completed
 contributor history was retained in active authority until the shared interval
 closed and that replacement capture lacked bounded exhaustion. ADR-0056 now
-governs those corrections. Implementation, deterministic retained-corpus
-regression, strict capacity evidence and final offline quality gates are
-complete. Independent public-preflight authorization, a new exact-SHA 60-second
-smoke and 5,400–7,200 second post-fix stability evidence remain pending. No
-six-hour rerun was performed.
+governs those corrections. Exact candidate
+`40acc02c3e6499a38675c3f8368fab3399488279` passed its 60-second public smoke
+and completed a 7,200-second stability observation, but failed the mandatory
+post-saturation RSS net-growth predicate (`535,859,200 B` observed versus
+`134,217,728 B` allowed). The retained result is documented in
+`GATE_1_PUBLIC_PREFLIGHT_FAILURE_20260826.md`. A narrow bounded
+storage-finalization transient correction is under requalification; its new
+exact SHA must repeat all affected offline gates, smoke and stability evidence.
+No six-hour rerun was performed.
 
 ## 2. Completed foundation
 
@@ -202,6 +206,9 @@ ADR-0055 and ADR-0056.
 ### R7 — Short preflight
 
 - full lock/SCA/lint/type/test/pre-commit/build/no-live gates;
+- v4 full-capacity evidence with two production post-saturation analytical
+  batches, eight completed full journal-segment samples and fail-closed
+  RSS/Python/native-residual net-growth bounds;
 - 60-second explicit-target smoke;
 - 5,400–7,200 second post-saturation stability observation, preferring 7,200;
 - independent review of transitions, audit triggers, causal mismatches,
@@ -210,9 +217,10 @@ ADR-0055 and ADR-0056.
   replacement retry/exhaustion, chronology, operational/terminal latency,
   memory attribution/plateau, queues, tails and storage.
 
-ADR-0056 implementation and offline gates are complete. The post-fix final-SHA
-smoke and stability runs remain pending separate independent authorization.
-Older public runs are forensic inputs, not acceptance of this candidate.
+Candidate `40acc02c...` passed the final-SHA smoke but failed the stability RSS
+net-growth bound. The source-modified bounded-storage successor must repeat the
+full v4 capacity workload, final-SHA smoke and stability runs. Retained public
+runs are forensic inputs, not acceptance of the successor.
 
 ### R8 — Fresh six-hour soak
 

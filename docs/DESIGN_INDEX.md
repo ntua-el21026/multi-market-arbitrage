@@ -57,6 +57,7 @@ If current normative documents conflict, stop and report the contradiction.
 | `PHASE_1_PERFORMANCE_BASELINE.md` | Historical measured performance evidence |
 | `GATE_1_SOAK_SPEC.md` | Normative Gate-1 acceptance contract |
 | `GATE_1_FAILURE_20260822.md` | Evidence/status summary for first failed six-hour soak |
+| `GATE_1_PUBLIC_PREFLIGHT_FAILURE_20260826.md` | Evidence/status summary for the exact-SHA public smoke and failed 7,200-second memory qualification |
 | `GATE_1_REMEDIATION_SPEC.md` | Normative current correction/rerun scope |
 | ADR-0052 | Continuous capture, audit fencing and Gate-1 evidence |
 | ADR-0053 | Bounded reported-top transition state |

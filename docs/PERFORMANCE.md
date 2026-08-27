@@ -394,9 +394,16 @@ identity. This section intentionally records no unexecuted benchmark result.
 ## 18. ADR-0055/ADR-0056 operational-snapshot and saturation gate
 
 Before the next public candidate is accepted, the exact implementation SHA must
-run one deterministic offline saturation benchmark that exceeds 4,096 scans,
-4,096 audit outcomes, multiple analytical flushes, and one journal segment
-rotation.
+run the `mma-gate1-final-pre-soak-capacity-v4` deterministic offline saturation
+benchmark. Its default Gate workload uses 6,096 scan-driving WebSocket events
+and 6,096 audit outcomes. Every scan-driving event refreshes both sides of both
+required books. Relative to the 4,096 saturation threshold, each phase contains
+two complete production 1,000-record post-saturation analytical batches. It
+also journals exactly 80,001 records with exactly 1,400 application-payload
+bytes per record against the production 10,000-event segment limit. The tail
+record forces all eight full-segment seal samples to complete before close.
+Gate-minimum mode rejects any other analytical batch size, journal segment
+limit or payload size, and any journal event count below `8 * 10,000 + 1`.
 
 Measure and retain:
 
@@ -413,7 +420,8 @@ Measure and retain:
   availability/contribution writers;
 - Python allocation groups, PyArrow current/peak allocated bytes, process
   current/peak RSS, native/allocator residual and post-saturation slope;
-- queue high-water marks, batch flushes, history saturation and segment seals;
+- queue high-water marks, batch flushes, history saturation and at least eight
+  full production segment seals;
 - independent received-prefix oracle cost/results, fault-lifecycle transitions,
   interval-contribution construction/reconciliation and typed-resync routing;
 - true concurrent-active contributor occupancy separately from cumulative
@@ -464,7 +472,7 @@ uv run --frozen --all-groups --no-sync python benchmarks/gate1_pre_soak_capacity
   --output "${capacity_root}/final-capacity-benchmark.json"
 ```
 
-The `mma-gate1-final-pre-soak-capacity-v3` JSON includes `latency`,
+The `mma-gate1-final-pre-soak-capacity-v4` JSON includes `latency`,
 `history_retention`, `post_saturation`, `domain_capacity`, `production_health`,
 `memory`, `analytical`, `journal`, `acceptance_policy`, and `acceptance`.
 `domain_capacity` separately saturates mismatch/resolution, audit-fault,
@@ -489,10 +497,19 @@ record plus one 1-MiB CPython allocator arena per bounded processor/analytical
 domain amortized over the measured interval (and one RSS page per event);
 equivalent analytical batch phases require zero PyArrow current-byte growth.
 Saturated scan/audit retained-record and deep retained-byte slopes must be
-exactly zero over the declared endpoint interval. Every consecutive
-post-capacity window must retain a fixed record count and may grow by no more
-than one measured record phase; bounded shrinkage is not misclassified as
-growth. All formulas and numerical limits are emitted in `acceptance_policy`.
+exactly zero over the declared endpoint interval. Endpoint measurements must be
+phase-equivalent. Every consecutive post-capacity window must retain a fixed
+record count and may grow by no more than one measured record phase. All
+formulas and numerical limits are emitted in `acceptance_policy`.
+
+The v4 journal window compares the first through eighth completed full-segment
+samples. Positive first-to-last net growth is capped independently at 128 MiB
+RSS, 64 MiB traced Python current and 128 MiB native/allocator residual. It also
+requires production queue/group-commit/run-byte settings, exact ordered replay,
+manifest/completion cross-binding and zero active PyArrow allocation after
+analytical close. These offline predicates strengthen storage-transient
+coverage; they do not replace or relax the separate public post-saturation RSS
+formula.
 
 After offline gates, the exact SHA must pass a new 60-second explicit-target
 smoke and a 5,400- to 7,200-second post-fix stability observation, preferring 7,200
@@ -501,8 +518,9 @@ The stability report must include operational/terminal latency, stage-specific
 audit timing, fault/divergence/contribution lifecycles, history occupancy,
 Python/PyArrow/RSS attribution and a defensible post-saturation plateau.
 
-The successor's strict offline run exercised 10,001 sequential lifecycles, 1,001
-overlapping groups, 4,608 scans/audit outcomes, 4,096 durable interval/
+The predecessor v3 offline run for candidate `40acc02c...` exercised 10,001
+sequential lifecycles, 1,001 overlapping groups, 4,608 scans/audit outcomes,
+4,096 durable interval/
 contribution pairs, the genuine 64/attempted-65 active boundary, recovery
 exhaustion, 56 analytical flushes and two journal rotations. All 58 acceptance
 predicates passed. The six-hour availability projection is 5,566 intervals plus
@@ -510,6 +528,25 @@ predicates passed. The six-hour availability projection is 5,566 intervals plus
 bounds. Active retained bytes remained constant after each sequential
 completion, and operational-snapshot p95 did not grow with cumulative history.
 
-This offline result does not claim a public smoke, stability observation,
-six-hour soak or Gate-1 pass. Those require separate authorization and exact-SHA
-public evidence.
+The later public observation exposed post-saturation RSS growth that this v3
+workload did not bound at production storage-finalization scale. The v3 result
+is retained forensic evidence, not qualification of the corrected source.
+
+The authoritative pre-freeze working-tree run of the corrected dual-book v4
+workload completed with exit zero on 2026-08-27 and all 65 acceptance predicates
+true. It exercised 6,096 scan-driving events across both required books, 6,096
+audit outcomes, 24,389 analytical records across 27 flushes, and 80,001 journal
+records across eight full 10,000-record segments plus one tail record. From the
+first through eighth full-segment samples, RSS, traced-Python-current and native-
+residual net growth were respectively `48,582,656 B`, `17,520 B` and
+`48,565,136 B`, within the unchanged `128 MiB`, `64 MiB` and `128 MiB` bounds.
+The exact-zero saturated retained-record and deep-retained-byte predicates also
+passed. The retained result is
+`/home/peppaspan/mma_gate1_memory_remediation/20260827T010509Z_40acc02c3e64/offline/final-capacity-v4-publication-guard-final.json`
+(SHA-256 `aa626aa03eff5ee4c9d2cf767f7cf93eb42565e5422f8bfcf578f4f755340df2`).
+
+This is authoritative correction evidence before source freeze, not final
+exact-SHA qualification: it was not run from a new clean successor commit. The
+frozen successor SHA must reproduce the v4 pass and independently pass the
+exact-SHA smoke and stability observation. Neither offline result can claim a
+six-hour soak or Gate-1 pass.

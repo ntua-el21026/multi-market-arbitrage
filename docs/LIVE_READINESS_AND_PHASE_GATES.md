@@ -15,6 +15,7 @@ Design Freeze v0.1 remains locked.
 The first six-hour run completed but failed independent acceptance. Evidence is recorded in:
 
 - `GATE_1_FAILURE_20260822.md`;
+- `GATE_1_PUBLIC_PREFLIGHT_FAILURE_20260826.md`;
 - `GATE_1_REMEDIATION_SPEC.md`;
 - ADR-0053;
 - ADR-0054;
@@ -42,8 +43,11 @@ external-attribution, fault-lifecycle, direct-contribution, typed-resync and
 classification-latency defects now governed by ADR-0055.
 The later contributor-capacity failure exposed completed history retained as
 active plus replacement capture without bounded exhaustion. ADR-0056 reconciles
-that governance. Implementation and deterministic offline gates are complete;
-public preflight and Gate-1 rerun authorization remain pending.
+that governance. Exact candidate `40acc02c...` later passed its 60-second smoke,
+but its complete 7,200-second observation failed the mandatory post-saturation
+RSS net-growth criterion (`535,859,200 B` versus `134,217,728 B`). The
+source-modified bounded-storage successor must repeat all affected offline and
+public qualification; Gate-1 rerun authorization remains pending.
 
 Before a rerun:
 
@@ -61,6 +65,9 @@ Before a rerun:
 - prove ADR-0056 unresolved-only active contributors, independent completion,
   separate active/cumulative bounds, interval-union/cross-stream reconciliation
   and bounded replacement retry/deadline/exhaustion;
+- pass the v4 production-scale storage-finalization workload, including two
+  post-saturation analytical batches, eight completed full journal-segment
+  samples and all RSS/Python/native-residual net-growth bounds;
 - pass a new post-fix exact-SHA 60-second smoke and 5,400–7,200 second
   stability observation.
 

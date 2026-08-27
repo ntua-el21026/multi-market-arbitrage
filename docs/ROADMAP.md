@@ -44,9 +44,11 @@ governed by `GATE_1_REMEDIATION_SPEC.md`, ADR-0053, ADR-0054, ADR-0055 and
 ADR-0056. The first result is not
 rewritten: Gate 1 remains `FAIL` until a new authorized six-hour run passes.
 
-The implementation branch is eligible only for independent public-preflight
-authorization review. A public smoke, stability observation and six-hour soak
-remain unperformed and cannot be inferred from the offline result.
+Exact candidate `40acc02c3e6499a38675c3f8368fab3399488279` passed a public
+60-second smoke and completed a 7,200-second stability observation. The latter
+failed the unchanged post-saturation RSS net-growth requirement, so it is not
+eligible for six-hour authorization. The result is recorded in
+`GATE_1_PUBLIC_PREFLIGHT_FAILURE_20260826.md`.
 
 The raw journal, deterministic replay, rebuild, data validation, immutability
 and no-live boundary passed. The first-soak defects were concentrated in:
@@ -65,10 +67,11 @@ direct-interval-contribution, typed-resync and local classification-latency
 defects. ADR-0055 governs checkpoint v4 and strict pre-expiry PREPARE plus exact
 attestation. A later stability attempt exposed cumulative completed contributors
 retained as active and replacement recovery without bounded exhaustion. ADR-0056
-reconciles that governance. Implementation and final offline gates are complete;
-a new post-fix exact-SHA 60-second smoke and 5,400–7,200 second stability
-observation remain pending independent authorization. No six-hour rerun was run
-for this remediation task.
+reconciles that governance. Forensics on the later public failure identified
+allocator-retentive journal sealing/verification and analytical batch hashing
+as narrow storage-finalization correction targets. A source-modified successor
+must pass the strengthened v4 offline capacity gate and new exact-SHA smoke and
+stability observations. No six-hour rerun was run for this remediation task.
 
 ## 3. Phase A — Design foundation — COMPLETE
 
@@ -158,6 +161,8 @@ recovery-generation match is recovery evidence, not natural convergence.
 ### C4. Short operational validation
 
 - full CI/static/SCA/security/no-live gates;
+- v4 production-scale analytical/journal finalization workload with eight full
+  segment memory samples and fail-closed RSS/Python/native-residual bounds;
 - new 60-second explicit-target smoke;
 - new 5,400–7,200 second post-saturation stability observation;
 - inspect triggers, causal mismatch relations, divergence lifecycle and

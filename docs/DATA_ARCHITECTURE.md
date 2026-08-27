@@ -51,6 +51,22 @@ sealed: *.jsonl.zst
 
 Exact payload bytes are reversibly encoded.
 
+Sealing preserves those exact uncompressed JSONL bytes while bounding transient
+memory. The writer incrementally hashes the active payload, streams Zstandard
+compression through a fixed-size buffer into a sibling temporary file, syncs
+that file, atomically replaces the final segment and syncs the parent directory.
+Post-seal integrity verification streams and exhausts the decoded records
+without retaining a segment-sized envelope inventory.
+
+The manifest's `payload_digest` binds the exact uncompressed bytes used by
+replay. Its `segment_digest` and `compressed_bytes` bind the actual compressed
+frame emitted by the exact implementation and compression configuration.
+Compressed frames are deterministic for that bound identity, but are not a
+cross-version byte-identity contract: a streaming compressor frame need not be
+byte-identical to a legacy one-shot-compressor frame with the same uncompressed
+payload. Existing sealed segments remain immutable and are verified against
+their own manifests.
+
 ## 4. Durability states
 
 ```text
@@ -216,6 +232,11 @@ Application payload
 Persisted schemas are versioned.
 
 Hash serialization is deterministic.
+
+Analytical fragment `records_sha256` is the canonical JSON-array digest of the
+ordered record sequence. The writer computes that same identity incrementally,
+one canonical record at a time, without materializing an additional
+batch-sized canonical byte string.
 
 Raw history is never rewritten to satisfy a new canonical schema.
 

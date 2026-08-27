@@ -26,7 +26,7 @@ from multi_market_arbitrage.core.serialization import (
     CanonicalSerializationError,
     CanonicalValue,
     canonical_json_bytes,
-    canonical_sha256,
+    canonical_sequence_sha256,
     canonicalize,
 )
 from multi_market_arbitrage.journal.recovery import atomic_write_bytes, fsync_directory
@@ -494,7 +494,7 @@ class AnalyticalDatasetWriter:
                 file_name=final_path.name,
                 file_bytes=file_bytes,
                 file_sha256=file_sha256,
-                records_sha256=canonical_sha256(records),
+                records_sha256=canonical_sequence_sha256(records),
                 provenance=self._provenance,
             )
             manifest_path = final_path.with_name(f"{final_path.name}.manifest.json")

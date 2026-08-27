@@ -245,6 +245,32 @@ def test_arrow_type_drift_across_fragments_fails_closed(tmp_path: Path) -> None:
     assert writer.buffered_records == 1
 
 
+def test_fragment_record_hash_remains_canonical_sequence_identity(tmp_path: Path) -> None:
+    records = (
+        {"id": "one", "labels": ["a", "b"]},
+        {"labels": ["c"], "id": "two"},
+    )
+    fragment_provenance = provenance()
+    writer = AnalyticalDatasetWriter(
+        config(tmp_path, batch_size=2),
+        fragment_provenance,
+    )
+
+    fragment = writer.append_many(records)
+
+    assert len(fragment) == 1
+    stored_records = tuple(
+        {
+            **record,
+            "_mma_provenance_sha256": fragment_provenance.sha256,
+            "_mma_record_sha256": canonical_sha256(record),
+            "_mma_schema_version": "opportunity-v1",
+        }
+        for record in records
+    )
+    assert fragment[0].records_sha256 == canonical_sha256(stored_records)
+
+
 def test_dataset_rebuild_rejects_conflicting_fragment_arrow_schemas(tmp_path: Path) -> None:
     primary_root = tmp_path / "primary"
     secondary_root = tmp_path / "secondary"

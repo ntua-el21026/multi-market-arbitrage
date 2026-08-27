@@ -16,10 +16,19 @@ contribution, typed-resync, and local classification-latency defects. ADR-0055
 governs those corrections. A later pre-soak stability attempt exposed completed
 contributors retained in active authority until interval closure and replacement
 capture without bounded exhaustion. ADR-0056 reconciles that governance;
-implementation and offline validation are complete. Independent public-preflight
-authorization, a new 60-second smoke, and a new 5,400- to 7,200-second stability
-observation remain required before independent pre-soak review. No six-hour
-rerun was performed; the first soak remains `FAIL`.
+candidate `40acc02c3e6499a38675c3f8368fab3399488279` passed its exact-SHA
+60-second smoke and completed a 7,200-second stability observation, but the
+stability validator failed the unchanged post-saturation RSS net-growth
+criterion. That result is recorded in
+`GATE_1_PUBLIC_PREFLIGHT_FAILURE_20260826.md`. A bounded storage-finalization
+transient correction has passed the strengthened dual-book v4 capacity workload
+in the pre-freeze working tree, with all 65 acceptance predicates true; the
+retained result is recorded in `GATE_1_PUBLIC_PREFLIGHT_FAILURE_20260826.md`.
+Because that run did not use a new clean successor commit, it is correction
+evidence rather than exact-SHA qualification. The frozen successor SHA must
+repeat all affected offline gates plus a fresh smoke and stability observation
+before independent pre-soak review. No six-hour rerun was performed; the first
+soak remains `FAIL`.
 
 Design Freeze v0.1 remains locked.
 
@@ -638,16 +647,25 @@ collapse into a generic schema/protocol label; genuine unknown remains explicit.
 
 ### 7.9 Saturation evidence
 
-The offline capacity benchmark exceeds 4,096 scans/outcomes, multiple
-analytical flushes and one journal rotation. It reports operational/terminal
-latency, event-loop blocking, per-domain occupancy/retained bytes, Python
-allocations, PyArrow current/peak bytes, current/peak RSS, native residual,
-post-saturation slope, queue high-water marks and classification latency during
-real production health-checkpoint construction/persistence. Success requires
-zero retained-record and deep retained-byte slopes for the saturated scan/audit
-domains, config-derived scheduling limits, a capacity-derived latency-constancy
-factor, and allocator-phase-derived Python/RSS/PyArrow limits. The JSON records
-every formula, operand and boolean; GC or allocator trimming is not the primary
+The v4 offline capacity benchmark uses 6,096 scan-driving WebSocket events,
+each updating both sides of both required books, and 6,096 audit outcomes.
+Relative to the 4,096 saturation threshold, each phase contains two complete
+production 1,000-record post-saturation analytical batches. It journals at
+least 80,001 records with exactly 1,400 application-payload bytes per generated
+record against the production 10,000-event segment limit, so eight completed
+full-segment samples precede the tail record and close.
+
+The benchmark reports operational/terminal latency, event-loop blocking, per-
+domain occupancy/retained bytes, Python allocations, PyArrow current/peak bytes,
+current/peak RSS, native residual, post-saturation slope, queue high-water marks
+and classification latency during real production health-checkpoint
+construction/persistence. Success requires exactly zero retained-record and
+deep-retained-byte slopes at phase-equivalent saturated scan/audit endpoints,
+config-derived scheduling limits, a capacity-derived latency-constancy factor,
+allocator-phase-derived Python/RSS/PyArrow limits, and first-to-last full-segment
+positive net growth no greater than `128 MiB` RSS, `64 MiB` traced Python current
+and `128 MiB` native residual. The JSON records every formula, operand and
+boolean; GC, allocator trimming or criterion weakening is not an accepted
 correction.
 
 ## 8. Required tests
@@ -850,6 +868,9 @@ The rerun is not authorized until:
 - ADR-0056 active and cumulative contributor bounds, independent closure,
   interval-union/cross-stream reconciliation, replacement retry/deadline/
   exhaustion, and shutdown evidence all pass offline tests;
+- the final exact SHA passes the v4 production-scale dual-book analytical and
+  journal capacity workload, including all exact-zero phase-equivalent slopes,
+  eight full-segment samples and unchanged RSS/Python/native-residual bounds;
 - the final stability run has bounded operational-snapshot cost and acceptable
   post-saturation memory/latency/queue behavior;
 - current official Polymarket documentation is rechecked;
