@@ -236,6 +236,16 @@ if arguments[:2] == ["python", "find"]:
     raise SystemExit(0)
 if arguments and arguments[0] in {{"lock", "sync"}}:
     raise SystemExit(0)
+if "python" in arguments:
+    python_index = arguments.index("python")
+    python_arguments = arguments[python_index + 1:]
+    if (
+        len(python_arguments) >= 3
+        and python_arguments[0] == "-I"
+        and python_arguments[2] == "write-command"
+    ):
+        python = os.environ["MMA_TEST_PYTHON"]
+        os.execv(python, [python, *python_arguments])
 if "python" in arguments and arguments[-2:] == ["python", "-"]:
     python = os.environ["MMA_TEST_PYTHON"]
     os.execv(python, [python, "-"])
@@ -377,7 +387,178 @@ def test_launcher_contract_has_no_embedded_candidate_or_target_default() -> None
     assert "merge-base" not in content
     assert 'GATE1_DURATION_SECONDS="21600"' in content
     assert "origin/main to equal --expected-sha exactly" in content
+    assert '"$RUN_SEAL_RELATIVE" \\\n  write-command' in content
+    assert '"schema_version": "mma-gate1-observer-command-v1"' not in content
+    assert "for environment_prefix in GIT_ PYTHON UV_" in content
     assert _run(["bash", "-n", _ROOT / _LAUNCHER_RELATIVE]).returncode == 0
+
+
+def test_evidence_helpers_require_isolated_python() -> None:
+    sealer = _run([sys.executable, _ROOT / _SEALER_RELATIVE])
+    assert sealer.returncode != 0
+    assert "invoke this helper with Python -I" in sealer.stderr
+
+    auditor = _run([sys.executable, _ROOT / _AUDITOR_RELATIVE])
+    assert auditor.returncode != 0
+    assert "invoke this helper with Python -I" in auditor.stderr
+
+    direct_auditor_help = _run([_ROOT / _AUDITOR_RELATIVE, "--help"])
+    assert direct_auditor_help.returncode == 0
+    assert "--collector-run-id" in direct_auditor_help.stdout
+
+
+def test_exact_candidate_sealer_writes_canonical_observer_command(tmp_path: Path) -> None:
+    repository, candidate = _candidate_repository(tmp_path)
+    evidence = tmp_path / "evidence-command"
+    evidence.mkdir()
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "GIT_CONFIG_PARAMETERS": "'core.fsmonitor=true'",
+            "GIT_DIR": str(tmp_path / "attacker-git-dir"),
+            "GIT_OBJECT_DIRECTORY": str(tmp_path / "attacker-object-dir"),
+        }
+    )
+    completed = _run(
+        [
+            sys.executable,
+            "-I",
+            repository / _SEALER_RELATIVE,
+            "write-command",
+            "--source-worktree",
+            repository,
+            "--expected-sha",
+            candidate,
+            "--target-id",
+            "665374",
+            "--duration-seconds",
+            "7200",
+            "--output",
+            evidence / "soak-command.json",
+        ],
+        env=environment,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads((evidence / "soak-command.json").read_text(encoding="utf-8")) == {
+        "argv": [
+            "uv",
+            "run",
+            "--offline",
+            "--frozen",
+            "--no-sync",
+            "--all-groups",
+            "mma",
+            "observe",
+            "polymarket",
+            "--gamma-market-id",
+            "665374",
+            "--duration",
+            "7200",
+            "--config",
+            "config/phase1.toml",
+        ],
+        "config_relative_path": "config/phase1.toml",
+        "cwd": str(repository),
+        "duration_seconds": 7200,
+        "environment": {"PYTHONHASHSEED": "0", "PYTHONUNBUFFERED": "1"},
+        "expected_source_sha": candidate,
+        "schema_version": "mma-gate1-observer-command-v1",
+        "target_id": "665374",
+    }
+
+
+def test_observer_command_writer_rejects_non_exact_identity_and_overwrite(
+    tmp_path: Path,
+) -> None:
+    repository, candidate = _candidate_repository(tmp_path)
+    evidence = tmp_path / "evidence-command"
+    evidence.mkdir()
+    output = evidence / "soak-command.json"
+    arguments: list[str | Path] = [
+        sys.executable,
+        "-I",
+        repository / _SEALER_RELATIVE,
+        "write-command",
+        "--source-worktree",
+        repository,
+        "--expected-sha",
+        candidate,
+        "--target-id",
+        "665374",
+        "--duration-seconds",
+        "60",
+        "--output",
+        output,
+    ]
+    abbreviated = list(arguments)
+    abbreviated[abbreviated.index(candidate)] = candidate[:12]
+    rejected_identity = _run(abbreviated)
+    assert rejected_identity.returncode != 0
+    assert "full lowercase 40-character" in rejected_identity.stderr
+
+    created = _run(arguments)
+    assert created.returncode == 0, created.stderr
+    original = output.read_bytes()
+    rejected_overwrite = _run(arguments)
+    assert rejected_overwrite.returncode != 0
+    assert "refusing to replace" in rejected_overwrite.stderr
+    assert output.read_bytes() == original
+
+
+def test_launcher_and_command_writer_reject_git_replacement_refs(tmp_path: Path) -> None:
+    repository, candidate = _candidate_repository(tmp_path)
+    _git(repository, "replace", candidate, f"{candidate}^")
+    shim_directory = tmp_path / "shim"
+    shim_directory.mkdir()
+    uv_log = _install_uv_shim(shim_directory)
+
+    launcher = _run(
+        _launcher_arguments(repository, candidate, tmp_path, validate_only=True),
+        env=_shim_environment(shim_directory, uv_log),
+    )
+    assert launcher.returncode != 0
+    assert "forbidden Git replacement refs" in launcher.stderr
+    assert not uv_log.exists()
+    assert not (tmp_path / "worktrees").exists()
+    assert not (tmp_path / "evidence").exists()
+
+    evidence = tmp_path / "evidence-command"
+    evidence.mkdir()
+    writer = _run(
+        [
+            sys.executable,
+            "-I",
+            repository / _SEALER_RELATIVE,
+            "write-command",
+            "--source-worktree",
+            repository,
+            "--expected-sha",
+            candidate,
+            "--target-id",
+            "665374",
+            "--duration-seconds",
+            "60",
+            "--output",
+            evidence / "soak-command.json",
+        ]
+    )
+    assert writer.returncode != 0
+    assert "forbidden Git replacement refs" in writer.stderr
+    assert not (evidence / "soak-command.json").exists()
+
+
+def test_auditor_rejects_git_replacement_refs(tmp_path: Path) -> None:
+    repository, candidate, evidence, analysis, run_id, environment, _ = _prepare_audit_fixture(
+        tmp_path
+    )
+    _git(repository, "replace", candidate, f"{candidate}^")
+    completed = _run(
+        _audit_arguments(repository, candidate, evidence, analysis, run_id),
+        env=environment,
+    )
+    assert completed.returncode != 0
+    assert "forbidden Git replacement refs" in completed.stderr
+    assert not analysis.exists()
 
 
 @pytest.mark.parametrize(
@@ -482,6 +663,9 @@ def test_validate_only_is_offline_and_never_starts_a_process(tmp_path: Path) -> 
     _git(repository, "remote", "set-url", "origin", "ssh://offline.invalid/repository.git")
     environment = _shim_environment(shim_directory, log)
     environment["GIT_SSH_COMMAND"] = str(ssh_shim)
+    environment["PYTHONPATH"] = str(tmp_path / "attacker-pythonpath")
+    environment["UV_PROJECT"] = str(tmp_path / "attacker-pyproject.toml")
+    environment["UV_WORKING_DIR"] = str(tmp_path / "attacker-working-directory")
     completed = _run(
         _launcher_arguments(repository, candidate, tmp_path, validate_only=True),
         env=environment,
@@ -662,6 +846,7 @@ def _seal_arguments(
 ) -> list[str | Path]:
     return [
         sys.executable,
+        "-I",
         repository / _SEALER_RELATIVE,
         "--source-worktree",
         repository,
@@ -849,35 +1034,25 @@ def _prepare_audit_fixture(
     (evidence / "soak-summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    command = {
-        "argv": [
-            "uv",
-            "run",
-            "--offline",
-            "--frozen",
-            "--no-sync",
-            "--all-groups",
-            "mma",
-            "observe",
-            "polymarket",
-            "--gamma-market-id",
+    command = _run(
+        [
+            sys.executable,
+            "-I",
+            repository / _SEALER_RELATIVE,
+            "write-command",
+            "--source-worktree",
+            repository,
+            "--expected-sha",
+            candidate,
+            "--target-id",
             "665374",
-            "--duration",
+            "--duration-seconds",
             str(duration_seconds),
-            "--config",
-            "config/phase1.toml",
-        ],
-        "config_relative_path": "config/phase1.toml",
-        "cwd": str(repository),
-        "duration_seconds": duration_seconds,
-        "environment": {"PYTHONHASHSEED": "0", "PYTHONUNBUFFERED": "1"},
-        "expected_source_sha": candidate,
-        "schema_version": "mma-gate1-observer-command-v1",
-        "target_id": "665374",
-    }
-    (evidence / "soak-command.json").write_text(
-        json.dumps(command, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            "--output",
+            evidence / "soak-command.json",
+        ]
     )
+    assert command.returncode == 0, command.stderr
     (evidence / "soak-exit-code.txt").write_text(f"{exit_code}\n", encoding="utf-8")
     sealed = _run(
         _seal_arguments(
@@ -903,6 +1078,7 @@ def _audit_arguments(
 ) -> list[str | Path]:
     return [
         sys.executable,
+        "-I",
         repository / _AUDITOR_RELATIVE,
         "--source-worktree",
         repository,
@@ -924,6 +1100,37 @@ def _mma_calls(log: Path) -> list[list[str]]:
         return []
     calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
     return [call[call.index("mma") + 1 :] for call in calls if "mma" in call]
+
+
+def test_sealer_rejects_full_child_environment_as_observer_plan(tmp_path: Path) -> None:
+    repository, candidate, evidence, _analysis, _run_id, _environment, _log = (
+        _prepare_audit_fixture(tmp_path, duration_seconds=60)
+    )
+    (evidence / "run-completion-seal.json").unlink()
+    command_path = evidence / "soak-command.json"
+    command = json.loads(command_path.read_text(encoding="utf-8"))
+    command["environment"] = {
+        **cast(dict[str, str], command["environment"]),
+        "LC_ALL": "C",
+        "SHLVL": "1",
+        "_": "/usr/bin/python3",
+    }
+    command_path.write_text(
+        json.dumps(command, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    rejected = _run(
+        _seal_arguments(
+            repository,
+            candidate,
+            evidence,
+            duration_seconds=60,
+            exit_code=0,
+        )
+    )
+    assert rejected.returncode != 0
+    assert "observer command record differs from the exact sealed command" in rejected.stderr
 
 
 _HOST_IDENTITY_MISMATCHES: tuple[tuple[str, object], ...] = (

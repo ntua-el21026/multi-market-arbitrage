@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I
 """Create one fail-closed completion and raw-inventory seal for a public run."""
 
 from __future__ import annotations
@@ -247,6 +247,32 @@ def _read_json(path: Path, *, label: str) -> dict[str, Any]:
     return cast(dict[str, Any], value)
 
 
+def _git_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    for name in tuple(environment):
+        if name.startswith("GIT_"):
+            environment.pop(name)
+    environment.update(
+        {
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_COUNT": "4",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_KEY_1": "core.fsmonitor",
+            "GIT_CONFIG_KEY_2": "core.attributesFile",
+            "GIT_CONFIG_KEY_3": "core.excludesFile",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_CONFIG_VALUE_0": "/dev/null",
+            "GIT_CONFIG_VALUE_1": "false",
+            "GIT_CONFIG_VALUE_2": "/dev/null",
+            "GIT_CONFIG_VALUE_3": "/dev/null",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+        }
+    )
+    return environment
+
+
 def _git(repository: Path, *arguments: str) -> str:
     git = shutil.which("git")
     if git is None:
@@ -255,6 +281,7 @@ def _git(repository: Path, *arguments: str) -> str:
         (git, "-C", str(repository), *arguments),
         capture_output=True,
         check=False,
+        env=_git_environment(),
         text=True,
     )
     if completed.returncode != 0:
@@ -271,6 +298,7 @@ def _git_blob_sha256(repository: Path, commit: str, relative: str) -> str:
         (git, "-C", str(repository), "cat-file", "blob", f"{commit}:{relative}"),
         capture_output=True,
         check=False,
+        env=_git_environment(),
     )
     if completed.returncode != 0:
         raise SealFailure(f"candidate does not contain required path: {relative}")
@@ -845,6 +873,75 @@ def _expected_command(
     }
 
 
+def _command_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Write the exact observer command contract consumed by the run sealer."
+    )
+    parser.add_argument("--source-worktree", type=Path, required=True)
+    parser.add_argument("--expected-sha", required=True)
+    parser.add_argument("--target-id", required=True)
+    parser.add_argument("--duration-seconds", type=int, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    return parser
+
+
+def _write_command_record(arguments: argparse.Namespace) -> Path:
+    expected_sha: str = arguments.expected_sha
+    target_id: str = arguments.target_id
+    duration_seconds: int = arguments.duration_seconds
+    if SHA_PATTERN.fullmatch(expected_sha) is None:
+        raise SealFailure("--expected-sha must be a full lowercase 40-character Git SHA")
+    if TARGET_PATTERN.fullmatch(target_id) is None:
+        raise SealFailure("--target-id must be an explicit positive numeric Gamma market ID")
+    if isinstance(duration_seconds, bool) or duration_seconds <= 0:
+        raise SealFailure("--duration-seconds must be a positive integer")
+
+    source_argument: Path = arguments.source_worktree
+    source = _require_directory(source_argument, label="source worktree")
+    if source_argument != source:
+        raise SealFailure("--source-worktree must be an absolute canonical path")
+    if _git(source, "rev-parse", "--show-toplevel") != str(source):
+        raise SealFailure("--source-worktree is not a Git worktree root")
+    if _git(source, "for-each-ref", "--format=%(refname)", "refs/replace"):
+        raise SealFailure("source repository contains forbidden Git replacement refs")
+    if _git(source, "status", "--porcelain=v1", "--untracked-files=all"):
+        raise SealFailure("source worktree is not clean")
+    if _git(source, "rev-parse", "HEAD") != expected_sha:
+        raise SealFailure("source worktree HEAD differs from --expected-sha")
+    if _git(source, "rev-parse", "design-freeze-v0.1^{commit}") != DESIGN_FREEZE_SHA:
+        raise SealFailure("Design Freeze tag identity differs")
+
+    script = Path(__file__).resolve(strict=True)
+    if not script.is_relative_to(source):
+        raise SealFailure("command writer must be invoked from the exact source worktree")
+    script_relative = script.relative_to(source).as_posix()
+    if _sha256_file(script) != _git_blob_sha256(source, expected_sha, script_relative):
+        raise SealFailure("executed command-writer bytes differ from the exact candidate")
+
+    output_argument: Path = arguments.output
+    if not output_argument.is_absolute():
+        raise SealFailure("--output must be absolute")
+    if output_argument.is_symlink() or output_argument.parent.is_symlink():
+        raise SealFailure("--output cannot be symbolic")
+    output_parent = _require_directory(output_argument.parent, label="output directory")
+    if output_argument.parent != output_parent:
+        raise SealFailure("--output parent must be an absolute canonical path")
+    output = output_parent / output_argument.name
+    if output.name != "soak-command.json":
+        raise SealFailure("--output must be named soak-command.json")
+    if (
+        output_parent == source
+        or output_parent.is_relative_to(source)
+        or source.is_relative_to(output_parent)
+    ):
+        raise SealFailure("observer command evidence must be outside the source worktree")
+
+    record = _expected_command(source, expected_sha, target_id, duration_seconds)
+    payload = json.dumps(record, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    _atomic_create(output, payload)
+    return output
+
+
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-worktree", type=Path, required=True)
@@ -893,6 +990,8 @@ def _seal(arguments: argparse.Namespace) -> Path:
 
     if _git(source, "rev-parse", "--show-toplevel") != str(source):
         raise SealFailure("--source-worktree is not a Git worktree root")
+    if _git(source, "for-each-ref", "--format=%(refname)", "refs/replace"):
+        raise SealFailure("source repository contains forbidden Git replacement refs")
     if _git(source, "status", "--porcelain=v1", "--untracked-files=all"):
         raise SealFailure("source worktree is not clean")
     if _git(source, "rev-parse", "HEAD") != expected_sha:
@@ -1049,6 +1148,19 @@ def _seal(arguments: argparse.Namespace) -> Path:
 
 
 def main() -> int:
+    if not sys.flags.isolated:
+        print("RUN SEAL FAILED: invoke this helper with Python -I", file=sys.stderr)
+        return 1
+    if sys.argv[1:2] == ["write-command"]:
+        arguments = _command_argument_parser().parse_args(sys.argv[2:])
+        try:
+            output = _write_command_record(arguments)
+        except (OSError, SealFailure, ValueError) as error:
+            print(f"OBSERVER COMMAND RECORD FAILED: {error}", file=sys.stderr)
+            return 1
+        print(f"OBSERVER COMMAND RECORD CREATED: {output}")
+        return 0
+
     arguments = _argument_parser().parse_args()
     try:
         output = _seal(arguments)

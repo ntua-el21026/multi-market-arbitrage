@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I
 """Fail-closed, read-only post-run audit for one exact Gate-1 collector run."""
 
 from __future__ import annotations
@@ -315,6 +315,32 @@ def _read_json(path: Path) -> dict[str, Any]:
     return cast(dict[str, Any], value)
 
 
+def _git_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    for name in tuple(environment):
+        if name.startswith("GIT_"):
+            environment.pop(name)
+    environment.update(
+        {
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_COUNT": "4",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_KEY_1": "core.fsmonitor",
+            "GIT_CONFIG_KEY_2": "core.attributesFile",
+            "GIT_CONFIG_KEY_3": "core.excludesFile",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_CONFIG_VALUE_0": "/dev/null",
+            "GIT_CONFIG_VALUE_1": "false",
+            "GIT_CONFIG_VALUE_2": "/dev/null",
+            "GIT_CONFIG_VALUE_3": "/dev/null",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+        }
+    )
+    return environment
+
+
 def _git(repository: Path, *arguments: str) -> str:
     git = shutil.which("git")
     if git is None:
@@ -323,6 +349,7 @@ def _git(repository: Path, *arguments: str) -> str:
         (git, "-C", str(repository), *arguments),
         capture_output=True,
         check=False,
+        env=_git_environment(),
         text=True,
     )
     if completed.returncode != 0:
@@ -340,6 +367,7 @@ def _git_blob_sha256(repository: Path, commit: str, relative: str) -> str:
         (git, "-C", str(repository), "cat-file", "blob", f"{commit}:{relative}"),
         capture_output=True,
         check=False,
+        env=_git_environment(),
     )
     if completed.returncode != 0:
         raise AuditFailure(f"candidate does not contain required path: {relative}")
@@ -1239,6 +1267,8 @@ def _audit(arguments: argparse.Namespace) -> Path:
 
     if _git(source, "rev-parse", "--show-toplevel") != str(source):
         raise AuditFailure("--source-worktree is not a Git worktree root")
+    if _git(source, "for-each-ref", "--format=%(refname)", "refs/replace"):
+        raise AuditFailure("source repository contains forbidden Git replacement refs")
     if _git(source, "status", "--porcelain=v1", "--untracked-files=all"):
         raise AuditFailure("source worktree is not clean")
     if _git(source, "rev-parse", "HEAD") != expected_sha:
@@ -1584,6 +1614,9 @@ def _audit(arguments: argparse.Namespace) -> Path:
 
 
 def main() -> int:
+    if not sys.flags.isolated:
+        print("POST-RUN AUDIT FAILED: invoke this helper with Python -I", file=sys.stderr)
+        return 1
     arguments = _argument_parser().parse_args()
     try:
         manifest = _audit(arguments)

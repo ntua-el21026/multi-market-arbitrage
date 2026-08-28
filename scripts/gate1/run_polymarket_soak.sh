@@ -10,6 +10,21 @@ readonly PREFLIGHT_PROCESS_TIMEOUT_SECONDS="180"
 readonly MINIMUM_FREE_BYTES="$((10 * 1024 * 1024 * 1024))"
 readonly RUN_SEAL_RELATIVE="scripts/gate1/seal_polymarket_run.py"
 
+for environment_prefix in GIT_ PYTHON UV_; do
+  while IFS= read -r environment_name; do
+    unset "$environment_name"
+  done < <(compgen -A variable "$environment_prefix")
+done
+unset BASH_ENV ENV LD_LIBRARY_PATH LD_PRELOAD PYTHON UV VIRTUAL_ENV
+export GIT_ATTR_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+export GIT_CONFIG_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1
+export GIT_CONFIG_COUNT=4
+export GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null
+export GIT_CONFIG_KEY_1=core.fsmonitor GIT_CONFIG_VALUE_1=false
+export GIT_CONFIG_KEY_2=core.attributesFile GIT_CONFIG_VALUE_2=/dev/null
+export GIT_CONFIG_KEY_3=core.excludesFile GIT_CONFIG_VALUE_3=/dev/null
+export PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 UV_NO_CONFIG=1
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -132,6 +147,12 @@ require_clean_repository() {
   local repository="$1"
   [[ -z "$(git -C "$repository" status --porcelain=v1 --untracked-files=all)" ]] \
     || fail "source repository is not clean: $repository"
+}
+
+require_no_replace_refs() {
+  local repository="$1"
+  [[ -z "$(git -C "$repository" for-each-ref --format='%(refname)' refs/replace)" ]] \
+    || fail "source repository contains forbidden Git replacement refs: $repository"
 }
 
 verify_python() {
@@ -303,6 +324,7 @@ fi
 SOURCE_REPO="$(canonical_existing_directory "$SOURCE_REPO")"
 [[ "$(git -C "$SOURCE_REPO" rev-parse --show-toplevel)" == "$SOURCE_REPO" ]] \
   || fail "--source-repo is not a Git worktree root"
+require_no_replace_refs "$SOURCE_REPO"
 require_clean_repository "$SOURCE_REPO"
 require_native_linux_filesystem "$SOURCE_REPO" "source repository"
 
@@ -508,49 +530,13 @@ printf '%s\n' "$POST_PREFLIGHT_ORIGIN_MAIN" \
   || fail "detached worktree identity changed after preflight"
 require_clean_repository "$SOAK_DIR"
 
-python3 - \
-  "$EVIDENCE_DIR/soak-command.json" \
-  "$SOAK_DIR" \
-  "$EXPECTED_SHA" \
-  "$TARGET_ID" \
-  "$GATE1_DURATION_SECONDS" <<'PY'
-import json
-from pathlib import Path
-import sys
-
-output = Path(sys.argv[1])
-source = sys.argv[2]
-expected_sha = sys.argv[3]
-target_id = sys.argv[4]
-duration = int(sys.argv[5])
-record = {
-    "argv": [
-        "uv",
-        "run",
-        "--offline",
-        "--frozen",
-        "--no-sync",
-        "--all-groups",
-        "mma",
-        "observe",
-        "polymarket",
-        "--gamma-market-id",
-        target_id,
-        "--duration",
-        str(duration),
-        "--config",
-        "config/phase1.toml",
-    ],
-    "config_relative_path": "config/phase1.toml",
-    "cwd": source,
-    "duration_seconds": duration,
-    "environment": {"PYTHONHASHSEED": "0", "PYTHONUNBUFFERED": "1"},
-    "expected_source_sha": expected_sha,
-    "schema_version": "mma-gate1-observer-command-v1",
-    "target_id": target_id,
-}
-output.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-PY
+uv run --offline --frozen --no-sync --all-groups python -I "$RUN_SEAL_RELATIVE" \
+  write-command \
+  --source-worktree "$SOAK_DIR" \
+  --expected-sha "$EXPECTED_SHA" \
+  --target-id "$TARGET_ID" \
+  --duration-seconds "$GATE1_DURATION_SECONDS" \
+  --output "$EVIDENCE_DIR/soak-command.json"
 
 RUNNER="$EVIDENCE_DIR/run-soak.sh"
 cat > "$RUNNER" <<EOF
@@ -581,7 +567,7 @@ printf '%s\n' "\$rc" > $(printf '%q' "$EVIDENCE_DIR/soak-exit-code.txt")
 date -u --iso-8601=seconds > $(printf '%q' "$EVIDENCE_DIR/soak-ended-at-utc.txt")
 df -B1 -- . > $(printf '%q' "$EVIDENCE_DIR/disk-after-bytes.txt")
 
-uv run --offline --frozen --no-sync --all-groups python \
+uv run --offline --frozen --no-sync --all-groups python -I \
   $(printf '%q' "$RUN_SEAL_RELATIVE") \
   --source-worktree $(printf '%q' "$SOAK_DIR") \
   --evidence-dir $(printf '%q' "$EVIDENCE_DIR") \
