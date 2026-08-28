@@ -244,14 +244,17 @@ records to the file, and bind the digest plus observed periodic/terminal counts
 and maximum record sizes, and find exactly one terminal record last. Producer
 role/version, exact target record, and terminal cutoff identity must reconcile
 to the observation summary. Observed
-periodic or terminal maxima above 31,319 or 44,963 bytes fail. The accepted
+periodic or terminal maxima above 31,573 or 45,217 bytes fail. The accepted
 six-hour projection is fixed at 2,160 periodic records plus one terminal record,
-or exactly 67,694,003 bytes, leaving exactly 3,609,165 bytes under the
-71,303,168-byte cap. The derived periodic file-budget ceiling is 32,019 bytes,
-preserving an exact 700-byte capacity-qualification margin above the 31,319-byte
+or exactly 68,242,897 bytes, leaving exactly 3,060,271 bytes under the
+71,303,168-byte cap. The derived periodic file-budget ceiling is 32,018 bytes,
+preserving an exact 445-byte capacity-qualification margin above the 31,573-byte
 maximum; it is not an observed-record acceptance bound. Other stochastic rate-
 derived fields retain 2.0x headroom
 and the WebSocket observation duration denominator. The report must bind the
+current RSS, normalized Python `ru_maxrss`, and exact same-sample composite
+source/value contract. Fabricated sources, a composite unequal to the maximum
+of its inputs, or unknown platform raw units fail closed. The report must bind the
 exact requested duration and exact completed monotonic duration; a completed
 duration shorter than requested, a health count/record/file overrun, or less
 than 2 MiB projected health-file margin is a fail-closed validation result.

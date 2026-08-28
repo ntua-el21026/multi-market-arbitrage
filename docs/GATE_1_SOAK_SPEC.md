@@ -354,14 +354,24 @@ checkpoint. Historical v1-v4 evidence remains readable without inferred
 chronology, trigger, evidence-dimension, fault-closure, contribution, or
 journal-seal fields.
 
+Pre-clarification historical v5 records that lack `peak_rss_source`,
+`python_ru_maxrss_bytes`, and `python_ru_maxrss_source` remain readable only as
+legacy evidence in which `peak_rss_bytes` means normalized Python `ru_maxrss`.
+They must not be reinterpreted as composite-peak evidence and do not qualify a
+current exact-source candidate, which must emit all three additive fields and
+must set the composite to the exact maximum of current RSS (or zero when
+unavailable) and normalized Python `ru_maxrss`. Qualification requires the
+exact Linux source labels. Darwin's raw `ru_maxrss` unit is explicitly bytes;
+unknown platform units fail closed rather than inheriting the Darwin rule.
+
 The ten-second cadence and 8,192-checkpoint count bound remain fixed. The
-capacity-qualified v5 maxima are 31,319 bytes periodic and 44,963 bytes
+capacity-qualified v5 maxima are 31,573 bytes periodic and 45,217 bytes
 terminal. The fixed six-hour shape is 2,160 periodic records plus one terminal
-record, so `2,160 * 31,319 + 1 * 44,963 = 67,694,003` bytes. The exact
+record, so `2,160 * 31,573 + 1 * 45,217 = 68,242,897` bytes. The exact
 configuration uses
-a 68 MiB (71,303,168-byte) file cap, leaving 3,609,165 bytes and exceeding the
-required 2 MiB headroom. The derived 32,019-byte periodic file-budget ceiling
-leaves an exact 700-byte capacity-qualification margin above the 31,319-byte
+a 68 MiB (71,303,168-byte) file cap, leaving 3,060,271 bytes and exceeding the
+required 2 MiB headroom. The derived 32,018-byte periodic file-budget ceiling
+leaves an exact 445-byte capacity-qualification margin above the 31,573-byte
 maximum; it is not an observed-record acceptance bound. Reaching the file/count
 bound, missing a checkpoint, or
 emitting incomplete health evidence still fails closed; the provisioned cap is

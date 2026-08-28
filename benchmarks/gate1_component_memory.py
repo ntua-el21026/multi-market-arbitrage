@@ -88,6 +88,7 @@ from multi_market_arbitrage.pipeline import observe as observe_module  # noqa: E
 from multi_market_arbitrage.pipeline.health import (  # noqa: E402
     MAXIMUM_REPORTED_RESOURCE_DISCONTINUITIES,
     SupervisedProcessResourceSampler,
+    normalize_python_ru_maxrss_bytes,
 )
 from multi_market_arbitrage.pipeline.observe import (  # noqa: E402
     PolymarketObservationService,
@@ -796,8 +797,10 @@ class _Measurement:
 
 
 def _ru_maxrss_bytes() -> int:
-    scale = 1024 if sys.platform.startswith("linux") else 1
-    return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * scale
+    value, _source = normalize_python_ru_maxrss_bytes(
+        int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    )
+    return value
 
 
 def _optional_delta(end: int | None, start: int | None) -> int | None:

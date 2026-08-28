@@ -8,13 +8,13 @@ import json
 import math
 import os
 import platform
-import resource
 import shutil
 import stat
 import subprocess
 import sys
 import time
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -53,6 +53,11 @@ from .health import (
     AUDIT_STAGE_TIMING_TELEMETRY_HISTOGRAM_FIELDS,
     AUDIT_STAGE_TIMING_TELEMETRY_SCHEMA,
     AUDIT_STAGE_TIMING_TELEMETRY_STAGES,
+    COMPOSITE_PEAK_RSS_SOURCE,
+    DARWIN_PYTHON_RU_MAXRSS_SOURCE,
+    LINUX_CURRENT_RSS_SOURCE,
+    LINUX_CURRENT_RSS_UNAVAILABLE_SOURCES,
+    LINUX_PYTHON_RU_MAXRSS_SOURCE,
 )
 from .observe import ObservationSummary, PolymarketObservationService
 
@@ -149,6 +154,25 @@ _HEALTH_V5_DECISION_FIELDS = frozenset(
         "research_eligible",
     }
 )
+_HEALTH_V5_CURRENT_RSS_FIELDS = frozenset(
+    {
+        "current_rss_bytes",
+        "current_rss_source",
+        "peak_rss_bytes",
+        "peak_rss_source",
+        "python_ru_maxrss_bytes",
+        "python_ru_maxrss_source",
+    }
+)
+_HEALTH_V5_NEW_RSS_FIELDS = frozenset(
+    {
+        "peak_rss_source",
+        "python_ru_maxrss_bytes",
+        "python_ru_maxrss_source",
+    }
+)
+HEALTH_V5_CURRENT_RSS_SEMANTICS = "current-composite-peak-and-explicit-python-ru-maxrss"
+HEALTH_V5_LEGACY_RSS_SEMANTICS = "legacy-peak-rss-is-python-ru-maxrss"
 
 _AUDIT_STAGE_INDEX = {
     stage: index for index, (stage, _metric_name) in enumerate(AUDIT_STAGE_TIMING_TELEMETRY_STAGES)
@@ -600,6 +624,91 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, ob
     return result
 
 
+def _health_v5_rss_semantics(
+    resources: Mapping[str, object],
+    *,
+    require_current_contract: bool,
+) -> str:
+    """Classify legacy v5 RSS evidence or validate the current exact contract."""
+
+    present_new_fields = _HEALTH_V5_NEW_RSS_FIELDS.intersection(resources)
+    if not present_new_fields:
+        legacy_fields = {"current_rss_bytes", "current_rss_source", "peak_rss_bytes"}
+        if not legacy_fields.issubset(resources):
+            raise RuntimeError("health-v5 RSS evidence is incomplete")
+        legacy_current = resources["current_rss_bytes"]
+        legacy_peak = resources["peak_rss_bytes"]
+        legacy_current_source = resources["current_rss_source"]
+        if (
+            (
+                legacy_current is not None
+                and (
+                    isinstance(legacy_current, bool)
+                    or not isinstance(legacy_current, int)
+                    or legacy_current < 0
+                )
+            )
+            or isinstance(legacy_peak, bool)
+            or not isinstance(legacy_peak, int)
+            or legacy_peak < 0
+            or not isinstance(legacy_current_source, str)
+            or not legacy_current_source
+        ):
+            raise RuntimeError("legacy health-v5 RSS evidence is malformed")
+        if require_current_contract:
+            raise RuntimeError("current exact health-v5 RSS source fields are missing")
+        return HEALTH_V5_LEGACY_RSS_SEMANTICS
+    if present_new_fields != _HEALTH_V5_NEW_RSS_FIELDS or not (
+        _HEALTH_V5_CURRENT_RSS_FIELDS.issubset(resources)
+    ):
+        raise RuntimeError("health-v5 RSS evidence mixes legacy and current fields")
+
+    current_rss = resources["current_rss_bytes"]
+    peak_rss = resources["peak_rss_bytes"]
+    python_ru_maxrss = resources["python_ru_maxrss_bytes"]
+    if current_rss is not None and (
+        isinstance(current_rss, bool) or not isinstance(current_rss, int) or current_rss < 0
+    ):
+        raise RuntimeError("health-v5 current RSS value is malformed")
+    if (
+        isinstance(peak_rss, bool)
+        or not isinstance(peak_rss, int)
+        or peak_rss < 0
+        or isinstance(python_ru_maxrss, bool)
+        or not isinstance(python_ru_maxrss, int)
+        or python_ru_maxrss < 0
+    ):
+        raise RuntimeError("health-v5 peak or Python ru_maxrss value is malformed")
+    expected_peak_rss = max(python_ru_maxrss, current_rss or 0)
+    if peak_rss != expected_peak_rss:
+        raise RuntimeError("health-v5 composite peak RSS is incoherent")
+    current_rss_source = resources["current_rss_source"]
+    peak_rss_source = resources["peak_rss_source"]
+    python_ru_maxrss_source = resources["python_ru_maxrss_source"]
+    source_fields = (current_rss_source, peak_rss_source, python_ru_maxrss_source)
+    if any(
+        not isinstance(source, str) or not source or len(source.encode("utf-8")) > 256
+        for source in source_fields
+    ):
+        raise RuntimeError("health-v5 RSS source is malformed")
+    if peak_rss_source != COMPOSITE_PEAK_RSS_SOURCE:
+        raise RuntimeError("health-v5 composite peak RSS source differs")
+    if python_ru_maxrss_source == LINUX_PYTHON_RU_MAXRSS_SOURCE:
+        if current_rss is None:
+            if current_rss_source not in LINUX_CURRENT_RSS_UNAVAILABLE_SOURCES:
+                raise RuntimeError("health-v5 Linux current RSS source/value differs")
+        elif current_rss_source != LINUX_CURRENT_RSS_SOURCE:
+            raise RuntimeError("health-v5 Linux current RSS source/value differs")
+    elif python_ru_maxrss_source == DARWIN_PYTHON_RU_MAXRSS_SOURCE:
+        if current_rss is not None or current_rss_source != "UNAVAILABLE_PLATFORM:darwin":
+            raise RuntimeError("health-v5 Darwin current RSS source/value differs")
+    else:
+        raise RuntimeError("health-v5 Python ru_maxrss source differs")
+    if require_current_contract and python_ru_maxrss_source != LINUX_PYTHON_RU_MAXRSS_SOURCE:
+        raise RuntimeError("current exact health-v5 qualification requires Linux RSS sources")
+    return HEALTH_V5_CURRENT_RSS_SEMANTICS
+
+
 def _health_checkpoint_sizes(
     path: Path,
     *,
@@ -671,6 +780,10 @@ def _health_checkpoint_sizes(
                     raise RuntimeError("calibration health-v5 books group is malformed")
                 if record["schema_version"] != HEALTH_CHECKPOINT_SCHEMA_VERSION:
                     raise RuntimeError("calibration health evidence is not current health-v5")
+                _health_v5_rss_semantics(
+                    cast(dict[str, object], record["resources"]),
+                    require_current_contract=True,
+                )
                 if record["collector_run_id"] != expected_collector_run_id:
                     raise RuntimeError("calibration health evidence run identity differs")
                 if record["git_commit"] != expected_git_commit:
@@ -816,7 +929,12 @@ def _measurement(
     analytical_before: BoundedTreeUsage,
     analytical_after: BoundedTreeUsage,
     cpu_time_ns: int,
+    current_rss_bytes: int | None,
+    current_rss_source: str,
     peak_rss_bytes: int,
+    peak_rss_source: str,
+    python_ru_maxrss_bytes: int,
+    python_ru_maxrss_source: str,
     requested_duration_ns: int,
     health_checkpoint_sizes: _HealthCheckpointSizes,
 ) -> CalibrationMeasurements:
@@ -881,7 +999,12 @@ def _measurement(
         audit_failed=summary.processor.rest_audit_failed,
         audit_retries=audit_retries,
         cpu_time_ns=cpu_time_ns,
+        current_rss_bytes=current_rss_bytes,
+        current_rss_source=current_rss_source,
         peak_rss_bytes=peak_rss_bytes,
+        peak_rss_source=peak_rss_source,
+        python_ru_maxrss_bytes=python_ru_maxrss_bytes,
+        python_ru_maxrss_source=python_ru_maxrss_source,
         analytical_bytes=analytical_delta.bytes,
         health_bytes=summary.health_evidence.file_bytes,
         health_content_sha256=health_checkpoint_sizes.content_sha256,
@@ -947,8 +1070,6 @@ async def run_polymarket_calibration(
         gamma_market_id=gamma_market_id,
     )
     cpu_time_ns = time.process_time_ns() - cpu_started_ns
-    usage = resource.getrusage(resource.RUSAGE_SELF)
-    peak_rss_bytes = int(usage.ru_maxrss) * (1024 if sys.platform.startswith("linux") else 1)
     storage_after, analytical_after, free_disk_bytes = await asyncio.to_thread(
         _post_run_usage,
         prepared.storage_root,
@@ -957,6 +1078,9 @@ async def run_polymarket_calibration(
     target = summary.target
     if target is None or not target.gate1_explicit:
         raise RuntimeError("calibration observation did not resolve the explicit target")
+    terminal_process_resources = summary.terminal_process_resources
+    if terminal_process_resources is None:
+        raise RuntimeError("calibration observation lacks terminal process-resource evidence")
     health_checkpoint_sizes = await asyncio.to_thread(
         _health_checkpoint_sizes,
         summary.health_evidence.path,
@@ -1002,7 +1126,12 @@ async def run_polymarket_calibration(
         analytical_before=prepared.analytical_before,
         analytical_after=analytical_after,
         cpu_time_ns=cpu_time_ns,
-        peak_rss_bytes=peak_rss_bytes,
+        current_rss_bytes=terminal_process_resources.current_rss_bytes,
+        current_rss_source=terminal_process_resources.current_rss_source,
+        peak_rss_bytes=terminal_process_resources.peak_rss_bytes,
+        peak_rss_source=terminal_process_resources.peak_rss_source,
+        python_ru_maxrss_bytes=terminal_process_resources.python_ru_maxrss_bytes,
+        python_ru_maxrss_source=terminal_process_resources.python_ru_maxrss_source,
         requested_duration_ns=requested_duration_ns,
         health_checkpoint_sizes=health_checkpoint_sizes,
     )

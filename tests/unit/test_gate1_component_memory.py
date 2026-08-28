@@ -17,6 +17,7 @@ import pytest
 REPOSITORY = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY))
 
+import benchmarks.gate1_component_memory as component_memory_module  # noqa: E402
 from benchmarks.gate1_component_memory import (  # noqa: E402
     CI_FIXTURE_MODE,
     DIAGNOSTIC_MODE,
@@ -26,6 +27,7 @@ from benchmarks.gate1_component_memory import (  # noqa: E402
     WORKLOAD_NAMES,
     WORKLOAD_SCHEMA,
     WorkloadSizing,
+    _ru_maxrss_bytes,  # pyright: ignore[reportPrivateUsage]
     _wait_for_seal_headroom,  # pyright: ignore[reportPrivateUsage]
     h_runtime_configuration,
     run_component_memory_campaign,
@@ -60,6 +62,25 @@ _EXPECTED_H_COMPONENTS = [
     "process_resource_sampler",
     "terminal_finalization_and_reconciliation",
 ]
+
+
+def test_component_memory_ru_maxrss_normalization_is_platform_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def getrusage(_: int) -> SimpleNamespace:
+        return SimpleNamespace(ru_maxrss=123)
+
+    monkeypatch.setattr(
+        component_memory_module.resource,
+        "getrusage",
+        getrusage,
+    )
+    monkeypatch.setattr(component_memory_module.sys, "platform", "darwin")
+    assert _ru_maxrss_bytes() == 123
+
+    monkeypatch.setattr(component_memory_module.sys, "platform", "freebsd14")
+    with pytest.raises(RuntimeError, match="units are unsupported"):
+        _ru_maxrss_bytes()
 
 
 class _DelayedRotationWriter:

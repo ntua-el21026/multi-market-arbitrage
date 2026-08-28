@@ -11,6 +11,7 @@ import pytest
 REPOSITORY = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY))
 
+import benchmarks.gate1_pre_soak_capacity as capacity_module  # noqa: E402
 from benchmarks.gate1_pre_soak_capacity import (  # noqa: E402
     _RUN_ID,  # pyright: ignore[reportPrivateUsage]
     DEFAULT_ANALYTICAL_BATCH_SIZE,
@@ -32,6 +33,9 @@ from benchmarks.gate1_pre_soak_capacity import (  # noqa: E402
     JOURNAL_PAYLOAD_BYTES,
     JOURNAL_PYTHON_NET_GROWTH_LIMIT_BYTES,
     JOURNAL_RSS_NET_GROWTH_LIMIT_BYTES,
+    RESULT_SCHEMA,
+    _allocator_measurement,  # pyright: ignore[reportPrivateUsage]
+    _allocator_rss_contract_valid,  # pyright: ignore[reportPrivateUsage]
     _bootstrap,  # pyright: ignore[reportPrivateUsage]
     _deep_size_bytes,  # pyright: ignore[reportPrivateUsage]
     _diagnostic_retention_independence,  # pyright: ignore[reportPrivateUsage]
@@ -49,11 +53,17 @@ from benchmarks.gate1_pre_soak_capacity import (  # noqa: E402
 from multi_market_arbitrage.core.config import load_phase1_config  # noqa: E402
 from multi_market_arbitrage.journal import RunCompletionHead  # noqa: E402
 from multi_market_arbitrage.pipeline import WS_MARKET, CanonicalProcessor  # noqa: E402
+from multi_market_arbitrage.pipeline.health import (  # noqa: E402
+    COMPOSITE_PEAK_RSS_SOURCE,
+    LINUX_CURRENT_RSS_SOURCE,
+    LINUX_PYTHON_RU_MAXRSS_SOURCE,
+)
 from multi_market_arbitrage.pipeline.processor import ProcessorRetentionDomain  # noqa: E402
 
 
 def test_gate1_capacity_defaults_exceed_historical_plateau() -> None:
     config = load_phase1_config(REPOSITORY / "config" / "phase1.toml")
+    assert RESULT_SCHEMA == "mma-gate1-final-pre-soak-capacity-v5"
     assert DEFAULT_SCAN_EVENTS > DEFAULT_SATURATION_THRESHOLD == 4_096
     assert DEFAULT_AUDIT_OUTCOMES > DEFAULT_SATURATION_THRESHOLD
     assert (
@@ -78,6 +88,62 @@ def test_gate1_capacity_defaults_exceed_historical_plateau() -> None:
     )
     assert JOURNAL_EVENT_COUNT == 80_001
     assert JOURNAL_EVENT_COUNT % JOURNAL_EVENTS_PER_SEGMENT == 1
+
+
+def test_allocator_measurement_labels_current_ru_maxrss_and_composite_peak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        capacity_module,
+        "_current_rss_measurement",
+        lambda: (
+            420_605_952,
+            capacity_module.LINUX_PROC_STATUS_CURRENT_RSS_SOURCE,
+        ),
+    )
+    monkeypatch.setattr(
+        capacity_module,
+        "_python_ru_maxrss",
+        lambda: (418_234_368, LINUX_PYTHON_RU_MAXRSS_SOURCE),
+    )
+
+    measurement = _allocator_measurement()
+
+    assert measurement["rss_current_bytes"] == 420_605_952
+    assert measurement["rss_current_source"] == ("linux-proc-self-status-vmrss-kib-times-1024")
+    assert measurement["python_ru_maxrss_bytes"] == 418_234_368
+    assert measurement["python_ru_maxrss_source"] == LINUX_PYTHON_RU_MAXRSS_SOURCE
+    assert measurement["rss_same_sample_composite_peak_bytes"] == 420_605_952
+    assert measurement["rss_same_sample_composite_peak_source"] == COMPOSITE_PEAK_RSS_SOURCE
+    assert _allocator_rss_contract_valid(measurement)
+
+
+def test_allocator_measurement_marks_current_rss_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        capacity_module,
+        "_current_rss_measurement",
+        lambda: (
+            None,
+            capacity_module.LINUX_PROC_STATUS_CURRENT_RSS_OS_ERROR_SOURCE,
+        ),
+    )
+    monkeypatch.setattr(
+        capacity_module,
+        "_python_ru_maxrss",
+        lambda: (418_234_368, LINUX_PYTHON_RU_MAXRSS_SOURCE),
+    )
+
+    measurement = _allocator_measurement()
+
+    assert measurement["rss_current_bytes"] is None
+    assert measurement["rss_current_source"] == (
+        capacity_module.LINUX_PROC_STATUS_CURRENT_RSS_OS_ERROR_SOURCE
+    )
+    assert measurement["rss_same_sample_composite_peak_bytes"] == 418_234_368
+    assert measurement["rss_same_sample_composite_peak_source"] == COMPOSITE_PEAK_RSS_SOURCE
+    assert _allocator_rss_contract_valid(measurement)
     assert DEFAULT_SCAN_EVENTS - DEFAULT_SATURATION_THRESHOLD >= 2 * DEFAULT_ANALYTICAL_BATCH_SIZE
     assert (
         DEFAULT_AUDIT_OUTCOMES - DEFAULT_SATURATION_THRESHOLD >= 2 * DEFAULT_ANALYTICAL_BATCH_SIZE
@@ -86,6 +152,40 @@ def test_gate1_capacity_defaults_exceed_historical_plateau() -> None:
         DEFAULT_AVAILABILITY_WRITER_CONTRIBUTIONS
         >= GATE1_MINIMUM_AVAILABILITY_WRITER_CONTRIBUTIONS
         == 4_096
+    )
+
+
+def test_capacity_current_rss_source_is_platform_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(capacity_module.sys, "platform", "darwin")
+
+    assert capacity_module._current_rss_measurement() == (  # pyright: ignore[reportPrivateUsage]
+        None,
+        "UNAVAILABLE_PLATFORM:darwin",
+    )
+
+
+def test_allocator_rss_contract_rejects_fabricated_source_or_composite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        capacity_module,
+        "_current_rss_measurement",
+        lambda: (1, capacity_module.LINUX_PROC_STATUS_CURRENT_RSS_SOURCE),
+    )
+    monkeypatch.setattr(
+        capacity_module,
+        "_python_ru_maxrss",
+        lambda: (2, LINUX_PYTHON_RU_MAXRSS_SOURCE),
+    )
+    measurement = _allocator_measurement()
+
+    assert not _allocator_rss_contract_valid(
+        {**measurement, "rss_current_source": "fabricated-source"}
+    )
+    assert not _allocator_rss_contract_valid(
+        {**measurement, "rss_same_sample_composite_peak_bytes": 3}
     )
 
 
@@ -421,6 +521,13 @@ async def test_capacity_workload_saturates_production_histories_and_persistence(
     )
     assert terminal_resources["python_allocation_group_capture"] == (
         "TERMINAL_POST_CUTOFF_FILENAME_GROUPS"
+    )
+    assert terminal_resources["current_rss_source"] == LINUX_CURRENT_RSS_SOURCE
+    assert terminal_resources["peak_rss_source"] == COMPOSITE_PEAK_RSS_SOURCE
+    assert terminal_resources["python_ru_maxrss_source"] == LINUX_PYTHON_RU_MAXRSS_SOURCE
+    assert terminal_resources["peak_rss_bytes"] == max(
+        cast(int, terminal_resources["current_rss_bytes"]),
+        cast(int, terminal_resources["python_ru_maxrss_bytes"]),
     )
 
 

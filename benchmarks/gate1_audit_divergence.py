@@ -116,6 +116,7 @@ from multi_market_arbitrage.pipeline.health import (  # noqa: E402
     AUDIT_STAGE_TIMING_TELEMETRY_HISTOGRAM_FIELDS,
     AUDIT_STAGE_TIMING_TELEMETRY_SCHEMA,
     AUDIT_STAGE_TIMING_TELEMETRY_STAGES,
+    COMPOSITE_PEAK_RSS_SOURCE,
     MAXIMUM_REPORTED_PYTHON_ALLOCATION_GROUPS,
     MAXIMUM_REPORTED_RESOURCE_DISCONTINUITIES,
     PROCESS_RESOURCE_DISCONTINUITY_TELEMETRY_ROW_FIELDS,
@@ -127,6 +128,7 @@ from multi_market_arbitrage.pipeline.health import (  # noqa: E402
     PUBLIC_READ_ENDPOINT_TELEMETRY_ROW_FIELDS,
     PUBLIC_READ_ENDPOINT_TELEMETRY_SCHEMA,
     REPORTED_TOP_TRANSITION_HEALTH_TELEMETRY_SCHEMA,
+    normalize_python_ru_maxrss_bytes,
 )
 from multi_market_arbitrage.pipeline.health import (  # noqa: E402
     MAXIMUM_AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVES as MAXIMUM_RESOLUTION_REPRESENTATIVES,
@@ -159,8 +161,13 @@ from multi_market_arbitrage.venues.polymarket import (  # noqa: E402
     PolymarketRetryBlockedReason,
 )
 
-RESULT_SCHEMA = "mma-gate1-audit-divergence-benchmark-v1"
+RESULT_SCHEMA = "mma-gate1-audit-divergence-benchmark-v2"
 WORKLOAD_VERSION = "adr-0054-production-paths-v2"
+LINUX_PROC_STATUS_CURRENT_RSS_SOURCE = "linux-proc-self-status-vmrss-kib-times-1024"
+LINUX_PROC_STATUS_CURRENT_RSS_OS_ERROR_SOURCE = "UNAVAILABLE:OSError:linux-proc-self-status-vmrss"
+LINUX_PROC_STATUS_CURRENT_RSS_VALUE_ERROR_SOURCE = (
+    "UNAVAILABLE:ValueError:linux-proc-self-status-vmrss"
+)
 DEFAULT_WARMUPS = 5
 DEFAULT_REPETITIONS = 30
 DEFAULT_CAUSAL_REPETITIONS = 10
@@ -2231,22 +2238,40 @@ def _measure_replacement_release_series(
     }
 
 
-def _current_rss_bytes() -> int | None:
+def _current_rss_bytes() -> tuple[int | None, str]:
+    if not sys.platform.startswith("linux"):
+        return None, f"UNAVAILABLE_PLATFORM:{sys.platform}"
     try:
         lines = Path("/proc/self/status").read_text(encoding="utf-8").splitlines()
     except OSError:
-        return None
+        return None, LINUX_PROC_STATUS_CURRENT_RSS_OS_ERROR_SOURCE
     for line in lines:
         if line.startswith("VmRSS:"):
             fields = line.split()
             if len(fields) == 3 and fields[2] == "kB":
-                return int(fields[1]) * 1024
-    return None
+                try:
+                    return int(fields[1]) * 1024, LINUX_PROC_STATUS_CURRENT_RSS_SOURCE
+                except ValueError:
+                    return None, LINUX_PROC_STATUS_CURRENT_RSS_VALUE_ERROR_SOURCE
+    return None, LINUX_PROC_STATUS_CURRENT_RSS_VALUE_ERROR_SOURCE
 
 
-def _peak_rss_bytes() -> int:
-    value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    return value if sys.platform == "darwin" else value * 1024
+def _rss_measurement() -> dict[str, int | str | None]:
+    current_rss_bytes, current_rss_source = _current_rss_bytes()
+    python_ru_maxrss_bytes, python_ru_maxrss_source = normalize_python_ru_maxrss_bytes(
+        int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    )
+    return {
+        "current_rss_bytes": current_rss_bytes,
+        "current_rss_source": current_rss_source,
+        "python_ru_maxrss_bytes": python_ru_maxrss_bytes,
+        "python_ru_maxrss_source": python_ru_maxrss_source,
+        "same_sample_composite_peak_bytes": max(
+            python_ru_maxrss_bytes,
+            current_rss_bytes or 0,
+        ),
+        "same_sample_composite_peak_source": COMPOSITE_PEAK_RSS_SOURCE,
+    }
 
 
 class _CapacityProcessorView:
@@ -3027,8 +3052,7 @@ def run_benchmark(
 
     if warmups < 0 or min(repetitions, causal_repetitions, replay_repetitions) <= 0:
         raise ValueError("warmups must be non-negative and repetitions must be positive")
-    rss_before = _current_rss_bytes()
-    peak_rss_before = _peak_rss_bytes()
+    rss_before = _rss_measurement()
     config = load_phase1_config(REPOSITORY / "config" / "phase1.toml")
     if config.health.checkpoint_interval_seconds != SIX_HOUR_CHECKPOINT_CADENCE_SECONDS:
         raise RuntimeError("configured health cadence differs from the Gate-1 projection")
@@ -3340,8 +3364,13 @@ def run_benchmark(
         != SINGLE_TARGET_MAXIMUM_PENDING_DIVERGENCES
     ):
         raise RuntimeError("six-hour capacity checkpoint did not saturate exact evidence")
-    rss_after = _current_rss_bytes()
-    peak_rss_after = _peak_rss_bytes()
+    rss_after = _rss_measurement()
+    current_rss_before = cast(int | None, rss_before["current_rss_bytes"])
+    current_rss_after = cast(int | None, rss_after["current_rss_bytes"])
+    python_ru_maxrss_before = cast(int, rss_before["python_ru_maxrss_bytes"])
+    python_ru_maxrss_after = cast(int, rss_after["python_ru_maxrss_bytes"])
+    composite_peak_before = cast(int, rss_before["same_sample_composite_peak_bytes"])
+    composite_peak_after = cast(int, rss_after["same_sample_composite_peak_bytes"])
     result: dict[str, object] = {
         "bounds": {
             "exact_levels_per_side": EXACT_LEVELS_PER_SIDE,
@@ -3373,14 +3402,17 @@ def run_benchmark(
         },
         "replay_throughput": replay_throughput,
         "resources": {
-            "current_rss_after_bytes": rss_after,
-            "current_rss_before_bytes": rss_before,
+            "after": rss_after,
+            "before": rss_before,
             "current_rss_delta_bytes": (
-                None if rss_before is None or rss_after is None else rss_after - rss_before
+                None
+                if current_rss_before is None or current_rss_after is None
+                else current_rss_after - current_rss_before
             ),
-            "peak_rss_after_bytes": peak_rss_after,
-            "peak_rss_before_bytes": peak_rss_before,
-            "peak_rss_delta_bytes": peak_rss_after - peak_rss_before,
+            "python_ru_maxrss_delta_bytes": (python_ru_maxrss_after - python_ru_maxrss_before),
+            "same_sample_composite_peak_delta_bytes": (
+                composite_peak_after - composite_peak_before
+            ),
             "rss_scope": "single benchmark process; allocation probes are reported per series",
         },
         "schema_version": RESULT_SCHEMA,
@@ -3397,6 +3429,8 @@ def _render_report(result: dict[str, object]) -> str:
     capacity_shape = cast(dict[str, object], result["capacity_evidence_shape"])
     replay = cast(dict[str, object], result["replay_throughput"])
     resources = cast(dict[str, object], result["resources"])
+    before_resources = cast(dict[str, object], resources["before"])
+    after_resources = cast(dict[str, object], resources["after"])
     series = cast(tuple[dict[str, object], ...], result["series"])
     lines = [
         "# Gate-1 audit-divergence performance benchmark",
@@ -3421,10 +3455,18 @@ def _render_report(result: dict[str, object]) -> str:
         f"- Compact resolution schema: `{capacity_shape['resolution_representative_schema']}`",
         f"- Replay workload: {replay['source_event_count']} events; "
         f"{replay['events_per_second_at_median']} events/s at median",
-        f"- Current RSS before/after: {resources['current_rss_before_bytes']} / "
-        f"{resources['current_rss_after_bytes']} bytes",
-        f"- Peak RSS before/after: {resources['peak_rss_before_bytes']} / "
-        f"{resources['peak_rss_after_bytes']} bytes",
+        f"- Current RSS before/after: {before_resources['current_rss_bytes']} / "
+        f"{after_resources['current_rss_bytes']} bytes "
+        f"(`{before_resources['current_rss_source']}` / "
+        f"`{after_resources['current_rss_source']}`)",
+        f"- Python ru_maxrss before/after: {before_resources['python_ru_maxrss_bytes']} / "
+        f"{after_resources['python_ru_maxrss_bytes']} bytes "
+        f"(`{before_resources['python_ru_maxrss_source']}` / "
+        f"`{after_resources['python_ru_maxrss_source']}`)",
+        "- Same-sample composite peak before/after: "
+        f"{before_resources['same_sample_composite_peak_bytes']} / "
+        f"{after_resources['same_sample_composite_peak_bytes']} bytes "
+        f"(`{after_resources['same_sample_composite_peak_source']}`)",
         "",
         "| Series | Repetitions | p50 ns | p95 ns | p99 ns | Peak traced delta bytes |",
         "|---|---:|---:|---:|---:|---:|",

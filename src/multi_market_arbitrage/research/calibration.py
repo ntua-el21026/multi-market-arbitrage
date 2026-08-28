@@ -39,8 +39,8 @@ STDIO_STREAM_LOG_STORAGE_MODEL = "STDIO_STREAM_ONLY_UNMANAGED"
 HEALTH_V5_CHECKPOINT_INTERVAL_NANOSECONDS = 10_000_000_000
 HEALTH_V5_MAXIMUM_CHECKPOINTS = 8_192
 HEALTH_V5_MAXIMUM_FILE_BYTES = 68 * 1024 * 1024
-HEALTH_V5_CAPACITY_MAXIMUM_PERIODIC_CHECKPOINT_BYTES = 31_319
-HEALTH_V5_CAPACITY_MAXIMUM_TERMINAL_CHECKPOINT_BYTES = 44_963
+HEALTH_V5_CAPACITY_MAXIMUM_PERIODIC_CHECKPOINT_BYTES = 31_573
+HEALTH_V5_CAPACITY_MAXIMUM_TERMINAL_CHECKPOINT_BYTES = 45_217
 HEALTH_V5_MINIMUM_FILE_HEADROOM_BYTES = 2 * 1024 * 1024
 
 
@@ -306,7 +306,12 @@ class CalibrationMeasurements:
     audit_failed: int
     audit_retries: int
     cpu_time_ns: int
+    current_rss_bytes: int | None
+    current_rss_source: str
     peak_rss_bytes: int
+    peak_rss_source: str
+    python_ru_maxrss_bytes: int
+    python_ru_maxrss_source: str
     analytical_bytes: int
     health_bytes: int
     health_content_sha256: str
@@ -351,6 +356,7 @@ class CalibrationMeasurements:
             self.audit_retries,
             self.cpu_time_ns,
             self.peak_rss_bytes,
+            self.python_ru_maxrss_bytes,
             self.analytical_bytes,
             self.health_bytes,
             self.health_periodic_checkpoints,
@@ -367,6 +373,20 @@ class CalibrationMeasurements:
         )
         if any(value < 0 for value in counts):
             raise ValueError("calibration measurements cannot be negative")
+        if self.current_rss_bytes is not None and self.current_rss_bytes < 0:
+            raise ValueError("calibration current RSS cannot be negative")
+        if self.peak_rss_bytes != max(
+            self.python_ru_maxrss_bytes,
+            self.current_rss_bytes or 0,
+        ):
+            raise ValueError("calibration peak RSS is not the exact same-sample composite")
+        rss_sources = (
+            self.current_rss_source,
+            self.peak_rss_source,
+            self.python_ru_maxrss_source,
+        )
+        if any(not source or len(source.encode("utf-8")) > 256 for source in rss_sources):
+            raise ValueError("calibration RSS sources must be explicit and bounded")
         if self.log_storage_model != STDIO_STREAM_LOG_STORAGE_MODEL or self.log_bytes != 0:
             raise ValueError("calibration log storage must bind the stdio-stream zero-byte model")
         if not is_sha256_hex(self.health_content_sha256):
@@ -403,6 +423,8 @@ class CalibrationMeasurements:
             "capture_healthy": self.capture_healthy,
             "completed_run_duration_ns": self.completed_run_duration_ns,
             "cpu_time_ns": self.cpu_time_ns,
+            "current_rss_bytes": self.current_rss_bytes,
+            "current_rss_source": self.current_rss_source,
             "durable_raw_records": self.durable_raw_records,
             "existing_artifact_paths": self.existing_artifact_paths,
             "gate1_eligible_so_far": self.gate1_eligible_so_far,
@@ -426,6 +448,9 @@ class CalibrationMeasurements:
             "log_bytes": self.log_bytes,
             "log_storage_model": self.log_storage_model,
             "peak_rss_bytes": self.peak_rss_bytes,
+            "peak_rss_source": self.peak_rss_source,
+            "python_ru_maxrss_bytes": self.python_ru_maxrss_bytes,
+            "python_ru_maxrss_source": self.python_ru_maxrss_source,
             "queues": [item.to_record() for item in self.queues],
             "research_eligible": self.research_eligible,
             "requested_duration_ns": self.requested_duration_ns,
@@ -1043,7 +1068,12 @@ def render_calibration_markdown(report: CalibrationReport) -> str:
             f"- Free disk at calibration: {projection.free_disk_bytes} bytes",
             f"- Projected artifact paths: {projection.artifact_paths}",
             f"- Artifact path limit: {report.limits.artifact_path_limit}",
-            f"- Peak RSS: {measurement.peak_rss_bytes} bytes",
+            f"- Current RSS: {measurement.current_rss_bytes} bytes "
+            f"(`{measurement.current_rss_source}`)",
+            f"- Same-sample composite peak RSS: {measurement.peak_rss_bytes} bytes "
+            f"(`{measurement.peak_rss_source}`)",
+            f"- Python ru_maxrss: {measurement.python_ru_maxrss_bytes} bytes "
+            f"(`{measurement.python_ru_maxrss_source}`)",
             f"- CPU time: {measurement.cpu_time_ns} ns",
             "",
             "This bounded run is calibration evidence only; it is not the six-hour Gate-1 soak.",

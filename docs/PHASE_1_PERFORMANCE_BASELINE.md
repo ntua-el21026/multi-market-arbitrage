@@ -329,10 +329,12 @@ PYTHONHASHSEED=0 taskset -c 0 uv run --frozen --all-groups --no-sync python \
   --baseline-b-json <baseline-b-results.json>
 ```
 
-The current harness emits `mma-phase1-performance-final-c-v2`. It leaves the
+The current harness emits `mma-phase1-performance-final-c-v3`. It leaves the
 historical 54-series comparable contract unchanged and adds production-path
 current-stage records for bounded audit HTTP adapter work, fixed-lag response
-barrier catch-up, and typed audit classification. The separate
+barrier catch-up, and typed audit classification. V3 also labels current Linux
+`VmRSS` separately from Python `getrusage(RUSAGE_SELF).ru_maxrss`; neither is
+reported as an externally sampled peak. The separate
 `gate1-health-benchmark-v2` harness now measures the production observation
 checkpoint builder plus non-blocking enqueue, off-path write/`fsync`, and
 periodic-plus-final count/file projections.

@@ -185,8 +185,8 @@ either exact binding remains historical and cannot qualify. Generic stochastic r
 integer arithmetic, the WebSocket observation duration as their denominator,
 and 2.0x workload headroom. Health v5 is instead a fixed-cardinality projection:
 2,160 periodic checkpoints plus one terminal checkpoint, using the
-capacity-qualified 31,319-byte periodic and 44,963-byte terminal maxima. The
-derived 32,019-byte periodic file-budget ceiling leaves an exact 700-byte
+capacity-qualified 31,573-byte periodic and 45,217-byte terminal maxima. The
+derived 32,018-byte periodic file-budget ceiling leaves an exact 445-byte
 capacity-qualification margin; it is not an observed-record acceptance bound.
 The producer opens the current v5 health file once without
 following links, requires
@@ -211,10 +211,10 @@ live at once; concurrency requires separately additive disk reservation.
 The Gate-1 health profile retains its ten-second cadence and checkpoint-count
 bound; calibration rejects any different cadence, count cap, or file cap. The
 fixed six-hour shape is exactly 2,160 periodic records plus one terminal
-record, so `2,160 * 31,319 + 1 * 44,963 = 67,694,003` bytes. The
-health-evidence file cap is 68 MiB (71,303,168 bytes), leaving 3,609,165 bytes
-and exceeding the required 2 MiB projection headroom. The derived 32,019-byte
-periodic file-budget ceiling retains an exact 700-byte capacity-qualification
-margin without relaxing the 31,319-byte observed-record maximum. The writer
+record, so `2,160 * 31,573 + 1 * 45,217 = 68,242,897` bytes. The
+health-evidence file cap is 68 MiB (71,303,168 bytes), leaving 3,060,271 bytes
+and exceeding the required 2 MiB projection headroom. The derived 32,018-byte
+periodic file-budget ceiling retains an exact 445-byte capacity-qualification
+margin without relaxing the 31,573-byte observed-record maximum. The writer
 still rejects
 before overflow, and missing or partial health evidence still fails closed.

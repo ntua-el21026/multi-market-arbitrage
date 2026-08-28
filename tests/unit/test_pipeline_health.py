@@ -7,10 +7,12 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 
+import multi_market_arbitrage.pipeline.health as health_module
 from multi_market_arbitrage.availability_authority import (
     AuditAvailabilityAuthoritySnapshot,
     AuditAvailabilityBinding,
@@ -94,6 +96,11 @@ from multi_market_arbitrage.pipeline.health import (
     AUDIT_MISMATCH_REPRESENTATIVE_TELEMETRY_SCHEMA,
     AUDIT_STAGE_TIMING_TELEMETRY_SCHEMA,
     AUDIT_STAGE_TIMING_TELEMETRY_STAGES,
+    COMPOSITE_PEAK_RSS_SOURCE,
+    DARWIN_PYTHON_RU_MAXRSS_SOURCE,
+    LINUX_CURRENT_RSS_OS_ERROR_SOURCE,
+    LINUX_CURRENT_RSS_SOURCE,
+    LINUX_PYTHON_RU_MAXRSS_SOURCE,
     MAXIMUM_OPEN_AVAILABILITY_CONTRIBUTIONS,
     PROCESSOR_RETENTION_TELEMETRY_ROW_FIELDS,
     PROCESSOR_RETENTION_TELEMETRY_SCHEMA,
@@ -108,6 +115,7 @@ from multi_market_arbitrage.pipeline.health import (
     audit_availability_authority_reconciled,
     build_observation_health_checkpoint,
     capture_terminal_process_resources,
+    normalize_python_ru_maxrss_bytes,
     public_read_fault_availability_projection_reconciled,
 )
 from multi_market_arbitrage.pipeline.ingress import BoundedRawIngress
@@ -863,8 +871,11 @@ def _checkpoint(
                 cpu_user_seconds=1.0,
                 cpu_system_seconds=0.5,
                 current_rss_bytes=900,
-                peak_rss_bytes=1024,
-                current_rss_source="test-current-rss",
+                peak_rss_bytes=1000,
+                current_rss_source=LINUX_CURRENT_RSS_SOURCE,
+                peak_rss_source=COMPOSITE_PEAK_RSS_SOURCE,
+                python_ru_maxrss_bytes=1000,
+                python_ru_maxrss_source=LINUX_PYTHON_RU_MAXRSS_SOURCE,
             )
             if resources is None
             else resources
@@ -1622,8 +1633,11 @@ def test_checkpoint_reports_bounded_resource_telemetry_and_marks_saturation() ->
             cpu_user_seconds=1.0,
             cpu_system_seconds=0.5,
             current_rss_bytes=10_000,
-            peak_rss_bytes=12_000,
-            current_rss_source="test-current-rss",
+            peak_rss_bytes=11_000,
+            current_rss_source=LINUX_CURRENT_RSS_SOURCE,
+            peak_rss_source=COMPOSITE_PEAK_RSS_SOURCE,
+            python_ru_maxrss_bytes=11_000,
+            python_ru_maxrss_source=LINUX_PYTHON_RU_MAXRSS_SOURCE,
             python_tracemalloc_current_bytes=2_000,
             python_tracemalloc_peak_bytes=3_000,
             python_tracemalloc_source="test-tracemalloc",
@@ -1692,6 +1706,160 @@ def test_terminal_resource_capture_bounds_python_allocation_groups(tmp_path: Pat
     )
 
 
+def test_resource_capture_distinguishes_current_ru_maxrss_and_coherent_peak(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    current_rss_bytes = 420_605_952
+    normalized_ru_maxrss_bytes = 418_234_368
+    monkeypatch.setattr(
+        health_module,
+        "_current_rss_bytes",
+        lambda: (current_rss_bytes, LINUX_CURRENT_RSS_SOURCE),
+    )
+
+    def getrusage(_: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            ru_maxrss=normalized_ru_maxrss_bytes // 1024,
+            ru_utime=1.0,
+            ru_stime=0.5,
+        )
+
+    monkeypatch.setattr(
+        health_module.resource,
+        "getrusage",
+        getrusage,
+    )
+
+    resources = health_module.capture_process_resources(tmp_path)
+
+    assert resources.current_rss_bytes == current_rss_bytes
+    assert resources.current_rss_source == LINUX_CURRENT_RSS_SOURCE
+    assert resources.python_ru_maxrss_bytes == normalized_ru_maxrss_bytes
+    assert resources.python_ru_maxrss_source == (LINUX_PYTHON_RU_MAXRSS_SOURCE)
+    assert resources.peak_rss_bytes == current_rss_bytes
+    assert resources.peak_rss_source == (COMPOSITE_PEAK_RSS_SOURCE)
+
+
+def test_resource_capture_uses_ru_maxrss_when_it_exceeds_current(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    current_rss_bytes = 100_000
+    normalized_ru_maxrss_bytes = 200_704
+    monkeypatch.setattr(
+        health_module,
+        "_current_rss_bytes",
+        lambda: (current_rss_bytes, LINUX_CURRENT_RSS_SOURCE),
+    )
+
+    def getrusage(_: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            ru_maxrss=normalized_ru_maxrss_bytes // 1024,
+            ru_utime=1.0,
+            ru_stime=0.5,
+        )
+
+    monkeypatch.setattr(health_module.resource, "getrusage", getrusage)
+
+    resources = health_module.capture_process_resources(tmp_path)
+
+    assert resources.current_rss_bytes == current_rss_bytes
+    assert resources.python_ru_maxrss_bytes == normalized_ru_maxrss_bytes
+    assert resources.peak_rss_bytes == normalized_ru_maxrss_bytes
+
+
+def test_resource_capture_preserves_unavailable_current_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        health_module,
+        "_current_rss_bytes",
+        lambda: (None, LINUX_CURRENT_RSS_OS_ERROR_SOURCE),
+    )
+
+    def getrusage(_: int) -> SimpleNamespace:
+        return SimpleNamespace(ru_maxrss=123, ru_utime=1.0, ru_stime=0.5)
+
+    monkeypatch.setattr(health_module.resource, "getrusage", getrusage)
+
+    resources = health_module.capture_process_resources(tmp_path)
+
+    assert resources.current_rss_bytes is None
+    assert resources.current_rss_source == LINUX_CURRENT_RSS_OS_ERROR_SOURCE
+    assert resources.python_ru_maxrss_bytes == 123 * 1024
+    assert resources.peak_rss_bytes == resources.python_ru_maxrss_bytes
+
+
+def test_resource_capture_labels_non_linux_ru_maxrss_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(health_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        health_module,
+        "_current_rss_bytes",
+        lambda: (None, "UNAVAILABLE_PLATFORM:darwin"),
+    )
+
+    def getrusage(_: int) -> SimpleNamespace:
+        return SimpleNamespace(ru_maxrss=123_456, ru_utime=1.0, ru_stime=0.5)
+
+    monkeypatch.setattr(health_module.resource, "getrusage", getrusage)
+
+    resources = health_module.capture_process_resources(tmp_path)
+
+    assert resources.python_ru_maxrss_bytes == 123_456
+    assert resources.python_ru_maxrss_source == DARWIN_PYTHON_RU_MAXRSS_SOURCE
+    assert resources.peak_rss_bytes == 123_456
+
+
+def test_current_rss_capture_labels_darwin_before_touching_linux_procfs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(health_module.sys, "platform", "darwin")
+
+    assert health_module._current_rss_bytes() == (  # pyright: ignore[reportPrivateUsage]
+        None,
+        "UNAVAILABLE_PLATFORM:darwin",
+    )
+
+
+def test_ru_maxrss_normalization_fails_closed_on_unknown_platform_units() -> None:
+    with pytest.raises(RuntimeError, match="units are unsupported"):
+        normalize_python_ru_maxrss_bytes(123, platform_name="freebsd14")
+
+
+@pytest.mark.parametrize(
+    ("current_rss_bytes", "peak_rss_bytes", "python_ru_maxrss_bytes", "error"),
+    [
+        (2, 1, 1, "below current RSS"),
+        (1, 1, 2, "below Python ru_maxrss"),
+        (1, 3, 2, "equal the maximum"),
+    ],
+)
+def test_process_resource_snapshot_rejects_incoherent_sampled_peak(
+    current_rss_bytes: int,
+    peak_rss_bytes: int,
+    python_ru_maxrss_bytes: int,
+    error: str,
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        ProcessResourceSnapshot(
+            sampled_monotonic_ns=1,
+            free_disk_bytes=1,
+            cpu_user_seconds=0.0,
+            cpu_system_seconds=0.0,
+            current_rss_bytes=current_rss_bytes,
+            peak_rss_bytes=peak_rss_bytes,
+            current_rss_source=LINUX_CURRENT_RSS_SOURCE,
+            peak_rss_source=COMPOSITE_PEAK_RSS_SOURCE,
+            python_ru_maxrss_bytes=python_ru_maxrss_bytes,
+            python_ru_maxrss_source=LINUX_PYTHON_RU_MAXRSS_SOURCE,
+        )
+
+
 def test_process_resource_snapshot_rejects_unbounded_or_periodic_allocation_groups() -> None:
     common: dict[str, object] = {
         "sampled_monotonic_ns": 1,
@@ -1700,6 +1868,9 @@ def test_process_resource_snapshot_rejects_unbounded_or_periodic_allocation_grou
         "cpu_system_seconds": 0.0,
         "current_rss_bytes": 1,
         "peak_rss_bytes": 1,
+        "peak_rss_source": COMPOSITE_PEAK_RSS_SOURCE,
+        "python_ru_maxrss_bytes": 1,
+        "python_ru_maxrss_source": LINUX_PYTHON_RU_MAXRSS_SOURCE,
     }
     with pytest.raises(ValueError, match="explicit and bounded"):
         ProcessResourceSnapshot(
@@ -1709,8 +1880,26 @@ def test_process_resource_snapshot_rejects_unbounded_or_periodic_allocation_grou
     with pytest.raises(ValueError, match="periodic resource evidence"):
         ProcessResourceSnapshot(
             **common,  # type: ignore[arg-type]
-            current_rss_source="test",
+            current_rss_source=LINUX_CURRENT_RSS_SOURCE,
             python_allocation_groups=(PythonAllocationGroup("fixture.py", 1, 1),),
+        )
+    with pytest.raises(ValueError, match="composite RSS source is unsupported"):
+        ProcessResourceSnapshot(
+            **{**common, "peak_rss_source": "not-the-composite-source"},  # type: ignore[arg-type]
+            current_rss_source=LINUX_CURRENT_RSS_SOURCE,
+        )
+    with pytest.raises(ValueError, match="available Linux current RSS source is inconsistent"):
+        ProcessResourceSnapshot(
+            **common,  # type: ignore[arg-type]
+            current_rss_source="fabricated-current-rss-source",
+        )
+    with pytest.raises(ValueError, match="unavailable Linux current RSS source is inconsistent"):
+        ProcessResourceSnapshot(
+            **{  # type: ignore[arg-type]
+                **common,
+                "current_rss_bytes": None,
+                "current_rss_source": "UNAVAILABLE:fabricated",
+            },
         )
 
 
@@ -1956,7 +2145,10 @@ def test_checkpoint_builder_emits_all_scoped_groups_and_fail_closed_decision() -
     assert checkpoint.http["active_attempts"] == 0
     assert checkpoint.recovery["longest_unavailable_nanoseconds"] == 0
     assert checkpoint.resources["current_rss_bytes"] == 900
-    assert checkpoint.resources["peak_rss_bytes"] == 1024
+    assert checkpoint.resources["peak_rss_bytes"] == 1000
+    assert checkpoint.resources["peak_rss_source"] == COMPOSITE_PEAK_RSS_SOURCE
+    assert checkpoint.resources["python_ru_maxrss_bytes"] == 1000
+    assert checkpoint.resources["python_ru_maxrss_source"] == LINUX_PYTHON_RU_MAXRSS_SOURCE
     rss_trend = cast(dict[str, object], checkpoint.resources["rss_trend"])
     host_identity = cast(dict[str, object], checkpoint.resources["host_runtime_identity"])
     assert rss_trend["start_rss_bytes"] == 800
@@ -3963,7 +4155,10 @@ async def test_resource_sampler_reports_current_rss_linear_slope_and_discontinui
             cpu_system_seconds=0.0,
             current_rss_bytes=100 + index * 10,
             peak_rss_bytes=1_000,
-            current_rss_source="test",
+            current_rss_source=LINUX_CURRENT_RSS_SOURCE,
+            peak_rss_source=COMPOSITE_PEAK_RSS_SOURCE,
+            python_ru_maxrss_bytes=1_000,
+            python_ru_maxrss_source=LINUX_PYTHON_RU_MAXRSS_SOURCE,
             python_tracemalloc_current_bytes=1_000 + index * 20,
             python_tracemalloc_peak_bytes=2_000,
             python_tracemalloc_source="test",

@@ -9,7 +9,6 @@ import json
 import math
 import os
 import platform
-import resource
 import statistics
 import subprocess
 import sys
@@ -67,6 +66,9 @@ from multi_market_arbitrage.pipeline import (  # noqa: E402
 )
 from multi_market_arbitrage.pipeline.health import (  # noqa: E402
     AUDIT_STAGE_TIMING_TELEMETRY_STAGES,
+    COMPOSITE_PEAK_RSS_SOURCE,
+    LINUX_CURRENT_RSS_SOURCE,
+    LINUX_PYTHON_RU_MAXRSS_SOURCE,
     MAXIMUM_REPORTED_RESOURCE_DISCONTINUITIES,
     ObservationRuntimeHealthSnapshot,
     ProcessResourceDiscontinuity,
@@ -74,6 +76,7 @@ from multi_market_arbitrage.pipeline.health import (  # noqa: E402
     ProcessResourceTrendSnapshot,
     PythonAllocationGroup,
     build_observation_health_checkpoint,
+    capture_process_resources,
 )
 from multi_market_arbitrage.pipeline.ingress import RawIngressMetricsSnapshot  # noqa: E402
 from multi_market_arbitrage.pipeline.targeting import resolve_polymarket_target  # noqa: E402
@@ -157,8 +160,11 @@ def _capacity_process_resources(*, terminal: bool) -> ProcessResourceSnapshot:
         cpu_user_seconds=21_600.123456,
         cpu_system_seconds=10_800.654321,
         current_rss_bytes=9_000_000_000_000,
-        peak_rss_bytes=9_100_000_000_000,
-        current_rss_source="proc-statusm-statm-benchmark-capacity",
+        peak_rss_bytes=9_050_000_000_000,
+        current_rss_source=LINUX_CURRENT_RSS_SOURCE,
+        peak_rss_source=COMPOSITE_PEAK_RSS_SOURCE,
+        python_ru_maxrss_bytes=9_050_000_000_000,
+        python_ru_maxrss_source=LINUX_PYTHON_RU_MAXRSS_SOURCE,
         python_tracemalloc_current_bytes=2_000_000_000_000,
         python_tracemalloc_peak_bytes=2_100_000_000_000,
         python_tracemalloc_source="tracemalloc-get-traced-memory-benchmark-capacity",
@@ -581,7 +587,10 @@ def _production_checkpoint_builder(
         cpu_system_seconds=1.0,
         current_rss_bytes=120 * 1024 * 1024,
         peak_rss_bytes=128 * 1024 * 1024,
-        current_rss_source="benchmark-fixture",
+        current_rss_source=LINUX_CURRENT_RSS_SOURCE,
+        peak_rss_source=COMPOSITE_PEAK_RSS_SOURCE,
+        python_ru_maxrss_bytes=128 * 1024 * 1024,
+        python_ru_maxrss_source=LINUX_PYTHON_RU_MAXRSS_SOURCE,
     )
     resource_trend = ProcessResourceTrendSnapshot(
         sample_count=12,
@@ -1060,6 +1069,7 @@ async def _run(output: Path) -> dict[str, object]:
     ]
     source_status = _command("git", "status", "--short")
     uv_executable = os.environ.get("MMA_BENCHMARK_UV", "uv")
+    process_resources = capture_process_resources(output)
     return {
         "schema_version": SCHEMA_VERSION,
         "identity": {
@@ -1114,7 +1124,12 @@ async def _run(output: Path) -> dict[str, object]:
             "1s exceeds the "
             "configured count bound"
         ),
-        "process_peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
+        "process_current_rss_bytes": process_resources.current_rss_bytes,
+        "process_current_rss_source": process_resources.current_rss_source,
+        "process_peak_rss_bytes": process_resources.peak_rss_bytes,
+        "process_peak_rss_source": process_resources.peak_rss_source,
+        "process_python_ru_maxrss_bytes": process_resources.python_ru_maxrss_bytes,
+        "process_python_ru_maxrss_source": process_resources.python_ru_maxrss_source,
     }
 
 
@@ -1160,6 +1175,12 @@ def _render_report(result: dict[str, object]) -> str:
         "",
         f"- Selected cadence: {result['selected_cadence_seconds']} seconds",
         f"- Checkpoint size: {result['checkpoint_bytes']} bytes",
+        f"- Current RSS: {result['process_current_rss_bytes']} bytes "
+        f"(`{result['process_current_rss_source']}`)",
+        f"- Same-sample composite peak RSS: {result['process_peak_rss_bytes']} bytes "
+        f"(`{result['process_peak_rss_source']}`)",
+        f"- Python ru_maxrss: {result['process_python_ru_maxrss_bytes']} bytes "
+        f"(`{result['process_python_ru_maxrss_source']}`)",
         f"- Production checkpoint construction p50/p95/p99: {construction['p50_ns']} / "
         f"{construction['p95_ns']} / {construction['p99_ns']} ns",
         f"- Non-blocking enqueue p50/p95/p99: {enqueue['p50_ns']} / "

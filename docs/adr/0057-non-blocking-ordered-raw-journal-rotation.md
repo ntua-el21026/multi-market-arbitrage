@@ -501,12 +501,12 @@ ADR-0055's requirement that new producers emit v4; all other ADR-0055 health
 semantics remain authoritative. The existing decision-mask mapping remains
 unchanged unless a later explicit schema decision adds a reason.
 
-Measured maximum v5 records are 31,319 bytes periodic and 44,963 bytes terminal.
-At the unchanged ten-second cadence, the six-hour projection is 67,694,003
+Measured maximum v5 records are 31,573 bytes periodic and 45,217 bytes terminal.
+At the unchanged ten-second cadence, the six-hour projection is 68,242,897
 bytes. The configured health-evidence cap is therefore 68 MiB (71,303,168
-bytes), leaving 3,609,165 bytes of headroom and preserving the existing 2 MiB
-minimum. The derived 32,019-byte periodic file-budget ceiling leaves an exact
-700-byte capacity-qualification margin above the 31,319-byte qualified maximum;
+bytes), leaving 3,060,271 bytes of headroom and preserving the existing 2 MiB
+minimum. The derived 32,018-byte periodic file-budget ceiling leaves an exact
+445-byte capacity-qualification margin above the 31,573-byte qualified maximum;
 it is not an observed-record acceptance bound. This is bounded capacity
 provisioning for the additive schema, not a weaker cadence,
 checkpoint-count, completeness, or writer-failure predicate.

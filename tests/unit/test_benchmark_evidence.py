@@ -18,6 +18,8 @@ from multi_market_arbitrage.pipeline.health import (
     AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVE_SCHEMA,
     AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_CODEBOOKS,
     AUDIT_STAGE_TIMING_TELEMETRY_STAGES,
+    COMPOSITE_PEAK_RSS_SOURCE,
+    LINUX_PYTHON_RU_MAXRSS_SOURCE,
     MAXIMUM_AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVES,
     PROCESSOR_HISTORY_CHAIN_TELEMETRY_FIELDS,
     PROCESSOR_RETENTION_TELEMETRY_SCHEMA,
@@ -31,6 +33,7 @@ from multi_market_arbitrage.venues.polymarket import PolymarketEndpointClass
 REPOSITORY = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY))
 
+import benchmarks.gate1_audit_divergence as audit_divergence_module  # noqa: E402
 from benchmarks.gate1_audit_divergence import (  # noqa: E402
     CAPACITY_PENDING_SATURATION_KIND,
     HEALTH_EVIDENCE_MAXIMUM_BYTES,
@@ -75,6 +78,8 @@ from benchmarks.gate1_scan_report import (  # noqa: E402
     _whole_units_per_second,  # pyright: ignore[reportPrivateUsage]
 )
 from benchmarks.phase1_performance import (  # noqa: E402
+    CURRENT_RSS_KIB_SOURCE,
+    PYTHON_RU_MAXRSS_KIB_SOURCE,
     RESULT_SCHEMA,
     audit_http_benchmark,
     audit_pipeline_benchmarks,
@@ -144,7 +149,7 @@ def test_audit_divergence_benchmark_covers_changed_paths_and_capacity() -> None:
         replay_repetitions=1,
     )
 
-    assert AUDIT_DIVERGENCE_RESULT_SCHEMA == "mma-gate1-audit-divergence-benchmark-v1"
+    assert AUDIT_DIVERGENCE_RESULT_SCHEMA == "mma-gate1-audit-divergence-benchmark-v2"
     assert result["schema_version"] == AUDIT_DIVERGENCE_RESULT_SCHEMA
     series_items = cast(tuple[dict[str, object], ...], result["series"])
     series = {cast(str, item["name"]): item for item in series_items}
@@ -165,6 +170,23 @@ def test_audit_divergence_benchmark_covers_changed_paths_and_capacity() -> None:
         allocation = cast(dict[str, int], measurement["allocation_probe"])
         assert timing["median_ns"] > 0
         assert allocation["peak_delta_bytes"] >= 0
+
+    resources = cast(dict[str, object], result["resources"])
+    before = cast(dict[str, object], resources["before"])
+    after = cast(dict[str, object], resources["after"])
+    for snapshot in (before, after):
+        current = cast(int | None, snapshot["current_rss_bytes"])
+        python_ru_maxrss = cast(int, snapshot["python_ru_maxrss_bytes"])
+        assert current is not None
+        assert snapshot["current_rss_source"] == (
+            audit_divergence_module.LINUX_PROC_STATUS_CURRENT_RSS_SOURCE
+        )
+        assert snapshot["python_ru_maxrss_source"] == LINUX_PYTHON_RU_MAXRSS_SOURCE
+        assert snapshot["same_sample_composite_peak_bytes"] == max(
+            current or 0,
+            python_ru_maxrss,
+        )
+        assert snapshot["same_sample_composite_peak_source"] == COMPOSITE_PEAK_RSS_SOURCE
 
     causal_validation = cast(
         dict[str, object],
@@ -228,14 +250,14 @@ def test_audit_divergence_benchmark_covers_changed_paths_and_capacity() -> None:
     assert (
         capacity["maximum_periodic_checkpoint_bytes"]
         == HEALTH_V5_CAPACITY_MAXIMUM_PERIODIC_CHECKPOINT_BYTES
-        == 31_319
+        == 31_573
     )
     assert (
         capacity["maximum_terminal_checkpoint_bytes"]
         == HEALTH_V5_CAPACITY_MAXIMUM_TERMINAL_CHECKPOINT_BYTES
-        == 44_963
+        == 45_217
     )
-    assert capacity["projected_file_bytes"] == 67_694_003
+    assert capacity["projected_file_bytes"] == 68_242_897
     assert capacity["projected_file_bytes"] <= HEALTH_EVIDENCE_MAXIMUM_BYTES
     assert (
         maximum_periodic_checkpoint_bytes_acceptance
@@ -246,14 +268,14 @@ def test_audit_divergence_benchmark_covers_changed_paths_and_capacity() -> None:
         )
         // capacity["periodic_checkpoint_count"]
     )
-    assert maximum_periodic_checkpoint_bytes_acceptance == 32_019
+    assert maximum_periodic_checkpoint_bytes_acceptance == 32_018
     assert (
         capacity["maximum_periodic_checkpoint_bytes"]
         <= maximum_periodic_checkpoint_bytes_acceptance
     )
     assert (
         maximum_periodic_checkpoint_bytes_acceptance - capacity["maximum_periodic_checkpoint_bytes"]
-        >= 512
+        == 445
     )
     assert capacity["remaining_file_bytes"] >= minimum_six_hour_file_headroom_bytes
     assert capacity["unknown_host_source_field_count"] == 9
@@ -346,6 +368,17 @@ def test_audit_divergence_benchmark_covers_changed_paths_and_capacity() -> None:
     assert replacement_capture_shape["pending_record_count"] == 0
     assert replacement_capture_shape["replacement_capture_count"] == 2
     assert replacement_capture_shape["replacement_capture_saturated"] is True
+
+
+def test_audit_divergence_current_rss_source_is_platform_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(audit_divergence_module.sys, "platform", "darwin")
+
+    assert audit_divergence_module._current_rss_bytes() == (  # pyright: ignore[reportPrivateUsage]
+        None,
+        "UNAVAILABLE_PLATFORM:darwin",
+    )
 
 
 def test_capacity_compactness_is_derived_from_schema_and_scalar_rows() -> None:
@@ -580,9 +613,13 @@ def test_scan_report_benchmark_emits_conservative_integral_throughput() -> None:
 async def test_phase1_benchmark_executes_production_audit_http_series() -> None:
     result = await audit_http_benchmark()
 
-    assert RESULT_SCHEMA == "mma-phase1-performance-final-c-v2"
+    assert RESULT_SCHEMA == "mma-phase1-performance-final-c-v3"
     assert result["name"] == "audit_http_adapter_success_mock_transport"
     assert result["sample_count"] == 50
+    assert result["rss_kib_after"] > 0
+    assert result["rss_kib_after_source"] == CURRENT_RSS_KIB_SOURCE
+    assert result["python_ru_maxrss_kib_after"] > 0
+    assert result["python_ru_maxrss_kib_after_source"] == PYTHON_RU_MAXRSS_KIB_SOURCE
     assert result["extra"]["endpoint_class"] == "CLOB_BOOK"
     assert result["extra"]["network_latency_included"] is False
 

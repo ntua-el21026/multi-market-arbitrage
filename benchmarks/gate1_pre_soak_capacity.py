@@ -109,6 +109,9 @@ from multi_market_arbitrage.pipeline import (  # noqa: E402
     ProcessedEnvelope,
 )
 from multi_market_arbitrage.pipeline.health import (  # noqa: E402
+    COMPOSITE_PEAK_RSS_SOURCE,
+    DARWIN_PYTHON_RU_MAXRSS_SOURCE,
+    LINUX_PYTHON_RU_MAXRSS_SOURCE,
     MAXIMUM_OPEN_AVAILABILITY_CONTRIBUTIONS,
     AvailabilityInterruption,
     ObservationRuntimeHealth,
@@ -118,6 +121,7 @@ from multi_market_arbitrage.pipeline.health import (  # noqa: E402
     SupervisedProcessResourceSampler,
     build_observation_health_checkpoint,
     capture_terminal_process_resources,
+    normalize_python_ru_maxrss_bytes,
 )
 from multi_market_arbitrage.pipeline.ingress import (  # noqa: E402
     BoundedRawIngress,
@@ -148,7 +152,12 @@ from multi_market_arbitrage.venues.polymarket import (  # noqa: E402
     PublicReadMetricsSnapshot,
 )
 
-RESULT_SCHEMA = "mma-gate1-final-pre-soak-capacity-v4"
+RESULT_SCHEMA = "mma-gate1-final-pre-soak-capacity-v5"
+LINUX_PROC_STATUS_CURRENT_RSS_SOURCE = "linux-proc-self-status-vmrss-kib-times-1024"
+LINUX_PROC_STATUS_CURRENT_RSS_OS_ERROR_SOURCE = "UNAVAILABLE:OSError:linux-proc-self-status-vmrss"
+LINUX_PROC_STATUS_CURRENT_RSS_VALUE_ERROR_SOURCE = (
+    "UNAVAILABLE:ValueError:linux-proc-self-status-vmrss"
+)
 WORKLOAD_SCHEMA = "mma-gate1-final-pre-soak-capacity-workload-v4"
 DEFAULT_SATURATION_THRESHOLD = 4_096
 GATE1_MINIMUM_SCAN_EVENTS = 4_096
@@ -618,22 +627,31 @@ def _measure_calls(operation: Callable[[], object], repetitions: int) -> dict[st
     return latency_distribution(samples)
 
 
-def _current_rss_bytes() -> int | None:
+def _current_rss_measurement() -> tuple[int | None, str]:
+    if not sys.platform.startswith("linux"):
+        return None, f"UNAVAILABLE_PLATFORM:{sys.platform}"
     try:
         lines = Path("/proc/self/status").read_text(encoding="utf-8").splitlines()
     except OSError:
-        return None
+        return None, LINUX_PROC_STATUS_CURRENT_RSS_OS_ERROR_SOURCE
     for line in lines:
         if line.startswith("VmRSS:"):
             fields_value = line.split()
             if len(fields_value) == 3 and fields_value[2] == "kB":
-                return int(fields_value[1]) * 1_024
-    return None
+                try:
+                    return int(fields_value[1]) * 1_024, LINUX_PROC_STATUS_CURRENT_RSS_SOURCE
+                except ValueError:
+                    return None, LINUX_PROC_STATUS_CURRENT_RSS_VALUE_ERROR_SOURCE
+    return None, LINUX_PROC_STATUS_CURRENT_RSS_VALUE_ERROR_SOURCE
 
 
-def _peak_rss_bytes() -> int:
-    maximum = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    return maximum if sys.platform == "darwin" else maximum * 1_024
+def _current_rss_bytes() -> int | None:
+    value, _source = _current_rss_measurement()
+    return value
+
+
+def _python_ru_maxrss() -> tuple[int, str]:
+    return normalize_python_ru_maxrss_bytes(int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss))
 
 
 def _deep_size_bytes(value: object, seen: set[int] | None = None) -> int:
@@ -731,10 +749,11 @@ def _semantic_memory_measurement(processor: CanonicalProcessor) -> dict[str, int
     }
 
 
-def _allocator_measurement() -> dict[str, int | None]:
+def _allocator_measurement() -> dict[str, int | str | None]:
     python_current, python_peak = tracemalloc.get_traced_memory()
     memory_pool = pa.default_memory_pool()
-    rss_current = _current_rss_bytes()
+    rss_current, rss_current_source = _current_rss_measurement()
+    python_ru_maxrss, python_ru_maxrss_source = _python_ru_maxrss()
     pyarrow_current = memory_pool.bytes_allocated()
     return {
         "sampled_monotonic_ns": time.monotonic_ns(),
@@ -744,11 +763,48 @@ def _allocator_measurement() -> dict[str, int | None]:
         "pyarrow_current_bytes": pyarrow_current,
         "pyarrow_peak_bytes": memory_pool.max_memory(),
         "rss_current_bytes": rss_current,
-        "rss_process_lifetime_peak_bytes": _peak_rss_bytes(),
+        "rss_current_source": rss_current_source,
+        "rss_same_sample_composite_peak_bytes": max(python_ru_maxrss, rss_current or 0),
+        "rss_same_sample_composite_peak_source": COMPOSITE_PEAK_RSS_SOURCE,
+        "python_ru_maxrss_bytes": python_ru_maxrss,
+        "python_ru_maxrss_source": python_ru_maxrss_source,
         "native_residual_bytes": (
             None if rss_current is None else rss_current - python_current - pyarrow_current
         ),
     }
+
+
+def _allocator_rss_contract_valid(measurement: Mapping[str, object]) -> bool:
+    current = measurement.get("rss_current_bytes")
+    current_source = measurement.get("rss_current_source")
+    composite = measurement.get("rss_same_sample_composite_peak_bytes")
+    composite_source = measurement.get("rss_same_sample_composite_peak_source")
+    python_ru_maxrss = measurement.get("python_ru_maxrss_bytes")
+    python_ru_maxrss_source = measurement.get("python_ru_maxrss_source")
+    if current is not None and (isinstance(current, bool) or not isinstance(current, int)):
+        return False
+    if isinstance(composite, bool) or not isinstance(composite, int):
+        return False
+    if isinstance(python_ru_maxrss, bool) or not isinstance(python_ru_maxrss, int):
+        return False
+    if (
+        composite != max(0 if current is None else current, python_ru_maxrss)
+        or composite_source != COMPOSITE_PEAK_RSS_SOURCE
+    ):
+        return False
+    if python_ru_maxrss_source == LINUX_PYTHON_RU_MAXRSS_SOURCE:
+        return (
+            current_source == LINUX_PROC_STATUS_CURRENT_RSS_SOURCE
+            if current is not None
+            else current_source
+            in {
+                LINUX_PROC_STATUS_CURRENT_RSS_OS_ERROR_SOURCE,
+                LINUX_PROC_STATUS_CURRENT_RSS_VALUE_ERROR_SOURCE,
+            }
+        )
+    if python_ru_maxrss_source == DARWIN_PYTHON_RU_MAXRSS_SOURCE:
+        return current is None and current_source == "UNAVAILABLE_PLATFORM:darwin"
+    return False
 
 
 def _journal_allocator_trend(
@@ -3735,7 +3791,11 @@ async def run_capacity_benchmark(
             "terminal_post_cutoff_resources": {
                 "sampled_monotonic_ns": terminal_resources.sampled_monotonic_ns,
                 "current_rss_bytes": terminal_resources.current_rss_bytes,
+                "current_rss_source": terminal_resources.current_rss_source,
                 "peak_rss_bytes": terminal_resources.peak_rss_bytes,
+                "peak_rss_source": terminal_resources.peak_rss_source,
+                "python_ru_maxrss_bytes": terminal_resources.python_ru_maxrss_bytes,
+                "python_ru_maxrss_source": terminal_resources.python_ru_maxrss_source,
                 "python_tracemalloc_current_bytes": (
                     terminal_resources.python_tracemalloc_current_bytes
                 ),
@@ -3870,6 +3930,10 @@ async def run_capacity_benchmark(
             },
         },
         "acceptance": {
+            "allocator_rss_sources_and_composites_exact": all(
+                _allocator_rss_contract_valid(measurement)
+                for measurement in (baseline_allocators, final_allocators)
+            ),
             "scans_exceed_threshold": terminal_summary.scans > saturation_threshold,
             "audit_outcomes_exceed_threshold": terminal_summary.rest_audits > saturation_threshold,
             "scan_history_evicted_without_chain_loss": scan_retention.truncated,

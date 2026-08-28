@@ -213,12 +213,12 @@ built only after raw completion and analytical/availability owner closure. It
 must be durably written last; missing, duplicate, non-last, pre-drain, or
 completion-unbound terminal evidence is ineligible.
 
-Maximum measured v5 serialization is 31,319 bytes for a periodic checkpoint and
-44,963 bytes for the terminal checkpoint. The unchanged ten-second six-hour
-schedule projects 67,694,003 bytes. A 68 MiB (71,303,168-byte) file cap leaves
-3,609,165 bytes of headroom, above the required 2 MiB. The derived periodic
-file-budget ceiling is 32,019 bytes, leaving an exact 700-byte capacity-
-qualification margin above the 31,319-byte measured maximum; it is not an
+Maximum measured v5 serialization is 31,573 bytes for a periodic checkpoint and
+45,217 bytes for the terminal checkpoint. The unchanged ten-second six-hour
+schedule projects 68,242,897 bytes. A 68 MiB (71,303,168-byte) file cap leaves
+3,060,271 bytes of headroom, above the required 2 MiB. The derived periodic
+file-budget ceiling is 32,018 bytes, leaving an exact 445-byte capacity-
+qualification margin above the 31,573-byte measured maximum; it is not an
 observed-record acceptance bound. Checkpoint count, cadence, completeness, and
 fail-closed writer semantics are unchanged.
 
@@ -834,8 +834,34 @@ or per-endpoint reconciliation.
 One supervised off-loop sampler publishes process/resource snapshots at the
 health cadence. On Linux, current RSS is resident pages from
 `/proc/self/statm` multiplied by the runtime page size; other platforms or read
-failures produce `null` with an explicit source string. Peak `ru_maxrss` is
-normalized to bytes and is never substituted for current RSS.
+failures produce `null` with an explicit source string. Python
+`resource.getrusage(RUSAGE_SELF).ru_maxrss` is normalized to bytes and published
+separately as `python_ru_maxrss_bytes` with `python_ru_maxrss_source`; it is not
+treated as the same kernel measurement as current RSS. The backward-compatible
+`peak_rss_bytes` field is the conservative maximum of that normalized
+`ru_maxrss` value and the same snapshot's current RSS (when available), so it is
+internally coherent and can never be below either input. `peak_rss_source`
+states this composite definition explicitly.
+
+Component-memory evidence keeps its independently sampled `/proc` current-RSS
+peak and `/proc/self/smaps` current-process attribution under separate names and
+source definitions. Those measurements may be compared within their own
+definitions, but neither is asserted to equal Python `ru_maxrss` or the
+compatibility `peak_rss_bytes` composite.
+
+Historical health-v5 records produced before this additive clarification lack
+`peak_rss_source`, `python_ru_maxrss_bytes`, and `python_ru_maxrss_source`.
+Readers may retain those records only under the explicit legacy interpretation
+that `peak_rss_bytes` is normalized Python `ru_maxrss`; they must never relabel
+that value as the composite peak. A current exact-source candidate health-v5
+record must contain all three additive fields, must label the composite source,
+and must satisfy
+`peak_rss_bytes == max(current_rss_bytes or 0, python_ru_maxrss_bytes)`. Linux
+uses the exact `/proc/self/statm` current-RSS source and normalizes Python
+`ru_maxrss` from KiB; a failed Linux current-RSS read has one of the exact typed
+`UNAVAILABLE:OSError` or `UNAVAILABLE:ValueError` labels. Darwin publishes
+`UNAVAILABLE_PLATFORM:darwin` for current RSS and treats Python `ru_maxrss` as
+bytes. Other platforms fail closed rather than guessing raw units.
 
 The sampler keeps constant-memory OLS current-RSS slope evidence plus sample
 counts, first/last monotonic times, start/end/maximum RSS, largest absolute

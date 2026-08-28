@@ -290,10 +290,10 @@ reconcile file bytes and record counts, require exactly one terminal record in
 the final position, and bind observed periodic/terminal counts and maxima.
 Regression coverage uses a short mixed file whose terminal record is larger
 than its periodic records and proves that health is projected as exactly 2,160
-periodic records at 31,319 bytes plus one terminal record at 44,963 bytes:
-67,694,003 bytes with 3,609,165 bytes remaining. The derived periodic file-
-budget ceiling is 32,019 bytes, leaving 700 bytes of capacity-qualification
-margin above the qualified 31,319-byte maximum; it is not an observed-record
+periodic records at 31,573 bytes plus one terminal record at 45,217 bytes:
+68,242,897 bytes with 3,060,271 bytes remaining. The derived periodic file-
+budget ceiling is 32,018 bytes, leaving 445 bytes of capacity-qualification
+margin above the qualified 31,573-byte maximum; it is not an observed-record
 acceptance bound. Negative cases cover a missing,
 duplicate or non-final terminal, malformed/partial/noncanonical/non-v5 or
 symlink evidence, inventory mismatch, either capacity-qualified record maximum
@@ -343,13 +343,18 @@ Required:
   chain/reconciliation, contribution reconciliation, and separate current/
   sticky reasons; explicit v1-v4 historical compatibility without synthesized
   seal fields;
-- maximum periodic/terminal v5 serialization of 31,319/44,963 bytes, exact
+- maximum periodic/terminal v5 serialization of 31,573/45,217 bytes, exact
   fixed cardinality of 2,160 periodic records plus one terminal-last record,
-  67,694,003-byte six-hour projection, 68 MiB file cap, exact 3,609,165-byte
-  margin, at least 2 MiB remaining headroom, a 32,019-byte derived periodic
-  file-budget ceiling and exact 700-byte capacity-qualification margin that do
-  not relax the 31,319-byte observed-record maximum, unchanged ten-second
+  68,242,897-byte six-hour projection, 68 MiB file cap, exact 3,060,271-byte
+  margin, at least 2 MiB remaining headroom, a 32,018-byte derived periodic
+  file-budget ceiling and exact 445-byte capacity-qualification margin that do
+  not relax the 31,573-byte observed-record maximum, unchanged ten-second
   cadence/8,192 count bound, and injected record/count/file overflow failure;
+- exact current/composite/Python-`ru_maxrss` source and value relationships,
+  including equality of the composite to the same-sample maximum, typed Linux
+  current-RSS read failures, explicit Darwin byte units, rejection of unknown
+  platform units, fabricated sources, and pre-clarification v5 compatibility
+  without relabeling historical peak values;
 - exact `mma-audit-stage-timing-telemetry-table-v2` shape with 17 ordered rows,
   including independently populated response-to-PREPARE-decision and
   response-to-ATTEST-processing histograms, with rejection of v1 row order,

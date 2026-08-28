@@ -9,7 +9,12 @@ from typing import Any
 import pytest
 
 from multi_market_arbitrage.observability import capture_host_runtime_identity
-from multi_market_arbitrage.pipeline.health import capture_process_resources
+from multi_market_arbitrage.pipeline.health import (
+    COMPOSITE_PEAK_RSS_SOURCE,
+    LINUX_CURRENT_RSS_SOURCE,
+    LINUX_PYTHON_RU_MAXRSS_SOURCE,
+    capture_process_resources,
+)
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -242,6 +247,13 @@ def test_process_resources_include_current_and_peak_rss(tmp_path: Path) -> None:
     assert resources.sampled_monotonic_ns > 0
     assert resources.free_disk_bytes > 0
     assert resources.peak_rss_bytes > 0
-    assert resources.current_rss_source
+    assert resources.peak_rss_source == COMPOSITE_PEAK_RSS_SOURCE
+    assert resources.python_ru_maxrss_bytes > 0
+    assert resources.python_ru_maxrss_source == LINUX_PYTHON_RU_MAXRSS_SOURCE
+    assert resources.current_rss_source == LINUX_CURRENT_RSS_SOURCE
     if resources.current_rss_bytes is not None:
         assert resources.current_rss_bytes > 0
+    assert resources.peak_rss_bytes == max(
+        resources.current_rss_bytes or 0,
+        resources.python_ru_maxrss_bytes,
+    )

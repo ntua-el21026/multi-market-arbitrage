@@ -131,11 +131,11 @@ rejects a time bound longer than the five-second maximum book age. A bounded
 live calibration rejected the initial five-second checkpoint choice because its
 conservative six-hour projection threatened the then-64 MiB health-evidence
 limit. Health v5 retains the ten-second cadence and 8,192-checkpoint bound. Its
-measured 31,319-byte periodic maximum and 44,963-byte terminal maximum project
-to 67,694,003 bytes over six hours; the committed 68 MiB (71,303,168-byte) cap
-leaves 3,609,165 bytes, above the required 2 MiB headroom. The derived
-32,019-byte periodic file-budget ceiling leaves an exact 700-byte capacity-
-qualification margin above the 31,319-byte maximum; it is not an observed-
+measured 31,573-byte periodic maximum and 45,217-byte terminal maximum project
+to 68,242,897 bytes over six hours; the committed 68 MiB (71,303,168-byte) cap
+leaves 3,060,271 bytes, above the required 2 MiB headroom. The derived
+32,018-byte periodic file-budget ceiling leaves an exact 445-byte capacity-
+qualification margin above the 31,573-byte maximum; it is not an observed-
 record acceptance bound. This preserves
 incident reconstruction and fail-closed file/count enforcement without
 omitting v5 fields.
@@ -247,11 +247,11 @@ matches and binds the writer SHA-256, reconciles reported bytes and records,
 binds the observed periodic/terminal counts and record-size
 maxima, and requires exactly one terminal checkpoint last. Health is not
 rate-scaled from that mixed file: the six-hour projection has exactly 2,160
-periodic checkpoints at the capacity-qualified 31,319-byte maximum plus one
-terminal checkpoint at the capacity-qualified 44,963-byte maximum, totaling
-67,694,003 bytes and leaving 3,609,165 bytes under the 68 MiB cap. The derived
-32,019-byte periodic file-budget ceiling therefore retains an exact 700-byte
-capacity-qualification margin without relaxing the 31,319-byte observed-record
+periodic checkpoints at the capacity-qualified 31,573-byte maximum plus one
+terminal checkpoint at the capacity-qualified 45,217-byte maximum, totaling
+68,242,897 bytes and leaving 3,060,271 bytes under the 68 MiB cap. The derived
+32,018-byte periodic file-budget ceiling therefore retains an exact 445-byte
+capacity-qualification margin without relaxing the 31,573-byte observed-record
 maximum. An observed
 record maximum above its qualified bound, a count/file overrun, an incomplete
 requested duration, or less than 2 MiB remaining health-file margin fails
@@ -1080,9 +1080,9 @@ directory sync only after clean completion; the summary records counts,
 high-water, bytes, SHA-256, completion/evidence eligibility, and failure type.
 The exact Gate-1 bounds are ten-second cadence, 8,192 checkpoints, and a 68 MiB
 (71,303,168-byte) health-evidence file. The measured v5 six-hour projection is
-exactly 2,160 periodic records at 31,319 bytes plus one terminal-last record at
-44,963 bytes, or 67,694,003 bytes, leaving 3,609,165 bytes of file headroom and
-an exact 700-byte capacity-qualification margin below the derived 32,019-byte
+exactly 2,160 periodic records at 31,573 bytes plus one terminal-last record at
+45,217 bytes, or 68,242,897 bytes, leaving 3,060,271 bytes of file headroom and
+an exact 445-byte capacity-qualification margin below the derived 32,018-byte
 periodic file-budget ceiling, not a relaxed observed-record bound;
 overflow or missing evidence remains a hard failure.
 
@@ -1177,13 +1177,20 @@ mismatch, or a dirty tree emit `CODE_IDENTITY_UNAVAILABLE`,
 do not stop or relabel raw capture and do not by themselves make current
 research ineligible.
 An off-loop supervised sampler records Linux `/proc/self/statm` current RSS (or
-an explicit unavailable source), normalized `ru_maxrss`, CPU, disk, and a
-constant-memory current-RSS trend: start/end/max, largest step, OLS bytes/second,
-and the 16 largest discontinuities. The observer freezes the sampler cache at
+an explicit unavailable source), separately sourced normalized Python
+`resource.getrusage(RUSAGE_SELF).ru_maxrss`, their sourced conservative
+same-sample maximum as `peak_rss_bytes`, CPU, disk, and a constant-memory
+current-RSS trend: start/end/max, largest step, OLS bytes/second, and the 16
+largest discontinuities. The observer freezes the sampler cache at
 the terminal capture cutoff. Checkpoint construction rejects a resource sample,
 trend bound, or discontinuity that postdates its emission; if no pre-cutoff
 sample exists, health evidence fails closed instead of backdating a later
 sample.
+The compatibility peak must equal the exact maximum of its two same-sample
+inputs. Linux normalizes Python `ru_maxrss` from KiB and uses exact typed source
+labels for available or failed `/proc/self/statm` current RSS. Darwin identifies
+current RSS as `UNAVAILABLE_PLATFORM:darwin` and treats `ru_maxrss` as bytes;
+unknown platform units fail closed.
 
 The deterministic offline mismatch-lineage report separately emits each
 mismatch's observation fact, independent received-prefix integrity, external

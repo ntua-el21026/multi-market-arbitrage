@@ -123,6 +123,21 @@ MAXIMUM_REPORTED_RESOURCE_DISCONTINUITIES = 16
 MAXIMUM_REPORTED_PYTHON_ALLOCATION_GROUPS = 12
 MAXIMUM_ALLOCATION_GROUP_FILENAME_BYTES = 1024
 MAXIMUM_RESOURCE_SOURCE_BYTES = 256
+LINUX_CURRENT_RSS_SOURCE = "proc-self-statm-resident-pages"
+LINUX_CURRENT_RSS_OS_ERROR_SOURCE = "UNAVAILABLE:OSError"
+LINUX_CURRENT_RSS_VALUE_ERROR_SOURCE = "UNAVAILABLE:ValueError"
+LINUX_CURRENT_RSS_UNAVAILABLE_SOURCES = frozenset(
+    {
+        LINUX_CURRENT_RSS_OS_ERROR_SOURCE,
+        LINUX_CURRENT_RSS_VALUE_ERROR_SOURCE,
+    }
+)
+COMPOSITE_PEAK_RSS_SOURCE = (
+    "max-of-same-sample-current-rss-bytes-and-python-ru-maxrss-bytes; "
+    "conservative-in-process-same-sample-composite"
+)
+LINUX_PYTHON_RU_MAXRSS_SOURCE = "python-resource-getrusage-rusage-self-ru-maxrss-kib-times-1024"
+DARWIN_PYTHON_RU_MAXRSS_SOURCE = "python-resource-getrusage-rusage-self-ru-maxrss-darwin-bytes"
 MAXIMUM_OPEN_AVAILABILITY_CONTRIBUTIONS = 64
 EMPTY_AVAILABILITY_PERSISTENCE_FAILURE_CHAIN_SHA256 = canonical_sha256(
     {"schema": "gate1-availability-contribution-persistence-failure-chain-seed-v1"}
@@ -2648,6 +2663,9 @@ class ProcessResourceSnapshot:
     current_rss_bytes: int | None
     peak_rss_bytes: int
     current_rss_source: str
+    peak_rss_source: str
+    python_ru_maxrss_bytes: int
+    python_ru_maxrss_source: str
     python_tracemalloc_current_bytes: int | None = None
     python_tracemalloc_peak_bytes: int | None = None
     python_tracemalloc_source: str = "UNAVAILABLE"
@@ -2662,6 +2680,7 @@ class ProcessResourceSnapshot:
         if (
             self.free_disk_bytes < 0
             or self.peak_rss_bytes < 0
+            or self.python_ru_maxrss_bytes < 0
             or (self.current_rss_bytes is not None and self.current_rss_bytes < 0)
             or (
                 self.python_tracemalloc_current_bytes is not None
@@ -2679,6 +2698,8 @@ class ProcessResourceSnapshot:
             raise ValueError("resource CPU measurements cannot be negative")
         source_values = (
             self.current_rss_source,
+            self.peak_rss_source,
+            self.python_ru_maxrss_source,
             self.python_tracemalloc_source,
             self.python_allocation_group_capture,
         )
@@ -2699,6 +2720,29 @@ class ProcessResourceSnapshot:
             raise ValueError("periodic resource evidence cannot contain allocation groups")
         if len(self.python_allocation_groups) > MAXIMUM_REPORTED_PYTHON_ALLOCATION_GROUPS:
             raise ValueError("Python allocation-group evidence exceeds its hard bound")
+        if self.peak_rss_bytes < self.python_ru_maxrss_bytes:
+            raise ValueError("same-sample composite RSS cannot be below Python ru_maxrss")
+        if self.current_rss_bytes is not None and self.peak_rss_bytes < self.current_rss_bytes:
+            raise ValueError("same-sample composite RSS cannot be below current RSS")
+        expected_peak_rss_bytes = max(self.python_ru_maxrss_bytes, self.current_rss_bytes or 0)
+        if self.peak_rss_bytes != expected_peak_rss_bytes:
+            raise ValueError("same-sample composite RSS must equal the maximum of its inputs")
+        if self.peak_rss_source != COMPOSITE_PEAK_RSS_SOURCE:
+            raise ValueError("same-sample composite RSS source is unsupported")
+        if self.python_ru_maxrss_source == LINUX_PYTHON_RU_MAXRSS_SOURCE:
+            if self.current_rss_bytes is None:
+                if self.current_rss_source not in LINUX_CURRENT_RSS_UNAVAILABLE_SOURCES:
+                    raise ValueError("unavailable Linux current RSS source is inconsistent")
+            elif self.current_rss_source != LINUX_CURRENT_RSS_SOURCE:
+                raise ValueError("available Linux current RSS source is inconsistent")
+        elif self.python_ru_maxrss_source == DARWIN_PYTHON_RU_MAXRSS_SOURCE:
+            if (
+                self.current_rss_bytes is not None
+                or self.current_rss_source != "UNAVAILABLE_PLATFORM:darwin"
+            ):
+                raise ValueError("Darwin current RSS source/value is inconsistent")
+        else:
+            raise ValueError("Python ru_maxrss source is unsupported")
 
 
 def _current_rss_bytes() -> tuple[int | None, str]:
@@ -2713,9 +2757,35 @@ def _current_rss_bytes() -> tuple[int | None, str]:
         page_size = os.sysconf("SC_PAGE_SIZE")
         if page_size <= 0:
             raise ValueError("SC_PAGE_SIZE is unavailable")
-        return int(fields[1]) * page_size, "proc-self-statm-resident-pages"
-    except (OSError, ValueError) as error:
-        return None, f"UNAVAILABLE:{type(error).__name__}"
+        return int(fields[1]) * page_size, LINUX_CURRENT_RSS_SOURCE
+    except OSError:
+        return None, LINUX_CURRENT_RSS_OS_ERROR_SOURCE
+    except ValueError:
+        return None, LINUX_CURRENT_RSS_VALUE_ERROR_SOURCE
+
+
+def normalize_python_ru_maxrss_bytes(
+    raw_ru_maxrss: object,
+    *,
+    platform_name: str | None = None,
+) -> tuple[int, str]:
+    """Normalize a supported platform's Python ``ru_maxrss`` value to bytes."""
+
+    if isinstance(raw_ru_maxrss, bool) or not isinstance(raw_ru_maxrss, int):
+        raise ValueError("Python ru_maxrss must be an integer")
+    if raw_ru_maxrss < 0:
+        raise ValueError("Python ru_maxrss cannot be negative")
+    selected_platform = sys.platform if platform_name is None else platform_name
+    if selected_platform.startswith("linux"):
+        return (
+            raw_ru_maxrss * 1024,
+            LINUX_PYTHON_RU_MAXRSS_SOURCE,
+        )
+    if selected_platform == "darwin":
+        return raw_ru_maxrss, DARWIN_PYTHON_RU_MAXRSS_SOURCE
+    raise RuntimeError(
+        f"Python ru_maxrss byte units are unsupported on platform {selected_platform!r}"
+    )
 
 
 def _bounded_allocation_filename(filename: str) -> str:
@@ -2756,10 +2826,11 @@ def _capture_process_resources(
     """
 
     usage = resource.getrusage(resource.RUSAGE_SELF)
-    # Linux/WSL reports KiB; macOS reports bytes.  Phase 1 records the
-    # normalized byte value and separately binds the host/kernel in calibration.
-    rss_scale = 1024 if sys.platform.startswith("linux") else 1
     current_rss_bytes, current_rss_source = _current_rss_bytes()
+    python_ru_maxrss_bytes, python_ru_maxrss_source = normalize_python_ru_maxrss_bytes(
+        int(usage.ru_maxrss)
+    )
+    peak_rss_bytes = max(python_ru_maxrss_bytes, current_rss_bytes or 0)
     if not tracemalloc.is_tracing():
         tracemalloc.start(1)
         tracemalloc_source = "started-by-resource-sampler-one-frame"
@@ -2778,8 +2849,11 @@ def _capture_process_resources(
         cpu_user_seconds=usage.ru_utime,
         cpu_system_seconds=usage.ru_stime,
         current_rss_bytes=current_rss_bytes,
-        peak_rss_bytes=int(usage.ru_maxrss) * rss_scale,
+        peak_rss_bytes=peak_rss_bytes,
         current_rss_source=current_rss_source,
+        peak_rss_source=COMPOSITE_PEAK_RSS_SOURCE,
+        python_ru_maxrss_bytes=python_ru_maxrss_bytes,
+        python_ru_maxrss_source=python_ru_maxrss_source,
         python_tracemalloc_current_bytes=python_current_bytes,
         python_tracemalloc_peak_bytes=python_peak_bytes,
         python_tracemalloc_source=tracemalloc_source,
@@ -4837,6 +4911,9 @@ def build_observation_health_checkpoint(
             "free_disk_bytes": resources.free_disk_bytes,
             "host_runtime_identity": host_identity.to_record(),
             "peak_rss_bytes": resources.peak_rss_bytes,
+            "peak_rss_source": resources.peak_rss_source,
+            "python_ru_maxrss_bytes": resources.python_ru_maxrss_bytes,
+            "python_ru_maxrss_source": resources.python_ru_maxrss_source,
             "processor_operational": {
                 "history_chains": _processor_history_chain_telemetry(processor_snapshot),
                 "recovery_reason_counts": tuple(
@@ -4947,6 +5024,13 @@ __all__ = [
     "AUDIT_STAGE_TIMING_TELEMETRY_HISTOGRAM_FIELDS",
     "AUDIT_STAGE_TIMING_TELEMETRY_SCHEMA",
     "AUDIT_STAGE_TIMING_TELEMETRY_STAGES",
+    "COMPOSITE_PEAK_RSS_SOURCE",
+    "DARWIN_PYTHON_RU_MAXRSS_SOURCE",
+    "LINUX_CURRENT_RSS_OS_ERROR_SOURCE",
+    "LINUX_CURRENT_RSS_SOURCE",
+    "LINUX_CURRENT_RSS_UNAVAILABLE_SOURCES",
+    "LINUX_CURRENT_RSS_VALUE_ERROR_SOURCE",
+    "LINUX_PYTHON_RU_MAXRSS_SOURCE",
     "PROCESSOR_HISTORY_CHAIN_TELEMETRY_FIELDS",
     "PROCESSOR_HISTORY_CHAIN_TELEMETRY_SCHEMA",
     "PROCESSOR_RETENTION_TELEMETRY_ROW_FIELDS",
@@ -4971,6 +5055,7 @@ __all__ = [
     "capture_process_resources",
     "capture_terminal_process_resources",
     "evaluate_required_book_health",
+    "normalize_python_ru_maxrss_bytes",
     "public_read_fault_availability_projection_reconciled",
     "required_instrument_ids_for_target",
 ]

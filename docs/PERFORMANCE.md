@@ -443,7 +443,7 @@ identity. This section intentionally records no unexecuted benchmark result.
 ## 18. ADR-0055/ADR-0056/ADR-0057 operational-snapshot and saturation gate
 
 Before the next public candidate is accepted, the exact implementation SHA must
-run the `mma-gate1-final-pre-soak-capacity-v4` deterministic offline saturation
+run the `mma-gate1-final-pre-soak-capacity-v5` deterministic offline saturation
 benchmark. Its default Gate workload uses 6,096 scan-driving WebSocket events
 and 6,096 audit outcomes. Every scan-driving event refreshes both sides of both
 required books. Relative to the 4,096 saturation threshold, each phase contains
@@ -471,7 +471,9 @@ Measure and retain:
   outcomes, lifecycle state, journal/analytical buffers, metrics and health/
   availability/contribution writers;
 - Python allocation groups, PyArrow current/peak allocated bytes, process
-  current/peak RSS, native/allocator residual and post-saturation slope;
+  current RSS with source, normalized Python `ru_maxrss` with source, the
+  conservative same-sample composite `peak_rss_bytes` with source,
+  native/allocator residual and post-saturation slope;
 - queue high-water marks, batch flushes, history saturation and at least eight
   full production segment seals;
 - independent received-prefix oracle cost/results, fault-lifecycle transitions,
@@ -527,7 +529,7 @@ uv run --frozen --all-groups --no-sync python benchmarks/gate1_pre_soak_capacity
   --output "${capacity_root}/final-capacity-benchmark.json"
 ```
 
-The `mma-gate1-final-pre-soak-capacity-v4` JSON includes `latency`,
+The `mma-gate1-final-pre-soak-capacity-v5` JSON includes `latency`,
 `history_retention`, `post_saturation`, `domain_capacity`, `production_health`,
 `memory`, `analytical`, `journal`, `acceptance_policy`, and `acceptance`.
 `domain_capacity` separately saturates mismatch/resolution, audit-fault,
@@ -545,12 +547,12 @@ create a false post-saturation Python-memory slope.
 
 For health v5, capacity acceptance uses the maximum across known/unknown-host
 and current/replacement-capture periodic and terminal fixtures. The measured
-maxima are 31,319 bytes periodic and 44,963 bytes terminal. At ten-second
+maxima are 31,573 bytes periodic and 45,217 bytes terminal. At ten-second
 cadence the fixed projection is 2,160 periodic records plus one terminal record:
-`2,160 * 31,319 + 1 * 44,963 = 67,694,003` bytes. The exact 68 MiB
-(71,303,168-byte) file cap leaves 3,609,165 bytes, above the fixed 2 MiB minimum
-headroom. The derived 32,019-byte periodic file-budget ceiling leaves an exact
-700-byte capacity-qualification margin above the 31,319-byte maximum; it is not
+`2,160 * 31,573 + 1 * 45,217 = 68,242,897` bytes. The exact 68 MiB
+(71,303,168-byte) file cap leaves 3,060,271 bytes, above the fixed 2 MiB minimum
+headroom. The derived 32,018-byte periodic file-budget ceiling leaves an exact
+445-byte capacity-qualification margin above the 31,573-byte maximum; it is not
 an observed-record acceptance bound. The 8,192 checkpoint-count bound and
 cadence remain unchanged.
 Exceeding any projected record/file/count predicate fails rather than truncates
@@ -578,6 +580,24 @@ manifest/completion cross-binding and zero active PyArrow allocation after
 analytical close. These offline predicates strengthen storage-transient
 coverage; they do not replace or relax the separate public post-saturation RSS
 formula.
+
+RSS instrumentation does not identify differently defined kernel readings as
+one metric. Periodic and terminal health evidence publishes `/proc/self/statm`
+current RSS, normalized Python `resource.getrusage(RUSAGE_SELF).ru_maxrss`, and
+their conservative same-sample maximum as three explicitly sourced fields.
+The maximum is the compatibility `peak_rss_bytes` value and must equal the
+maximum of both inputs. On Linux, current RSS is sourced exactly from
+`/proc/self/statm` and Python `ru_maxrss` is normalized from KiB; on Darwin,
+current RSS is explicitly unavailable and Python `ru_maxrss` is already bytes.
+Any other platform fails closed because its raw units are not established.
+Component-memory campaign evidence separately retains its
+externally sampled `/proc` current-RSS maximum and `/proc/self/smaps` current
+attribution; those diagnostics are not substituted for, or equality-compared
+with, Python `ru_maxrss`.
+Historical v5 records without the additive peak/Python-`ru_maxrss` source fields
+remain legacy-readable only: their `peak_rss_bytes` means normalized Python
+`ru_maxrss`, never the current composite definition. Current exact-source
+qualification rejects such a legacy-shaped record.
 
 Verified replay no longer retains a Python ingest-ID mapping proportional to
 event count. Exact uniqueness uses a temporary SQLite primary-key index capped

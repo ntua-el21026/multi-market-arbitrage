@@ -15,9 +15,12 @@ import pytest
 from multi_market_arbitrage.core.serialization import canonical_json_bytes
 from multi_market_arbitrage.observability import HistogramSnapshot, MetricKey, MetricsSnapshot
 from multi_market_arbitrage.pipeline.calibration import (
+    HEALTH_V5_CURRENT_RSS_SEMANTICS,
+    HEALTH_V5_LEGACY_RSS_SEMANTICS,
     _counter,  # pyright: ignore[reportPrivateUsage]
     _duration_nanoseconds,  # pyright: ignore[reportPrivateUsage]
     _health_checkpoint_sizes,  # pyright: ignore[reportPrivateUsage]
+    _health_v5_rss_semantics,  # pyright: ignore[reportPrivateUsage]
     _HealthCheckpointSizes,  # pyright: ignore[reportPrivateUsage]
     _journal_commit_to_durable_distribution,  # pyright: ignore[reportPrivateUsage]
     _verify_clean_source_checkout,  # pyright: ignore[reportPrivateUsage]
@@ -25,6 +28,10 @@ from multi_market_arbitrage.pipeline.calibration import (
 from multi_market_arbitrage.pipeline.health import (
     AUDIT_STAGE_TIMING_TELEMETRY_SCHEMA,
     AUDIT_STAGE_TIMING_TELEMETRY_STAGES,
+    COMPOSITE_PEAK_RSS_SOURCE,
+    LINUX_CURRENT_RSS_OS_ERROR_SOURCE,
+    LINUX_CURRENT_RSS_SOURCE,
+    LINUX_PYTHON_RU_MAXRSS_SOURCE,
 )
 from multi_market_arbitrage.pipeline.observe import ObservationSummary
 from multi_market_arbitrage.research import (
@@ -123,7 +130,12 @@ def _measurements() -> CalibrationMeasurements:
         audit_failed=0,
         audit_retries=1,
         cpu_time_ns=2_000_000_000,
-        peak_rss_bytes=128 * 1024 * 1024,
+        current_rss_bytes=120 * 1024 * 1024,
+        current_rss_source=LINUX_CURRENT_RSS_SOURCE,
+        peak_rss_bytes=126 * 1024 * 1024,
+        peak_rss_source=COMPOSITE_PEAK_RSS_SOURCE,
+        python_ru_maxrss_bytes=126 * 1024 * 1024,
+        python_ru_maxrss_source=LINUX_PYTHON_RU_MAXRSS_SOURCE,
         analytical_bytes=500_000,
         health_bytes=50_000,
         health_content_sha256="d" * 64,
@@ -219,7 +231,14 @@ def _health_record(*, terminal: bool, monotonic_ns: int) -> dict[str, object]:
         "ingress": {},
         "journal": {"terminal": terminal},
         "recovery": {},
-        "resources": {},
+        "resources": {
+            "current_rss_bytes": 900,
+            "current_rss_source": LINUX_CURRENT_RSS_SOURCE,
+            "peak_rss_bytes": 1000,
+            "peak_rss_source": COMPOSITE_PEAK_RSS_SOURCE,
+            "python_ru_maxrss_bytes": 1000,
+            "python_ru_maxrss_source": LINUX_PYTHON_RU_MAXRSS_SOURCE,
+        },
         "scanner": {},
         "schema_version": "gate1-health-checkpoint-v5",
         "target": {},
@@ -242,6 +261,82 @@ def _audit_stage_index(stage: str) -> int:
 
 def _health_file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_health_v5_rss_compatibility_never_relabels_legacy_peak() -> None:
+    legacy = {
+        "current_rss_bytes": 420_605_952,
+        "current_rss_source": "legacy-proc-current-rss",
+        "peak_rss_bytes": 418_234_368,
+    }
+
+    assert (
+        _health_v5_rss_semantics(legacy, require_current_contract=False)
+        == HEALTH_V5_LEGACY_RSS_SEMANTICS
+    )
+    with pytest.raises(RuntimeError, match=r"current exact.*source fields"):
+        _health_v5_rss_semantics(legacy, require_current_contract=True)
+
+
+def test_health_v5_rss_compatibility_accepts_current_composite_contract() -> None:
+    resources = cast(dict[str, object], _health_record(terminal=True, monotonic_ns=1)["resources"])
+
+    assert (
+        _health_v5_rss_semantics(resources, require_current_contract=True)
+        == HEALTH_V5_CURRENT_RSS_SEMANTICS
+    )
+
+
+def test_health_v5_rss_compatibility_rejects_partial_current_contract() -> None:
+    resources = cast(dict[str, object], _health_record(terminal=True, monotonic_ns=1)["resources"])
+    resources.pop("python_ru_maxrss_source")
+
+    with pytest.raises(RuntimeError, match="mixes legacy and current fields"):
+        _health_v5_rss_semantics(resources, require_current_contract=True)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        ({"python_ru_maxrss_source": None}, "mixes legacy and current|source is malformed"),
+        ({"peak_rss_bytes": 899}, "composite peak RSS is incoherent"),
+        ({"peak_rss_bytes": 1001}, "composite peak RSS is incoherent"),
+        ({"current_rss_source": "fabricated-current-source"}, "current RSS source/value"),
+        ({"python_ru_maxrss_source": "fabricated-python-source"}, "ru_maxrss source differs"),
+        (
+            {"current_rss_bytes": None, "current_rss_source": LINUX_CURRENT_RSS_SOURCE},
+            "current RSS source/value",
+        ),
+        (
+            {"current_rss_bytes": None, "current_rss_source": "UNAVAILABLE:fabricated"},
+            "current RSS source/value",
+        ),
+    ],
+)
+def test_health_v5_rss_compatibility_rejects_partial_or_incoherent_current_fields(
+    mutation: dict[str, object],
+    error: str,
+) -> None:
+    resources = cast(dict[str, object], _health_record(terminal=True, monotonic_ns=1)["resources"])
+    resources.update(mutation)
+
+    with pytest.raises(RuntimeError, match=error):
+        _health_v5_rss_semantics(resources, require_current_contract=True)
+
+
+def test_health_v5_rss_compatibility_accepts_exact_linux_unavailable_source() -> None:
+    resources = cast(dict[str, object], _health_record(terminal=True, monotonic_ns=1)["resources"])
+    resources.update(
+        {
+            "current_rss_bytes": None,
+            "current_rss_source": LINUX_CURRENT_RSS_OS_ERROR_SOURCE,
+        }
+    )
+
+    assert (
+        _health_v5_rss_semantics(resources, require_current_contract=True)
+        == HEALTH_V5_CURRENT_RSS_SEMANTICS
+    )
 
 
 def _inventory(
@@ -659,12 +754,12 @@ def test_calibration_under_cap_passes_with_all_disk_workloads() -> None:
     assert report.projection.health_checkpoints < report.limits.health_maximum_checkpoints
     assert report.projection.health_periodic_checkpoints == 2_160
     assert report.projection.health_terminal_checkpoints == 1
-    assert report.projection.health_periodic_checkpoint_bytes == 31_319
-    assert report.projection.health_terminal_checkpoint_bytes == 44_963
-    assert report.projection.health_periodic_bytes == 67_649_040
-    assert report.projection.health_terminal_bytes == 44_963
-    assert report.projection.health_bytes == 67_694_003
-    assert report.projection.health_remaining_file_bytes == 3_609_165
+    assert report.projection.health_periodic_checkpoint_bytes == 31_573
+    assert report.projection.health_terminal_checkpoint_bytes == 45_217
+    assert report.projection.health_periodic_bytes == 68_197_680
+    assert report.projection.health_terminal_bytes == 45_217
+    assert report.projection.health_bytes == 68_242_897
+    assert report.projection.health_remaining_file_bytes == 3_060_271
     assert report.projection.health_bytes < report.limits.health_maximum_file_bytes
     assert report.projection.temporary_sealing_active_bytes == 64 * 1024 * 1024
     assert report.projection.temporary_sealing_pending_bytes == 256 * 1024 * 1024
@@ -695,6 +790,12 @@ def test_calibration_binds_health_bounds_and_stdio_stream_log_model() -> None:
     assert report.projection_method_version == "phase1-pre-soak-calibration-projection-method-v2"
     assert measurement_record["log_bytes"] == 0
     assert measurement_record["log_storage_model"] == STDIO_STREAM_LOG_STORAGE_MODEL
+    assert measurement_record["current_rss_bytes"] == 120 * 1024 * 1024
+    assert measurement_record["current_rss_source"] == LINUX_CURRENT_RSS_SOURCE
+    assert measurement_record["peak_rss_bytes"] == 126 * 1024 * 1024
+    assert measurement_record["peak_rss_source"] == COMPOSITE_PEAK_RSS_SOURCE
+    assert measurement_record["python_ru_maxrss_bytes"] == 126 * 1024 * 1024
+    assert measurement_record["python_ru_maxrss_source"] == LINUX_PYTHON_RU_MAXRSS_SOURCE
     assert measurement_record["journal_commit_to_durable"] == {
         "count": 510,
         "maximum": 4_000_000,
@@ -706,8 +807,8 @@ def test_calibration_binds_health_bounds_and_stdio_stream_log_model() -> None:
     assert limits_record["health_checkpoint_interval_nanoseconds"] == 10_000_000_000
     assert limits_record["health_maximum_checkpoints"] == 8_192
     assert limits_record["health_maximum_file_bytes"] == 68 * 1024 * 1024
-    assert limits_record["health_capacity_maximum_periodic_checkpoint_bytes"] == 31_319
-    assert limits_record["health_capacity_maximum_terminal_checkpoint_bytes"] == 44_963
+    assert limits_record["health_capacity_maximum_periodic_checkpoint_bytes"] == 31_573
+    assert limits_record["health_capacity_maximum_terminal_checkpoint_bytes"] == 45_217
     assert limits_record["health_minimum_file_headroom_bytes"] == 2 * 1024 * 1024
     assert limits_record["journal_seal_queue_capacity"] == 4
     assert limits_record["journal_pending_seal_max_uncompressed_bytes"] == 256 * 1024 * 1024
@@ -763,17 +864,17 @@ def test_calibration_uses_capacity_health_shape_instead_of_rate_scaling_mixed_fi
     report = build_calibration_report(_identity(), measured, _limits())
 
     assert report.decision.passed
-    assert report.projection.health_bytes == 67_694_003
-    assert report.projection.health_remaining_file_bytes == 3_609_165
+    assert report.projection.health_bytes == 68_242_897
+    assert report.projection.health_remaining_file_bytes == 3_060_271
     assert report.projection.health_periodic_checkpoints == 2_160
     assert report.projection.health_terminal_checkpoints == 1
-    assert report.projection.total_required_disk_bytes == 3_792_344_001
+    assert report.projection.total_required_disk_bytes == 3_793_030_118
 
 
 def test_calibration_fails_if_public_health_record_exceeds_capacity_qualification() -> None:
     measured = replace(
         _measurements(),
-        health_maximum_periodic_checkpoint_bytes=31_320,
+        health_maximum_periodic_checkpoint_bytes=31_574,
     )
 
     report = build_calibration_report(_identity(), measured, _limits())
@@ -824,6 +925,13 @@ def test_calibration_rate_projection_keeps_websocket_duration_denominator() -> N
     )
 
 
+def test_calibration_measurement_rejects_incoherent_or_unlabeled_rss() -> None:
+    with pytest.raises(ValueError, match="exact same-sample composite"):
+        replace(_measurements(), peak_rss_bytes=125 * 1024 * 1024)
+    with pytest.raises(ValueError, match="explicit and bounded"):
+        replace(_measurements(), python_ru_maxrss_source="")
+
+
 def test_calibration_rejects_changed_health_profile() -> None:
     with pytest.raises(ValueError, match="qualified health-v5 profile"):
         _limits(health_checkpoint_interval_nanoseconds=20_000_000_000)
@@ -832,9 +940,9 @@ def test_calibration_rejects_changed_health_profile() -> None:
     with pytest.raises(ValueError, match="qualified health-v5 profile"):
         _limits(health_maximum_file_bytes=256 * 1024 * 1024)
     with pytest.raises(ValueError, match="qualified health-v5 profile"):
-        _limits(health_capacity_maximum_periodic_checkpoint_bytes=31_320)
+        _limits(health_capacity_maximum_periodic_checkpoint_bytes=31_574)
     with pytest.raises(ValueError, match="qualified health-v5 profile"):
-        _limits(health_capacity_maximum_terminal_checkpoint_bytes=44_964)
+        _limits(health_capacity_maximum_terminal_checkpoint_bytes=45_218)
     with pytest.raises(ValueError, match="qualified health-v5 profile"):
         _limits(health_minimum_file_headroom_bytes=2 * 1024 * 1024 - 1)
 
