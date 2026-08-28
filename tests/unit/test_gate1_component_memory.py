@@ -5,8 +5,11 @@ import copy
 import json
 import sys
 import tempfile
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -23,11 +26,14 @@ from benchmarks.gate1_component_memory import (  # noqa: E402
     WORKLOAD_NAMES,
     WORKLOAD_SCHEMA,
     WorkloadSizing,
+    _wait_for_seal_headroom,  # pyright: ignore[reportPrivateUsage]
     h_runtime_configuration,
     run_component_memory_campaign,
+    run_component_memory_workload,
     validate_component_memory_result,
 )
 from multi_market_arbitrage.core.config import load_phase1_config  # noqa: E402
+from multi_market_arbitrage.journal.writer import RawJournalWriter  # noqa: E402
 from multi_market_arbitrage.observability import (  # noqa: E402
     HealthDecisionReason,
     health_decision_reason_mask,
@@ -54,6 +60,90 @@ _EXPECTED_H_COMPONENTS = [
     "process_resource_sampler",
     "terminal_finalization_and_reconciliation",
 ]
+
+
+class _DelayedRotationWriter:
+    def __init__(self) -> None:
+        self.config = SimpleNamespace(
+            max_pending_seal_uncompressed_bytes=4_096,
+            max_pending_seal_age_seconds=1.0,
+            max_uncompressed_bytes_per_segment=1_024,
+            seal_queue_capacity=4,
+        )
+        self.failure = None
+        self.handoffs = 0
+        self.pending = 0
+        self.pending_bytes = 0
+        self.sample_count = 0
+
+    @property
+    def metrics(self) -> SimpleNamespace:
+        self.sample_count += 1
+        return SimpleNamespace(
+            pending_uncompressed_bytes=self.pending_bytes,
+            pending_segments=self.pending,
+            segment_handoffs=self.handoffs,
+        )
+
+
+@pytest.mark.asyncio
+async def test_rotation_headroom_waits_for_published_handoff_before_seal_credit() -> None:
+    writer = _DelayedRotationWriter()
+
+    async def complete_handoff_and_release_credit() -> None:
+        await asyncio.sleep(0.01)
+        writer.handoffs = 1
+        writer.pending = writer.config.seal_queue_capacity
+        writer.pending_bytes = writer.config.max_pending_seal_uncompressed_bytes
+        await asyncio.sleep(0.01)
+        writer.pending -= 1
+        writer.pending_bytes -= writer.config.max_uncompressed_bytes_per_segment
+
+    completion = asyncio.create_task(complete_handoff_and_release_credit())
+    await _wait_for_seal_headroom(
+        cast(RawJournalWriter, writer),
+        expected_handoffs=1,
+    )
+    await completion
+
+    assert writer.handoffs == 1
+    assert writer.pending == writer.config.seal_queue_capacity - 1
+    assert writer.pending_bytes == (
+        writer.config.max_pending_seal_uncompressed_bytes
+        - writer.config.max_uncompressed_bytes_per_segment
+    )
+    assert writer.sample_count > 1
+
+
+@pytest.mark.asyncio
+async def test_rotation_workload_paces_delayed_sealer_without_exceeding_bounds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sizing = replace(
+        WorkloadSizing.ci_fixture(),
+        rotation_count=10,
+        rotation_events_per_segment=2,
+    )
+    original_seal = RawJournalWriter._seal_pending_segment  # pyright: ignore[reportPrivateUsage]
+    call_original_seal = cast(Callable[..., object], original_seal)
+
+    def delayed_seal(*args: object, **kwargs: object) -> object:
+        time.sleep(0.01)
+        return call_original_seal(*args, **kwargs)
+
+    monkeypatch.setattr(RawJournalWriter, "_seal_pending_segment", delayed_seal)
+    result = await run_component_memory_workload("B", tmp_path, sizing)
+    details = cast(dict[str, object], result["details"])
+    occupancies = cast(list[dict[str, object]], result["owner_occupancies"])
+
+    assert details["asynchronous_rotation_count"] == 10
+    assert details["verified_segments"] == 11
+    assert details["pending_segments_at_completion"] == 0
+    assert all(
+        cast(int, item["observed_high_water"]) <= cast(int, item["hard_limit"])
+        for item in occupancies
+    )
 
 
 @pytest.fixture(scope="module")

@@ -1056,14 +1056,32 @@ def _writer_config(
     )
 
 
-async def _wait_for_seal_headroom(writer: RawJournalWriter) -> None:
+async def _wait_for_seal_headroom(
+    writer: RawJournalWriter,
+    *,
+    expected_handoffs: int,
+) -> None:
     deadline = time.monotonic() + writer.config.max_pending_seal_age_seconds
     target = max(0, writer.config.seal_queue_capacity - 1)
-    while writer.metrics.pending_segments > target:
+    byte_target = max(
+        0,
+        writer.config.max_pending_seal_uncompressed_bytes
+        - writer.config.max_uncompressed_bytes_per_segment,
+    )
+    while True:
         if writer.failure is not None:
             raise writer.failure
+        metrics = writer.metrics
+        if (
+            metrics.segment_handoffs >= expected_handoffs
+            and metrics.pending_segments <= target
+            and metrics.pending_uncompressed_bytes <= byte_target
+        ):
+            return
         if time.monotonic() >= deadline:
-            raise TimeoutError("ordered sealer did not recover bounded queue headroom")
+            raise TimeoutError(
+                "journal rotation did not publish its handoff and recover bounded seal headroom"
+            )
         await asyncio.sleep(0.001)
 
 
@@ -1108,7 +1126,10 @@ async def _append_generated(
                 process(envelope)
         sequence += batch_count
         if sequence % writer.config.max_events_per_segment == 0:
-            await _wait_for_seal_headroom(writer)
+            await _wait_for_seal_headroom(
+                writer,
+                expected_handoffs=sequence // writer.config.max_events_per_segment,
+            )
         if measurement is not None and (
             sequence == count or sequence % normalized_sample_every == 0
         ):
