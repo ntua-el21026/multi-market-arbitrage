@@ -1231,7 +1231,10 @@ async def test_prepare_attest_classification_deadline_is_transactional_and_repla
         update={
             "scanner": config.scanner.model_copy(
                 update={
-                    "maximum_book_age_seconds": 0.3,
+                    # Keep the test-only expiry window wide enough that an ordinary
+                    # durability fsync cannot accidentally consume the processing
+                    # delay this case is intended to isolate on a loaded host.
+                    "maximum_book_age_seconds": 1.0,
                     "maximum_interleg_skew_seconds": 0.1,
                 }
             )
