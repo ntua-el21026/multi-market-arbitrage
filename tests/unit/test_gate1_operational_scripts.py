@@ -235,6 +235,11 @@ if arguments[:2] == ["python", "find"]:
     print(os.environ["MMA_TEST_PYTHON"])
     raise SystemExit(0)
 if arguments and arguments[0] in {{"lock", "sync"}}:
+    if os.environ.get("MMA_TEST_REQUIRE_UV_PRERELEASE") and (
+        os.environ.get("UV_NO_CONFIG") != "1"
+        or os.environ.get("UV_PRERELEASE") != "disallow"
+    ):
+        raise SystemExit("launcher did not bind the frozen uv prerelease policy")
     raise SystemExit(0)
 if "python" in arguments:
     python_index = arguments.index("python")
@@ -664,6 +669,8 @@ def test_validate_only_is_offline_and_never_starts_a_process(tmp_path: Path) -> 
     environment = _shim_environment(shim_directory, log)
     environment["GIT_SSH_COMMAND"] = str(ssh_shim)
     environment["PYTHONPATH"] = str(tmp_path / "attacker-pythonpath")
+    environment["MMA_TEST_REQUIRE_UV_PRERELEASE"] = "1"
+    environment["UV_PRERELEASE"] = "if-necessary"
     environment["UV_PROJECT"] = str(tmp_path / "attacker-pyproject.toml")
     environment["UV_WORKING_DIR"] = str(tmp_path / "attacker-working-directory")
     completed = _run(

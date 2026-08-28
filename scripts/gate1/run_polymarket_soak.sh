@@ -23,7 +23,11 @@ export GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null
 export GIT_CONFIG_KEY_1=core.fsmonitor GIT_CONFIG_VALUE_1=false
 export GIT_CONFIG_KEY_2=core.attributesFile GIT_CONFIG_VALUE_2=/dev/null
 export GIT_CONFIG_KEY_3=core.excludesFile GIT_CONFIG_VALUE_3=/dev/null
-export PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 UV_NO_CONFIG=1
+export PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1
+# UV_NO_CONFIG deliberately excludes both user configuration and the
+# repository's [tool.uv] table.  Rebind the lock's frozen prerelease policy
+# explicitly so validation is independent of either source.
+export UV_NO_CONFIG=1 UV_PRERELEASE=disallow
 
 usage() {
   cat <<'EOF'
