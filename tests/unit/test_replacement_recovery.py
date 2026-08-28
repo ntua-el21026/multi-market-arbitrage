@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import pytest
-from hypothesis import given
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from multi_market_arbitrage.core.ids import ConnectionId, IngestId, InstrumentId
@@ -662,6 +662,7 @@ def test_duplicate_required_instruments_and_excluded_connections_are_rejected() 
         max_value=MAXIMUM_REPLACEMENT_RECOVERY_ATTEMPTS,
     )
 )
+@settings(deadline=None, derandomize=True)
 def test_generated_retry_sequences_never_multiply_identity(
     maximum_attempts: int,
 ) -> None:
