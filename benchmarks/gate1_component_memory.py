@@ -121,6 +121,10 @@ _MAXIMUM_RETAINED_RESOURCE_POINTS: Final = 256
 _GIT_SHA_LENGTH: Final = 40
 _INGEST_ID_INDEX_PAGE_CACHE_BYTES: Final = 2 * 1024 * 1024
 _H_WORKSPACE_ENV: Final = "MMA_GATE1_COMPONENT_MEMORY_H_WORKSPACE"
+_H_CI_WEBSOCKET_DELAY_SECONDS: Final = 0.001
+_H_CI_DURATION_SECONDS: Final = 1.25
+_H_QUALIFICATION_WEBSOCKET_DELAY_SECONDS: Final = 0.005
+_H_QUALIFICATION_DURATION_HEADROOM_MULTIPLIER: Final = 4
 _EXPECTED_C_STAGE_ORDER: Final = (
     "rotation_handoff",
     "compression",
@@ -299,6 +303,11 @@ _EXPECTED_DETAIL_FIELDS: Final[dict[str, frozenset[str]]] = {
             "effective_runtime_config_sha256",
             "effective_runtime_timing",
             "fixture_calls",
+            "fixture_websocket_delay_seconds",
+            "fixture_websocket_emission_span_nanoseconds",
+            "fixture_websocket_interframe_sample_count",
+            "fixture_websocket_minimum_interframe_nanoseconds",
+            "fixture_websocket_nominal_maximum_frames_per_second",
             "health_checkpoint_count",
             "health_evidence_completed",
             "health_gate1_evidence_eligible",
@@ -453,6 +462,32 @@ class WorkloadSizing:
             complete_pipeline_events=_required_int(values, "complete_pipeline_events"),
             journal_payload_bytes=_required_int(values, "journal_payload_bytes"),
         )
+
+
+def _h_workload_timing(
+    phase1: Phase1Config,
+    *,
+    complete_pipeline_events: int,
+    qualification: bool,
+) -> tuple[float, float]:
+    """Return the bounded offline source cadence and observation duration for H."""
+
+    if complete_pipeline_events <= 0:
+        raise ValueError("complete-pipeline event count must be positive")
+    if not qualification:
+        return _H_CI_WEBSOCKET_DELAY_SECONDS, _H_CI_DURATION_SECONDS
+    websocket_delay_seconds = _H_QUALIFICATION_WEBSOCKET_DELAY_SECONDS
+    # This multiplier provides bounded wall-time headroom for fixture delivery
+    # and finalization; audit completion is validated independently.
+    duration_seconds = max(
+        (
+            _H_QUALIFICATION_DURATION_HEADROOM_MULTIPLIER
+            * phase1.polymarket.snapshot_audit_interval_seconds
+        ),
+        phase1.health.checkpoint_interval_seconds + 5.0,
+        complete_pipeline_events * websocket_delay_seconds + 5.0,
+    )
+    return websocket_delay_seconds, duration_seconds
 
 
 def _required_text(values: Mapping[str, object], name: str) -> str:
@@ -2323,18 +2358,14 @@ async def _workload_h(
     if cloned_head != _git_head():
         raise RuntimeError("production-assembly workspace does not match benchmark source SHA")
 
-    websocket_delay_seconds = 0.00075 if qualification else 0.001
+    websocket_delay_seconds, duration_seconds = _h_workload_timing(
+        phase1,
+        complete_pipeline_events=sizing.complete_pipeline_events,
+        qualification=qualification,
+    )
     configured, effective_timing, timing_overrides, runtime_config_mode, coverage_gaps = (
         h_runtime_configuration(phase1, qualification=qualification)
     )
-    if qualification:
-        duration_seconds = max(
-            phase1.polymarket.snapshot_audit_interval_seconds + 5.0,
-            phase1.health.checkpoint_interval_seconds + 5.0,
-            sizing.complete_pipeline_events * websocket_delay_seconds + 5.0,
-        )
-    else:
-        duration_seconds = 1.25
     gamma_page = cast(
         dict[str, object], json.loads(_fixture("polymarket_gamma_market_keyset.json"))
     )
@@ -2357,6 +2388,10 @@ async def _workload_h(
         "audit_book": 0,
         "websocket_frames": 0,
     }
+    websocket_emission_started_ns: int | None = None
+    websocket_emission_ended_ns: int | None = None
+    websocket_previous_emission_ns: int | None = None
+    websocket_minimum_interframe_ns: int | None = None
 
     class _OfflinePublicClient:
         def __init__(self, **kwargs: object) -> None:
@@ -2455,14 +2490,30 @@ async def _workload_h(
             *,
             ready: asyncio.Event,
         ) -> None:
+            nonlocal websocket_emission_ended_ns
+            nonlocal websocket_emission_started_ns
+            nonlocal websocket_minimum_interframe_ns
+            nonlocal websocket_previous_emission_ns
             ready.set()
             sample_every = max(1, websocket_event_count // 32)
             for index in range(websocket_event_count):
+                emitted_ns = time.monotonic_ns()
+                if websocket_previous_emission_ns is None:
+                    websocket_emission_started_ns = emitted_ns
+                else:
+                    interframe_ns = emitted_ns - websocket_previous_emission_ns
+                    websocket_minimum_interframe_ns = (
+                        interframe_ns
+                        if websocket_minimum_interframe_ns is None
+                        else min(websocket_minimum_interframe_ns, interframe_ns)
+                    )
+                websocket_previous_emission_ns = emitted_ns
+                websocket_emission_ended_ns = emitted_ns
                 admit(
                     ReceivedWebSocketMessage(
                         payload_bytes=websocket_payload,
                         received_wall_time=UtcTimestamp.now(),
-                        received_monotonic_ns=time.monotonic_ns(),
+                        received_monotonic_ns=emitted_ns,
                         message_type="TEXT",
                     )
                 )
@@ -2491,6 +2542,12 @@ async def _workload_h(
     measured = measurement.finish(final_progress=sizing.complete_pipeline_events)
     if fixture_calls["websocket_frames"] != websocket_event_count:
         raise RuntimeError("production assembly did not admit the complete fixture frame source")
+    if websocket_emission_started_ns is None or websocket_emission_ended_ns is None:
+        raise RuntimeError("production assembly did not record fixture emission timing")
+    websocket_interframe_sample_count = max(0, websocket_event_count - 1)
+    if websocket_interframe_sample_count and websocket_minimum_interframe_ns is None:
+        raise RuntimeError("production assembly did not record fixture inter-frame timing")
+    websocket_emission_span_ns = websocket_emission_ended_ns - websocket_emission_started_ns
     if summary.journal_metrics.durable < sizing.complete_pipeline_events:
         raise RuntimeError("production assembly did not durably process the requested input floor")
     if fixture_calls["audit_book"] <= 0 or summary.processor.rest_audits <= 0:
@@ -2583,6 +2640,13 @@ async def _workload_h(
                 "deterministic public-read and WebSocket fixtures at adapter boundaries"
             ),
             "fixture_calls": fixture_calls,
+            "fixture_websocket_delay_seconds": websocket_delay_seconds,
+            "fixture_websocket_emission_span_nanoseconds": websocket_emission_span_ns,
+            "fixture_websocket_interframe_sample_count": websocket_interframe_sample_count,
+            "fixture_websocket_minimum_interframe_nanoseconds": (
+                websocket_minimum_interframe_ns or 0
+            ),
+            "fixture_websocket_nominal_maximum_frames_per_second": (1.0 / websocket_delay_seconds),
             "requested_minimum_events": sizing.complete_pipeline_events,
             "requested_duration_seconds": duration_seconds,
             "actual_duration_nanoseconds": summary.actual_duration_nanoseconds,
@@ -3423,13 +3487,21 @@ def _h_production_evidence_valid(
         h_runtime_configuration(phase1, qualification=qualification)
     )
     minimum_health_checkpoints = 3 if qualification else 2
-    minimum_duration_seconds = (
-        max(
-            phase1.polymarket.snapshot_audit_interval_seconds + 5.0,
-            phase1.health.checkpoint_interval_seconds + 5.0,
-        )
-        if qualification
-        else 1.25
+    expected_websocket_delay_seconds, minimum_duration_seconds = _h_workload_timing(
+        phase1,
+        complete_pipeline_events=expected_minimum_events,
+        qualification=qualification,
+    )
+    expected_interframe_sample_count = max(0, expected_websocket_frames - 1)
+    expected_minimum_interframe_ns = int(expected_websocket_delay_seconds * 1e9)
+    fixture_emission_span_ns = _int_value(
+        details.get("fixture_websocket_emission_span_nanoseconds")
+    )
+    fixture_interframe_sample_count = _int_value(
+        details.get("fixture_websocket_interframe_sample_count")
+    )
+    fixture_minimum_interframe_ns = _int_value(
+        details.get("fixture_websocket_minimum_interframe_nanoseconds")
     )
     expected_source_execution_mode = (
         "EXACT_CLEAN_CLONED_SOURCE_INTERPRETER"
@@ -3490,8 +3562,18 @@ def _h_production_evidence_valid(
         and requested_events == expected_minimum_events
         and actual_events is not None
         and actual_events >= expected_minimum_events
+        and details.get("fixture_websocket_delay_seconds") == expected_websocket_delay_seconds
+        and details.get("fixture_websocket_nominal_maximum_frames_per_second")
+        == 1.0 / expected_websocket_delay_seconds
+        and fixture_interframe_sample_count == expected_interframe_sample_count
+        and fixture_minimum_interframe_ns is not None
+        and fixture_minimum_interframe_ns
+        >= (expected_minimum_interframe_ns if expected_interframe_sample_count else 0)
+        and fixture_emission_span_ns is not None
+        and fixture_emission_span_ns
+        >= expected_interframe_sample_count * expected_minimum_interframe_ns
         and _finite_number_value(requested_duration)
-        and float(cast(int | float, requested_duration)) >= minimum_duration_seconds
+        and float(cast(int | float, requested_duration)) == minimum_duration_seconds
         and actual_duration_ns is not None
         and actual_duration_ns >= int(float(cast(int | float, requested_duration)) * 1e9)
         and fixture.get("gamma_market") == 1

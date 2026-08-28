@@ -234,6 +234,29 @@ def test_h_qualification_uses_exact_runtime_config_and_ci_discloses_overrides() 
     assert len(ci_gaps) == 2
 
 
+def test_h_qualification_fixture_timing_is_bounded_and_ci_remains_accelerated() -> None:
+    phase1 = load_phase1_config(REPOSITORY / "config" / "phase1.toml")
+    qualification_events = WorkloadSizing.qualification().complete_pipeline_events
+
+    qualification_delay, qualification_duration = component_memory_module._h_workload_timing(  # pyright: ignore[reportPrivateUsage]
+        phase1,
+        complete_pipeline_events=qualification_events,
+        qualification=True,
+    )
+    assert qualification_delay == 0.005
+    assert 1.0 / qualification_delay <= 200.0
+    assert qualification_duration >= (4 * phase1.polymarket.snapshot_audit_interval_seconds)
+    assert qualification_duration >= qualification_events * qualification_delay + 5.0
+
+    ci_delay, ci_duration = component_memory_module._h_workload_timing(  # pyright: ignore[reportPrivateUsage]
+        phase1,
+        complete_pipeline_events=WorkloadSizing.ci_fixture().complete_pipeline_events,
+        qualification=False,
+    )
+    assert ci_delay == 0.001
+    assert ci_duration == 1.25
+
+
 def test_component_memory_fixture_covers_a_through_h_with_explicit_modes(
     component_memory_fixture: tuple[Path, dict[str, object]],
 ) -> None:
@@ -386,6 +409,11 @@ def test_component_memory_fixture_covers_a_through_h_with_explicit_modes(
     assert h_details["availability_contribution_path_present"] is True
     assert cast(int, h_details["audit_matches"]) == cast(int, h_details["audit_observations"])
     assert cast(int, h_details["audit_matches"]) >= 1
+    assert h_details["fixture_websocket_delay_seconds"] == 0.001
+    assert h_details["fixture_websocket_nominal_maximum_frames_per_second"] == 1000.0
+    assert h_details["fixture_websocket_interframe_sample_count"] == 2
+    assert cast(int, h_details["fixture_websocket_minimum_interframe_nanoseconds"]) >= 1_000_000
+    assert cast(int, h_details["fixture_websocket_emission_span_nanoseconds"]) >= 2_000_000
     h_owner_names = {
         cast(str, item["name"])
         for item in cast(list[dict[str, object]], workloads["H"]["owner_occupancies"])
@@ -513,6 +541,11 @@ def test_component_memory_validator_detects_injected_owner_retention(
         ("h_missing_terminal_resources", "complete_production_assembly_exercised"),
         ("h_zero_audits", "complete_production_assembly_exercised"),
         ("h_malformed_health_count", "complete_production_assembly_exercised"),
+        ("h_requested_duration_too_short", "complete_production_assembly_exercised"),
+        ("h_requested_duration_too_long", "complete_production_assembly_exercised"),
+        ("h_fixture_delay_mismatch", "complete_production_assembly_exercised"),
+        ("h_fixture_interframe_too_short", "complete_production_assembly_exercised"),
+        ("h_fixture_emission_span_too_short", "complete_production_assembly_exercised"),
         ("e_instrumentation_stalled", "resource_instrumentation_complete"),
         ("extra_h_detail", "result_shape_valid"),
     ],
@@ -642,6 +675,22 @@ def test_component_memory_validator_rejects_schema_and_semantic_tampering(
         cast(dict[str, object], workloads["H"]["details"])["audit_observations"] = 0
     elif case == "h_malformed_health_count":
         cast(dict[str, object], workloads["H"]["details"])["health_checkpoint_count"] = "two"
+    elif case == "h_requested_duration_too_short":
+        cast(dict[str, object], workloads["H"]["details"])["requested_duration_seconds"] = 1.0
+    elif case == "h_requested_duration_too_long":
+        cast(dict[str, object], workloads["H"]["details"])["requested_duration_seconds"] = 2.0
+    elif case == "h_fixture_delay_mismatch":
+        cast(dict[str, object], workloads["H"]["details"])["fixture_websocket_delay_seconds"] = (
+            0.0005
+        )
+    elif case == "h_fixture_interframe_too_short":
+        cast(dict[str, object], workloads["H"]["details"])[
+            "fixture_websocket_minimum_interframe_nanoseconds"
+        ] = 999_999
+    elif case == "h_fixture_emission_span_too_short":
+        cast(dict[str, object], workloads["H"]["details"])[
+            "fixture_websocket_emission_span_nanoseconds"
+        ] = 1_999_999
     elif case == "e_instrumentation_stalled":
         cast(dict[str, object], workloads["E"]["details"])["post_saturation_sample_count"] = 1
     elif case == "extra_h_detail":
