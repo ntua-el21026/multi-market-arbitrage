@@ -1348,12 +1348,15 @@ def test_v2_reconciliation_rejects_overlapping_duplicate_stable_key() -> None:
     result = reconcile_availability_v2((interval,), (first, second))
 
     assert not result.reconciled
+    assert AvailabilityReconciliationDiscrepancy.DUPLICATE_STABLE_CAUSAL_KEY in (
+        result.discrepancies
+    )
     assert (
         AvailabilityReconciliationDiscrepancy.OVERLAPPING_STABLE_CAUSAL_KEY in result.discrepancies
     )
 
 
-def test_v2_reconciliation_accepts_nonoverlapping_key_reuse_with_exact_terminal_object() -> None:
+def test_v2_reconciliation_rejects_nonoverlapping_key_reuse_with_exact_terminal_object() -> None:
     run_id = CollectorRunId.new()
     first = _contribution(
         run_id,
@@ -1381,8 +1384,45 @@ def test_v2_reconciliation_accepts_nonoverlapping_key_reuse_with_exact_terminal_
         active_causal_keys=(second.stable_causal_key,),
     )
 
-    assert result.reconciled
-    assert result.discrepancies == ()
+    assert not result.reconciled
+    assert AvailabilityReconciliationDiscrepancy.DUPLICATE_STABLE_CAUSAL_KEY in (
+        result.discrepancies
+    )
+    assert AvailabilityReconciliationDiscrepancy.OVERLAPPING_STABLE_CAUSAL_KEY not in (
+        result.discrepancies
+    )
+
+
+def test_v2_reconciliation_rejects_nonoverlapping_completed_key_reuse() -> None:
+    run_id = CollectorRunId.new()
+    first = _contribution(
+        run_id,
+        interval_id="interval-v2-first",
+        lifecycle="first-lifecycle",
+        start_ns=10,
+        end_ns=20,
+    )
+    second = replace(
+        _contribution(
+            run_id,
+            interval_id="interval-v2-second",
+            lifecycle="second-lifecycle",
+            sequence=2,
+            start_ns=30,
+            end_ns=40,
+        ),
+        stable_causal_key=first.stable_causal_key,
+    )
+
+    result = reconcile_availability_v2(
+        (_interval((first,)), _interval((second,))),
+        (first, second),
+    )
+
+    assert not result.reconciled
+    assert result.discrepancies == (
+        AvailabilityReconciliationDiscrepancy.DUPLICATE_STABLE_CAUSAL_KEY,
+    )
 
 
 def test_v2_reconciliation_types_required_count_chain_and_sequence_mismatches() -> None:

@@ -86,6 +86,7 @@ class AvailabilityReconciliationDiscrepancy(StrEnum):
     SCOPE_COUNT_MISMATCH = "SCOPE_COUNT_MISMATCH"
     AFFECTED_INSTRUMENT_MISMATCH = "AFFECTED_INSTRUMENT_MISMATCH"
     AFFECTED_SCOPE_MISMATCH = "AFFECTED_SCOPE_MISMATCH"
+    DUPLICATE_STABLE_CAUSAL_KEY = "DUPLICATE_STABLE_CAUSAL_KEY"
     OVERLAPPING_STABLE_CAUSAL_KEY = "OVERLAPPING_STABLE_CAUSAL_KEY"
     COMPLETED_CONTRIBUTOR_STILL_ACTIVE = "COMPLETED_CONTRIBUTOR_STILL_ACTIVE"
     UNRESOLVED_CONTRIBUTOR_OMITTED = "UNRESOLVED_CONTRIBUTOR_OMITTED"
@@ -381,6 +382,8 @@ def reconcile_availability_v2(
             scope_ranges.setdefault(scope, []).append(causal_range)
 
     for ranges in by_causal_key.values():
+        if len(ranges) > 1:
+            discrepancies.add(AvailabilityReconciliationDiscrepancy.DUPLICATE_STABLE_CAUSAL_KEY)
         prior_end: int | None = None
         for start_ns, end_ns in sorted(ranges):
             if prior_end is not None and start_ns < prior_end:
@@ -392,9 +395,9 @@ def reconcile_availability_v2(
     active_key_set = set(active_causal_keys)
     terminal_keys = {item.stable_causal_key for item in contributions if item.open_at_shutdown}
     closed_keys = {item.stable_causal_key for item in contributions if not item.open_at_shutdown}
-    # A stable key can recur in a later, non-overlapping contribution.  The
-    # terminal-open record identifies the current object; keys with no such
-    # record are completed-only and cannot remain in terminal active authority.
+    # Stable causal keys are run-wide contributor identities and cannot recur,
+    # even in a later non-overlapping lifecycle. The terminal-open record binds
+    # the exact current contributor; completed-only keys cannot remain active.
     if active_key_set & (closed_keys - terminal_keys):
         discrepancies.add(AvailabilityReconciliationDiscrepancy.COMPLETED_CONTRIBUTOR_STILL_ACTIVE)
     if active_key_set - terminal_keys:

@@ -150,12 +150,13 @@ Failure invalidates sequence-dependent state.
 eligible for recovery review only after all required ADR-0055 validation,
 contribution and reconciliation layers pass.
 
-ADR-0056 validation additionally proves one stable causal key per unresolved
-lifecycle, independent contributor closure/publication, separate active and
-cumulative bounds, global active-period union, exact interval/contribution
-count/digest/sequence/hash reconciliation, and bounded replacement attempts,
-deadlines and typed exhaustion. Historical schemas report unavailable fields;
-validation never synthesizes them.
+ADR-0056 validation additionally proves one run-wide unique stable causal key
+per contributor across active and completed evidence; non-overlapping later
+reuse is still a duplicate. It also proves independent contributor
+closure/publication, separate active and cumulative bounds, global active-period
+union, exact interval/contribution count/digest/sequence/hash reconciliation,
+and bounded replacement attempts, deadlines and typed exhaustion. Historical
+schemas report unavailable fields; validation never synthesizes them.
 
 Current validation recognizes `gate1-availability-interval-v2` and
 `gate1-availability-interval-contribution-v2` only through their paired v2
