@@ -33,6 +33,9 @@ from multi_market_arbitrage.observability import (
 from multi_market_arbitrage.pipeline import observe as observe_module
 from multi_market_arbitrage.pipeline.channels import (
     CLOB_MARKET_PREFIX,
+    CONTROL_BOOK_INVALIDATION,
+    CONTROL_REST_AUDIT_CLASSIFY,
+    CONTROL_REST_AUDIT_FAILED,
     CONTROL_REST_AUDIT_REPLACEMENT_RECOVERY,
     CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
     CONTROL_REST_AUDIT_REPLACEMENT_RELEASE_V2,
@@ -56,6 +59,8 @@ from multi_market_arbitrage.venues.polymarket import (
     PolymarketHttpFailureCategory,
     PolymarketHttpTransportError,
     PolymarketPublicClient,
+    PolymarketWebSocketFailureCategory,
+    PolymarketWebSocketTransportError,
     PublicReadEvidence,
     PublicReadMetricsSnapshot,
     PublicReadResult,
@@ -1164,6 +1169,306 @@ async def test_paired_response_is_classified_before_slow_mismatch_socket_cleanup
         for item in classifications
     )
     assert summary.runtime_health.availability_contributions_emitted >= 1
+
+
+@pytest.mark.asyncio
+async def test_mismatch_waits_for_inflight_sibling_before_generation_rotation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mismatch-driven rotation cannot manufacture a permanent sibling fault."""
+
+    service = _configured_service(tmp_path)
+    _prepare_runtime(monkeypatch, fail_resnapshot=False)
+    allow_sibling_response = asyncio.Event()
+    sibling_observed_live_generation: list[bool] = []
+    resnapshot_started_after_sibling_response: list[bool] = []
+
+    class _DelayedSiblingClient(_LifecyclePublicClient):
+        async def fetch_order_book_raw_with_evidence(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+            on_response_body_complete: Callable[[UtcTimestamp, int], None] | None = None,
+        ) -> PublicReadResult:
+            if asset_id == "token-no" and not allow_sibling_response.is_set():
+                await allow_sibling_response.wait()
+                sibling_observed_live_generation.append(
+                    bool(_LifecycleSocket.instances) and not _LifecycleSocket.instances[0].stopped
+                )
+            return await super().fetch_order_book_raw_with_evidence(
+                asset_id,
+                deadline=deadline,
+                on_response_body_complete=on_response_body_complete,
+            )
+
+        async def fetch_order_book_raw(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+        ) -> bytes:
+            resnapshot_started_after_sibling_response.append(allow_sibling_response.is_set())
+            return await super().fetch_order_book_raw(asset_id, deadline=deadline)
+
+    monkeypatch.setattr(observe_module, "PolymarketPublicClient", _DelayedSiblingClient)
+    original_preserve = (
+        observe_module._RawCaptureBoundary.preserve_then_process_with_evidence  # pyright: ignore[reportPrivateUsage]
+    )
+
+    async def release_sibling_after_mismatch(
+        capture: observe_module._RawCaptureBoundary,  # pyright: ignore[reportPrivateUsage]
+        *,
+        channel: str,
+        payload: bytes,
+        transport_type: str,
+        semantics_hash: str,
+        connection_id: ConnectionId | None = None,
+        subscription_id: SubscriptionId | None = None,
+        transport_metadata: dict[str, str | int | bool] | None = None,
+        received_wall_time: UtcTimestamp | None = None,
+        received_monotonic_ns: int | None = None,
+    ) -> object:
+        evidence = await original_preserve(
+            capture,
+            channel=channel,
+            payload=payload,
+            transport_type=transport_type,
+            semantics_hash=semantics_hash,
+            connection_id=connection_id,
+            subscription_id=subscription_id,
+            transport_metadata=transport_metadata,
+            received_wall_time=received_wall_time,
+            received_monotonic_ns=received_monotonic_ns,
+        )
+        result = evidence.result
+        if result.audit_outcomes and result.audit_outcomes[-1].outcome.value == "MISMATCH":
+            allow_sibling_response.set()
+        return evidence
+
+    monkeypatch.setattr(
+        observe_module._RawCaptureBoundary,  # pyright: ignore[reportPrivateUsage]
+        "preserve_then_process_with_evidence",
+        release_sibling_after_mismatch,
+    )
+    first_replacement_processed = _LifecycleSocket.first_replacement_processed
+    assert first_replacement_processed is not None
+    first_replacement_processed.set()
+
+    async with asyncio.timeout(30.0):
+        summary = await service.run(duration_seconds=3.0, gamma_market_id="101")
+
+    first_connection = summary.processor.audit_outcomes[0].connection_id
+    first_generation_outcomes = tuple(
+        outcome
+        for outcome in summary.processor.audit_outcomes
+        if outcome.connection_id == first_connection
+    )
+    assert tuple(outcome.outcome.value for outcome in first_generation_outcomes) == (
+        "MISMATCH",
+        "MATCH",
+    )
+    assert all(outcome.reason is None for outcome in first_generation_outcomes)
+    assert sibling_observed_live_generation == [True]
+    assert resnapshot_started_after_sibling_response == [True, True]
+    assert summary.processor.audit_faults_observed == 0
+    assert summary.processor.audit_faults_current == 0
+    assert summary.processor.audit_faults_permanent == 0
+    assert summary.processor.audit_replacement_captures_pending == 0
+    assert summary.processor.audit_divergences_pending == 0
+    assert summary.processor.audit_divergences_unresolved == 0
+    assert summary.processor.audit_divergence_lifecycle_reconciled
+    assert summary.health_decision.gate1_eligible_so_far
+
+    records = JournalReader(summary.journal_root, summary.collector_run_id).read_all()
+    first_request_ids = {outcome.request_id for outcome in first_generation_outcomes}
+    classification_indices = tuple(
+        index
+        for index, record in enumerate(records)
+        if record.channel == CONTROL_REST_AUDIT_CLASSIFY
+        and cast(dict[str, object], json.loads(record.payload_bytes)).get("request_id")
+        in first_request_ids
+    )
+    assert len(classification_indices) == 2
+    first_resnapshot_index = next(
+        index
+        for index, record in enumerate(records)
+        if index > max(classification_indices) and record.channel == REST_BOOK
+    )
+    assert max(classification_indices) < first_resnapshot_index
+    assert not any(
+        record.channel == CONTROL_REST_AUDIT_START
+        for record in records[min(classification_indices) + 1 : first_resnapshot_index]
+    )
+    assert not any(
+        record.channel == CONTROL_REST_AUDIT_FAILED
+        and cast(dict[str, object], json.loads(record.payload_bytes)).get("request_id")
+        in first_request_ids
+        for record in records
+    )
+    assert (
+        sum(record.channel == CONTROL_REST_AUDIT_REPLACEMENT_RELEASE_V2 for record in records) == 1
+    )
+    assert not any(record.channel == CONTROL_REST_AUDIT_REPLACEMENT_RELEASE for record in records)
+    contribution_path = summary.availability_evidence.contribution_path
+    assert contribution_path is not None
+    contributions = tuple(
+        cast(dict[str, object], json.loads(line))
+        for line in contribution_path.read_text(encoding="utf-8").splitlines()
+    )
+    released_recovery = next(
+        cast(dict[str, object], contribution["replacement_recovery"])
+        for contribution in contributions
+        if cast(dict[str, object], contribution["replacement_recovery"])["status"] == "RELEASED"
+    )
+    assert released_recovery["last_result"] == "RELEASED"
+    replay = replay_journal(
+        summary.journal_root,
+        summary.collector_run_id,
+        service._config,  # pyright: ignore[reportPrivateUsage]
+    )
+    assert replay.processor == summary.processor
+    assert replay.processor.terminal_hash == summary.processor.terminal_hash
+
+
+@pytest.mark.asyncio
+async def test_socket_end_during_mismatch_sibling_drain_preserves_disconnect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real generation end still owns disconnect recovery during the drain."""
+
+    service = _configured_service(tmp_path)
+    _prepare_runtime(monkeypatch, fail_resnapshot=False)
+    first_no_started = asyncio.Event()
+    first_no_cancelled = asyncio.Event()
+    end_first_generation = asyncio.Event()
+
+    class _DisconnectingLifecycleSocket(_LifecycleSocket):
+        async def pump_received(
+            self,
+            admit: Callable[[ReceivedWebSocketMessage], None],
+            *,
+            ready: asyncio.Event,
+        ) -> None:
+            if self.generation != 1:
+                await super().pump_received(admit, ready=ready)
+                return
+            del admit
+            ready.set()
+            try:
+                await end_first_generation.wait()
+                raise PolymarketWebSocketTransportError(
+                    category=PolymarketWebSocketFailureCategory.CONNECTION_CLOSED,
+                    retryable=True,
+                    detail="fixture socket ended while mismatch sibling remained in flight",
+                )
+            finally:
+                self.stopped = True
+
+    class _BlockedSiblingClient(_LifecyclePublicClient):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__(**kwargs)
+            self._block_first_no = True
+
+        async def fetch_order_book_raw_with_evidence(
+            self,
+            asset_id: str,
+            *,
+            deadline: float | None = None,
+            on_response_body_complete: Callable[[UtcTimestamp, int], None] | None = None,
+        ) -> PublicReadResult:
+            if asset_id == "token-yes" and self._block_first_no:
+                await first_no_started.wait()
+            elif asset_id == "token-no" and self._block_first_no:
+                self._block_first_no = False
+                first_no_started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    first_no_cancelled.set()
+            return await super().fetch_order_book_raw_with_evidence(
+                asset_id,
+                deadline=deadline,
+                on_response_body_complete=on_response_body_complete,
+            )
+
+    monkeypatch.setattr(
+        observe_module,
+        "PolymarketMarketWebSocket",
+        _DisconnectingLifecycleSocket,
+    )
+    monkeypatch.setattr(observe_module, "PolymarketPublicClient", _BlockedSiblingClient)
+    original_preserve = (
+        observe_module._RawCaptureBoundary.preserve_then_process_with_evidence  # pyright: ignore[reportPrivateUsage]
+    )
+
+    async def end_socket_after_mismatch(
+        capture: observe_module._RawCaptureBoundary,  # pyright: ignore[reportPrivateUsage]
+        *,
+        channel: str,
+        payload: bytes,
+        transport_type: str,
+        semantics_hash: str,
+        connection_id: ConnectionId | None = None,
+        subscription_id: SubscriptionId | None = None,
+        transport_metadata: dict[str, str | int | bool] | None = None,
+        received_wall_time: UtcTimestamp | None = None,
+        received_monotonic_ns: int | None = None,
+    ) -> object:
+        evidence = await original_preserve(
+            capture,
+            channel=channel,
+            payload=payload,
+            transport_type=transport_type,
+            semantics_hash=semantics_hash,
+            connection_id=connection_id,
+            subscription_id=subscription_id,
+            transport_metadata=transport_metadata,
+            received_wall_time=received_wall_time,
+            received_monotonic_ns=received_monotonic_ns,
+        )
+        if evidence.result.audit_outcomes and (
+            evidence.result.audit_outcomes[-1].outcome.value == "MISMATCH"
+        ):
+            end_first_generation.set()
+        return evidence
+
+    monkeypatch.setattr(
+        observe_module._RawCaptureBoundary,  # pyright: ignore[reportPrivateUsage]
+        "preserve_then_process_with_evidence",
+        end_socket_after_mismatch,
+    )
+    first_replacement_processed = _LifecycleSocket.first_replacement_processed
+    assert first_replacement_processed is not None
+    first_replacement_processed.set()
+
+    async with asyncio.timeout(30.0):
+        summary = await service.run(duration_seconds=3.0, gamma_market_id="101")
+
+    first_connection = summary.processor.audit_outcomes[0].connection_id
+    first_generation_outcomes = tuple(
+        outcome
+        for outcome in summary.processor.audit_outcomes
+        if outcome.connection_id == first_connection
+    )
+    assert tuple(outcome.outcome.value for outcome in first_generation_outcomes) == (
+        "MISMATCH",
+        "FAILED",
+    )
+    assert first_generation_outcomes[-1].reason is not None
+    assert first_generation_outcomes[-1].reason.value == "SOCKET_GENERATION_CHANGED"
+    assert first_no_cancelled.is_set()
+    assert len(_LifecycleSocket.instances) >= 2
+    assert summary.runtime_health.reconnects == 1
+    assert summary.runtime_health.resyncs == 1
+
+    counters = {key.name: value for key, value in summary.observability_metrics.counters}
+    assert counters["mma_websocket_disconnects_total"] == 1
+    assert counters["mma_websocket_reconnects_total"] == 1
+    records = JournalReader(summary.journal_root, summary.collector_run_id).read_all()
+    assert sum(record.channel == CONTROL_BOOK_INVALIDATION for record in records) == 1
 
 
 @pytest.mark.asyncio

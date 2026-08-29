@@ -198,6 +198,49 @@ class _ResnapshotProcessingError(RuntimeError):
     """A journaled recovery response failed canonical resnapshot invariants."""
 
 
+def _mismatch_sibling_pending_before_exit(
+    *,
+    pending_exit: _GenerationExit | None,
+    recovery_reasons: set[ProcessorRecoveryReason],
+    pending_audit_count: int,
+) -> bool:
+    return (
+        pending_exit is _GenerationExit.RESYNC_REQUIRED
+        and ProcessorRecoveryReason.AUDIT_MISMATCH_RECOVERY in recovery_reasons
+        and pending_audit_count > 0
+    )
+
+
+def _coordinator_wait_deadline_ns(
+    *,
+    default_deadline_ns: int,
+    run_deadline_ns: int,
+    pending_hard_expiries_ns: tuple[int, ...],
+    draining_mismatch_sibling: bool,
+) -> int:
+    if not draining_mismatch_sibling:
+        return default_deadline_ns
+    if not pending_hard_expiries_ns:
+        raise RuntimeError("mismatch sibling drain lacks a pending audit deadline")
+    return min(run_deadline_ns, *pending_hard_expiries_ns)
+
+
+def _pending_exit_before_acquisition_result(
+    *,
+    pending_exit: _GenerationExit | None,
+    recovery_reasons: set[ProcessorRecoveryReason],
+    pending_audit_count: int,
+    acquisition_done: bool,
+) -> _GenerationExit | None:
+    if acquisition_done and _mismatch_sibling_pending_before_exit(
+        pending_exit=pending_exit,
+        recovery_reasons=recovery_reasons,
+        pending_audit_count=pending_audit_count,
+    ):
+        return None
+    return pending_exit
+
+
 def _availability_cause_for_recovery(
     recovery: ProcessorRecoveryRequest,
 ) -> AvailabilityCause:
@@ -3806,6 +3849,31 @@ class PolymarketObservationService:
                 and (capture_cutoff is None or decision_monotonic_ns < capture_cutoff.monotonic_ns)
             )
 
+        def draining_mismatch_sibling_before_exit() -> bool:
+            """Keep an already-started paired audit on its original generation.
+
+            A race-free mismatch requires a resnapshot and socket rotation, but
+            cancelling that socket while its paired binary-leg audit is still
+            in flight would manufacture a current-schema
+            SOCKET_GENERATION_CHANGED fault.  That local fault is correctly
+            permanent and would then block every otherwise complete replacement
+            capture.  Keep acquisition alive only until the already-bounded
+            sibling request reaches its normal response/hard-deadline outcome.
+            No new audit work can launch once ``pending_exit`` is set, and an
+            actual socket exit immediately restores the ordinary fail-closed
+            generation-change path.
+            """
+
+            return (
+                _mismatch_sibling_pending_before_exit(
+                    pending_exit=pending_exit,
+                    recovery_reasons=recovery_reasons,
+                    pending_audit_count=len(pending_audits),
+                )
+                and pending_transport_error is None
+                and not acquisition_task.done()
+            )
+
         def due_transitions(decision_monotonic_ns: int) -> tuple[ReportedTopTransition, ...]:
             return tuple(
                 sorted(
@@ -4562,6 +4630,49 @@ class PolymarketObservationService:
             ):
                 await acquisition_task
 
+        def record_completed_acquisition() -> None:
+            """Project the sole acquisition task's completed terminal state."""
+
+            nonlocal pending_exit, pending_transport_error
+            try:
+                acquisition_task.result()
+            except RawIngressBackpressureError as error:
+                pending_exit = _GenerationExit.INGRESS_OVERFLOW
+                retain_recovery_reason(ProcessorRecoveryReason.BACKPRESSURE_RESOURCE)
+                register_interruption(
+                    _availability_interruption_for_error(
+                        error,
+                        connection_id=connection_id,
+                        asset_ids=asset_ids,
+                    ),
+                    started_at=_causal_moment_for_error(error),
+                )
+                deviations.append("bounded application ingress queue exhausted")
+                runtime_health.record_data_loss()
+                self._metrics.increment_counter("mma_ingress_overflows_total")
+            except PolymarketWebSocketError as error:
+                interruption_started_at = (
+                    acquisition_ended_at
+                    if acquisition_ended_at is not None
+                    else _causal_moment_for_error(error)
+                )
+                runtime_health.mark_interrupted(
+                    now_ns=interruption_started_at.monotonic_ns,
+                    now_utc=interruption_started_at.wall_time,
+                    interruption=_availability_interruption_for_error(
+                        error,
+                        connection_id=connection_id,
+                        asset_ids=asset_ids,
+                    ),
+                )
+                pending_transport_error = error
+            else:
+                pending_transport_error = PolymarketWebSocketTransportError(
+                    category=PolymarketWebSocketFailureCategory.CONNECTION_CLOSED,
+                    retryable=True,
+                    detail="public market WebSocket ended without an explicit transport error",
+                )
+
         try:
             readiness = await self._await_socket_readiness(
                 ready=ready,
@@ -4845,13 +4956,14 @@ class PolymarketObservationService:
                         )
                         deviations.append(f"REST audit MISMATCH at ingest_seq={result.ingest_seq}")
                         finish_cycle_leg(start.native_asset_id)
-                        # Cancellation is synchronous; awaiting socket cleanup
-                        # here previously blocked an already-received paired
-                        # response for seconds and could push its otherwise
-                        # timely classification across the hard freshness
-                        # expiry.  Drain every immutable announced response in
-                        # fence order before awaiting acquisition teardown.
-                        request_acquisition_stop()
+                        # Keep this generation alive only while an already-
+                        # started paired audit remains bounded by its existing
+                        # hard/run deadline.  Stopping it here would synthesize
+                        # a permanent sibling generation-change fault and make
+                        # the required replacement release impossible.  Once
+                        # the sibling closes, normal mismatch teardown resumes.
+                        if not draining_mismatch_sibling_before_exit():
+                            request_acquisition_stop()
                         continue
                     if outcome.outcome is AuditOutcome.FAILED:
                         expired_freshness_markers[start.native_asset_id] = (
@@ -4986,52 +5098,26 @@ class PolymarketObservationService:
 
                 now_ns = time.monotonic_ns()
                 due = current_deadline(now_ns=now_ns)
-                due_ns = due.deadline_ns
+                due_ns = _coordinator_wait_deadline_ns(
+                    default_deadline_ns=due.deadline_ns,
+                    run_deadline_ns=deadline_ns,
+                    pending_hard_expiries_ns=tuple(
+                        pending.hard_expiry_ns for pending in pending_audits.values()
+                    ),
+                    draining_mismatch_sibling=(draining_mismatch_sibling_before_exit()),
+                )
+                pending_exit = _pending_exit_before_acquisition_result(
+                    pending_exit=pending_exit,
+                    recovery_reasons=recovery_reasons,
+                    pending_audit_count=len(pending_audits),
+                    acquisition_done=acquisition_task.done(),
+                )
                 if (
                     pending_exit is None
                     and pending_transport_error is None
                     and acquisition_task.done()
                 ):
-                    try:
-                        acquisition_task.result()
-                    except RawIngressBackpressureError as error:
-                        pending_exit = _GenerationExit.INGRESS_OVERFLOW
-                        retain_recovery_reason(ProcessorRecoveryReason.BACKPRESSURE_RESOURCE)
-                        register_interruption(
-                            _availability_interruption_for_error(
-                                error,
-                                connection_id=connection_id,
-                                asset_ids=asset_ids,
-                            ),
-                            started_at=_causal_moment_for_error(error),
-                        )
-                        deviations.append("bounded application ingress queue exhausted")
-                        runtime_health.record_data_loss()
-                        self._metrics.increment_counter("mma_ingress_overflows_total")
-                    except PolymarketWebSocketError as error:
-                        interruption_started_at = (
-                            acquisition_ended_at
-                            if acquisition_ended_at is not None
-                            else _causal_moment_for_error(error)
-                        )
-                        runtime_health.mark_interrupted(
-                            now_ns=interruption_started_at.monotonic_ns,
-                            now_utc=interruption_started_at.wall_time,
-                            interruption=_availability_interruption_for_error(
-                                error,
-                                connection_id=connection_id,
-                                asset_ids=asset_ids,
-                            ),
-                        )
-                        pending_transport_error = error
-                    else:
-                        pending_transport_error = PolymarketWebSocketTransportError(
-                            category=(PolymarketWebSocketFailureCategory.CONNECTION_CLOSED),
-                            retryable=True,
-                            detail=(
-                                "public market WebSocket ended without an explicit transport error"
-                            ),
-                        )
+                    record_completed_acquisition()
                 if pending_exit is None and now_ns >= due_ns:
                     if due.reason is IntegrityDeadlineReason.RUN_DEADLINE:
                         suppress_deferred_race_retries(reason="run_deadline")
@@ -5234,15 +5320,16 @@ class PolymarketObservationService:
                 ):
                     if await drain_completed_exit_handoffs():
                         continue
-                    earliest = earliest_announced_audit()
-                    # A deferred post-fence ingress item must not trap an audit
-                    # cleanup that releases only when generation exit cancels
-                    # it. Unblock the globally earliest announced fence before
-                    # returning to normal ordered drain.
-                    if (earliest is None or earliest.response is None) and await fail_all_audits(
-                        AuditFailureReason.SOCKET_GENERATION_CHANGED
-                    ):
-                        continue
+                    if not draining_mismatch_sibling_before_exit():
+                        earliest = earliest_announced_audit()
+                        # A deferred post-fence ingress item must not trap an audit
+                        # cleanup that releases only when generation exit cancels
+                        # it. Unblock the globally earliest announced fence before
+                        # returning to normal ordered drain.
+                        if (
+                            earliest is None or earliest.response is None
+                        ) and await fail_all_audits(AuditFailureReason.SOCKET_GENERATION_CHANGED):
+                            continue
 
                 first_item: RawIngressItem | None = None
                 if deferred_item is not None:
@@ -5250,7 +5337,7 @@ class PolymarketObservationService:
                     deferred_item = None
                 elif not ingress.empty:
                     first_item = ingress.get_nowait()
-                elif pending_exit is not None:
+                elif pending_exit is not None and not draining_mismatch_sibling_before_exit():
                     if pending_audits and await drain_completed_exit_handoffs():
                         continue
                     if pending_audits and pending_exit is _GenerationExit.DEADLINE:
@@ -5698,7 +5785,7 @@ class PolymarketObservationService:
                     ingress_drained=ingress_drained and not replacement_timer_owned,
                     acquisition_active_at=acquisition_active_at,
                 )
-                if pending_exit is not None:
+                if pending_exit is not None and not draining_mismatch_sibling_before_exit():
                     await stop_acquisition()
         except BaseException as error:
             interruption_started_at = (
