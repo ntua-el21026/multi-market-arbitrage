@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import deque
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -18,16 +19,23 @@ from multi_market_arbitrage.core.ids import (
     SubscriptionId,
 )
 from multi_market_arbitrage.core.provenance import Provenance, RawSourceRef
-from multi_market_arbitrage.core.serialization import canonical_json_bytes
+from multi_market_arbitrage.core.serialization import canonical_json_bytes, canonical_sha256
 from multi_market_arbitrage.core.time import MonotonicTimestamp, UtcTimestamp
 from multi_market_arbitrage.ingestion import RawEventEnvelope
 from multi_market_arbitrage.journal import JournalDurabilityState, JournalReceipt
-from multi_market_arbitrage.normalization import CanonicalEvent, CanonicalEventType
+from multi_market_arbitrage.normalization import (
+    CanonicalEvent,
+    CanonicalEventType,
+    NormalizationError,
+)
 from multi_market_arbitrage.normalization import polymarket as normalization_module
+from multi_market_arbitrage.observability import AvailabilityEvidenceRuntimeSnapshot
 from multi_market_arbitrage.pipeline import (
+    AUDIT_CLASSIFICATION_PREPARE_ATTEST_PROTOCOL,
     CLOB_MARKET_PREFIX,
     CONTROL_BOOK_INVALIDATION,
     CONTROL_REST_AUDIT_CLASSIFY,
+    CONTROL_REST_AUDIT_CLASSIFY_PREPARE,
     CONTROL_REST_AUDIT_EXPIRED,
     CONTROL_REST_AUDIT_FAILED,
     CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
@@ -40,9 +48,11 @@ from multi_market_arbitrage.pipeline import (
     REST_BOOK_AUDIT,
     WS_MARKET,
     AuditClassificationCommand,
+    AuditClassificationPrepareCommand,
     AuditExpiryCommand,
     AuditFailureCommand,
     AuditFailureReason,
+    AuditHttpFailureHandoff,
     AuditMismatchCause,
     AuditOutcome,
     AuditStartEvidence,
@@ -53,11 +63,30 @@ from multi_market_arbitrage.pipeline import (
 )
 from multi_market_arbitrage.pipeline import processor as processor_module
 from multi_market_arbitrage.pipeline.audit import (
+    AUDIT_CLASSIFICATION_V1_SCHEMA,
+    AUDIT_CLASSIFICATION_V2_SCHEMA,
+    AUDIT_FAILURE_V1_SCHEMA,
+    AUDIT_FAILURE_V2_SCHEMA,
     AUDIT_REPLACEMENT_CAPTURE_MAX_BYTES,
     AUDIT_START_V1_SCHEMA,
     AUDIT_START_V2_SCHEMA,
+    AuditDivergencePending,
+    AuditFaultFailureEvidenceKind,
+    AuditFaultLifecycleRecord,
+    AuditFaultOrigin,
+    AuditFaultStatus,
+    AuditOutcomeEvidence,
     AuditReplacementReleaseCommand,
     AuditTriggerReason,
+)
+from multi_market_arbitrage.pipeline.health import (
+    ObservationRuntimeHealth,
+    audit_availability_authority_reconciled,
+)
+from multi_market_arbitrage.pipeline.processor import (
+    ProcessorRecoveryReason,
+    ProcessorRetentionDomain,
+    processor_recovery_reason_for_invalidation,
 )
 from multi_market_arbitrage.reference import POLYMARKET_VENUE_ID, ReferenceBundle
 from multi_market_arbitrage.research import Phase1AnalyticalOutputs
@@ -67,6 +96,15 @@ from multi_market_arbitrage.scanners.polymarket_complete_set import (
     ScanDisposition,
 )
 from multi_market_arbitrage.state import InvalidationReason
+from multi_market_arbitrage.venues.polymarket.errors import (
+    MAXIMUM_RETRY_AFTER_EVIDENCE_NANOSECONDS,
+    MAXIMUM_RETRY_AFTER_EVIDENCE_SECONDS,
+    PolymarketEndpointClass,
+    PolymarketHttpFailureCategory,
+    PolymarketHttpStatusError,
+    PolymarketRetryAfterDisposition,
+    PolymarketRetryBlockedReason,
+)
 
 FIXTURES = Path(__file__).parents[1] / "golden" / "fixtures"
 _BASE_TIME_NS = 1_787_198_410_000_000_000
@@ -260,6 +298,7 @@ def _audit_start(
     hard_expiry_monotonic_ns: int | None = None,
     response_deadline_monotonic_ns: int | None = None,
     run_deadline_monotonic_ns: int | None = None,
+    classification_protocol: str | None = None,
     request_started_monotonic_ns: int | None = None,
     trigger_reason: AuditTriggerReason = AuditTriggerReason.OTHER_TYPED_REASON,
     schema: str = AUDIT_START_V2_SCHEMA,
@@ -283,6 +322,29 @@ def _audit_start(
         trigger_reason=trigger_reason,
         schema=schema,
     )
+    transport_metadata: dict[str, str | int | bool] | None = None
+    if hard_expiry_monotonic_ns is not None:
+        transport_metadata = {
+            "hard_expiry_monotonic_ns": hard_expiry_monotonic_ns,
+            "response_deadline_monotonic_ns": (
+                hard_expiry_monotonic_ns
+                if response_deadline_monotonic_ns is None
+                else response_deadline_monotonic_ns
+            ),
+            "run_deadline_monotonic_ns": (
+                (
+                    hard_expiry_monotonic_ns
+                    if response_deadline_monotonic_ns is None
+                    else response_deadline_monotonic_ns
+                )
+                if run_deadline_monotonic_ns is None
+                else run_deadline_monotonic_ns
+            ),
+        }
+    if classification_protocol is not None:
+        if transport_metadata is None:
+            transport_metadata = {}
+        transport_metadata["classification_protocol"] = classification_protocol
     return start, _envelope(
         run_id,
         sequence,
@@ -290,27 +352,14 @@ def _audit_start(
         start.to_payload(),
         connection_id=connection_id,
         monotonic_ns=start.request_started_monotonic_ns,
-        transport_metadata=(
-            None
-            if hard_expiry_monotonic_ns is None
-            else {
-                "hard_expiry_monotonic_ns": hard_expiry_monotonic_ns,
-                "response_deadline_monotonic_ns": (
-                    hard_expiry_monotonic_ns
-                    if response_deadline_monotonic_ns is None
-                    else response_deadline_monotonic_ns
-                ),
-                "run_deadline_monotonic_ns": (
-                    (
-                        hard_expiry_monotonic_ns
-                        if response_deadline_monotonic_ns is None
-                        else response_deadline_monotonic_ns
-                    )
-                    if run_deadline_monotonic_ns is None
-                    else run_deadline_monotonic_ns
-                ),
-            }
-        ),
+        transport_metadata=transport_metadata,
+    )
+
+
+def _historical_direct_processor(config: Phase1Config) -> CanonicalProcessor:
+    return CanonicalProcessor(
+        config,
+        source_journal_git_commit="ee240c51184cccfc6e425906097758b5ca019a95",
     )
 
 
@@ -339,6 +388,70 @@ def _audit_response(
         payload,
         connection_id=start.connection_id,
         transport_metadata=metadata,
+    )
+
+
+def _audit_classification_prepare(
+    run_id: CollectorRunId,
+    sequence: int,
+    start: AuditStartEvidence,
+    response: RawEventEnvelope,
+    *,
+    hard_expiry_monotonic_ns: int,
+    monotonic_ns: int,
+) -> tuple[AuditClassificationPrepareCommand, RawEventEnvelope]:
+    command = AuditClassificationPrepareCommand(
+        request_id=start.request_id,
+        response_ingest_seq=response.ingest_seq,
+        hard_expiry_monotonic_ns=hard_expiry_monotonic_ns,
+    )
+    return command, _envelope(
+        run_id,
+        sequence,
+        CONTROL_REST_AUDIT_CLASSIFY_PREPARE,
+        command.to_payload(),
+        monotonic_ns=monotonic_ns,
+        connection_id=start.connection_id,
+        transport_metadata={"request_id": start.request_id},
+    )
+
+
+def _audit_classification_attestation(
+    run_id: CollectorRunId,
+    sequence: int,
+    start: AuditStartEvidence,
+    response: RawEventEnvelope,
+    preparation: RawEventEnvelope,
+    *,
+    hard_expiry_monotonic_ns: int,
+    durable_monotonic_ns: int,
+    processed_monotonic_ns: int,
+    attestation_monotonic_ns: int | None = None,
+    schema: str = AUDIT_CLASSIFICATION_V2_SCHEMA,
+) -> tuple[AuditClassificationCommand, RawEventEnvelope]:
+    command = AuditClassificationCommand(
+        request_id=start.request_id,
+        response_ingest_seq=response.ingest_seq,
+        classification_monotonic_ns=processed_monotonic_ns,
+        hard_expiry_monotonic_ns=hard_expiry_monotonic_ns,
+        schema=schema,
+    )
+    return command, _envelope(
+        run_id,
+        sequence,
+        CONTROL_REST_AUDIT_CLASSIFY,
+        command.to_payload(),
+        monotonic_ns=(
+            processed_monotonic_ns if attestation_monotonic_ns is None else attestation_monotonic_ns
+        ),
+        connection_id=start.connection_id,
+        transport_metadata={
+            "classification_prepare_durable_monotonic_ns": durable_monotonic_ns,
+            "classification_prepare_ingest_id": preparation.ingest_id.value,
+            "classification_prepare_payload_sha256": preparation.payload_sha256,
+            "classification_prepare_processed_monotonic_ns": processed_monotonic_ns,
+            "request_id": start.request_id,
+        },
     )
 
 
@@ -381,6 +494,51 @@ def _bootstrap(run_id: CollectorRunId) -> tuple[RawEventEnvelope, ...]:
     )
 
 
+def _stage_prepare_attest_audit(
+    processor: CanonicalProcessor,
+    config: Phase1Config,
+    run_id: CollectorRunId,
+    *,
+    request_id: str,
+) -> tuple[int, AuditStartEvidence, RawEventEnvelope, RawEventEnvelope]:
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    hard_expiry_ns = _bootstrap_hard_expiry_ns(config)
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id=request_id,
+        hard_expiry_monotonic_ns=hard_expiry_ns,
+        response_deadline_monotonic_ns=900,
+        classification_protocol=AUDIT_CLASSIFICATION_PREPARE_ATTEST_PROTOCOL,
+    )
+    assert processor.process_replayed(intent).success
+    response = _audit_response(
+        run_id,
+        5,
+        start,
+        _fixture("polymarket_rest_book_yes.json"),
+        boundary=0,
+        classification_deferred=True,
+    )
+    staged = processor.process_replayed(response)
+    assert staged.success
+    assert staged.audit_outcomes == ()
+    _, preparation = _audit_classification_prepare(
+        run_id,
+        6,
+        start,
+        response,
+        hard_expiry_monotonic_ns=hard_expiry_ns,
+        monotonic_ns=200,
+    )
+    prepared = processor.process_replayed(preparation)
+    assert prepared.success
+    assert prepared.audit_outcomes == ()
+    return hard_expiry_ns, start, response, preparation
+
+
 class _RecordingOutputs(Phase1AnalyticalOutputs):
     def __init__(self) -> None:
         self.references: list[tuple[ReferenceBundle, UtcTimestamp, Provenance]] = []
@@ -416,6 +574,31 @@ class _FailingCanonicalOutputs(_RecordingOutputs):
     def append_canonical(self, event: CanonicalEvent) -> None:
         del event
         raise self._error
+
+
+def test_every_invalidation_reason_has_one_exact_recovery_taxonomy_mapping() -> None:
+    expected = {
+        InvalidationReason.DISCONNECT: ProcessorRecoveryReason.TRANSPORT_DISCONNECT,
+        InvalidationReason.SCHEMA_VIOLATION: ProcessorRecoveryReason.SCHEMA_PROTOCOL_ERROR,
+        InvalidationReason.INVALID_PRICE: ProcessorRecoveryReason.SCHEMA_PROTOCOL_ERROR,
+        InvalidationReason.INVALID_QUANTITY: ProcessorRecoveryReason.SCHEMA_PROTOCOL_ERROR,
+        InvalidationReason.UNKNOWN_PRECISION: ProcessorRecoveryReason.REFERENCE_REFRESH,
+        InvalidationReason.UNKNOWN_REFERENCE_DATA: ProcessorRecoveryReason.REFERENCE_REFRESH,
+        InvalidationReason.BACKPRESSURE_DATA_LOSS: ProcessorRecoveryReason.BACKPRESSURE_RESOURCE,
+        InvalidationReason.STALE_SNAPSHOT: ProcessorRecoveryReason.FRESHNESS_EXPIRY,
+        InvalidationReason.IMPOSSIBLE_STATE: (ProcessorRecoveryReason.CANONICAL_STATE_INVALIDATION),
+        InvalidationReason.PROTOCOL_VIOLATION: ProcessorRecoveryReason.SCHEMA_PROTOCOL_ERROR,
+        InvalidationReason.REST_AUDIT_MISMATCH: (ProcessorRecoveryReason.AUDIT_MISMATCH_RECOVERY),
+        InvalidationReason.MARKET_RESOLVED_REFERENCE_REFRESH: (
+            ProcessorRecoveryReason.TARGET_LIFECYCLE
+        ),
+    }
+
+    assert set(expected) == set(InvalidationReason)
+    assert {
+        reason: processor_recovery_reason_for_invalidation(reason) for reason in InvalidationReason
+    } == expected
+    assert processor_recovery_reason_for_invalidation(None) is ProcessorRecoveryReason.UNKNOWN
 
 
 def test_exact_id_parent_relationship_is_replayable_and_preserves_all_raw_provenance() -> None:
@@ -621,6 +804,7 @@ def test_new_market_without_reference_emits_exact_deterministic_refresh_request(
     assert len(live_result.reference_refresh_requests) == 1
     request = live_result.reference_refresh_requests[0]
     assert request.event_type is CanonicalEventType.NEW_MARKET
+    assert request.recovery_reason is ProcessorRecoveryReason.REFERENCE_REFRESH
     assert request.market_id is None
     assert request.native_market_id == "99"
     assert request.native_condition_id == "new-condition-99"
@@ -724,7 +908,7 @@ def test_bound_audit_start_rejects_legacy_or_invalid_deferred_response(
     deferred_marker: bool | str | None,
 ) -> None:
     config = load_phase1_config(Path("config/phase1.toml"))
-    processor = CanonicalProcessor(config)
+    processor = _historical_direct_processor(config)
     run_id = CollectorRunId(f"processor-bound-audit-mode-{deferred_marker!s}")
     for envelope in _bootstrap(run_id):
         assert processor.process_replayed(envelope).success
@@ -871,7 +1055,7 @@ def test_bound_audit_start_cannot_precede_accepted_freshness() -> None:
 def test_bound_audit_start_rejects_forged_run_cutoff_extension() -> None:
     config = load_phase1_config(Path("config/phase1.toml"))
     run_id = CollectorRunId("processor-bound-audit-forged-run-cutoff")
-    processor = CanonicalProcessor(config)
+    processor = _historical_direct_processor(config)
     for envelope in _bootstrap(run_id):
         assert processor.process_replayed(envelope).success
     yes_expiry_ns = _bootstrap_hard_expiry_ns(config, "token-yes")
@@ -943,7 +1127,7 @@ def test_audit_start_protocol_mode_cannot_upgrade_or_downgrade_mid_run() -> None
     config = load_phase1_config(Path("config/phase1.toml"))
 
     bound_run = CollectorRunId("processor-audit-mode-bound-first")
-    bound_first = CanonicalProcessor(config)
+    bound_first = _historical_direct_processor(config)
     for envelope in _bootstrap(bound_run):
         assert bound_first.process_replayed(envelope).success
     bound_start, bound_intent = _audit_start(
@@ -1013,6 +1197,102 @@ def test_audit_start_protocol_mode_cannot_upgrade_or_downgrade_mid_run() -> None
     assert legacy_first.summary().pending_rest_audits == 0
 
 
+def test_current_source_requires_explicit_prepare_attest_selector() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    hard_expiry_ns = _bootstrap_hard_expiry_ns(config)
+
+    omitted_run = CollectorRunId("processor-current-source-selector-omitted")
+    omitted_processor = CanonicalProcessor(
+        config,
+        source_journal_git_commit=None,
+    )
+    for envelope in _bootstrap(omitted_run):
+        assert omitted_processor.process_replayed(envelope).success
+    _, omitted = _audit_start(
+        omitted_processor,
+        omitted_run,
+        4,
+        request_id="current-source-omitted-selector",
+        hard_expiry_monotonic_ns=hard_expiry_ns,
+        response_deadline_monotonic_ns=900,
+    )
+    rejected = omitted_processor.process_replayed(omitted)
+    assert not rejected.success
+    assert rejected.error_type == "NormalizationError"
+    assert omitted_processor.summary().pending_rest_audits == 0
+
+    selected_run = CollectorRunId("processor-current-source-selector-present")
+    selected_processor = CanonicalProcessor(
+        config,
+        source_journal_git_commit="2222222222222222222222222222222222222222",
+    )
+    for envelope in _bootstrap(selected_run):
+        assert selected_processor.process_replayed(envelope).success
+    _, selected = _audit_start(
+        selected_processor,
+        selected_run,
+        4,
+        request_id="current-source-explicit-selector",
+        hard_expiry_monotonic_ns=hard_expiry_ns,
+        response_deadline_monotonic_ns=900,
+        classification_protocol=AUDIT_CLASSIFICATION_PREPARE_ATTEST_PROTOCOL,
+    )
+    assert selected_processor.process_replayed(selected).success
+    assert selected_processor.summary().pending_rest_audits == 1
+
+
+def test_known_historical_source_retains_direct_deferred_compatibility() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("processor-historical-direct-deferred-source")
+    processor = CanonicalProcessor(
+        config,
+        source_journal_git_commit="ee240c51184cccfc6e425906097758b5ca019a95",
+    )
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    _, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="historical-direct-deferred",
+        hard_expiry_monotonic_ns=_bootstrap_hard_expiry_ns(config),
+        response_deadline_monotonic_ns=900,
+    )
+    assert processor.process_replayed(intent).success
+    assert processor.summary().pending_rest_audits == 1
+
+
+def test_known_historical_source_reconstructs_legacy_precision_book_identity() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("processor-historical-precision-book-identity")
+    historical_source = "6dc5dc43bbb673a35ff960bb7d84fed062aefda4"
+
+    producer = CanonicalProcessor(config, source_journal_git_commit=historical_source)
+    replay = CanonicalProcessor(config, source_journal_git_commit=historical_source)
+    current = CanonicalProcessor(
+        config,
+        source_journal_git_commit="2222222222222222222222222222222222222222",
+    )
+    for envelope in _bootstrap(run_id):
+        assert producer.process_replayed(envelope).success
+        assert replay.process_replayed(envelope).success
+        assert current.process_replayed(envelope).success
+
+    start, historical_intent = _audit_start(
+        producer,
+        run_id,
+        4,
+        request_id="historical-precision-book-identity",
+    )
+    assert replay.audit_book_identity(start.native_asset_id) == start.starting_book
+    assert replay.process_replayed(historical_intent).success
+
+    assert current.audit_book_identity(start.native_asset_id) != start.starting_book
+    rejected = current.process_replayed(historical_intent)
+    assert not rejected.success
+    assert rejected.error_type == "NormalizationError"
+
+
 def test_deferred_audit_response_requires_bound_start_and_predeadline_receipt() -> None:
     config = load_phase1_config(Path("config/phase1.toml"))
     run_id = CollectorRunId("processor-deferred-audit-mode")
@@ -1037,7 +1317,7 @@ def test_deferred_audit_response_requires_bound_start_and_predeadline_receipt() 
     assert not legacy.process_replayed(deferred).success
     assert legacy.summary().pending_rest_audits == 1
 
-    bound = CanonicalProcessor(config)
+    bound = _historical_direct_processor(config)
     for envelope in _bootstrap(run_id):
         assert bound.process_replayed(envelope).success
     bound_start, bound_intent = _audit_start(
@@ -1067,7 +1347,7 @@ def test_deferred_protocol_rejects_cross_epoch_response_and_classification() -> 
     start_run = CollectorRunId("processor-deferred-epoch-start")
     response_run = CollectorRunId("processor-deferred-epoch-response")
 
-    response_epoch = CanonicalProcessor(config)
+    response_epoch = _historical_direct_processor(config)
     for envelope in _bootstrap(start_run):
         assert response_epoch.process_replayed(envelope).success
     response_start, response_intent = _audit_start(
@@ -1092,7 +1372,7 @@ def test_deferred_protocol_rejects_cross_epoch_response_and_classification() -> 
     assert rejected_response.error_type == "NormalizationError"
     assert not response_epoch.audit_outcomes
 
-    classification_epoch = CanonicalProcessor(config)
+    classification_epoch = _historical_direct_processor(config)
     for envelope in _bootstrap(start_run):
         assert classification_epoch.process_replayed(envelope).success
     classification_start, classification_intent = _audit_start(
@@ -1135,10 +1415,483 @@ def test_deferred_protocol_rejects_cross_epoch_response_and_classification() -> 
     assert classification_epoch.summary().pending_rest_audits == 1
 
 
+@pytest.mark.parametrize("control_kind", ["classification-v1", "failure-v1"])
+def test_prepare_attest_rejects_v1_completion_authority(
+    control_kind: str,
+) -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId(f"processor-prepare-attest-reject-{control_kind}")
+    processor = _historical_direct_processor(config)
+    hard_expiry_ns, start, response, preparation = _stage_prepare_attest_audit(
+        processor,
+        config,
+        run_id,
+        request_id=f"prepare-attest-reject-{control_kind}",
+    )
+    before = processor.summary()
+    books_before = processor.snapshots()
+
+    if control_kind == "classification-v1":
+        _, rejected_envelope = _audit_classification_attestation(
+            run_id,
+            7,
+            start,
+            response,
+            preparation,
+            hard_expiry_monotonic_ns=hard_expiry_ns,
+            durable_monotonic_ns=201,
+            processed_monotonic_ns=250,
+            schema=AUDIT_CLASSIFICATION_V1_SCHEMA,
+        )
+    else:
+        rejected_command = AuditFailureCommand(
+            request_id=start.request_id,
+            reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+            schema=AUDIT_FAILURE_V1_SCHEMA,
+        )
+        rejected_envelope = _envelope(
+            run_id,
+            7,
+            CONTROL_REST_AUDIT_FAILED,
+            rejected_command.to_payload(),
+            connection_id=start.connection_id,
+        )
+
+    rejected = processor.process_replayed(rejected_envelope)
+    after_rejection = processor.summary()
+
+    if control_kind == "classification-v1":
+        assert rejected.success
+        assert tuple(item.outcome for item in rejected.audit_outcomes) == (AuditOutcome.FAILED,)
+        assert rejected.audit_outcomes[0].reason is AuditFailureReason.BOOK_FRESHNESS_EXPIRED
+        assert rejected.canonical_event_count == 0
+        assert rejected.scan_count == 0
+        assert rejected.book_freshness_updates == ()
+        assert processor.snapshots() == books_before
+        assert after_rejection.pending_rest_audits == 0
+        assert after_rejection.audit_faults_permanent == before.audit_faults_permanent + 1
+        return
+
+    assert not rejected.success
+    assert rejected.error_type == "NormalizationError"
+    assert rejected.audit_outcomes == ()
+    assert processor.audit_outcomes == ()
+    assert after_rejection.pending_rest_audits == 1
+    assert after_rejection.rest_audits == before.rest_audits
+    accepted_command = AuditFailureCommand(
+        request_id=start.request_id,
+        reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+        schema=AUDIT_FAILURE_V2_SCHEMA,
+    )
+    accepted_envelope = _envelope(
+        run_id,
+        8,
+        CONTROL_REST_AUDIT_FAILED,
+        accepted_command.to_payload(),
+        connection_id=start.connection_id,
+    )
+
+    accepted = processor.process_replayed(accepted_envelope)
+    assert accepted.success
+    assert len(accepted.audit_outcomes) == 1
+    assert processor.summary().pending_rest_audits == 0
+
+
+def test_rejected_duplicate_prepare_is_inert_and_retains_first_preparation() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("processor-prepare-attest-duplicate")
+    processor = CanonicalProcessor(config)
+    hard_expiry_ns, start, response, preparation = _stage_prepare_attest_audit(
+        processor,
+        config,
+        run_id,
+        request_id="prepare-attest-duplicate",
+    )
+    books_before = processor.snapshots()
+    ineligible_before = processor.audit_ineligible_instruments
+    summary_before = processor.summary()
+    _, duplicate = _audit_classification_prepare(
+        run_id,
+        7,
+        start,
+        response,
+        hard_expiry_monotonic_ns=hard_expiry_ns,
+        monotonic_ns=201,
+    )
+
+    rejected = processor.process_replayed(duplicate)
+    summary_after = processor.summary()
+
+    assert not rejected.success
+    assert rejected.error_type == "NormalizationError"
+    assert rejected.canonical_event_count == 0
+    assert rejected.scan_count == 0
+    assert rejected.scan_triggers == ()
+    assert rejected.audit_outcomes == ()
+    assert rejected.book_freshness_updates == ()
+    assert rejected.relevant_l2_receive_updates == ()
+    assert rejected.recovery_requests == ()
+    assert rejected.audit_divergences_opened == ()
+    assert rejected.audit_divergences_resolved == ()
+    assert rejected.audit_divergences_eligibility_restored == ()
+    assert rejected.affected_instrument_ids == ()
+    assert not rejected.needs_resync
+    assert processor.snapshots() == books_before
+    assert processor.audit_ineligible_instruments == ineligible_before
+    assert summary_after.pending_rest_audits == 1
+    assert summary_after.parse_failures == summary_before.parse_failures + 1
+    assert summary_after.invalidations == summary_before.invalidations
+    assert summary_after.scans == summary_before.scans
+    assert summary_after.rest_audits == summary_before.rest_audits
+
+    _, final = _audit_classification_attestation(
+        run_id,
+        8,
+        start,
+        response,
+        preparation,
+        hard_expiry_monotonic_ns=hard_expiry_ns,
+        durable_monotonic_ns=202,
+        processed_monotonic_ns=250,
+    )
+    accepted = processor.process_replayed(final)
+    assert accepted.success
+    assert accepted.audit_outcomes[0].outcome is AuditOutcome.MATCH
+    assert processor.summary().pending_rest_audits == 0
+
+
+def test_attributable_malformed_attestation_fails_closed_permanently() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("processor-prepare-attest-missing-metadata-request")
+    processor = CanonicalProcessor(config)
+    hard_expiry_ns, start, response, preparation = _stage_prepare_attest_audit(
+        processor,
+        config,
+        run_id,
+        request_id="prepare-attest-missing-metadata-request",
+    )
+    _, final = _audit_classification_attestation(
+        run_id,
+        7,
+        start,
+        response,
+        preparation,
+        hard_expiry_monotonic_ns=hard_expiry_ns,
+        durable_monotonic_ns=201,
+        processed_monotonic_ns=250,
+    )
+    malformed_metadata = final.transport_metadata
+    malformed_metadata.pop("request_id")
+    malformed = replace(
+        final,
+        transport_metadata_allowlist=tuple(sorted(malformed_metadata.items())),
+    )
+    books_before = processor.snapshots()
+    summary_before = processor.summary()
+
+    rejected = processor.process_replayed(malformed)
+    summary_after = processor.summary()
+
+    assert rejected.success
+    assert rejected.canonical_event_count == 0
+    assert rejected.scan_count == 0
+    assert rejected.scan_triggers == ()
+    assert tuple(item.outcome for item in rejected.audit_outcomes) == (AuditOutcome.FAILED,)
+    assert rejected.audit_outcomes[0].reason is AuditFailureReason.BOOK_FRESHNESS_EXPIRED
+    assert rejected.affected_instrument_ids == ()
+    assert not rejected.needs_resync
+    assert processor.snapshots() == books_before
+    assert summary_after.pending_rest_audits == 0
+    assert summary_after.parse_failures == summary_before.parse_failures
+    assert summary_after.audit_faults_permanent == summary_before.audit_faults_permanent + 1
+    assert summary_after.invalidations == summary_before.invalidations
+    assert summary_after.scans == summary_before.scans
+
+
+def test_prepare_attestation_at_fault_capacity_is_transactionally_inert() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("processor-prepare-attest-fault-capacity")
+    processor = CanonicalProcessor(config)
+    hard_expiry_ns, start, response, preparation = _stage_prepare_attest_audit(
+        processor,
+        config,
+        run_id,
+        request_id="prepare-attest-fault-capacity",
+    )
+    before = processor.summary()
+    books_before = processor.snapshots()
+    ineligible_before = processor.audit_ineligible_instruments
+    _, expired_final = _audit_classification_attestation(
+        run_id,
+        7,
+        start,
+        response,
+        preparation,
+        hard_expiry_monotonic_ns=hard_expiry_ns,
+        durable_monotonic_ns=hard_expiry_ns,
+        processed_monotonic_ns=hard_expiry_ns,
+    )
+
+    sentinel = cast(AuditFaultLifecycleRecord, object())
+    permanent_faults = processor._permanent_audit_faults  # pyright: ignore[reportPrivateUsage]
+    permanent_faults.update(
+        {
+            f"synthetic-capacity-{index}": sentinel
+            for index in range(processor_module.MAXIMUM_ACTIVE_AUDIT_FAULTS)
+        }
+    )
+    rejected = processor.process_replayed(expired_final)
+    permanent_faults.clear()
+    after_rejection = processor.summary()
+
+    assert not rejected.success
+    assert rejected.error_type == "NormalizationError"
+    assert rejected.canonical_event_count == 0
+    assert rejected.scan_count == 0
+    assert rejected.scan_triggers == ()
+    assert rejected.audit_outcomes == ()
+    assert rejected.book_freshness_updates == ()
+    assert rejected.recovery_requests == ()
+    assert rejected.affected_instrument_ids == ()
+    assert not rejected.needs_resync
+    assert processor.snapshots() == books_before
+    assert processor.audit_ineligible_instruments == ineligible_before
+    assert after_rejection.pending_rest_audits == 1
+    assert after_rejection.parse_failures == before.parse_failures + 1
+    assert after_rejection.rest_audits == before.rest_audits
+    assert after_rejection.rest_audit_failed == before.rest_audit_failed
+    assert after_rejection.invalidations == before.invalidations
+    assert after_rejection.scans == before.scans
+
+    _, accepted_final = _audit_classification_attestation(
+        run_id,
+        8,
+        start,
+        response,
+        preparation,
+        hard_expiry_monotonic_ns=hard_expiry_ns,
+        durable_monotonic_ns=201,
+        processed_monotonic_ns=250,
+    )
+    accepted = processor.process_replayed(accepted_final)
+
+    assert accepted.success
+    assert accepted.audit_outcomes[0].outcome is AuditOutcome.MATCH
+    assert processor.summary().pending_rest_audits == 0
+
+
+def test_book_invalidation_reserves_capacity_for_all_pending_audits_atomically() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("processor-invalidation-batch-fault-capacity")
+    processor = CanonicalProcessor(config)
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    for sequence, native_asset_id in ((4, "token-yes"), (5, "token-no")):
+        _, intent = _audit_start(
+            processor,
+            run_id,
+            sequence,
+            request_id=f"invalidation-capacity-{native_asset_id}",
+            native_asset_id=native_asset_id,
+            hard_expiry_monotonic_ns=_bootstrap_hard_expiry_ns(
+                config,
+                native_asset_id,
+            ),
+            response_deadline_monotonic_ns=900,
+            classification_protocol=AUDIT_CLASSIFICATION_PREPARE_ATTEST_PROTOCOL,
+        )
+        assert processor.process_replayed(intent).success
+    before = processor.summary()
+    books_before = processor.snapshots()
+    ineligible_before = processor.audit_ineligible_instruments
+    prepare_requests = (
+        processor._prepare_attest_rest_audit_requests  # pyright: ignore[reportPrivateUsage]
+    )
+    assert len(prepare_requests) == 2
+    invalidation = _envelope(
+        run_id,
+        6,
+        CONTROL_BOOK_INVALIDATION,
+        canonical_json_bytes({"reason": InvalidationReason.DISCONNECT.value}),
+    )
+
+    sentinel = cast(AuditFaultLifecycleRecord, object())
+    permanent_faults = processor._permanent_audit_faults  # pyright: ignore[reportPrivateUsage]
+    permanent_faults.update(
+        {
+            f"synthetic-capacity-{index}": sentinel
+            for index in range(processor_module.MAXIMUM_ACTIVE_AUDIT_FAULTS - 1)
+        }
+    )
+    rejected = processor.process_replayed(invalidation)
+    permanent_faults.clear()
+    after_rejection = processor.summary()
+
+    assert not rejected.success
+    assert rejected.error_type == "NormalizationError"
+    assert rejected.canonical_event_count == 0
+    assert rejected.scan_count == 0
+    assert rejected.scan_triggers == ()
+    assert rejected.audit_outcomes == ()
+    assert rejected.book_freshness_updates == ()
+    assert rejected.recovery_requests == ()
+    assert rejected.affected_instrument_ids == ()
+    assert not rejected.needs_resync
+    assert processor.snapshots() == books_before
+    assert processor.audit_ineligible_instruments == ineligible_before
+    assert after_rejection.pending_rest_audits == 2
+    assert len(prepare_requests) == 2
+    assert after_rejection.rest_audits == before.rest_audits
+    assert after_rejection.rest_audit_failed == before.rest_audit_failed
+    assert after_rejection.invalidations == before.invalidations
+    assert after_rejection.scans == before.scans
+
+    accepted = processor.process_replayed(
+        _envelope(
+            run_id,
+            7,
+            CONTROL_BOOK_INVALIDATION,
+            invalidation.payload_bytes,
+        )
+    )
+
+    assert accepted.success
+    assert len(accepted.audit_outcomes) == 2
+    assert all(item.outcome is AuditOutcome.FAILED for item in accepted.audit_outcomes)
+    assert processor.summary().pending_rest_audits == 0
+
+
+@pytest.mark.parametrize(
+    ("payload_size", "accepted"),
+    [(64, True), (65, False)],
+    ids=["exact-bound", "bound-plus-one"],
+)
+def test_deferred_audit_response_enforces_configured_byte_bound_before_retention(
+    payload_size: int,
+    accepted: bool,
+) -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    config = config.model_copy(
+        update={
+            "polymarket": config.polymarket.model_copy(update={"maximum_http_response_bytes": 64})
+        }
+    )
+    run_id = CollectorRunId(f"processor-deferred-byte-bound-{payload_size}")
+    processor = CanonicalProcessor(config)
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    hard_expiry_ns = _bootstrap_hard_expiry_ns(config)
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="deferred-byte-bound",
+        hard_expiry_monotonic_ns=hard_expiry_ns,
+        response_deadline_monotonic_ns=900,
+        classification_protocol=AUDIT_CLASSIFICATION_PREPARE_ATTEST_PROTOCOL,
+    )
+    assert processor.process_replayed(intent).success
+    response = _audit_response(
+        run_id,
+        5,
+        start,
+        b"x" * payload_size,
+        boundary=0,
+        classification_deferred=True,
+    )
+
+    result = processor.process_replayed(response)
+
+    assert result.success is accepted
+    assert result.audit_outcomes == ()
+    assert processor.summary().pending_rest_audits == 1
+    retained = processor._pending_rest_audit_responses  # pyright: ignore[reportPrivateUsage]
+    assert (start.request_id in retained) is accepted
+    if accepted:
+        assert retained[start.request_id].payload_bytes == b"x" * payload_size
+    else:
+        assert result.error_type == "NormalizationError"
+
+
+def test_terminal_hash_binds_completed_prepare_attestation_durable_time() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("processor-prepare-attest-terminal-binding")
+    first = CanonicalProcessor(config)
+    second = CanonicalProcessor(config)
+    for envelope in _bootstrap(run_id):
+        assert first.process_replayed(envelope).success
+        assert second.process_replayed(envelope).success
+    hard_expiry_ns = _bootstrap_hard_expiry_ns(config)
+    start, intent = _audit_start(
+        first,
+        run_id,
+        4,
+        request_id="prepare-attest-terminal-binding",
+        hard_expiry_monotonic_ns=hard_expiry_ns,
+        response_deadline_monotonic_ns=900,
+        classification_protocol=AUDIT_CLASSIFICATION_PREPARE_ATTEST_PROTOCOL,
+    )
+    for processor in (first, second):
+        assert processor.process_replayed(intent).success
+    response = _audit_response(
+        run_id,
+        5,
+        start,
+        _fixture("polymarket_rest_book_yes.json"),
+        boundary=0,
+        classification_deferred=True,
+    )
+    for processor in (first, second):
+        assert processor.process_replayed(response).success
+    _, preparation = _audit_classification_prepare(
+        run_id,
+        6,
+        start,
+        response,
+        hard_expiry_monotonic_ns=hard_expiry_ns,
+        monotonic_ns=200,
+    )
+    for processor in (first, second):
+        assert processor.process_replayed(preparation).success
+    _, final_first = _audit_classification_attestation(
+        run_id,
+        7,
+        start,
+        response,
+        preparation,
+        hard_expiry_monotonic_ns=hard_expiry_ns,
+        durable_monotonic_ns=201,
+        processed_monotonic_ns=250,
+    )
+    alternate_metadata = final_first.transport_metadata
+    alternate_metadata["classification_prepare_durable_monotonic_ns"] = 249
+    final_second = replace(
+        final_first,
+        transport_metadata_allowlist=tuple(sorted(alternate_metadata.items())),
+    )
+
+    first_result = first.process_replayed(final_first)
+    second_result = second.process_replayed(final_second)
+    first_summary = first.summary()
+    second_summary = second.summary()
+
+    assert first_result.success
+    assert second_result.success
+    assert first_result.audit_outcomes == second_result.audit_outcomes
+    assert first_result.audit_outcomes[0].outcome is AuditOutcome.MATCH
+    assert first_summary.raw_input_chain_sha256 == second_summary.raw_input_chain_sha256
+    assert first_summary.audit_outcome_chain_sha256 == second_summary.audit_outcome_chain_sha256
+    assert (
+        first_summary.audit_classification_attestation_chain_sha256
+        != second_summary.audit_classification_attestation_chain_sha256
+    )
+    assert first_summary.terminal_hash != second_summary.terminal_hash
+
+
 def test_deferred_match_uses_response_freshness_and_expiry_equality_fails() -> None:
     config = load_phase1_config(Path("config/phase1.toml"))
     run_id = CollectorRunId("processor-deferred-audit-freshness")
-    processor = CanonicalProcessor(config)
+    processor = _historical_direct_processor(config)
     for envelope in _bootstrap(run_id):
         assert processor.process_replayed(envelope).success
     hard_expiry_ns = _bootstrap_hard_expiry_ns(config)
@@ -1183,7 +1936,7 @@ def test_deferred_match_uses_response_freshness_and_expiry_equality_fails() -> N
     assert matched.book_freshness_updates[0].received_monotonic == response.received_monotonic
     assert matched.scan_source_received_monotonic_ns == response.received_monotonic.nanoseconds
 
-    equality_processor = CanonicalProcessor(config)
+    equality_processor = _historical_direct_processor(config)
     equality_run = CollectorRunId("processor-deferred-audit-expiry-equality")
     for envelope in _bootstrap(equality_run):
         assert equality_processor.process_replayed(envelope).success
@@ -1227,9 +1980,127 @@ def test_deferred_match_uses_response_freshness_and_expiry_equality_fails() -> N
     assert not expired.book_freshness_updates
 
 
+@pytest.mark.parametrize(
+    ("classification_schema", "blocks_current_scope"),
+    [
+        (AUDIT_CLASSIFICATION_V1_SCHEMA, False),
+        (AUDIT_CLASSIFICATION_V2_SCHEMA, True),
+    ],
+)
+def test_classification_schema_is_exact_implicit_fault_authority(
+    classification_schema: str,
+    blocks_current_scope: bool,
+) -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId(f"processor-classification-authority-{classification_schema}")
+    processor = _historical_direct_processor(config)
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    hard_expiry_ns = _bootstrap_hard_expiry_ns(config)
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id=f"classification-authority-{classification_schema}",
+        hard_expiry_monotonic_ns=hard_expiry_ns,
+        response_deadline_monotonic_ns=900,
+    )
+    assert processor.process_replayed(intent).success
+    response = _audit_response(
+        run_id,
+        5,
+        start,
+        _fixture("polymarket_rest_book_yes.json"),
+        boundary=0,
+        classification_deferred=True,
+    )
+    assert processor.process_replayed(response).success
+    classification = AuditClassificationCommand(
+        request_id=start.request_id,
+        response_ingest_seq=response.ingest_seq,
+        classification_monotonic_ns=hard_expiry_ns,
+        hard_expiry_monotonic_ns=hard_expiry_ns,
+        schema=classification_schema,
+    )
+    failed = processor.process_replayed(
+        _envelope(
+            run_id,
+            6,
+            CONTROL_REST_AUDIT_CLASSIFY,
+            classification.to_payload(),
+            monotonic_ns=classification.classification_monotonic_ns,
+            connection_id=start.connection_id,
+        )
+    )
+    lifecycle = processor.summary().audit_fault_lifecycle_records[0]
+
+    assert failed.success
+    assert failed.audit_faults_opened == (lifecycle,)
+    assert failed.audit_faults_resolved == ()
+    assert failed.audit_outcomes[0].reason is AuditFailureReason.BOOK_FRESHNESS_EXPIRED
+    assert (
+        lifecycle.failure_evidence_kind
+        is AuditFaultFailureEvidenceKind.AUDIT_CLASSIFICATION_CONTROL
+    )
+    assert lifecycle.failure_schema == classification_schema
+    assert lifecycle.status is AuditFaultStatus.PERMANENT
+    assert lifecycle.blocks_current_scope is blocks_current_scope
+    assert lifecycle.resolution is None
+    with pytest.raises(ValueError, match="source authority"):
+        replace(
+            lifecycle,
+            failure_evidence_kind="AUDIT_CLASSIFICATION_CONTROL",  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "failure_channel"),
+    [
+        (AuditFaultFailureEvidenceKind.REST_AUDIT_RESPONSE, REST_BOOK_AUDIT),
+        (
+            AuditFaultFailureEvidenceKind.BOOK_INVALIDATION_CONTROL,
+            CONTROL_BOOK_INVALIDATION,
+        ),
+    ],
+)
+def test_unversioned_implicit_fault_sources_are_typed_and_v2_start_authoritative(
+    source_kind: AuditFaultFailureEvidenceKind,
+    failure_channel: str,
+) -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId(f"processor-implicit-fault-source-{source_kind.value.lower()}")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id=f"implicit-fault-source-{source_kind.value.lower()}",
+    )
+    assert processor.process_replayed(intent).success
+    if failure_channel == REST_BOOK_AUDIT:
+        failure = _audit_response(run_id, 5, start, b"{}", boundary=0)
+    else:
+        failure = _envelope(
+            run_id,
+            5,
+            CONTROL_BOOK_INVALIDATION,
+            canonical_json_bytes({"reason": InvalidationReason.DISCONNECT.value}),
+        )
+    failed = processor.process_replayed(failure)
+    lifecycle = processor.summary().audit_fault_lifecycle_records[0]
+
+    assert failed.success
+    assert lifecycle.audit_start_schema == AUDIT_START_V2_SCHEMA
+    assert lifecycle.failure_evidence_kind is source_kind
+    assert lifecycle.failure_schema is None
+    assert lifecycle.status is AuditFaultStatus.PERMANENT
+    assert lifecycle.blocks_current_scope is True
+
+
 def test_audit_expiry_control_rejects_same_asset_pending_request() -> None:
     config = load_phase1_config(Path("config/phase1.toml"))
-    processor = CanonicalProcessor(config)
+    processor = _historical_direct_processor(config)
     run_id = CollectorRunId("processor-expiry-pending-audit-conflict")
     for envelope in _bootstrap(run_id):
         assert processor.process_replayed(envelope).success
@@ -1261,12 +2132,98 @@ def test_audit_expiry_control_rejects_same_asset_pending_request() -> None:
     assert processor.summary().pending_rest_audits == 1
 
 
+def test_audit_expiry_control_requires_typed_coordinator_recovery() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    processor = CanonicalProcessor(config)
+    run_id = CollectorRunId("processor-expiry-typed-recovery")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    instrument_id = processor.audit_book_identity("token-yes").instrument_id
+    expiry = AuditExpiryCommand(
+        native_asset_id="token-yes",
+        last_accepted_receive_monotonic_ns=100,
+    )
+    envelope = _envelope(
+        run_id,
+        4,
+        CONTROL_REST_AUDIT_EXPIRED,
+        expiry.to_payload(),
+        connection_id=ConnectionId("processor-expiry-typed-recovery-connection"),
+    )
+
+    result = processor.process_replayed(envelope)
+
+    assert result.success
+    assert result.needs_resync
+    assert result.affected_instrument_ids == (instrument_id,)
+    assert len(result.recovery_requests) == 1
+    recovery = result.recovery_requests[0]
+    assert recovery.reason is ProcessorRecoveryReason.FRESHNESS_EXPIRY
+    assert recovery.original_reason_code == AuditFailureReason.BOOK_FRESHNESS_EXPIRED.value
+    assert recovery.affected_instrument_ids == result.affected_instrument_ids
+    assert (
+        recovery.source
+        == result.source
+        == RawSourceRef(
+            ingest_id=envelope.ingest_id,
+            payload_sha256=envelope.payload_sha256,
+        )
+    )
+    assert processor.audit_ineligible_instruments == (instrument_id,)
+    assert all(owner.health is BookHealth.HEALTHY for owner in processor.owners)
+
+
+def test_error_result_preserves_typed_recovery_affected_instruments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    processor = CanonicalProcessor(config)
+    run_id = CollectorRunId("processor-error-typed-recovery")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    original_expiry = processor._expire_rest_audit_eligibility  # pyright: ignore[reportPrivateUsage]
+
+    def record_then_fail(envelope: RawEventEnvelope) -> None:
+        original_expiry(envelope)
+        raise NormalizationError("forced failure after typed recovery")
+
+    monkeypatch.setattr(processor, "_expire_rest_audit_eligibility", record_then_fail)
+    expiry = AuditExpiryCommand(
+        native_asset_id="token-yes",
+        last_accepted_receive_monotonic_ns=100,
+    )
+
+    result = processor.process_replayed(
+        _envelope(
+            run_id,
+            4,
+            CONTROL_REST_AUDIT_EXPIRED,
+            expiry.to_payload(),
+            connection_id=ConnectionId("processor-error-typed-recovery-connection"),
+        )
+    )
+
+    recovery_affected = {
+        instrument_id
+        for recovery in result.recovery_requests
+        for instrument_id in recovery.affected_instrument_ids
+    }
+    assert not result.success
+    assert result.needs_resync
+    assert recovery_affected
+    assert set(result.affected_instrument_ids) == recovery_affected
+    assert any(
+        recovery.reason is ProcessorRecoveryReason.FRESHNESS_EXPIRY
+        for recovery in result.recovery_requests
+    )
+
+
 def test_terminal_hash_binds_pending_audit_deadlines_and_staged_response_mapping() -> None:
     config = load_phase1_config(Path("config/phase1.toml"))
     run_id = CollectorRunId("processor-pending-audit-terminal-hash")
     bootstrap = _bootstrap(run_id)
-    expiry_a = CanonicalProcessor(config)
-    expiry_b = CanonicalProcessor(config)
+    expiry_a = _historical_direct_processor(config)
+    expiry_b = _historical_direct_processor(config)
     for envelope in bootstrap:
         assert expiry_a.process_replayed(envelope).success
         assert expiry_b.process_replayed(envelope).success
@@ -1296,8 +2253,8 @@ def test_terminal_hash_binds_pending_audit_deadlines_and_staged_response_mapping
     assert expiry_a.summary().raw_input_chain_sha256 == expiry_b.summary().raw_input_chain_sha256
     assert expiry_a.summary().terminal_hash != expiry_b.summary().terminal_hash
 
-    mapping_a = CanonicalProcessor(config)
-    mapping_b = CanonicalProcessor(config)
+    mapping_a = _historical_direct_processor(config)
+    mapping_b = _historical_direct_processor(config)
     for envelope in bootstrap:
         assert mapping_a.process_replayed(envelope).success
         assert mapping_b.process_replayed(envelope).success
@@ -1463,6 +2420,7 @@ def test_v1_audit_start_replays_byte_exact_with_unknown_legacy_trigger() -> None
         AuditFailureCommand(
             request_id=start.request_id,
             reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+            schema=AUDIT_FAILURE_V1_SCHEMA,
         ).to_payload(),
         connection_id=start.connection_id,
     )
@@ -1478,6 +2436,16 @@ def test_v1_audit_start_replays_byte_exact_with_unknown_legacy_trigger() -> None
         AuditOutcome.FAILED,
         1,
     ) in summary.audit_outcome_trigger_counts
+    assert summary.audit_faults_permanent == 1
+    assert summary.audit_faults_current == 0
+    lifecycle = summary.audit_fault_lifecycle_records[0]
+    assert lifecycle.audit_start_schema == AUDIT_START_V1_SCHEMA
+    assert lifecycle.failure_schema == AUDIT_FAILURE_V1_SCHEMA
+    assert lifecycle.status is AuditFaultStatus.PERMANENT
+    assert lifecycle.blocks_current_scope is False
+    assert lifecycle.resolution is None
+    with pytest.raises(ValueError, match="exact boolean"):
+        replace(lifecycle, blocks_current_scope=0)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -1724,13 +2692,89 @@ def test_mismatch_divergence_closes_only_on_separate_authoritative_rest_snapshot
     assert processor.audit_ineligible_instruments == ()
 
 
-def test_v1_replacement_capture_auto_release_remains_byte_replay_compatible() -> None:
+def test_v1_failure_schema_replays_through_match_and_replacement_release() -> None:
     config = load_phase1_config(Path("config/phase1.toml"))
     run_id = CollectorRunId("processor-v1-replacement-auto-release")
     processor = CanonicalProcessor(config)
     envelopes = list(_bootstrap(run_id))
     for envelope in envelopes:
         assert processor.process_replayed(envelope).success
+
+    failure_start, failure_intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="historical-v1-failure",
+        trigger_reason=AuditTriggerReason.OTHER_TYPED_REASON,
+        schema=AUDIT_START_V2_SCHEMA,
+    )
+    failure = _envelope(
+        run_id,
+        5,
+        CONTROL_REST_AUDIT_FAILED,
+        AuditFailureCommand(
+            request_id=failure_start.request_id,
+            reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+            schema=AUDIT_FAILURE_V1_SCHEMA,
+        ).to_payload(),
+        connection_id=failure_start.connection_id,
+    )
+    envelopes.extend((failure_intent, failure))
+    assert processor.process_replayed(failure_intent).success
+    assert processor.process_replayed(failure).success
+    failed_summary = processor.summary()
+    historical_fault = failed_summary.audit_fault_lifecycle_records[0]
+    assert historical_fault.audit_start_schema == AUDIT_START_V2_SCHEMA
+    assert (
+        historical_fault.failure_evidence_kind
+        is AuditFaultFailureEvidenceKind.AUDIT_FAILURE_CONTROL
+    )
+    assert historical_fault.failure_schema == AUDIT_FAILURE_V1_SCHEMA
+    assert historical_fault.status is AuditFaultStatus.PERMANENT
+    assert historical_fault.blocks_current_scope is False
+    assert historical_fault.resolution is None
+    assert historical_fault.fault_id == canonical_sha256(
+        {
+            "audit_start_schema": historical_fault.audit_start_schema,
+            "audit_start_source": historical_fault.audit_start_source,
+            "blocks_current_scope": historical_fault.blocks_current_scope,
+            "failure_evidence_kind": historical_fault.failure_evidence_kind,
+            "failure_schema": historical_fault.failure_schema,
+            "failure_source": historical_fault.failure_source,
+            "original_reason": historical_fault.original_reason,
+            "reason": historical_fault.reason,
+            "request_id": historical_fault.request_id,
+            "schema": "mma-rest-audit-fault-id-v1",
+        }
+    )
+    assert failed_summary.audit_faults_permanent == 1
+    assert failed_summary.audit_ineligible_books == 1
+
+    match_start, match_intent = _audit_start(
+        processor,
+        run_id,
+        6,
+        request_id="historical-v1-later-match",
+        trigger_reason=AuditTriggerReason.UNKNOWN_LEGACY,
+        schema=AUDIT_START_V1_SCHEMA,
+    )
+    match = _audit_response(
+        run_id,
+        7,
+        match_start,
+        _fixture("polymarket_rest_book_yes.json"),
+        boundary=0,
+    )
+    envelopes.extend((match_intent, match))
+    assert processor.process_replayed(match_intent).success
+    match_result = processor.process_replayed(match)
+    assert match_result.success
+    assert match_result.audit_outcomes[0].outcome is AuditOutcome.MATCH
+    matched_summary = processor.summary()
+    assert matched_summary.audit_faults_permanent == 1
+    assert matched_summary.audit_faults_resolved == 0
+    assert matched_summary.audit_fault_lifecycle_records == (historical_fault,)
+    assert processor.audit_ineligible_instruments == ()
 
     mismatched_payload = _fixture("polymarket_rest_book_yes.json").replace(
         b'"price": "0.40", "size": "10"',
@@ -1739,17 +2783,17 @@ def test_v1_replacement_capture_auto_release_remains_byte_replay_compatible() ->
     start, intent = _audit_start(
         processor,
         run_id,
-        4,
+        8,
         request_id="historical-v1-divergence",
         trigger_reason=AuditTriggerReason.UNKNOWN_LEGACY,
         schema=AUDIT_START_V1_SCHEMA,
     )
-    mismatch = _audit_response(run_id, 5, start, mismatched_payload, boundary=0)
-    resnapshot = _envelope(run_id, 6, REST_BOOK, mismatched_payload)
+    mismatch = _audit_response(run_id, 9, start, mismatched_payload, boundary=0)
+    resnapshot = _envelope(run_id, 10, REST_BOOK, mismatched_payload)
     replacement_connection = ConnectionId("historical-v1-replacement")
     replacement_yes = _envelope(
         run_id,
-        7,
+        11,
         WS_MARKET,
         _websocket_book_payload(mismatched_payload, label="historical-v1-yes"),
         monotonic_ns=2_000,
@@ -1758,7 +2802,7 @@ def test_v1_replacement_capture_auto_release_remains_byte_replay_compatible() ->
     )
     replacement_no = _envelope(
         run_id,
-        8,
+        12,
         WS_MARKET,
         _websocket_book_payload(_no_book(), label="historical-v1-no"),
         monotonic_ns=2_001,
@@ -1774,7 +2818,12 @@ def test_v1_replacement_capture_auto_release_remains_byte_replay_compatible() ->
     final_snapshot = processor.process_replayed(replacement_no)
     assert final_snapshot.success
     assert final_snapshot.scan_count == 1
-    assert processor.summary().audit_replacement_captures_pending == 0
+    assert final_snapshot.audit_divergences_eligibility_restored == ()
+    final_summary = processor.summary()
+    assert final_summary.audit_replacement_captures_pending == 0
+    assert final_summary.audit_faults_permanent == 1
+    assert final_summary.audit_faults_resolved == 0
+    assert final_summary.audit_fault_lifecycle_records == (historical_fault,)
     assert processor.audit_ineligible_instruments == ()
     assert (
         processor.audit_replacement_release_commands(
@@ -1852,6 +2901,194 @@ def _pending_v2_replacement_release(
     )
     assert len(commands) == 1
     return config, run_id, processor, replacement_connection, commands[0]
+
+
+@pytest.mark.parametrize(
+    ("failure_schema", "release_allowed"),
+    [
+        (AUDIT_FAILURE_V1_SCHEMA, True),
+        (AUDIT_FAILURE_V2_SCHEMA, False),
+    ],
+)
+def test_only_v1_fault_backed_sibling_ineligibility_allows_capture_release(
+    failure_schema: str,
+    release_allowed: bool,
+) -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId(f"processor-fault-backed-sibling-{failure_schema}")
+    processor = CanonicalProcessor(config)
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id=f"fault-backed-sibling-{failure_schema}",
+        native_asset_id="token-no",
+    )
+    assert processor.process_replayed(intent).success
+    if failure_schema == AUDIT_FAILURE_V1_SCHEMA:
+        failure_command = AuditFailureCommand(
+            request_id=start.request_id,
+            reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+            schema=AUDIT_FAILURE_V1_SCHEMA,
+        )
+    else:
+        failure_command = AuditFailureCommand(
+            request_id=start.request_id,
+            reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+            error_type="PolymarketHttpProtocolError:RESPONSE_PROTOCOL",
+            endpoint_class=PolymarketEndpointClass.CLOB_BOOK,
+            category=PolymarketHttpFailureCategory.RESPONSE_PROTOCOL,
+            retryable=False,
+            attempt=1,
+            status_code=200,
+            retry_after_disposition=PolymarketRetryAfterDisposition.ABSENT,
+            retry_exhausted=False,
+        )
+    assert processor.process_replayed(
+        _envelope(
+            run_id,
+            5,
+            CONTROL_REST_AUDIT_FAILED,
+            failure_command.to_payload(),
+            connection_id=start.connection_id,
+        )
+    ).success
+    failed_summary = processor.summary()
+    lifecycle = failed_summary.audit_fault_lifecycle_records[-1]
+    assert lifecycle.failure_schema == failure_schema
+    assert lifecycle.blocks_current_scope is (not release_allowed)
+
+    mismatched_payload = _fixture("polymarket_rest_book_yes.json").replace(
+        b'"price": "0.40", "size": "10"',
+        b'"price": "0.40", "size": "11"',
+    )
+    mismatch_start, mismatch_intent = _audit_start(
+        processor,
+        run_id,
+        6,
+        request_id=f"fault-backed-sibling-capture-{failure_schema}",
+        trigger_reason=AuditTriggerReason.PERIODIC,
+    )
+    assert processor.process_replayed(mismatch_intent).success
+    assert processor.process_replayed(
+        _audit_response(run_id, 7, mismatch_start, mismatched_payload, boundary=0)
+    ).needs_resync
+    assert processor.process_replayed(_envelope(run_id, 8, REST_BOOK, mismatched_payload)).success
+    replacement_connection = ConnectionId(f"fault-backed-sibling-{failure_schema}")
+    assert processor.process_replayed(
+        _envelope(
+            run_id,
+            9,
+            WS_MARKET,
+            _websocket_book_payload(mismatched_payload, label="fault-backed-yes"),
+            monotonic_ns=2_000,
+            connection_id=replacement_connection,
+            transport_metadata={"websocket_admission_ordinal": 1},
+        )
+    ).success
+    assert processor.process_replayed(
+        _envelope(
+            run_id,
+            10,
+            WS_MARKET,
+            _websocket_book_payload(_no_book(), label="fault-backed-no"),
+            monotonic_ns=2_001,
+            connection_id=replacement_connection,
+            transport_metadata={"websocket_admission_ordinal": 2},
+        )
+    ).success
+    failed_summary = processor.summary()
+    assert failed_summary.audit_replacement_captures_pending == 1
+    assert failed_summary.audit_ineligible_books == 2
+
+    commands = processor.audit_replacement_release_commands(
+        connection_id=replacement_connection,
+        decision_monotonic=MonotonicTimestamp(run_id.value, 2_001),
+    )
+    assert len(commands) == int(release_allowed)
+    if not release_allowed:
+        return
+    released = processor.process_replayed(
+        _envelope(
+            run_id,
+            11,
+            CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
+            commands[0].to_payload(),
+            monotonic_ns=2_001,
+            connection_id=replacement_connection,
+        )
+    )
+    final_summary = processor.summary()
+
+    assert released.success
+    assert final_summary.audit_replacement_captures_pending == 0
+    assert final_summary.audit_faults_permanent == 1
+    assert final_summary.audit_faults_resolved == 0
+    assert final_summary.audit_ineligible_books == 1
+    assert final_summary.audit_fault_lifecycle_records == (lifecycle,)
+
+
+def test_v2_replacement_release_accepts_historical_divergence_identity() -> None:
+    _, run_id, processor, replacement_connection, current_command = _pending_v2_replacement_release(
+        "historical-divergence-identity"
+    )
+    resolution = processor.summary().audit_divergence_resolution_records[0]
+    enriched_pending = resolution.observed_divergence
+    enriched_outcome = enriched_pending.audit_outcome
+    assert enriched_outcome.audit_start_source is not None
+    assert enriched_outcome.classification_source is not None
+
+    historical_pending = AuditDivergencePending.create(
+        market_id=enriched_pending.market_id,
+        audit_outcome=replace(
+            enriched_outcome,
+            audit_start_source=None,
+            classification_source=None,
+        ),
+        audit_start_control_source=enriched_pending.audit_start_control_source,
+        classification_source=enriched_pending.classification_source,
+        classification_control_source=enriched_pending.classification_control_source,
+        classification_received_wall_time=enriched_pending.classification_received_wall_time,
+        classification_received_monotonic_ns=(
+            enriched_pending.classification_received_monotonic_ns
+        ),
+    )
+    assert enriched_pending.divergence_id == historical_pending.divergence_id
+    assert enriched_pending.to_record() != historical_pending.to_record()
+
+    historical_capture_record = current_command.capture_record
+    historical_capture_record["divergence_id"] = historical_pending.divergence_id
+    historical_command = AuditReplacementReleaseCommand.create(
+        divergence_id=historical_pending.divergence_id,
+        instrument_id=current_command.instrument_id,
+        market_id=current_command.market_id,
+        replacement_connection_id=current_command.replacement_connection_id,
+        capture_record=historical_capture_record,
+        monotonic_epoch_id=current_command.monotonic_epoch_id,
+        decision_monotonic_ns=current_command.decision_monotonic_ns,
+        schema=current_command.schema,
+    )
+
+    released = processor.process_replayed(
+        _envelope(
+            run_id,
+            9,
+            CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
+            historical_command.to_payload(),
+            monotonic_ns=historical_command.decision_monotonic_ns,
+            connection_id=replacement_connection,
+        )
+    )
+    assert released.success
+    assert len(released.audit_divergences_eligibility_restored) == 1
+    restoration = released.audit_divergences_eligibility_restored[0]
+    assert restoration.divergence_id == historical_command.divergence_id
+    assert restoration.replacement_release_source == released.source
+    assert restoration.capture_state_sha256 == historical_command.capture_state_sha256
+    assert restoration.availability_binding.replacement_release_source == released.source
+    assert processor.summary().audit_replacement_captures_pending == 0
 
 
 @pytest.mark.parametrize(
@@ -2368,6 +3605,7 @@ def test_audit_replacement_release_capture_record_has_exact_parser_bound() -> No
         capture_record=capture_record,
         monotonic_epoch_id=valid.monotonic_epoch_id,
         decision_monotonic_ns=valid.decision_monotonic_ns,
+        schema=valid.schema,
     )
 
     assert len(bounded.capture_record_json.encode("utf-8")) == (AUDIT_REPLACEMENT_CAPTURE_MAX_BYTES)
@@ -2381,6 +3619,7 @@ def test_audit_replacement_release_capture_record_has_exact_parser_bound() -> No
             capture_record_json=bounded.capture_record_json,
             monotonic_epoch_id=bounded.monotonic_epoch_id,
             decision_monotonic_ns=bounded.decision_monotonic_ns,
+            schema=bounded.schema,
         )
         == bounded
     )
@@ -2402,6 +3641,7 @@ def test_audit_replacement_release_capture_record_has_exact_parser_bound() -> No
             capture_record=oversized_record,
             monotonic_epoch_id=valid.monotonic_epoch_id,
             decision_monotonic_ns=valid.decision_monotonic_ns,
+            schema=valid.schema,
         )
 
 
@@ -2458,7 +3698,7 @@ def test_failed_resnapshot_and_disconnect_leave_divergence_pending_until_recover
 
 def test_deferred_mismatch_binds_exact_classification_control_provenance() -> None:
     config = load_phase1_config(Path("config/phase1.toml"))
-    processor = CanonicalProcessor(config)
+    processor = _historical_direct_processor(config)
     run_id = CollectorRunId("processor-deferred-divergence-provenance")
     for envelope in _bootstrap(run_id):
         assert processor.process_replayed(envelope).success
@@ -2866,6 +4106,14 @@ def test_rest_audit_failure_blocks_eligibility_without_forcing_socket_resync() -
         AuditFailureCommand(
             request_id=explicit_start.request_id,
             reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+            error_type="PolymarketHttpTransportError:TIMEOUT",
+            endpoint_class=PolymarketEndpointClass.CLOB_BOOK,
+            category=PolymarketHttpFailureCategory.TIMEOUT,
+            retryable=True,
+            attempt=3,
+            retry_after_disposition=PolymarketRetryAfterDisposition.ABSENT,
+            retry_exhausted=True,
+            retry_blocked_reason=PolymarketRetryBlockedReason.ATTEMPTS_EXHAUSTED,
         ).to_payload(),
         connection_id=explicit_start.connection_id,
     )
@@ -2876,6 +4124,18 @@ def test_rest_audit_failure_blocks_eligibility_without_forcing_socket_resync() -
     assert explicit_result.audit_outcomes[0].reason is AuditFailureReason.HTTP_REQUEST_FAILED
     assert explicit.summary().rest_audit_failed == 1
     assert explicit.summary().audit_ineligible_books == 1
+    assert explicit.summary().audit_faults_current == 1
+    assert explicit.summary().audit_faults_permanent == 0
+    assert explicit.summary().audit_http_faults_observed == 1
+    explicit_operational = explicit.operational_snapshot()
+    assert explicit_operational.audit_fault_current_representatives == (
+        explicit.summary().audit_fault_current_records
+    )
+    assert explicit_operational.audit_fault_current_instrument_ids == (
+        explicit.summary().audit_fault_current_records[0].instrument_id,
+    )
+    assert explicit_operational.audit_fault_current_representative_capacity == 2
+    assert explicit_operational.audit_fault_current_representatives_truncated is False
 
     recovery_start, recovery_intent = _audit_start(
         explicit,
@@ -2895,7 +4155,606 @@ def test_rest_audit_failure_blocks_eligibility_without_forcing_socket_resync() -
     )
 
     assert recovered.audit_outcomes[0].outcome is AuditOutcome.MATCH
+    assert recovered.audit_faults_opened == ()
+    assert recovered.audit_faults_resolved == (
+        explicit.summary().audit_fault_lifecycle_records[-1],
+    )
     assert explicit.summary().audit_ineligible_books == 0
+    assert explicit.summary().audit_faults_current == 0
+    assert explicit.summary().audit_faults_resolved == 1
+    assert explicit.summary().audit_http_faults_resolved == 1
+    assert explicit.summary().audit_http_retry_exhaustions_resolved == 1
+    assert explicit.operational_snapshot().audit_fault_current_representatives == ()
+    assert explicit.operational_snapshot().audit_fault_current_instrument_ids == ()
+
+
+def test_canonical_replay_rejects_internal_reason_with_transient_http_metadata() -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId("processor-reject-internal-http-metadata")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="reject-internal-http-metadata",
+    )
+    assert processor.process_replayed(intent).success
+    payload = canonical_json_bytes(
+        {
+            "category": PolymarketHttpFailureCategory.TIMEOUT.value,
+            "endpoint_class": PolymarketEndpointClass.CLOB_BOOK.value,
+            "error_type": "PolymarketHttpTransportError:TIMEOUT",
+            "http_attempt": 1,
+            "reason": AuditFailureReason.OBSERVATION_DEADLINE.value,
+            "request_id": start.request_id,
+            "retry_after_disposition": PolymarketRetryAfterDisposition.ABSENT.value,
+            "retry_after_nanoseconds": None,
+            "retry_blocked_reason": None,
+            "retry_exhausted": False,
+            "retryable": True,
+            "schema": AUDIT_FAILURE_V2_SCHEMA,
+            "status_code": None,
+        }
+    )
+
+    result = processor.process_replayed(
+        _envelope(
+            run_id,
+            5,
+            CONTROL_REST_AUDIT_FAILED,
+            payload,
+            connection_id=start.connection_id,
+        )
+    )
+
+    assert not result.success
+    assert result.error_type == "NormalizationError"
+    assert processor.summary().pending_rest_audits == 1
+    assert processor.audit_outcomes == ()
+
+
+@pytest.mark.parametrize(
+    ("endpoint_class", "category", "status_code"),
+    [
+        (
+            PolymarketEndpointClass.GAMMA_MARKETS,
+            PolymarketHttpFailureCategory.HTTP_STATUS,
+            503,
+        ),
+        (
+            PolymarketEndpointClass.CLOB_BOOK,
+            PolymarketHttpFailureCategory.TIMEOUT,
+            404,
+        ),
+    ],
+)
+def test_canonical_replay_rejects_forged_audit_http_provenance(
+    endpoint_class: PolymarketEndpointClass,
+    category: PolymarketHttpFailureCategory,
+    status_code: int,
+) -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId(
+        f"processor-reject-forged-http-{endpoint_class.value.lower()}-{category.value.lower()}"
+    )
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="reject-forged-audit-http-provenance",
+    )
+    assert processor.process_replayed(intent).success
+    payload = canonical_json_bytes(
+        {
+            "category": category.value,
+            "endpoint_class": endpoint_class.value,
+            "error_type": f"PolymarketHttpError:{category.value}",
+            "http_attempt": 3,
+            "reason": AuditFailureReason.HTTP_REQUEST_FAILED.value,
+            "request_id": start.request_id,
+            "retry_after_disposition": PolymarketRetryAfterDisposition.ABSENT.value,
+            "retry_after_nanoseconds": None,
+            "retry_blocked_reason": PolymarketRetryBlockedReason.ATTEMPTS_EXHAUSTED.value,
+            "retry_exhausted": True,
+            "retryable": True,
+            "schema": AUDIT_FAILURE_V2_SCHEMA,
+            "status_code": status_code,
+        }
+    )
+
+    result = processor.process_replayed(
+        _envelope(
+            run_id,
+            5,
+            CONTROL_REST_AUDIT_FAILED,
+            payload,
+            connection_id=start.connection_id,
+        )
+    )
+
+    assert not result.success
+    assert result.error_type == "NormalizationError"
+    assert processor.summary().pending_rest_audits == 1
+    assert processor.audit_outcomes == ()
+
+
+@pytest.mark.parametrize(
+    ("attempt", "retry_after_nanoseconds", "blocked_reason"),
+    [
+        (2, None, PolymarketRetryBlockedReason.ATTEMPTS_EXHAUSTED),
+        (4, None, PolymarketRetryBlockedReason.ATTEMPTS_EXHAUSTED),
+        (1, 1, PolymarketRetryBlockedReason.RETRY_AFTER_POLICY),
+        (3, 10_000_000_001, PolymarketRetryBlockedReason.RETRY_AFTER_POLICY),
+        (1, 10_000_000_001, PolymarketRetryBlockedReason.DEADLINE),
+    ],
+)
+def test_canonical_replay_rejects_audit_http_policy_impossibilities(
+    attempt: int,
+    retry_after_nanoseconds: int | None,
+    blocked_reason: PolymarketRetryBlockedReason,
+) -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId(
+        f"processor-reject-http-policy-{attempt}-{blocked_reason.value.lower()}"
+    )
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="reject-audit-http-policy-impossibility",
+    )
+    assert processor.process_replayed(intent).success
+    command = AuditFailureCommand(
+        request_id=start.request_id,
+        reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+        error_type="PolymarketHttpStatusError:HTTP_STATUS",
+        endpoint_class=PolymarketEndpointClass.CLOB_BOOK,
+        category=PolymarketHttpFailureCategory.HTTP_STATUS,
+        retryable=True,
+        attempt=attempt,
+        status_code=503,
+        retry_after_nanoseconds=retry_after_nanoseconds,
+        retry_after_disposition=(
+            PolymarketRetryAfterDisposition.PARSED
+            if retry_after_nanoseconds is not None
+            else PolymarketRetryAfterDisposition.ABSENT
+        ),
+        retry_exhausted=(blocked_reason is PolymarketRetryBlockedReason.ATTEMPTS_EXHAUSTED),
+        retry_blocked_reason=blocked_reason,
+    )
+
+    result = processor.process_replayed(
+        _envelope(
+            run_id,
+            5,
+            CONTROL_REST_AUDIT_FAILED,
+            command.to_payload(),
+            connection_id=start.connection_id,
+        )
+    )
+
+    assert not result.success
+    assert result.error_type == "NormalizationError"
+    assert processor.summary().pending_rest_audits == 1
+    assert processor.audit_outcomes == ()
+
+
+def test_saturated_retry_after_handoff_round_trips_through_canonical_replay() -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId("processor-saturated-retry-after-roundtrip")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="saturated-retry-after-roundtrip",
+    )
+    assert processor.process_replayed(intent).success
+    error = PolymarketHttpStatusError(
+        endpoint_class=PolymarketEndpointClass.CLOB_BOOK,
+        category=PolymarketHttpFailureCategory.HTTP_STATUS,
+        retryable=True,
+        attempt=1,
+        detail="oversized Retry-After saturated to durable evidence bound",
+        status_code=503,
+        retry_after_seconds=MAXIMUM_RETRY_AFTER_EVIDENCE_SECONDS,
+        retry_after_disposition=PolymarketRetryAfterDisposition.PARSED,
+        retry_exhausted=False,
+        retry_blocked_reason=PolymarketRetryBlockedReason.RETRY_AFTER_POLICY,
+    )
+    command = AuditHttpFailureHandoff.from_http_error(
+        request_id=start.request_id,
+        connection_id=start.connection_id,
+        effective_reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+        error=error,
+    ).to_command()
+    assert command.retry_after_nanoseconds == MAXIMUM_RETRY_AFTER_EVIDENCE_NANOSECONDS
+
+    result = processor.process_replayed(
+        _envelope(
+            run_id,
+            5,
+            CONTROL_REST_AUDIT_FAILED,
+            command.to_payload(),
+            connection_id=start.connection_id,
+        )
+    )
+    lifecycle = processor.summary().audit_fault_lifecycle_records[0]
+
+    assert result.success
+    assert processor.summary().parse_failures == 0
+    assert lifecycle.retry_after_nanoseconds == MAXIMUM_RETRY_AFTER_EVIDENCE_NANOSECONDS
+    assert lifecycle.retry_blocked_reason is PolymarketRetryBlockedReason.RETRY_AFTER_POLICY
+
+
+def test_internal_effective_failure_reason_dominates_original_external_transient() -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId("processor-effective-internal-fault-dominates")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="effective-socket-generation-change",
+    )
+    assert processor.process_replayed(intent).success
+    command = AuditFailureCommand(
+        request_id=start.request_id,
+        reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+        error_type="PolymarketHttpTransportError:TIMEOUT",
+        endpoint_class=PolymarketEndpointClass.CLOB_BOOK,
+        category=PolymarketHttpFailureCategory.TIMEOUT,
+        retryable=True,
+        attempt=3,
+        retry_after_disposition=PolymarketRetryAfterDisposition.ABSENT,
+        retry_exhausted=True,
+        retry_blocked_reason=PolymarketRetryBlockedReason.ATTEMPTS_EXHAUSTED,
+    )
+
+    result = processor.process_replayed(
+        _envelope(
+            run_id,
+            5,
+            CONTROL_REST_AUDIT_FAILED,
+            command.to_payload(),
+            connection_id=ConnectionId("wrong-failure-control-connection"),
+        )
+    )
+    summary = processor.summary()
+    lifecycle = summary.audit_fault_lifecycle_records[0]
+
+    assert result.success
+    assert result.audit_outcomes[0].reason is AuditFailureReason.SOCKET_GENERATION_CHANGED
+    assert lifecycle.original_reason is AuditFailureReason.HTTP_REQUEST_FAILED
+    assert lifecycle.reason is AuditFailureReason.SOCKET_GENERATION_CHANGED
+    assert lifecycle.origin is AuditFaultOrigin.INTERNAL
+    assert lifecycle.status is AuditFaultStatus.PERMANENT
+    assert summary.audit_faults_current == 0
+    assert summary.audit_faults_permanent == 1
+    with pytest.raises(ValueError, match="effective internal"):
+        replace(
+            lifecycle,
+            origin=AuditFaultOrigin.EXTERNAL,
+            status=AuditFaultStatus.CURRENT,
+        )
+
+
+@pytest.mark.parametrize(
+    (
+        "label",
+        "category",
+        "retryable",
+        "status_code",
+        "failure_v1",
+        "expected_origin",
+        "expected_resolved",
+    ),
+    [
+        (
+            "timeout",
+            PolymarketHttpFailureCategory.TIMEOUT,
+            True,
+            None,
+            False,
+            AuditFaultOrigin.EXTERNAL,
+            True,
+        ),
+        (
+            "status-503",
+            PolymarketHttpFailureCategory.HTTP_STATUS,
+            True,
+            503,
+            False,
+            AuditFaultOrigin.EXTERNAL,
+            True,
+        ),
+        (
+            "response-protocol",
+            PolymarketHttpFailureCategory.RESPONSE_PROTOCOL,
+            False,
+            200,
+            False,
+            AuditFaultOrigin.INDETERMINATE,
+            False,
+        ),
+        (
+            "status-404",
+            PolymarketHttpFailureCategory.HTTP_STATUS,
+            False,
+            404,
+            False,
+            AuditFaultOrigin.EXTERNAL,
+            False,
+        ),
+        (
+            "legacy-v1",
+            None,
+            False,
+            None,
+            True,
+            AuditFaultOrigin.INDETERMINATE,
+            False,
+        ),
+    ],
+)
+def test_only_proven_transient_audit_faults_clear_on_match_or_resnapshot(
+    label: str,
+    category: PolymarketHttpFailureCategory | None,
+    retryable: bool,
+    status_code: int | None,
+    failure_v1: bool,
+    expected_origin: AuditFaultOrigin,
+    expected_resolved: bool,
+) -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    processor = CanonicalProcessor(config)
+    run_id = CollectorRunId(f"processor-audit-fault-lifecycle-{label}")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id=f"fault-{label}",
+        trigger_reason=AuditTriggerReason.OTHER_TYPED_REASON,
+        schema=AUDIT_START_V2_SCHEMA,
+    )
+    assert processor.process_replayed(intent).success
+    if failure_v1:
+        command = AuditFailureCommand(
+            request_id=start.request_id,
+            reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+            schema=AUDIT_FAILURE_V1_SCHEMA,
+        )
+    else:
+        assert category is not None
+        command = AuditFailureCommand(
+            request_id=start.request_id,
+            reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+            error_type=(
+                "PolymarketHttpStatusError:HTTP_STATUS"
+                if category is PolymarketHttpFailureCategory.HTTP_STATUS
+                else f"PolymarketHttpTransportError:{category.value}"
+            ),
+            endpoint_class=PolymarketEndpointClass.CLOB_BOOK,
+            category=category,
+            retryable=retryable,
+            attempt=3,
+            status_code=status_code,
+            retry_after_disposition=PolymarketRetryAfterDisposition.ABSENT,
+            retry_exhausted=retryable,
+            retry_blocked_reason=(
+                PolymarketRetryBlockedReason.ATTEMPTS_EXHAUSTED if retryable else None
+            ),
+        )
+    failed = processor.process_replayed(
+        _envelope(
+            run_id,
+            5,
+            CONTROL_REST_AUDIT_FAILED,
+            command.to_payload(),
+            connection_id=start.connection_id,
+        )
+    )
+    failed_summary = processor.summary()
+    first_lifecycle = failed_summary.audit_fault_lifecycle_records[0]
+
+    assert failed.success
+    assert failed.audit_faults_opened == (first_lifecycle,)
+    assert failed.audit_faults_resolved == ()
+    assert first_lifecycle.origin is expected_origin
+    assert first_lifecycle.status is (
+        AuditFaultStatus.CURRENT if expected_resolved else AuditFaultStatus.PERMANENT
+    )
+    assert first_lifecycle.audit_start_schema == AUDIT_START_V2_SCHEMA
+    assert first_lifecycle.failure_schema == (
+        AUDIT_FAILURE_V1_SCHEMA if failure_v1 else AUDIT_FAILURE_V2_SCHEMA
+    )
+    assert (
+        first_lifecycle.failure_evidence_kind is AuditFaultFailureEvidenceKind.AUDIT_FAILURE_CONTROL
+    )
+    assert first_lifecycle.blocks_current_scope is not failure_v1
+    assert failed_summary.audit_faults_current == int(expected_resolved)
+    assert failed_summary.audit_faults_permanent == int(not expected_resolved)
+    assert failed_summary.audit_ineligible_books == 1
+
+    recovery_start, recovery_intent = _audit_start(
+        processor,
+        run_id,
+        6,
+        request_id=f"fault-recovery-{label}",
+    )
+    assert processor.process_replayed(recovery_intent).success
+    recovered = processor.process_replayed(
+        _audit_response(
+            run_id,
+            7,
+            recovery_start,
+            _fixture("polymarket_rest_book_yes.json"),
+            boundary=0,
+        )
+    )
+    after_match = processor.summary()
+
+    assert recovered.audit_outcomes[0].outcome is AuditOutcome.MATCH
+    assert recovered.audit_faults_opened == ()
+    assert recovered.audit_faults_resolved == (
+        (after_match.audit_fault_lifecycle_records[-1],) if expected_resolved else ()
+    )
+    assert after_match.audit_faults_current == 0
+    assert after_match.audit_faults_resolved == int(expected_resolved)
+    assert after_match.audit_faults_permanent == int(not expected_resolved)
+    assert after_match.audit_ineligible_books == int(not expected_resolved and not failure_v1)
+
+    assert processor.process_replayed(
+        _envelope(
+            run_id,
+            8,
+            REST_BOOK,
+            _fixture("polymarket_rest_book_yes.json"),
+        )
+    ).success
+    after_resnapshot = processor.summary()
+    assert after_resnapshot.audit_faults_resolved == int(expected_resolved)
+    assert after_resnapshot.audit_faults_permanent == int(not expected_resolved)
+    assert after_resnapshot.audit_ineligible_books == int(not expected_resolved and not failure_v1)
+    if failure_v1:
+        assert after_resnapshot.audit_fault_lifecycle_records == (first_lifecycle,)
+        assert first_lifecycle.resolution is None
+
+
+def test_v2_permanent_failure_blocks_current_scope_with_v1_start() -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId("processor-v2-permanent-failure-v1-start")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="v2-permanent-failure-v1-start",
+        trigger_reason=AuditTriggerReason.UNKNOWN_LEGACY,
+        schema=AUDIT_START_V1_SCHEMA,
+    )
+    assert processor.process_replayed(intent).success
+    failed = processor.process_replayed(
+        _envelope(
+            run_id,
+            5,
+            CONTROL_REST_AUDIT_FAILED,
+            AuditFailureCommand(
+                request_id=start.request_id,
+                reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+                error_type="PolymarketHttpProtocolError:RESPONSE_PROTOCOL",
+                endpoint_class=PolymarketEndpointClass.CLOB_BOOK,
+                category=PolymarketHttpFailureCategory.RESPONSE_PROTOCOL,
+                retryable=False,
+                attempt=1,
+                status_code=200,
+                retry_after_disposition=PolymarketRetryAfterDisposition.ABSENT,
+                retry_exhausted=False,
+            ).to_payload(),
+            connection_id=start.connection_id,
+        )
+    )
+    lifecycle = processor.summary().audit_fault_lifecycle_records[0]
+
+    assert failed.success
+    assert lifecycle.audit_start_schema == AUDIT_START_V1_SCHEMA
+    assert lifecycle.failure_schema == AUDIT_FAILURE_V2_SCHEMA
+    assert lifecycle.status is AuditFaultStatus.PERMANENT
+    assert lifecycle.blocks_current_scope is True
+
+    recovery_start, recovery_intent = _audit_start(
+        processor,
+        run_id,
+        6,
+        request_id="v2-permanent-failure-v1-start-later-match",
+    )
+    assert processor.process_replayed(recovery_intent).success
+    recovered = processor.process_replayed(
+        _audit_response(
+            run_id,
+            7,
+            recovery_start,
+            _fixture("polymarket_rest_book_yes.json"),
+            boundary=0,
+        )
+    )
+    after_match = processor.summary()
+
+    assert recovered.audit_outcomes[0].outcome is AuditOutcome.MATCH
+    assert after_match.audit_faults_permanent == 1
+    assert after_match.audit_faults_resolved == 0
+    assert after_match.audit_ineligible_books == 1
+    assert after_match.audit_fault_lifecycle_records == (lifecycle,)
+
+
+def test_historical_one_argument_audit_outcome_hook_preserves_v2_fault_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    run_id = CollectorRunId("processor-historical-audit-outcome-hook")
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="historical-hook-v2-failure",
+    )
+    assert processor.process_replayed(intent).success
+    command = AuditFailureCommand(
+        request_id=start.request_id,
+        reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+        error_type="PolymarketHttpStatusError:HTTP_STATUS",
+        endpoint_class=PolymarketEndpointClass.CLOB_BOOK,
+        category=PolymarketHttpFailureCategory.HTTP_STATUS,
+        retryable=True,
+        attempt=3,
+        status_code=503,
+        retry_after_disposition=PolymarketRetryAfterDisposition.ABSENT,
+        retry_exhausted=True,
+        retry_blocked_reason=PolymarketRetryBlockedReason.ATTEMPTS_EXHAUSTED,
+    )
+    original_record = CanonicalProcessor._record_audit_outcome  # pyright: ignore[reportPrivateUsage]
+    captured: list[AuditOutcomeEvidence] = []
+
+    def historical_record(
+        hooked_processor: CanonicalProcessor,
+        evidence: AuditOutcomeEvidence,
+    ) -> None:
+        captured.append(evidence)
+        original_record(hooked_processor, evidence)
+
+    monkeypatch.setattr(CanonicalProcessor, "_record_audit_outcome", historical_record)
+    result = processor.process_replayed(
+        _envelope(
+            run_id,
+            5,
+            CONTROL_REST_AUDIT_FAILED,
+            command.to_payload(),
+            connection_id=start.connection_id,
+        )
+    )
+    lifecycle = processor.summary().audit_fault_current_records[0]
+
+    assert result.success
+    assert captured == [result.audit_outcomes[0]]
+    assert lifecycle.endpoint_class is PolymarketEndpointClass.CLOB_BOOK
+    assert lifecycle.category is PolymarketHttpFailureCategory.HTTP_STATUS
+    assert lifecycle.status_code == 503
+    assert lifecycle.retryable is True
+    assert lifecycle.retry_exhausted is True
+    assert lifecycle.retry_blocked_reason is PolymarketRetryBlockedReason.ATTEMPTS_EXHAUSTED
 
 
 def test_changed_best_bid_ask_blocks_until_ordered_price_change_reconciles_l2() -> None:
@@ -3115,6 +4974,13 @@ def test_lagging_rest_match_cannot_clear_a_contradictory_pending_best_bid_ask() 
     assert outcome.outcome is AuditOutcome.FAILED
     assert outcome.reason is AuditFailureReason.LOCAL_STATE_NOT_COMPARABLE
     assert processor.audit_ineligible_instruments == (owner.instrument_id,)
+    failed_summary = processor.summary()
+    lifecycle = failed_summary.audit_fault_lifecycle_records[0]
+    assert lifecycle.audit_start_schema == AUDIT_START_V2_SCHEMA
+    assert lifecycle.status is AuditFaultStatus.PERMANENT
+    assert lifecycle.blocks_current_scope is True
+    assert failed_summary.audit_fault_lifecycle_reconciled is True
+    assert processor.operational_snapshot().audit_fault_lifecycle_reconciled is True
 
     price_change = _envelope(
         run_id,
@@ -3125,13 +4991,27 @@ def test_lagging_rest_match_cannot_clear_a_contradictory_pending_best_bid_ask() 
     )
     reconciled = processor.process_replayed(price_change)
     assert reconciled.success
-    assert processor.audit_ineligible_instruments == ()
+    assert processor.audit_ineligible_instruments == (owner.instrument_id,)
+    after_transition = processor.summary()
+    assert after_transition.pending_reported_top_transitions == 0
+    assert after_transition.audit_faults_permanent == 1
+    assert after_transition.audit_ineligible_books == 1
+    assert after_transition.audit_fault_lifecycle_reconciled is True
+    assert processor.operational_snapshot().audit_fault_lifecycle_reconciled is True
+    assert processor.scan_results[-1].disposition is ScanDisposition.BLOCKED
 
     replayed = CanonicalProcessor(config)
     for envelope in (*bootstrap, bbo, intent, response, price_change):
         assert replayed.process_replayed(envelope).success
     assert replayed.audit_outcomes == processor.audit_outcomes
     assert replayed.summary().terminal_hash == processor.summary().terminal_hash
+
+    processor._audit_ineligible_instruments.discard(  # pyright: ignore[reportPrivateUsage]
+        owner.instrument_id
+    )
+    assert processor.audit_ineligible_instruments == (owner.instrument_id,)
+    assert processor.operational_snapshot().audit_fault_lifecycle_reconciled is False
+    assert processor.summary().audit_fault_lifecycle_reconciled is False
 
 
 def test_scan_dirty_is_coalesced_and_last_trade_is_diagnostic_only() -> None:
@@ -3224,6 +5104,12 @@ def test_ws_l2_deadline_equality_is_accepted_and_strict_overrun_requires_rest() 
     assert rejected.success
     assert rejected.scan_count == 1
     assert rejected.needs_resync
+    assert len(rejected.recovery_requests) == 1
+    assert rejected.recovery_requests[0].reason is ProcessorRecoveryReason.FRESHNESS_EXPIRY
+    assert (
+        rejected.recovery_requests[0].effective_invalidation_reason
+        is InvalidationReason.STALE_SNAPSHOT
+    )
     assert not rejected.book_freshness_updates
     assert rejected.scan_triggers[0].reasons == (ScanTriggerReason.INVALIDATION,)
     assert yes_owner.snapshot().health is BookHealth.INVALID
@@ -3276,17 +5162,28 @@ def test_control_and_audit_channels_have_identical_live_and_replay_results() -> 
             canonical_json_bytes({"reason": InvalidationReason.DISCONNECT.value}),
         ),
     )
+    live_result: ProcessedEnvelope | None = None
     for envelope in inputs:
         live_result = live.process_durable(envelope, _receipt(envelope))
         replay_result = replay.process_replayed(envelope)
         assert live_result == replay_result
 
+    assert live_result is not None
+    assert len(live_result.recovery_requests) == 1
+    assert live_result.recovery_requests[0].reason is ProcessorRecoveryReason.TRANSPORT_DISCONNECT
     assert all(owner.health is BookHealth.INVALID for owner in live.owners)
     assert all(
         owner.snapshot().invalidation_reason is InvalidationReason.DISCONNECT
         for owner in live.owners
     )
     assert live.summary() == replay.summary()
+    live_summary = live.summary()
+    operational = live.operational_snapshot()
+    assert (
+        dict(live_summary.recovery_reason_counts)[ProcessorRecoveryReason.TRANSPORT_DISCONNECT] == 1
+    )
+    assert operational.recovery_reason_counts == live_summary.recovery_reason_counts
+    assert operational.recovery_request_chain_sha256 == live_summary.recovery_request_chain_sha256
 
 
 def test_dynamic_tick_publication_persists_provenance_and_invalidates_all_owners() -> None:
@@ -3313,6 +5210,10 @@ def test_dynamic_tick_publication_persists_provenance_and_invalidates_all_owners
     assert result.needs_resync
     assert len(result.reference_refresh_requests) == 1
     assert result.reference_refresh_requests[0].event_type is CanonicalEventType.TICK_SIZE_CHANGE
+    assert (
+        result.reference_refresh_requests[0].recovery_reason
+        is ProcessorRecoveryReason.REFERENCE_REFRESH
+    )
     assert result.reference_refresh_requests[0].market_id == bundle.market.market_id
     assert bundle.precision.tick_size is not None
     assert bundle.precision.tick_size.to_canonical_string() == "0.001"
@@ -3327,10 +5228,562 @@ def test_dynamic_tick_publication_persists_provenance_and_invalidates_all_owners
     assert dict(provenance.attributes)["dynamic_reference_event_id"]
 
 
+def _resolved_divergence_processor(run_id: CollectorRunId) -> CanonicalProcessor:
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    mismatched_payload = _fixture("polymarket_rest_book_yes.json").replace(
+        b'"price": "0.40", "size": "10"',
+        b'"price": "0.40", "size": "11"',
+    )
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="retention-independent-divergence",
+        trigger_reason=AuditTriggerReason.PERIODIC,
+    )
+    assert processor.process_replayed(intent).success
+    assert processor.process_replayed(
+        _audit_response(run_id, 5, start, mismatched_payload, boundary=0)
+    ).needs_resync
+    assert processor.process_replayed(_envelope(run_id, 6, REST_BOOK, mismatched_payload)).success
+    return processor
+
+
+def _empty_availability_writer_runtime() -> AvailabilityEvidenceRuntimeSnapshot:
+    return AvailabilityEvidenceRuntimeSnapshot(
+        healthy=True,
+        queue_depth=0,
+        queue_high_water=0,
+        accepted=0,
+        written=0,
+        rejected=0,
+        file_bytes=0,
+        unavailable_duration_nanoseconds=0,
+        longest_interval_nanoseconds=0,
+        open_at_shutdown_intervals=0,
+        failure_type=None,
+    )
+
+
+def test_audit_availability_rejects_current_binding_source_and_capture_disagreement() -> None:
+    run_id = CollectorRunId("processor-availability-current-binding-reconcile")
+    processor = CanonicalProcessor(load_phase1_config(Path("config/phase1.toml")))
+    for envelope in _bootstrap(run_id):
+        assert processor.process_replayed(envelope).success
+    mismatched_payload = _fixture("polymarket_rest_book_yes.json").replace(
+        b'"price": "0.40", "size": "10"',
+        b'"price": "0.40", "size": "11"',
+    )
+    start, intent = _audit_start(
+        processor,
+        run_id,
+        4,
+        request_id="availability-current-binding-reconcile",
+        trigger_reason=AuditTriggerReason.PERIODIC,
+    )
+    assert processor.process_replayed(intent).success
+    assert processor.process_replayed(
+        _audit_response(run_id, 5, start, mismatched_payload, boundary=0)
+    ).needs_resync
+
+    pending = processor.operational_snapshot()
+    pending_runtime = replace(
+        ObservationRuntimeHealth().snapshot(),
+        audit_availability_authority=pending.audit_availability_authority,
+    )
+    writer = _empty_availability_writer_runtime()
+    assert audit_availability_authority_reconciled(pending, pending_runtime, writer)
+
+    pending_binding = pending.audit_availability_authority.current_bindings[0]
+    wrong_pending_binding = replace(pending_binding, request_id="wrong-request")
+    wrong_pending_authority = replace(
+        pending.audit_availability_authority,
+        current_bindings=(wrong_pending_binding,),
+    )
+    assert not audit_availability_authority_reconciled(
+        replace(pending, audit_availability_authority=wrong_pending_authority),
+        replace(pending_runtime, audit_availability_authority=wrong_pending_authority),
+        writer,
+    )
+
+    assert processor.process_replayed(_envelope(run_id, 6, REST_BOOK, mismatched_payload)).success
+    resolved = processor.operational_snapshot()
+    resolved_runtime = replace(
+        pending_runtime,
+        audit_availability_authority=resolved.audit_availability_authority,
+    )
+    assert audit_availability_authority_reconciled(resolved, resolved_runtime, writer)
+    capture = resolved.audit_replacement_capture_authority[0]
+    binding = capture.availability_binding
+    assert binding is not None
+    wrong_capture = replace(
+        capture,
+        availability_binding=replace(binding, request_id="wrong-request"),
+    )
+    assert not audit_availability_authority_reconciled(
+        replace(resolved, audit_replacement_capture_authority=(wrong_capture,)),
+        resolved_runtime,
+        writer,
+    )
+
+
+def test_summary_exposes_complete_current_capture_without_changing_terminal_identity() -> None:
+    _, _, processor, _, release_command = _pending_v2_replacement_release(
+        "summary-current-capture-authority"
+    )
+
+    before = processor.summary()
+    operational = processor.operational_snapshot()
+    after = processor.summary()
+
+    assert before.terminal_hash == after.terminal_hash
+    assert before.audit_replacement_capture_authority == (
+        operational.audit_replacement_capture_authority
+    )
+    assert before.audit_replacement_captures_pending == len(
+        before.audit_replacement_capture_authority
+    )
+    capture = before.audit_replacement_capture_authority[0]
+    terminal_capture_record = release_command.capture_record
+    assert capture.instrument_id == release_command.instrument_id
+    assert capture.divergence_id == release_command.divergence_id
+    assert capture.market_id == release_command.market_id
+    assert capture.audit_start_schema == AUDIT_START_V2_SCHEMA
+    assert capture.availability_binding == before.audit_availability_authority.current_bindings[0]
+    assert capture.pre_open_connection_count == terminal_capture_record["pre_open_connection_count"]
+    assert (
+        capture.pre_open_connection_ids_sha256
+        == terminal_capture_record["pre_open_connection_ids_sha256"]
+    )
+    assert capture.resolution_ingest_seq == terminal_capture_record["resolution_ingest_seq"]
+    assert canonical_json_bytes(capture.resolution_source) == canonical_json_bytes(
+        terminal_capture_record["resolution_source"]
+    )
+    assert canonical_json_bytes(capture.captured_snapshot_sources) == canonical_json_bytes(
+        terminal_capture_record["captured_snapshot_sources"]
+    )
+    assert "audit_start_schema" not in terminal_capture_record
+    assert "availability_binding" not in terminal_capture_record
+
+
+def test_operational_snapshot_matches_full_summary_without_terminal_material() -> None:
+    processor = _resolved_divergence_processor(
+        CollectorRunId("processor-operational-summary-parity")
+    )
+
+    operational = processor.operational_snapshot()
+    summary = processor.summary()
+
+    shared_fields = (
+        "processed_raw_messages",
+        "parse_failures",
+        "canonical_events",
+        "reference_updates",
+        "scans",
+        "scan_disposition_counts",
+        "candidates",
+        "validated_opportunities",
+        "invalidations",
+        "resyncs",
+        "rest_audits",
+        "rest_audit_matches",
+        "rest_audit_mismatches",
+        "rest_audit_raced",
+        "rest_audit_failed",
+        "audit_start_generation_rebases",
+        "audit_mismatch_cause_counts",
+        "audit_start_trigger_counts",
+        "audit_outcome_trigger_counts",
+        "audit_divergences_observed",
+        "audit_divergences_resolved_by_authoritative_resnapshot",
+        "audit_divergences_resolved_same_generation",
+        "audit_divergences_pending",
+        "audit_divergences_unresolved",
+        "audit_divergences_unknown",
+        "audit_local_book_defects",
+        "audit_divergence_lifecycle_reconciled",
+        "audit_faults_observed",
+        "audit_faults_current",
+        "audit_faults_resolved",
+        "audit_faults_permanent",
+        "audit_http_faults_observed",
+        "audit_http_faults_resolved",
+        "audit_http_faults_permanent",
+        "audit_http_retry_exhaustions_observed",
+        "audit_http_retry_exhaustions_resolved",
+        "audit_http_retry_exhaustions_permanent",
+        "audit_http_endpoint_snapshots",
+        "audit_fault_lifecycle_reconciled",
+        "audit_availability_authority",
+        "audit_replacement_captures_pending",
+        "audit_replacement_capture_authority",
+        "audit_fault_current_instrument_ids",
+        "pending_rest_audits",
+        "audit_ineligible_books",
+        "reported_top_transitions_started",
+        "reported_top_transitions_converged",
+        "reported_top_transitions_superseded",
+        "reported_top_transitions_resnapshotted",
+        "reported_top_transitions_expired",
+        "reported_top_transitions_invalidated",
+        "reported_top_transition_frames",
+        "reported_top_transition_duration_total_ns",
+        "reported_top_transition_duration_max_ns",
+        "reported_top_transition_duration_lower_bound_count",
+        "reported_top_transition_entry_counts",
+        "reported_top_transition_reason_counts",
+        "reported_top_transition_research_eligibility_restored",
+        "reported_top_no_pending_recognized",
+        "reported_top_no_pending_rejected",
+        "pending_reported_top_transitions",
+        "reference_refresh_requests",
+        "healthy_books",
+        "raw_input_chain_sha256",
+        "canonical_event_chain_sha256",
+        "error_chain_sha256",
+        "scan_chain_sha256",
+        "validated_opportunity_chain_sha256",
+        "reference_refresh_chain_sha256",
+        "audit_start_chain_sha256",
+        "audit_outcome_chain_sha256",
+        "audit_divergence_history_chain_sha256",
+        "audit_fault_lifecycle_chain_sha256",
+        "reported_top_transition_chain_sha256",
+        "audit_divergence_pending_records",
+        "reported_top_transitions",
+    )
+    for field_name in shared_fields:
+        assert getattr(operational, field_name) == getattr(summary, field_name)
+
+    full_books = processor.snapshots()
+    assert len(operational.books) == len(full_books)
+    for compact, full in zip(operational.books, full_books, strict=True):
+        assert compact.instrument_id == full.instrument_id
+        assert compact.market_id == full.market_id
+        assert compact.generation == full.generation
+        assert compact.health is full.health
+        assert compact.invalidation_reason is full.invalidation_reason
+        assert compact.market_version_id == full.market_version_id
+        assert compact.precision_rule_version_id == full.precision_rule_version_id
+        assert compact.cost_rule_set_version_id == full.cost_rule_set_version_id
+
+    assert operational.audit_mismatch_diagnostic_representatives == (
+        summary.audit_mismatch_diagnostics[-1],
+    )
+    assert operational.audit_divergence_resolution_representatives == (
+        summary.audit_divergence_resolution_records[-1],
+    )
+    assert operational.audit_fault_current_representatives == (summary.audit_fault_current_records)
+    assert operational.audit_fault_current_representative_capacity == len(operational.books)
+    assert operational.audit_fault_current_representatives_truncated is False
+    assert not hasattr(operational, "terminal_hash")
+    assert not hasattr(operational, "audit_outcomes")
+    assert not hasattr(operational, "audit_mismatch_diagnostics")
+    assert not hasattr(operational, "audit_divergence_resolution_records")
+
+
+def test_operational_snapshot_does_not_iterate_retained_histories_or_build_hashes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = _resolved_divergence_processor(
+        CollectorRunId("processor-operational-no-history-materialization")
+    )
+
+    class _NonIterableDeque(deque[object]):
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            raise AssertionError("operational snapshot iterated retained history")
+
+    class _NonIterableCurrentFaults(dict[str, object]):
+        def items(self):  # type: ignore[no-untyped-def]
+            raise AssertionError("operational snapshot iterated all current audit faults")
+
+        def values(self):  # type: ignore[no-untyped-def]
+            raise AssertionError("operational snapshot iterated all current audit faults")
+
+    private_state = vars(processor)
+    for attribute in (
+        "_scan_results",
+        "_validated_opportunity_hashes",
+        "_reference_refresh_requests",
+        "_audit_outcomes",
+        "_audit_mismatch_diagnostics",
+        "_audit_divergence_resolutions",
+        "_audit_fault_lifecycle_records",
+        "_reported_top_transition_outcomes",
+    ):
+        retained = cast(deque[object], private_state[attribute])
+        private_state[attribute] = _NonIterableDeque(maxlen=retained.maxlen)
+    private_state["_current_audit_faults"] = _NonIterableCurrentFaults()
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("operational snapshot entered a terminal/full-depth path")
+
+    monkeypatch.setattr(processor, "summary", forbidden)
+    monkeypatch.setattr(processor, "snapshots", forbidden)
+    monkeypatch.setattr(processor_module, "canonical_sha256", forbidden)
+    for owner in processor.owners:
+        monkeypatch.setattr(owner, "snapshot", forbidden)
+        monkeypatch.setattr(owner, "content_sha256", forbidden)
+
+    operational = processor.operational_snapshot()
+
+    assert operational.rest_audits == 1
+    assert operational.audit_divergences_resolved_by_authoritative_resnapshot == 1
+    assert len(operational.audit_mismatch_diagnostic_representatives) == 1
+    assert len(operational.audit_divergence_resolution_representatives) == 1
+    assert all(item.retained == 0 for item in operational.retention)
+
+
+def test_audit_history_saturation_preserves_exact_counters_chains_and_terminal_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("processor-audit-history-saturation")
+    monkeypatch.setattr(processor_module, "_AUDIT_OUTCOME_HISTORY_LIMIT", 2)
+    bounded = CanonicalProcessor(config)
+    monkeypatch.setattr(processor_module, "_AUDIT_OUTCOME_HISTORY_LIMIT", 16)
+    retained = CanonicalProcessor(config)
+    for envelope in _bootstrap(run_id):
+        assert bounded.process_replayed(envelope).success
+        assert retained.process_replayed(envelope).success
+
+    for attempt in range(5):
+        sequence = 4 + attempt * 2
+        start, intent = _audit_start(
+            bounded,
+            run_id,
+            sequence,
+            request_id=f"saturated-audit-{attempt}",
+            attempt=attempt + 1,
+        )
+        assert bounded.process_replayed(intent).success
+        assert retained.process_replayed(intent).success
+        failure = _envelope(
+            run_id,
+            sequence + 1,
+            CONTROL_REST_AUDIT_FAILED,
+            AuditFailureCommand(
+                request_id=start.request_id,
+                reason=AuditFailureReason.RACE_RETRY_EXHAUSTED,
+            ).to_payload(),
+            connection_id=start.connection_id,
+        )
+        assert bounded.process_replayed(failure).success
+        assert retained.process_replayed(failure).success
+
+    bounded_operational = bounded.operational_snapshot()
+    retained_operational = retained.operational_snapshot()
+    bounded_summary = bounded.summary()
+    retained_summary = retained.summary()
+    bounded_retention = bounded_operational.retention_for(ProcessorRetentionDomain.AUDIT_OUTCOMES)
+
+    assert bounded_retention.retained == bounded_retention.capacity == 2
+    assert bounded_retention.total == bounded_operational.rest_audits == 5
+    assert bounded_retention.truncated
+    assert bounded_operational.audit_race_budget_exhaustions == 5
+    assert bounded_operational.audit_outcome_chain_sha256 == (
+        retained_operational.audit_outcome_chain_sha256
+    )
+    assert bounded_summary.terminal_hash == retained_summary.terminal_hash
+    assert len(bounded_summary.audit_outcomes) == 2
+    assert len(retained_summary.audit_outcomes) == 5
+
+
+def test_terminal_hash_is_independent_of_all_diagnostic_retention_capacities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retention_constants = (
+        "_SCAN_RESULT_HISTORY_LIMIT",
+        "_VALIDATED_OPPORTUNITY_HISTORY_LIMIT",
+        "_REFERENCE_REFRESH_HISTORY_LIMIT",
+        "_AUDIT_OUTCOME_HISTORY_LIMIT",
+        "_AUDIT_MISMATCH_DIAGNOSTIC_HISTORY_LIMIT",
+        "_AUDIT_DIVERGENCE_RESOLUTION_HISTORY_LIMIT",
+        "_REPORTED_TOP_TRANSITION_OUTCOME_HISTORY_LIMIT",
+    )
+    for constant in retention_constants:
+        monkeypatch.setattr(processor_module, constant, 0)
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("processor-terminal-retention-independence")
+    lean = CanonicalProcessor(config)
+    for constant in retention_constants:
+        monkeypatch.setattr(processor_module, constant, 16)
+    retained = CanonicalProcessor(config)
+    for envelope in _bootstrap(run_id):
+        assert lean.process_replayed(envelope).success
+        assert retained.process_replayed(envelope).success
+    mismatched_payload = _fixture("polymarket_rest_book_yes.json").replace(
+        b'"price": "0.40", "size": "10"',
+        b'"price": "0.40", "size": "11"',
+    )
+    start, intent = _audit_start(
+        lean,
+        run_id,
+        4,
+        request_id="retention-independent-divergence",
+        trigger_reason=AuditTriggerReason.PERIODIC,
+    )
+    assert lean.process_replayed(intent).success
+    assert retained.process_replayed(intent).success
+    mismatch = _audit_response(run_id, 5, start, mismatched_payload, boundary=0)
+    assert lean.process_replayed(mismatch).needs_resync
+    assert retained.process_replayed(mismatch).needs_resync
+    resnapshot = _envelope(run_id, 6, REST_BOOK, mismatched_payload)
+    assert lean.process_replayed(resnapshot).success
+    assert retained.process_replayed(resnapshot).success
+
+    lean_summary = lean.summary()
+    retained_summary = retained.summary()
+
+    assert lean_summary.audit_outcomes == ()
+    assert lean_summary.audit_mismatch_diagnostics == ()
+    assert lean_summary.audit_divergence_resolution_records == ()
+    assert retained_summary.audit_outcomes
+    assert retained_summary.audit_mismatch_diagnostics
+    assert retained_summary.audit_divergence_resolution_records
+    assert lean_summary.audit_outcome_chain_sha256 == retained_summary.audit_outcome_chain_sha256
+    assert (
+        lean_summary.audit_divergence_history_chain_sha256
+        == retained_summary.audit_divergence_history_chain_sha256
+    )
+    assert lean_summary.terminal_hash_schema == retained_summary.terminal_hash_schema
+    assert lean_summary.terminal_hash == retained_summary.terminal_hash
+
+
+def test_terminal_hash_is_independent_of_nonempty_audit_fault_retention_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    run_id = CollectorRunId("processor-fault-retention-independence")
+    monkeypatch.setattr(processor_module, "_AUDIT_FAULT_LIFECYCLE_HISTORY_LIMIT", 0)
+    lean = CanonicalProcessor(config)
+    monkeypatch.setattr(processor_module, "_AUDIT_FAULT_LIFECYCLE_HISTORY_LIMIT", 4)
+    retained = CanonicalProcessor(config)
+    for envelope in _bootstrap(run_id):
+        assert lean.process_replayed(envelope).success
+        assert retained.process_replayed(envelope).success
+
+    start, intent = _audit_start(
+        lean,
+        run_id,
+        4,
+        request_id="retention-independent-http-fault",
+    )
+    assert lean.process_replayed(intent).success
+    assert retained.process_replayed(intent).success
+    failure = _envelope(
+        run_id,
+        5,
+        CONTROL_REST_AUDIT_FAILED,
+        AuditFailureCommand(
+            request_id=start.request_id,
+            reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+            error_type="PolymarketHttpTransportError:TIMEOUT",
+            endpoint_class=PolymarketEndpointClass.CLOB_BOOK,
+            category=PolymarketHttpFailureCategory.TIMEOUT,
+            retryable=True,
+            attempt=3,
+            retry_after_disposition=PolymarketRetryAfterDisposition.ABSENT,
+            retry_exhausted=True,
+            retry_blocked_reason=PolymarketRetryBlockedReason.ATTEMPTS_EXHAUSTED,
+        ).to_payload(),
+        connection_id=start.connection_id,
+    )
+    lean_failure = lean.process_replayed(failure)
+    retained_failure = retained.process_replayed(failure)
+    assert lean_failure.success
+    assert retained_failure.success
+    assert lean_failure.audit_faults_opened == retained_failure.audit_faults_opened
+    assert len(lean_failure.audit_faults_opened) == 1
+    assert lean_failure.audit_faults_resolved == retained_failure.audit_faults_resolved == ()
+
+    lean_current = lean.summary()
+    retained_current = retained.summary()
+    lean_current_retention = lean.operational_snapshot().retention_for(
+        ProcessorRetentionDomain.AUDIT_FAULT_LIFECYCLES
+    )
+    retained_current_retention = retained.operational_snapshot().retention_for(
+        ProcessorRetentionDomain.AUDIT_FAULT_LIFECYCLES
+    )
+    assert lean_current.audit_faults_current == retained_current.audit_faults_current == 1
+    assert lean_current.audit_fault_lifecycle_records == ()
+    assert len(retained_current.audit_fault_lifecycle_records) == 1
+    assert (lean_current_retention.capacity, lean_current_retention.retained) == (0, 0)
+    assert (retained_current_retention.capacity, retained_current_retention.retained) == (4, 1)
+    assert lean_current_retention.total == retained_current_retention.total == 1
+    assert lean_current.audit_fault_lifecycle_chain_sha256 == (
+        retained_current.audit_fault_lifecycle_chain_sha256
+    )
+    assert (
+        lean_current.public_read_fault_availability_projection
+        == retained_current.public_read_fault_availability_projection
+        == lean.operational_snapshot().public_read_fault_availability_projection
+        == retained.operational_snapshot().public_read_fault_availability_projection
+    )
+    assert lean_current.public_read_fault_availability_projection.opened == 1
+    assert lean_current.public_read_fault_availability_projection.completed == 0
+    assert lean_current.terminal_hash == retained_current.terminal_hash
+
+    recovery_start, recovery_intent = _audit_start(
+        lean,
+        run_id,
+        6,
+        request_id="retention-independent-http-fault-recovery",
+    )
+    assert lean.process_replayed(recovery_intent).success
+    assert retained.process_replayed(recovery_intent).success
+    recovery = _audit_response(
+        run_id,
+        7,
+        recovery_start,
+        _fixture("polymarket_rest_book_yes.json"),
+        boundary=0,
+    )
+    lean_recovery = lean.process_replayed(recovery)
+    retained_recovery = retained.process_replayed(recovery)
+    assert lean_recovery.success
+    assert retained_recovery.success
+    assert lean_recovery.audit_faults_opened == retained_recovery.audit_faults_opened == ()
+    assert lean_recovery.audit_faults_resolved == retained_recovery.audit_faults_resolved
+    assert len(lean_recovery.audit_faults_resolved) == 1
+
+    lean_resolved = lean.summary()
+    retained_resolved = retained.summary()
+    lean_resolved_retention = lean.operational_snapshot().retention_for(
+        ProcessorRetentionDomain.AUDIT_FAULT_LIFECYCLES
+    )
+    retained_resolved_retention = retained.operational_snapshot().retention_for(
+        ProcessorRetentionDomain.AUDIT_FAULT_LIFECYCLES
+    )
+    assert lean_resolved.audit_faults_current == retained_resolved.audit_faults_current == 0
+    assert lean_resolved.audit_faults_resolved == retained_resolved.audit_faults_resolved == 1
+    assert lean_resolved.audit_fault_lifecycle_records == ()
+    assert len(retained_resolved.audit_fault_lifecycle_records) == 2
+    assert (lean_resolved_retention.capacity, lean_resolved_retention.retained) == (0, 0)
+    assert (retained_resolved_retention.capacity, retained_resolved_retention.retained) == (4, 2)
+    assert lean_resolved_retention.total == retained_resolved_retention.total == 2
+    assert lean_resolved.audit_fault_lifecycle_chain_sha256 == (
+        retained_resolved.audit_fault_lifecycle_chain_sha256
+    )
+    assert (
+        lean_resolved.public_read_fault_availability_projection
+        == retained_resolved.public_read_fault_availability_projection
+        == lean.operational_snapshot().public_read_fault_availability_projection
+        == retained.operational_snapshot().public_read_fault_availability_projection
+    )
+    assert lean_resolved.public_read_fault_availability_projection.opened == 1
+    assert lean_resolved.public_read_fault_availability_projection.completed == 1
+    assert lean_resolved.terminal_hash == retained_resolved.terminal_hash
+
+
 def test_processor_history_retention_is_bounded_without_losing_exact_counts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(processor_module, "_RECENT_HISTORY_LIMIT", 2)
+    monkeypatch.setattr(processor_module, "_SCAN_RESULT_HISTORY_LIMIT", 2)
+    monkeypatch.setattr(processor_module, "_VALIDATED_OPPORTUNITY_HISTORY_LIMIT", 2)
+    monkeypatch.setattr(processor_module, "_REFERENCE_REFRESH_HISTORY_LIMIT", 2)
     config = load_phase1_config(Path("config/phase1.toml"))
     run_id = CollectorRunId("processor-bounded-history")
     inputs = (

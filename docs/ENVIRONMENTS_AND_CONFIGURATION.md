@@ -148,3 +148,73 @@ Examples:
 - leveraged strategy requires margin thresholds;
 - enabled venue has current eligibility provider;
 - dead-man settings valid when required.
+
+Phase-1 raw-journal rotation additionally validates:
+
+- a positive pending-segment capacity within the implementation hard maximum;
+- a pending uncompressed-byte limit at least one maximum segment, no greater
+  than the run cap, and no greater than pending capacity times maximum segment
+  bytes;
+- a finite positive oldest-pending age;
+- one ordered seal worker;
+- count and byte accounting that includes the in-service job, not only queue
+  waiters;
+- recovered-age initialization from the immutable handoff UTC, with invalid or
+  future chronology rejected and no restart renewal of the age budget; and
+- disk headroom for the active maximum, complete pending-source byte allowance,
+  the compression bound for one maximum segment, and bounded descriptor/
+  manifest/scratch/recovery overhead.
+
+The accepted Gate-1 profile is four total outstanding segments, 256 MiB pending
+uncompressed bytes, 120 seconds oldest age, and one seal job. Its exact config
+hash is acceptance evidence. A different bound requires capacity measurement
+and revalidation; runtime pressure never causes silent enlargement.
+
+`phase1-pre-soak-calibration-v3` binds the seal-queue capacity and pending-seal
+byte limit and reports active-segment, full pending-source, worst-case compressed
+scratch, metadata/atomic-write scratch, and aggregate recovery-evidence reserves
+(one maximum recovery tail plus the 64-record/256-KiB compact ledger) separately.
+Their exact sum is `temporary_sealing_bytes` and is counted once in disk
+workload. Historical v1-v2 reports do not acquire these fields by inference.
+
+The corrected v3 producer conforms health capacity to ADR-0057 without changing
+the calibration schema. A qualifying report must carry producer contract
+`phase1-pre-soak-calibration-producer-contract-v1` and projection method
+`phase1-pre-soak-calibration-projection-method-v2`; an older v3 artifact lacking
+either exact binding remains historical and cannot qualify. Generic stochastic rate projections retain ceiling
+integer arithmetic, the WebSocket observation duration as their denominator,
+and 2.0x workload headroom. Health v5 is instead a fixed-cardinality projection:
+2,160 periodic checkpoints plus one terminal checkpoint, using the
+capacity-qualified 31,573-byte periodic and 45,217-byte terminal maxima. The
+derived 32,018-byte periodic file-budget ceiling leaves an exact 445-byte
+capacity-qualification margin; it is not an observed-record acceptance bound.
+The producer opens the current v5 health file once without
+following links, requires
+a single-link stable regular-file identity, streams and matches the writer's
+SHA-256, reconciles its observed byte and record counts, binds that digest plus
+the observed periodic/terminal counts and maxima, and
+requires exactly one terminal record in the last position. It also binds the
+exact requested duration and exact completed monotonic duration; completion
+shorter than requested is ineligible. Any health record/count/file overrun,
+incomplete duration, or projected file margin below 2 MiB fails closed.
+
+Replay/rebuild commands use the native-process temporary directory for the
+derived exact ingest-ID index. Preflight reserves at least the greater of 1 MiB
+and the selected uncompressed raw bytes, already represented by the raw-sized
+replay/rebuild allowance. SQLite page cache is fixed at 2 MiB and mmap is
+disabled; no runtime setting may silently enlarge the index or turn it into
+persistent state. Each command creates a fresh isolated directory; abandoned
+scratch after abrupt process death is never discovered or reused as evidence.
+Gate replay/rebuild commands run sequentially so only one raw-sized index is
+live at once; concurrency requires separately additive disk reservation.
+
+The Gate-1 health profile retains its ten-second cadence and checkpoint-count
+bound; calibration rejects any different cadence, count cap, or file cap. The
+fixed six-hour shape is exactly 2,160 periodic records plus one terminal
+record, so `2,160 * 31,573 + 1 * 45,217 = 68,242,897` bytes. The
+health-evidence file cap is 68 MiB (71,303,168 bytes), leaving 3,060,271 bytes
+and exceeding the required 2 MiB projection headroom. The derived 32,018-byte
+periodic file-budget ceiling retains an exact 445-byte capacity-qualification
+margin without relaxing the 31,573-byte observed-record maximum. The writer
+still rejects
+before overflow, and missing or partial health evidence still fails closed.

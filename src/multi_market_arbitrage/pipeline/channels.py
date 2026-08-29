@@ -14,8 +14,11 @@ CONTROL_BOOK_INVALIDATION = "mma.control.book-invalidation.v1"
 CONTROL_REST_AUDIT_START = "mma.control.rest-audit-start.v1"
 CONTROL_REST_AUDIT_FAILED = "mma.control.rest-audit-failed.v1"
 CONTROL_REST_AUDIT_EXPIRED = "mma.control.rest-audit-expired.v1"
+CONTROL_REST_AUDIT_CLASSIFY_PREPARE = "mma.control.rest-audit-classify-prepare.v1"
 CONTROL_REST_AUDIT_CLASSIFY = "mma.control.rest-audit-classify.v1"
+CONTROL_REST_AUDIT_REPLACEMENT_RECOVERY = "mma.control.rest-audit-replacement-recovery.v1"
 CONTROL_REST_AUDIT_REPLACEMENT_RELEASE = "mma.control.rest-audit-replacement-release.v1"
+CONTROL_REST_AUDIT_REPLACEMENT_RELEASE_V2 = "mma.control.rest-audit-replacement-release.v2"
 CONTROL_REPORTED_TOP_TRANSITION_EXPIRED = "mma.control.reported-top-transition-expired.v1"
 
 
@@ -33,9 +36,12 @@ __all__ = [
     "CONTROL_BOOK_INVALIDATION",
     "CONTROL_REPORTED_TOP_TRANSITION_EXPIRED",
     "CONTROL_REST_AUDIT_CLASSIFY",
+    "CONTROL_REST_AUDIT_CLASSIFY_PREPARE",
     "CONTROL_REST_AUDIT_EXPIRED",
     "CONTROL_REST_AUDIT_FAILED",
+    "CONTROL_REST_AUDIT_REPLACEMENT_RECOVERY",
     "CONTROL_REST_AUDIT_REPLACEMENT_RELEASE",
+    "CONTROL_REST_AUDIT_REPLACEMENT_RELEASE_V2",
     "CONTROL_REST_AUDIT_START",
     "GAMMA_EVENT_PREFIX",
     "GAMMA_MARKETS_KEYSET",

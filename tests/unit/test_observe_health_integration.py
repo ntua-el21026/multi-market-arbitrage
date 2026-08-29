@@ -9,6 +9,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from types import TracebackType
 from typing import ClassVar, cast
@@ -21,22 +22,35 @@ from multi_market_arbitrage.core.health import ComponentHealth
 from multi_market_arbitrage.core.ids import (
     CollectorRunId,
     ConnectionId,
+    IngestId,
     InstrumentId,
     SubscriptionId,
 )
+from multi_market_arbitrage.core.provenance import RawSourceRef
 from multi_market_arbitrage.core.time import UtcTimestamp
-from multi_market_arbitrage.journal import JournalBackpressureError, RawJournalWriter
+from multi_market_arbitrage.journal import (
+    JournalBackpressureError,
+    JournalMetricsSnapshot,
+    RawJournalWriter,
+    completion_path_for_run,
+    load_run_completion_head,
+)
 from multi_market_arbitrage.observability import (
     AVAILABILITY_EVIDENCE_SUMMARY_VERSION,
     HEALTH_EVIDENCE_SUMMARY_VERSION,
     AvailabilityCause,
     AvailabilityEvidenceSummary,
+    HealthCheckpoint,
     HealthDecision,
     HealthDecisionReason,
     HealthEvidenceSummary,
+    InMemoryMetrics,
+    health_decision_reasons_from_mask,
 )
+from multi_market_arbitrage.pipeline import ProcessorRecoveryReason, ProcessorRecoveryRequest
 from multi_market_arbitrage.pipeline import health as health_module
 from multi_market_arbitrage.pipeline import observe as observe_module
+from multi_market_arbitrage.pipeline import processor as processor_module
 from multi_market_arbitrage.pipeline.channels import (
     CLOB_MARKET_PREFIX,
     GAMMA_MARKETS_KEYSET,
@@ -51,6 +65,7 @@ from multi_market_arbitrage.pipeline.targeting import (
 )
 from multi_market_arbitrage.reference import POLYMARKET_VENUE_ID
 from multi_market_arbitrage.research import ResearchOutputSummary, SupervisedAnalyticalOutputs
+from multi_market_arbitrage.state import InvalidationReason
 from multi_market_arbitrage.venues.polymarket import (
     PolymarketPublicClient,
     PolymarketWebSocketFailureCategory,
@@ -65,6 +80,148 @@ from multi_market_arbitrage.venues.polymarket.schemas import parse_gamma_markets
 FIXTURES = Path(__file__).parents[1] / "golden" / "fixtures"
 
 
+def _record_decision_reasons(
+    record: dict[str, object],
+    *,
+    sticky: bool = False,
+) -> tuple[HealthDecisionReason, ...]:
+    decisions = cast(dict[str, object], record["decisions"])
+    key = "gate1_sticky_reason_mask" if sticky else "reason_mask"
+    return health_decision_reasons_from_mask(cast(int, decisions[key]))
+
+
+@pytest.mark.parametrize(
+    ("reason", "invalidation", "expected"),
+    [
+        (ProcessorRecoveryReason.UNKNOWN, None, AvailabilityCause.UNKNOWN),
+        (
+            ProcessorRecoveryReason.TRANSPORT_DISCONNECT,
+            InvalidationReason.DISCONNECT,
+            AvailabilityCause.TRANSPORT_DISCONNECT,
+        ),
+        (
+            ProcessorRecoveryReason.BACKPRESSURE_RESOURCE,
+            InvalidationReason.BACKPRESSURE_DATA_LOSS,
+            AvailabilityCause.BACKPRESSURE_RESOURCE,
+        ),
+        (
+            ProcessorRecoveryReason.SCHEMA_PROTOCOL_ERROR,
+            InvalidationReason.SCHEMA_VIOLATION,
+            AvailabilityCause.SCHEMA_PROTOCOL_ERROR,
+        ),
+        (
+            ProcessorRecoveryReason.REPORTED_TOP_TRANSITION_FAILURE,
+            InvalidationReason.PROTOCOL_VIOLATION,
+            AvailabilityCause.REPORTED_TOP_TRANSITION_FAILURE,
+        ),
+        (
+            ProcessorRecoveryReason.AUDIT_MISMATCH_RECOVERY,
+            InvalidationReason.REST_AUDIT_MISMATCH,
+            AvailabilityCause.AUDIT_MISMATCH_RECOVERY,
+        ),
+        (
+            ProcessorRecoveryReason.FRESHNESS_EXPIRY,
+            InvalidationReason.STALE_SNAPSHOT,
+            AvailabilityCause.FRESHNESS_EXPIRY,
+        ),
+        (
+            ProcessorRecoveryReason.REFERENCE_REFRESH,
+            InvalidationReason.UNKNOWN_PRECISION,
+            AvailabilityCause.REFERENCE_REFRESH,
+        ),
+        (
+            ProcessorRecoveryReason.CANONICAL_STATE_INVALIDATION,
+            InvalidationReason.IMPOSSIBLE_STATE,
+            AvailabilityCause.CANONICAL_STATE_INVALIDATION,
+        ),
+        (
+            ProcessorRecoveryReason.TARGET_LIFECYCLE,
+            InvalidationReason.MARKET_RESOLVED_REFERENCE_REFRESH,
+            AvailabilityCause.TARGET_LIFECYCLE,
+        ),
+    ],
+)
+def test_processor_recovery_routes_preserve_typed_availability_cause(
+    reason: ProcessorRecoveryReason,
+    invalidation: InvalidationReason | None,
+    expected: AvailabilityCause,
+) -> None:
+    request = ProcessorRecoveryRequest(
+        reason=reason,
+        source=RawSourceRef(IngestId("recovery-route"), "0" * 64),
+        affected_instrument_ids=(InstrumentId("instrument-route"),),
+        original_reason_code="ROUTE_TEST",
+        effective_invalidation_reason=invalidation,
+        audit_request_id=(
+            "route-audit-request"
+            if reason is ProcessorRecoveryReason.AUDIT_MISMATCH_RECOVERY
+            else None
+        ),
+        audit_divergence_id=(
+            "0" * 64 if reason is ProcessorRecoveryReason.AUDIT_MISMATCH_RECOVERY else None
+        ),
+    )
+
+    assert (
+        observe_module._availability_cause_for_recovery(request)  # pyright: ignore[reportPrivateUsage]
+        is expected
+    )
+
+
+def test_processor_recovery_taxonomy_exactly_matches_current_availability_causes() -> None:
+    expected = {
+        "AUDIT_MISMATCH_RECOVERY",
+        "REPORTED_TOP_TRANSITION_FAILURE",
+        "FRESHNESS_EXPIRY",
+        "REFERENCE_REFRESH",
+        "TRANSPORT_DISCONNECT",
+        "CANONICAL_STATE_INVALIDATION",
+        "SCHEMA_PROTOCOL_ERROR",
+        "BACKPRESSURE_RESOURCE",
+        "TARGET_LIFECYCLE",
+        "UNKNOWN",
+    }
+
+    assert {item.value for item in ProcessorRecoveryReason} == expected
+    assert expected.issubset({item.value for item in AvailabilityCause})
+
+
+def test_resynchronization_metrics_preserve_finite_reasons_and_unknown_fallback(
+    tmp_path: Path,
+) -> None:
+    metrics = InMemoryMetrics()
+    service = PolymarketObservationService(
+        load_phase1_config(Path("config/phase1.toml")),
+        workspace_root=tmp_path,
+        code_commit="0" * 40,
+        metrics=metrics,
+    )
+
+    normalized = service._record_resynchronization_metrics(  # pyright: ignore[reportPrivateUsage]
+        (
+            ProcessorRecoveryReason.TRANSPORT_DISCONNECT,
+            ProcessorRecoveryReason.REFERENCE_REFRESH,
+            ProcessorRecoveryReason.TRANSPORT_DISCONNECT,
+        )
+    )
+    unknown = service._record_resynchronization_metrics(())  # pyright: ignore[reportPrivateUsage]
+
+    assert normalized == (
+        ProcessorRecoveryReason.REFERENCE_REFRESH,
+        ProcessorRecoveryReason.TRANSPORT_DISCONNECT,
+    )
+    assert unknown == (ProcessorRecoveryReason.UNKNOWN,)
+    assert metrics.counter_value("mma_resynchronizations_total") == 2
+    for reason in (*normalized, *unknown):
+        assert (
+            metrics.counter_value(
+                "mma_resynchronizations_by_reason_total",
+                labels={"reason": reason.value},
+            )
+            == 1
+        )
+
+
 @pytest.mark.parametrize(
     ("error", "expected_cause", "expected_reason"),
     [
@@ -74,7 +231,7 @@ FIXTURES = Path(__file__).parents[1] / "golden" / "fixtures"
                 retryable=False,
                 detail="fixture protocol failure",
             ),
-            AvailabilityCause.PROTOCOL_SCHEMA_INVARIANT,
+            AvailabilityCause.SCHEMA_PROTOCOL_ERROR,
             "PolymarketWebSocketProtocolError:PROTOCOL",
             id="websocket-protocol",
         ),
@@ -84,7 +241,7 @@ FIXTURES = Path(__file__).parents[1] / "golden" / "fixtures"
                 retryable=True,
                 detail="fixture transport failure",
             ),
-            AvailabilityCause.EXTERNAL_CONNECTION_TRANSPORT,
+            AvailabilityCause.TRANSPORT_DISCONNECT,
             "PolymarketWebSocketTransportError:CONNECTION_CLOSED",
             id="websocket-transport",
         ),
@@ -219,7 +376,7 @@ async def test_pre_readiness_ingress_backpressure_opens_at_failing_receive_stamp
                 retryable=False,
                 detail="fixture pre-readiness protocol failure",
             ),
-            AvailabilityCause.PROTOCOL_SCHEMA_INVARIANT,
+            AvailabilityCause.SCHEMA_PROTOCOL_ERROR,
             id="protocol",
         ),
         pytest.param(
@@ -228,7 +385,7 @@ async def test_pre_readiness_ingress_backpressure_opens_at_failing_receive_stamp
                 retryable=True,
                 detail="fixture pre-readiness transport failure",
             ),
-            AvailabilityCause.EXTERNAL_CONNECTION_TRANSPORT,
+            AvailabilityCause.TRANSPORT_DISCONNECT,
             id="transport",
         ),
     ],
@@ -321,8 +478,16 @@ async def test_processing_failure_opens_at_owner_detection_boundary(
             assert native_asset_id == "token-yes"
             return type("BookIdentity", (), {"instrument_id": instrument_id})()
 
+        def audit_replacement_attempt_start_commands(self, **kwargs: object) -> tuple[()]:
+            del kwargs
+            return ()
+
+        def audit_replacement_next_action_deadline_ns(self, **kwargs: object) -> None:
+            del kwargs
+
     class _FailingCapture:
         def __init__(self) -> None:
+            self.collector_run_id = CollectorRunId("processing-causal-boundary-run")
             self.processor = _Processor()
             self.book_freshness_receive_ns_by_instrument = {instrument_id: time.monotonic_ns()}
             self.relevant_l2_receive_ns_by_instrument = {instrument_id: time.monotonic_ns()}
@@ -464,7 +629,45 @@ def test_gate1_checkpoint_decision_recovers_after_transient_staleness() -> None:
     assert restored.gate1_sticky_reason_codes == ()
 
 
-def test_recovered_audit_history_restores_current_research_but_not_gate1() -> None:
+def test_recovered_external_audit_fault_is_independent_of_checkpoint_cadence() -> None:
+    current = HealthDecision(
+        capture_healthy=True,
+        research_eligible=False,
+        gate1_eligible_so_far=False,
+        reason_codes=(
+            HealthDecisionReason.AUDIT_FAILED,
+            HealthDecisionReason.BOOK_NOT_HEALTHY,
+            HealthDecisionReason.HTTP_FINAL_FAILURE,
+            HealthDecisionReason.HTTP_INTEGRITY_UNAVAILABLE,
+        ),
+        gate1_sticky_reason_codes=(),
+    )
+    recovered = HealthDecision(
+        capture_healthy=True,
+        research_eligible=True,
+        gate1_eligible_so_far=True,
+        reason_codes=(),
+        gate1_sticky_reason_codes=(),
+    )
+
+    observed = observe_module._accumulate_gate1_decision(  # pyright: ignore[reportPrivateUsage]
+        current,
+        None,
+    )
+    restored = observe_module._accumulate_gate1_decision(  # pyright: ignore[reportPrivateUsage]
+        recovered,
+        observed,
+    )
+
+    assert observed.gate1_sticky_reason_codes == ()
+    assert restored.capture_healthy is True
+    assert restored.research_eligible is True
+    assert restored.gate1_eligible_so_far is True
+    assert restored.reason_codes == ()
+    assert restored.gate1_sticky_reason_codes == ()
+
+
+def test_permanent_audit_history_restores_current_research_but_not_gate1() -> None:
     failed = HealthDecision(
         capture_healthy=True,
         research_eligible=False,
@@ -719,13 +922,21 @@ def test_post_checkpoint_audit_blockers_fail_closed_at_terminal(
     runtime_health.begin_generation(connection_id, ingress)
     runtime_health.mark_connected(now_ns=10)
     runtime = runtime_health.snapshot(now_ns=11)
-    reasons = observe_module._terminal_runtime_health_reasons(  # pyright: ignore[reportPrivateUsage]
-        runtime,
+    processor_summary = replace(
+        processor_module.CanonicalProcessor(
+            load_phase1_config(Path("config/phase1.toml"))
+        ).summary(),
+        healthy_books=1,
         audit_divergences_unresolved=audit_divergences_unresolved,
         audit_replacement_captures_pending=audit_replacement_captures_pending,
         audit_divergences_unknown=audit_divergences_unknown,
         audit_local_book_defects=audit_local_book_defects,
-        audit_divergence_lifecycle_reconciled=audit_divergence_lifecycle_reconciled,
+        audit_divergence_lifecycle_reconciled=(audit_divergence_lifecycle_reconciled),
+    )
+    reasons = observe_module._terminal_runtime_health_reasons(  # pyright: ignore[reportPrivateUsage]
+        runtime,
+        processor=processor_summary,
+        all_required_books_healthy=True,
         audit_trigger_reconciled=audit_trigger_reconciled,
     )
     failed_terminal_evidence = HealthEvidenceSummary(
@@ -790,6 +1001,224 @@ def test_post_checkpoint_audit_blockers_fail_closed_at_terminal(
     assert HealthDecisionReason.HEALTH_EVIDENCE_UNHEALTHY in final.reason_codes
 
 
+@pytest.mark.parametrize(
+    ("current_faults", "permanent_faults"),
+    [(1, 0), (0, 1)],
+    ids=("current", "permanent"),
+)
+def test_terminal_fallback_rejects_stale_periodic_health_after_late_audit_fault(
+    current_faults: int,
+    permanent_faults: int,
+) -> None:
+    run_id = CollectorRunId(f"terminal-late-audit-fault-{current_faults}-{permanent_faults}")
+    processor_summary = replace(
+        processor_module.CanonicalProcessor(
+            load_phase1_config(Path("config/phase1.toml"))
+        ).summary(),
+        healthy_books=0,
+        audit_ineligible_books=1,
+        audit_faults_observed=1,
+        audit_faults_current=current_faults,
+        audit_faults_permanent=permanent_faults,
+        audit_http_faults_observed=1,
+        audit_http_faults_permanent=permanent_faults,
+        audit_http_endpoint_snapshots=(
+            processor_module.ProcessorAuditHttpEndpointSnapshot(
+                endpoint_class=processor_module.PolymarketEndpointClass.CLOB_BOOK,
+                observed=1,
+                current=current_faults,
+                resolved=0,
+                permanent=permanent_faults,
+                retry_exhaustions_observed=0,
+                retry_exhaustions_current=0,
+                retry_exhaustions_resolved=0,
+                retry_exhaustions_permanent=0,
+            ),
+        ),
+    )
+    connection_id = ConnectionId("terminal-late-audit-fault")
+    ingress = BoundedRawIngress(max_items=8, max_bytes=1_024, connection_id=connection_id)
+    runtime_health = ObservationRuntimeHealth()
+    runtime_health.begin_generation(connection_id, ingress)
+    runtime_health.mark_connected(now_ns=10)
+    reasons = observe_module._terminal_runtime_health_reasons(  # pyright: ignore[reportPrivateUsage]
+        runtime_health.snapshot(now_ns=11),
+        processor=processor_summary,
+        all_required_books_healthy=False,
+        audit_trigger_reconciled=True,
+    )
+    failed_terminal_evidence = HealthEvidenceSummary(
+        schema_version=HEALTH_EVIDENCE_SUMMARY_VERSION,
+        collector_run_id=run_id,
+        path=Path("health.jsonl.partial"),
+        completed=False,
+        gate1_evidence_eligible=False,
+        accepted=1,
+        written=1,
+        rejected=0,
+        queue_high_water=1,
+        file_bytes=1,
+        content_sha256=None,
+        failure_type="RuntimeError",
+    )
+    availability_evidence = AvailabilityEvidenceSummary(
+        schema_version=AVAILABILITY_EVIDENCE_SUMMARY_VERSION,
+        collector_run_id=run_id,
+        path=Path("availability.jsonl"),
+        completed=True,
+        gate1_evidence_eligible=True,
+        accepted=0,
+        written=0,
+        rejected=0,
+        queue_high_water=0,
+        file_bytes=0,
+        unavailable_duration_nanoseconds=0,
+        longest_interval_nanoseconds=0,
+        open_at_shutdown_intervals=0,
+        content_sha256="b" * 64,
+        failure_type=None,
+    )
+    analytical = ResearchOutputSummary(
+        root=Path("analytical"),
+        reference_manifest_hashes=(),
+        canonical_manifest_hashes=(),
+        scan_manifest_hashes=(),
+    )
+    stale_periodic_decision = HealthDecision(
+        capture_healthy=True,
+        research_eligible=True,
+        gate1_eligible_so_far=True,
+        reason_codes=(),
+    )
+
+    final = observe_module._final_health_decision(  # pyright: ignore[reportPrivateUsage]
+        stale_periodic_decision,
+        evidence=failed_terminal_evidence,
+        availability_evidence=availability_evidence,
+        availability_reconciled=True,
+        analytical_outputs=analytical,
+        terminal_runtime_reasons=reasons,
+    )
+
+    assert reasons == (
+        HealthDecisionReason.BOOK_NOT_HEALTHY,
+        HealthDecisionReason.AUDIT_FAILED,
+        HealthDecisionReason.HTTP_FINAL_FAILURE,
+    )
+    assert final.capture_healthy
+    assert not final.research_eligible
+    assert not final.gate1_eligible_so_far
+    assert HealthDecisionReason.BOOK_NOT_HEALTHY in final.reason_codes
+    assert HealthDecisionReason.BOOK_NOT_HEALTHY not in final.gate1_sticky_reason_codes
+    assert {
+        HealthDecisionReason.AUDIT_FAILED,
+        HealthDecisionReason.HTTP_FINAL_FAILURE,
+        HealthDecisionReason.HEALTH_EVIDENCE_UNHEALTHY,
+    }.issubset(final.gate1_sticky_reason_codes)
+
+
+def test_terminal_fallback_does_not_make_noncurrent_v1_fault_a_research_blocker() -> None:
+    run_id = CollectorRunId("terminal-historical-v1-fault")
+    processor_summary = replace(
+        processor_module.CanonicalProcessor(
+            load_phase1_config(Path("config/phase1.toml"))
+        ).summary(),
+        healthy_books=1,
+        audit_faults_observed=1,
+        audit_faults_permanent=1,
+    )
+    connection_id = ConnectionId("terminal-historical-v1-fault")
+    ingress = BoundedRawIngress(max_items=8, max_bytes=1_024, connection_id=connection_id)
+    runtime_health = ObservationRuntimeHealth()
+    runtime_health.begin_generation(connection_id, ingress)
+    runtime_health.mark_connected(now_ns=10)
+
+    reasons = observe_module._terminal_runtime_health_reasons(  # pyright: ignore[reportPrivateUsage]
+        runtime_health.snapshot(now_ns=11),
+        processor=processor_summary,
+        all_required_books_healthy=True,
+        audit_trigger_reconciled=True,
+    )
+
+    assert reasons == (HealthDecisionReason.AUDIT_FAILED,)
+    assert HealthDecisionReason.BOOK_NOT_HEALTHY not in reasons
+    final = observe_module._final_health_decision(  # pyright: ignore[reportPrivateUsage]
+        HealthDecision(
+            capture_healthy=True,
+            research_eligible=True,
+            gate1_eligible_so_far=True,
+            reason_codes=(),
+        ),
+        evidence=HealthEvidenceSummary(
+            schema_version=HEALTH_EVIDENCE_SUMMARY_VERSION,
+            collector_run_id=run_id,
+            path=Path("health.jsonl.partial"),
+            completed=False,
+            gate1_evidence_eligible=False,
+            accepted=1,
+            written=1,
+            rejected=0,
+            queue_high_water=1,
+            file_bytes=1,
+            content_sha256=None,
+            failure_type="RuntimeError",
+        ),
+        availability_evidence=AvailabilityEvidenceSummary(
+            schema_version=AVAILABILITY_EVIDENCE_SUMMARY_VERSION,
+            collector_run_id=run_id,
+            path=Path("availability.jsonl"),
+            completed=True,
+            gate1_evidence_eligible=True,
+            accepted=0,
+            written=0,
+            rejected=0,
+            queue_high_water=0,
+            file_bytes=0,
+            unavailable_duration_nanoseconds=0,
+            longest_interval_nanoseconds=0,
+            open_at_shutdown_intervals=0,
+            content_sha256="b" * 64,
+            failure_type=None,
+        ),
+        availability_reconciled=True,
+        analytical_outputs=ResearchOutputSummary(
+            root=Path("analytical"),
+            reference_manifest_hashes=(),
+            canonical_manifest_hashes=(),
+            scan_manifest_hashes=(),
+        ),
+        terminal_runtime_reasons=reasons,
+    )
+
+    assert final.research_eligible
+    assert not final.gate1_eligible_so_far
+    assert HealthDecisionReason.AUDIT_FAILED in final.gate1_sticky_reason_codes
+
+
+def test_terminal_fallback_promotes_fault_reconciliation_failure_to_gate_blocker() -> None:
+    processor_summary = replace(
+        processor_module.CanonicalProcessor(
+            load_phase1_config(Path("config/phase1.toml"))
+        ).summary(),
+        healthy_books=1,
+        audit_fault_lifecycle_reconciled=False,
+    )
+    connection_id = ConnectionId("terminal-fault-reconciliation")
+    ingress = BoundedRawIngress(max_items=8, max_bytes=1_024, connection_id=connection_id)
+    runtime_health = ObservationRuntimeHealth()
+    runtime_health.begin_generation(connection_id, ingress)
+    runtime_health.mark_connected(now_ns=10)
+
+    reasons = observe_module._terminal_runtime_health_reasons(  # pyright: ignore[reportPrivateUsage]
+        runtime_health.snapshot(now_ns=11),
+        processor=processor_summary,
+        all_required_books_healthy=True,
+        audit_trigger_reconciled=True,
+    )
+
+    assert reasons == (HealthDecisionReason.AUDIT_FAILED,)
+
+
 class _PublicClient:
     constructor_kwargs: ClassVar[dict[str, object]] = {}
 
@@ -830,11 +1259,27 @@ def _configured_service(
     tmp_path: Path,
     *,
     code_commit: str | None = None,
+    maximum_book_age_seconds: float | None = None,
 ) -> tuple[Phase1Config, PolymarketObservationService]:
     source_commit = _initialize_clean_source(tmp_path)
     config = load_phase1_config(Path("config/phase1.toml"))
     config = config.model_copy(
-        update={"health": config.health.model_copy(update={"checkpoint_interval_seconds": 0.01})}
+        update={
+            "health": config.health.model_copy(update={"checkpoint_interval_seconds": 0.01}),
+            "scanner": (
+                config.scanner
+                if maximum_book_age_seconds is None
+                else config.scanner.model_copy(
+                    update={
+                        "maximum_book_age_seconds": maximum_book_age_seconds,
+                        "maximum_interleg_skew_seconds": min(
+                            config.scanner.maximum_interleg_skew_seconds,
+                            maximum_book_age_seconds,
+                        ),
+                    }
+                )
+            ),
+        }
     )
     return config, PolymarketObservationService(
         config,
@@ -1174,10 +1619,136 @@ async def test_observation_emits_periodic_and_final_health_with_shared_http_poli
     assert summary.runtime_health.ingress.received == 1
     assert summary.websocket_observation_nanoseconds > 0
     assert summary.public_read_metrics == PublicReadMetricsSnapshot((), 0, 0)
+    assert summary.terminal_process_resource_failure_type is None
+    assert summary.terminal_process_resources is not None
+    assert summary.terminal_process_resources.sampled_monotonic_ns >= cast(
+        int, records[-1]["emitted_monotonic_ns"]
+    )
+    assert summary.terminal_process_resources.python_allocation_group_capture == (
+        "TERMINAL_POST_CUTOFF_FILENAME_GROUPS"
+    )
+    assert len(summary.terminal_process_resources.python_allocation_groups) <= 12
+    final_memory = cast(dict[str, object], records[-1]["resources"])["memory_allocators"]
+    assert cast(dict[str, object], final_memory)["python_allocation_group_capture"] == (
+        "PERIODIC_NOT_CAPTURED"
+    )
+    assert cast(dict[str, object], final_memory)["python_allocation_groups"] == []
     assert isinstance(_PublicClient.constructor_kwargs["public_read_policy"], PublicReadPolicy)
     policy = _PublicClient.constructor_kwargs["public_read_policy"]
     assert isinstance(policy, PublicReadPolicy)
     assert policy.maximum_attempts == config.polymarket.public_reads.maximum_attempts
+
+
+@pytest.mark.asyncio
+async def test_terminal_resource_capture_failure_degrades_health_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, service = _configured_service(tmp_path)
+
+    def fail_terminal_capture(_: Path) -> health_module.ProcessResourceSnapshot:
+        raise OSError("terminal resource fixture failure")
+
+    monkeypatch.setattr(observe_module, "capture_terminal_process_resources", fail_terminal_capture)
+    monkeypatch.setattr(observe_module, "PolymarketPublicClient", _PublicClient)
+    monkeypatch.setattr(
+        PolymarketObservationService,
+        "_bootstrap_explicit",
+        _healthy_bootstrap_fixture,
+    )
+    monkeypatch.setattr(
+        PolymarketObservationService,
+        "_observe_websocket",
+        _connected_stream_fixture,
+    )
+
+    summary = await service.run(duration_seconds=2.0, gamma_market_id="101")
+
+    assert summary.terminal_process_resources is None
+    assert summary.terminal_process_resource_failure_type == "OSError"
+    assert not summary.health_evidence.gate1_evidence_eligible
+    assert summary.health_evidence.failure_type == "OSError"
+    assert HealthDecisionReason.HEALTH_EVIDENCE_UNHEALTHY in summary.health_decision.reason_codes
+
+
+@pytest.mark.asyncio
+async def test_actual_history_eviction_starts_production_post_saturation_trend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, service = _configured_service(tmp_path)
+
+    async def saturating_stream(
+        service: PolymarketObservationService,
+        *,
+        client: object,
+        capture: observe_module._RawCaptureBoundary,  # pyright: ignore[reportPrivateUsage]
+        selected: tuple[object, ...],
+        asset_ids: tuple[str, ...],
+        deadline: float,
+        logger: object,
+        runtime_health: ObservationRuntimeHealth,
+        on_capture_cutoff: Callable[[observe_module._CaptureCutoffMoment], None],  # pyright: ignore[reportPrivateUsage]
+    ) -> observe_module._StreamResult:  # pyright: ignore[reportPrivateUsage]
+        del service, client, selected, asset_ids, deadline, logger
+        connection_id = ConnectionId.new()
+        ingress = BoundedRawIngress(
+            max_items=8,
+            max_bytes=1_024,
+            connection_id=connection_id,
+        )
+        runtime_health.begin_generation(connection_id, ingress)
+        runtime_health.mark_connected(now_ns=time.monotonic_ns())
+        result = await capture.preserve_then_process(
+            channel=REST_BOOK,
+            payload=_no_book_payload(),
+            transport_type="HTTP",
+            semantics_hash=hashlib.sha256(b"saturation-rest-book").hexdigest(),
+        )
+        assert result.success
+        await asyncio.sleep(0.08)
+        runtime_health.finish_generation(
+            continuity_interrupted=False,
+            now_ns=time.monotonic_ns(),
+        )
+        cutoff = observe_module._CaptureCutoffMoment(  # pyright: ignore[reportPrivateUsage]
+            wall_time=UtcTimestamp.now(),
+            monotonic_ns=time.monotonic_ns(),
+        )
+        on_capture_cutoff(cutoff)
+        return observe_module._StreamResult(  # pyright: ignore[reportPrivateUsage]
+            reconnects=0,
+            completed=True,
+            selected_market_resolved=False,
+            deviations=(),
+            ingress_metrics=ingress.metrics,
+            capture_cutoff=cutoff,
+        )
+
+    monkeypatch.setattr(
+        processor_module,
+        "_SCAN_RESULT_HISTORY_LIMIT",
+        1,
+    )
+    monkeypatch.setattr(observe_module, "PolymarketPublicClient", _PublicClient)
+    monkeypatch.setattr(
+        PolymarketObservationService,
+        "_bootstrap_explicit",
+        _healthy_bootstrap_fixture,
+    )
+    monkeypatch.setattr(
+        PolymarketObservationService,
+        "_observe_websocket",
+        saturating_stream,
+    )
+
+    summary = await service.run(duration_seconds=2.0, gamma_market_id="101")
+
+    assert summary.processor.scan_results_truncated
+    assert summary.resource_trend.history_saturation_started_monotonic_ns is not None
+    assert summary.resource_trend.post_saturation_sample_count >= 2
+    assert summary.resource_trend.post_saturation_rss_known_sample_count >= 2
+    assert summary.resource_trend.post_saturation_python_known_sample_count >= 2
 
 
 @pytest.mark.asyncio
@@ -1208,7 +1779,7 @@ async def test_unavailable_code_identity_blocks_terminal_gate_without_blocking_c
     assert final["decisions"]["capture_healthy"] is True
     assert final["decisions"]["research_eligible"] is True
     assert final["decisions"]["gate1_eligible_so_far"] is False
-    assert final["decisions"]["reason_codes"] == ["CODE_IDENTITY_UNAVAILABLE"]
+    assert _record_decision_reasons(final) == (HealthDecisionReason.CODE_IDENTITY_UNAVAILABLE,)
     assert summary.host_runtime_identity.code_commit is None
     assert summary.journal_metrics.durable >= 4
     assert summary.health_decision.capture_healthy is True
@@ -1248,7 +1819,7 @@ async def test_dirty_source_tree_blocks_terminal_gate_without_blocking_capture(
     assert final["decisions"]["capture_healthy"] is True
     assert final["decisions"]["research_eligible"] is True
     assert final["decisions"]["gate1_eligible_so_far"] is False
-    assert final["decisions"]["reason_codes"] == ["SOURCE_TREE_DIRTY"]
+    assert _record_decision_reasons(final) == (HealthDecisionReason.SOURCE_TREE_DIRTY,)
     assert summary.journal_metrics.durable >= 4
     assert summary.health_decision.reason_codes == (HealthDecisionReason.SOURCE_TREE_DIRTY,)
 
@@ -1279,8 +1850,8 @@ async def test_subcadence_disconnect_recovery_restores_gate1_current_eligibility
     assert final["decisions"]["capture_healthy"] is True
     assert final["decisions"]["research_eligible"] is True
     assert final["decisions"]["gate1_eligible_so_far"] is True
-    assert final["decisions"]["reason_codes"] == []
-    assert final["decisions"]["gate1_sticky_reason_codes"] == []
+    assert _record_decision_reasons(final) == ()
+    assert _record_decision_reasons(final, sticky=True) == ()
     assert final["recovery"]["availability"]["aggregate_reconciled"] is True
     assert summary.availability_evidence.written == 1
     assert (
@@ -1382,7 +1953,7 @@ async def test_immediate_capture_end_rejects_resource_sample_after_terminal_cuto
 
 
 @pytest.mark.asyncio
-async def test_terminal_checkpoint_is_frozen_before_delayed_owner_close(
+async def test_terminal_checkpoint_freezes_cutoff_but_builds_after_delayed_owner_close(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1511,13 +2082,195 @@ async def test_terminal_checkpoint_is_frozen_before_delayed_owner_close(
     assert final["decisions"]["capture_healthy"] is True
     assert final["decisions"]["research_eligible"] is True
     assert final["decisions"]["gate1_eligible_so_far"] is True
-    assert final["decisions"]["reason_codes"] == []
-    assert final["decisions"]["gate1_sticky_reason_codes"] == []
+    assert _record_decision_reasons(final) == ()
+    assert _record_decision_reasons(final, sticky=True) == ()
     assert summary.health_decision.gate1_eligible_so_far is True
     assert summary.health_decision.reason_codes == ()
     assert len(records) == recording_builder.call_count
     assert build_counts_during_close
-    assert set(build_counts_during_close) == {recording_builder.call_count}
+    assert set(build_counts_during_close) == {recording_builder.call_count - 1}
+    assert final["journal"]["terminal"] is True
+    assert final["journal"]["run_completion_sha256"] is not None
+    assert final["journal"]["pending_segments"] == 0
+    assert final["journal"]["active_seal_jobs"] == 0
+    assert final["journal"]["active_segment_events"] == 0
+
+
+@pytest.mark.asyncio
+async def test_terminal_checkpoint_waits_for_slow_final_segment_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, service = _configured_service(tmp_path)
+    writer_module = importlib.import_module("multi_market_arbitrage.journal.writer")
+    original_prepare = writer_module._prepare_sealed_payload  # pyright: ignore[reportPrivateUsage]
+    original_builder = observe_module.build_observation_health_checkpoint
+    seal_started = threading.Event()
+    seal_finished = threading.Event()
+    terminal_snapshots: list[tuple[bool, bool, int, int]] = []
+
+    def delayed_prepare(*args: object, **kwargs: object) -> object:
+        seal_started.set()
+        time.sleep(0.08)
+        result = original_prepare(*args, **kwargs)
+        seal_finished.set()
+        return result
+
+    def recording_builder(*args: object, **kwargs: object) -> HealthCheckpoint:
+        if kwargs.get("terminal") is True:
+            journal = cast(JournalMetricsSnapshot, kwargs["journal"])
+            terminal_snapshots.append(
+                (
+                    seal_started.is_set(),
+                    seal_finished.is_set(),
+                    journal.pending_segments,
+                    journal.active_seal_jobs,
+                )
+            )
+        return original_builder(*args, **kwargs)
+
+    monkeypatch.setattr(writer_module, "_prepare_sealed_payload", delayed_prepare)
+    monkeypatch.setattr(
+        observe_module,
+        "build_observation_health_checkpoint",
+        recording_builder,
+    )
+    monkeypatch.setattr(observe_module, "PolymarketPublicClient", _PublicClient)
+    monkeypatch.setattr(
+        PolymarketObservationService,
+        "_bootstrap_explicit",
+        _healthy_bootstrap_fixture,
+    )
+    monkeypatch.setattr(
+        PolymarketObservationService,
+        "_observe_websocket",
+        _connected_stream_fixture,
+    )
+
+    summary = await service.run(duration_seconds=2.0, gamma_market_id="101")
+
+    records = tuple(
+        json.loads(line)
+        for line in summary.health_evidence.path.read_text(encoding="utf-8").splitlines()
+    )
+    assert seal_started.is_set()
+    assert seal_finished.is_set()
+    assert terminal_snapshots == [(True, True, 0, 0)]
+    assert [record["journal"]["terminal"] for record in records].count(True) == 1
+    assert records[-1]["journal"]["terminal"] is True
+    completion = load_run_completion_head(
+        completion_path_for_run(
+            summary.journal_root,
+            summary.collector_run_id,
+            "polymarket-public",
+        )
+    )
+    assert records[-1]["journal"]["run_completion_sha256"] == completion.completion_sha256
+    assert records[-1]["journal"]["total_unverified_segments"] == 0
+    assert summary.health_evidence.gate1_evidence_eligible
+
+
+@pytest.mark.asyncio
+async def test_terminal_fallback_rechecks_freshness_when_terminal_checkpoint_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    maximum_book_age_seconds = 0.5
+    _, service = _configured_service(
+        tmp_path,
+        maximum_book_age_seconds=maximum_book_age_seconds,
+    )
+    original_builder = observe_module.build_observation_health_checkpoint
+    periodic_healthy = asyncio.Event()
+    periodic_healthy_count = 0
+    terminal_attempted = False
+
+    def fail_terminal_builder(*args: object, **kwargs: object) -> HealthCheckpoint:
+        nonlocal periodic_healthy_count, terminal_attempted
+        if kwargs.get("terminal") is True:
+            terminal_attempted = True
+            raise RuntimeError("injected terminal checkpoint build failure")
+        checkpoint = cast(Callable[..., HealthCheckpoint], original_builder)(*args, **kwargs)
+        if checkpoint.research_eligible:
+            periodic_healthy_count += 1
+            periodic_healthy.set()
+        return checkpoint
+
+    async def expire_after_healthy_periodic_checkpoint(
+        service: PolymarketObservationService,
+        *,
+        client: object,
+        capture: observe_module._RawCaptureBoundary,  # pyright: ignore[reportPrivateUsage]
+        selected: tuple[object, ...],
+        asset_ids: tuple[str, ...],
+        deadline: float,
+        logger: object,
+        runtime_health: ObservationRuntimeHealth,
+        on_capture_cutoff: Callable[[observe_module._CaptureCutoffMoment], None],  # pyright: ignore[reportPrivateUsage]
+    ) -> observe_module._StreamResult:  # pyright: ignore[reportPrivateUsage]
+        del service, client, selected, asset_ids, deadline, logger
+        connection_id = ConnectionId.new()
+        ingress = BoundedRawIngress(
+            max_items=8,
+            max_bytes=1_024,
+            connection_id=connection_id,
+        )
+        runtime_health.begin_generation(connection_id, ingress)
+        runtime_health.mark_connected(now_ns=time.monotonic_ns())
+        await asyncio.wait_for(periodic_healthy.wait(), timeout=5)
+
+        receive_times = capture.book_freshness_receive_ns_by_instrument
+        assert receive_times
+        expiry_ns = max(receive_times.values()) + int(maximum_book_age_seconds * 1_000_000_000)
+        remaining_before_spin_ns = expiry_ns - time.monotonic_ns() - 5_000_000
+        if remaining_before_spin_ns > 0:
+            await asyncio.sleep(remaining_before_spin_ns / 1_000_000_000)
+        while time.monotonic_ns() <= expiry_ns:
+            pass
+
+        cutoff = observe_module._CaptureCutoffMoment(  # pyright: ignore[reportPrivateUsage]
+            wall_time=UtcTimestamp.now(),
+            monotonic_ns=time.monotonic_ns(),
+        )
+        on_capture_cutoff(cutoff)
+        runtime_health.finish_generation(
+            continuity_interrupted=False,
+            now_ns=cutoff.monotonic_ns,
+        )
+        return observe_module._StreamResult(  # pyright: ignore[reportPrivateUsage]
+            reconnects=0,
+            completed=True,
+            selected_market_resolved=False,
+            deviations=(),
+            ingress_metrics=ingress.metrics,
+            capture_cutoff=cutoff,
+        )
+
+    monkeypatch.setattr(
+        observe_module,
+        "build_observation_health_checkpoint",
+        fail_terminal_builder,
+    )
+    monkeypatch.setattr(observe_module, "PolymarketPublicClient", _PublicClient)
+    monkeypatch.setattr(
+        PolymarketObservationService,
+        "_bootstrap_explicit",
+        _healthy_bootstrap_fixture,
+    )
+    monkeypatch.setattr(
+        PolymarketObservationService,
+        "_observe_websocket",
+        expire_after_healthy_periodic_checkpoint,
+    )
+
+    summary = await service.run(duration_seconds=2.0, gamma_market_id="101")
+
+    assert periodic_healthy_count > 0
+    assert terminal_attempted
+    assert summary.health_evidence.failure_type == "RuntimeError"
+    assert not summary.health_evidence.gate1_evidence_eligible
+    assert not summary.health_decision.research_eligible
+    assert HealthDecisionReason.BOOK_NOT_HEALTHY in summary.health_decision.reason_codes
 
 
 @pytest.mark.asyncio
@@ -1611,7 +2364,7 @@ async def test_terminal_disconnect_is_preserved_in_final_health_checkpoint(
     unavailable_started_monotonic_ns = availability_record["started_monotonic_ns"]
     inferred_started_monotonic_ns = terminal_monotonic_ns - summary.actual_duration_nanoseconds
     assert run_invoked_monotonic_ns <= inferred_started_monotonic_ns <= terminal_monotonic_ns
-    assert "SOCKET_DISCONNECTED" in final["decisions"]["reason_codes"]
+    assert HealthDecisionReason.SOCKET_DISCONNECTED in _record_decision_reasons(final)
     assert not summary.runtime_health.socket_connected
     assert summary.runtime_health.longest_unavailable_nanoseconds > 0
     assert not summary.health_decision.capture_healthy
@@ -1722,7 +2475,7 @@ async def test_terminal_health_uses_paired_capture_cutoff_before_audit_drain(
     assert emitted_at_ns[-1] == cutoff_wall_ns
     assert emitted_at_ns == tuple(sorted(emitted_at_ns))
     assert all(
-        HealthDecisionReason.BOOK_NOT_HEALTHY not in record["decisions"]["reason_codes"]
+        HealthDecisionReason.BOOK_NOT_HEALTHY not in _record_decision_reasons(record)
         for record in records
     )
     assert HealthDecisionReason.BOOK_NOT_HEALTHY not in summary.health_decision.reason_codes
@@ -1758,7 +2511,8 @@ async def test_periodic_health_continues_during_socket_unavailability(
     assert len(unavailable) >= 2
     assert any(record["capture"]["current_unavailable_nanoseconds"] > 0 for record in unavailable)
     assert all(
-        "SOCKET_DISCONNECTED" in record["decisions"]["reason_codes"] for record in unavailable
+        HealthDecisionReason.SOCKET_DISCONNECTED in _record_decision_reasons(record)
+        for record in unavailable
     )
 
 

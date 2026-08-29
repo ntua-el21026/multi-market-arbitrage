@@ -63,6 +63,31 @@
 | 0052 | Continuous capture during integrity audits and Gate-1 evidence | Accepted |
 | 0053 | Bounded reported-top transition state | Accepted |
 | 0054 | Audit divergence state and Gate eligibility | Accepted |
+| 0055 | Audit/public-read fault evidence dimensions and lifecycles | Accepted |
+| 0056 | Availability contributor ownership and bounded replacement recovery | Accepted |
+| 0057 | Non-blocking ordered raw-journal rotation | Accepted |
+
+## Narrow successor contracts
+
+ADR-0054 remains accepted. ADR-0056's second explicit narrow refinement adds
+bounded recovery identity, retry, deadline and exhaustion authority around the
+durable replacement-release control. Post-ADR-0056 producers therefore use the
+versioned successor channel `mma.control.rest-audit-replacement-release.v2` so
+the added authority is explicit; ADR-0054's paired decision boundary, complete
+capture preimage and fail-closed release conditions remain unchanged. Historical
+`.v1` controls retain their exact original meaning and replay contract and are
+never reinterpreted as `.v2`.
+
+ADR-0057 is an additive refinement of the raw-journal ownership and physical
+rotation contract. It separates append/data-`fsync` durability from ordered
+seal/manifest/verify work while preserving ADR-0016's record durability states,
+manifest/replay identity, and ADR-0055's strict PREPARE/ATTEST deadlines. New
+health producers use `gate1-health-checkpoint-v5`; v1-v4 remain historical and
+never gain synthesized seal-lifecycle evidence. Current pre-soak calibration
+uses `phase1-pre-soak-calibration-v3` with explicit seal-capacity bindings and
+component disk reserves; historical v1-v2 reports gain no synthesized v3
+fields. Full-run exact ingest-ID uniqueness uses bounded command-owned SQLite
+scratch and does not instantiate ADR-0030 operational state.
 
 ## Rule
 

@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import pyarrow as pa
+
 from multi_market_arbitrage.core.ids import CollectorRunId
+from multi_market_arbitrage.core.limits import MAX_ANALYTICAL_FRAGMENTS_PER_DATASET
 from multi_market_arbitrage.core.provenance import Provenance
 from multi_market_arbitrage.core.serialization import canonical_json_string
 from multi_market_arbitrage.core.time import UtcTimestamp
@@ -50,6 +54,55 @@ class ResearchOutputSummary:
     completion_sha256: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class AnalyticalFragmentRetentionSnapshot:
+    """O(1), bounded telemetry for one exact run-scoped SHA inventory."""
+
+    domain: str
+    retained: int
+    capacity: int
+    dataset_fragments_at_open: int
+    dataset_fragment_reservations: int
+    maximum_dataset_fragments: int
+    container_shallow_bytes: int
+    representative_hash_shallow_bytes: int
+    estimated_retained_bytes: int
+    maximum_estimated_retained_bytes: int
+    byte_estimate_method: str = (
+        "list-shallow-size-plus-retained-64-character-ascii-sha-shallow-size"
+    )
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "byte_estimate_method": self.byte_estimate_method,
+            "capacity": self.capacity,
+            "container_shallow_bytes": self.container_shallow_bytes,
+            "dataset_fragment_reservations": self.dataset_fragment_reservations,
+            "dataset_fragments_at_open": self.dataset_fragments_at_open,
+            "domain": self.domain,
+            "estimated_retained_bytes": self.estimated_retained_bytes,
+            "maximum_dataset_fragments": self.maximum_dataset_fragments,
+            "maximum_estimated_retained_bytes": self.maximum_estimated_retained_bytes,
+            "representative_hash_shallow_bytes": self.representative_hash_shallow_bytes,
+            "retained": self.retained,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AnalyticalOutputRuntimeSnapshot:
+    """Bounded buffer and native allocator telemetry for analytical writers."""
+
+    buffered_records: int
+    buffered_bytes: int
+    buffered_records_high_water: int
+    buffered_bytes_high_water: int
+    flushes: int
+    flushed_records: int
+    pyarrow_current_bytes: int
+    pyarrow_peak_bytes: int
+    fragment_retention: tuple[AnalyticalFragmentRetentionSnapshot, ...] = ()
+
+
 class Phase1AnalyticalOutputs:
     """Own three schema-homogeneous analytical dataset writers for one run."""
 
@@ -86,6 +139,10 @@ class Phase1AnalyticalOutputs:
                 batch_size=batch_size,
                 maximum_record_bytes=maximum_record_bytes,
                 maximum_buffered_bytes=maximum_buffered_bytes,
+                # This safety policy is fixed, not an unrecorded runtime
+                # option: config/raw identity must not silently select a
+                # different terminal-authority capacity.
+                maximum_fragments=MAX_ANALYTICAL_FRAGMENTS_PER_DATASET,
             )
 
         self._references = AnalyticalDatasetWriter(
@@ -107,6 +164,11 @@ class Phase1AnalyticalOutputs:
         self._reference_fragments: list[str] = []
         self._canonical_fragments: list[str] = []
         self._scan_fragments: list[str] = []
+        self._fragment_maximum_container_bytes = {
+            "reference": self._maximum_list_shallow_bytes(self._references.fragment_capacity),
+            "canonical_events": self._maximum_list_shallow_bytes(self._canonical.fragment_capacity),
+            "complete_set_scans": self._maximum_list_shallow_bytes(self._scans.fragment_capacity),
+        }
         self._closed = False
         self._record_counts = {
             "reference": 0,
@@ -120,13 +182,86 @@ class Phase1AnalyticalOutputs:
         if value is not None:
             target.append(value.manifest_sha256)
 
+    @staticmethod
+    def _maximum_list_shallow_bytes(capacity: int) -> int:
+        probe: list[None] = []
+        for _ in range(capacity):
+            # Match the retained SHA list's append growth/overallocation.
+            probe.append(None)  # noqa: PERF401
+        return sys.getsizeof(probe)
+
+    def _fragment_retention_snapshot(
+        self,
+        *,
+        domain: str,
+        target: list[str],
+        writer: AnalyticalDatasetWriter,
+    ) -> AnalyticalFragmentRetentionSnapshot:
+        retained = len(target)
+        representative_hash_shallow_bytes = sys.getsizeof("0" * 64)
+        container_shallow_bytes = sys.getsizeof(target)
+        return AnalyticalFragmentRetentionSnapshot(
+            domain=domain,
+            retained=retained,
+            capacity=writer.fragment_capacity,
+            dataset_fragments_at_open=writer.existing_fragment_count,
+            dataset_fragment_reservations=(writer.existing_fragment_count + retained),
+            maximum_dataset_fragments=writer.maximum_fragments,
+            container_shallow_bytes=container_shallow_bytes,
+            representative_hash_shallow_bytes=representative_hash_shallow_bytes,
+            estimated_retained_bytes=(
+                container_shallow_bytes + retained * representative_hash_shallow_bytes
+            ),
+            maximum_estimated_retained_bytes=(
+                self._fragment_maximum_container_bytes[domain]
+                + writer.fragment_capacity * representative_hash_shallow_bytes
+            ),
+        )
+
+    def operational_snapshot(self) -> AnalyticalOutputRuntimeSnapshot:
+        writers = (self._references, self._canonical, self._scans)
+        memory_pool = pa.default_memory_pool()
+        pyarrow_current_bytes = memory_pool.bytes_allocated()
+        pyarrow_peak_bytes = memory_pool.max_memory()
+        return AnalyticalOutputRuntimeSnapshot(
+            buffered_records=sum(writer.buffered_records for writer in writers),
+            buffered_bytes=sum(writer.buffered_bytes for writer in writers),
+            buffered_records_high_water=sum(
+                writer.buffered_records_high_water for writer in writers
+            ),
+            buffered_bytes_high_water=sum(writer.buffered_bytes_high_water for writer in writers),
+            flushes=sum(writer.flush_count for writer in writers),
+            flushed_records=sum(writer.flushed_records for writer in writers),
+            pyarrow_current_bytes=pyarrow_current_bytes,
+            pyarrow_peak_bytes=max(
+                pyarrow_current_bytes,
+                0 if pyarrow_peak_bytes is None else pyarrow_peak_bytes,
+            ),
+            fragment_retention=(
+                self._fragment_retention_snapshot(
+                    domain="reference",
+                    target=self._reference_fragments,
+                    writer=self._references,
+                ),
+                self._fragment_retention_snapshot(
+                    domain="canonical_events",
+                    target=self._canonical_fragments,
+                    writer=self._canonical,
+                ),
+                self._fragment_retention_snapshot(
+                    domain="complete_set_scans",
+                    target=self._scan_fragments,
+                    writer=self._scans,
+                ),
+            ),
+        )
+
     def append_reference(
         self,
         bundle: ReferenceBundle,
         observed_at: UtcTimestamp,
         provenance: Provenance,
     ) -> None:
-        self._record_counts["reference"] += 1
         record = {
             "collector_run_id": self._collector_run_id.value,
             "observed_at_utc_ns": observed_at.nanoseconds_since_epoch,
@@ -150,9 +285,9 @@ class Phase1AnalyticalOutputs:
             "schema_version": _REFERENCE_SCHEMA,
         }
         self._capture_fragment(self._reference_fragments, self._references.append(record))
+        self._record_counts["reference"] += 1
 
     def append_canonical(self, event: CanonicalEvent) -> None:
-        self._record_counts["canonical_events"] += 1
         record = {
             "collector_run_id": self._collector_run_id.value,
             "receive_time_utc_ns": event.receive_timestamp.nanoseconds_since_epoch,
@@ -179,6 +314,7 @@ class Phase1AnalyticalOutputs:
             "schema_version": _CANONICAL_SCHEMA,
         }
         self._capture_fragment(self._canonical_fragments, self._canonical.append(record))
+        self._record_counts["canonical_events"] += 1
 
     def append_scan(
         self,
@@ -186,7 +322,6 @@ class Phase1AnalyticalOutputs:
         *,
         lifecycle: OpportunityLifecycle | None = None,
     ) -> None:
-        self._record_counts["complete_set_scans"] += 1
         candidate = result.candidate
         opportunity = result.opportunity
         record = {
@@ -218,6 +353,7 @@ class Phase1AnalyticalOutputs:
             "schema_version": _SCAN_SCHEMA,
         }
         self._capture_fragment(self._scan_fragments, self._scans.append(record))
+        self._record_counts["complete_set_scans"] += 1
 
     def close(
         self,
@@ -309,4 +445,9 @@ class Phase1AnalyticalOutputs:
             self.close()
 
 
-__all__ = ["Phase1AnalyticalOutputs", "ResearchOutputSummary"]
+__all__ = [
+    "AnalyticalFragmentRetentionSnapshot",
+    "AnalyticalOutputRuntimeSnapshot",
+    "Phase1AnalyticalOutputs",
+    "ResearchOutputSummary",
+]

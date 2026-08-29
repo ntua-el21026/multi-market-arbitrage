@@ -27,8 +27,67 @@ from .host import normalize_git_commit
 
 HEALTH_CHECKPOINT_V1_SCHEMA_VERSION: Final = "gate1-health-checkpoint-v1"
 HEALTH_CHECKPOINT_V2_SCHEMA_VERSION: Final = "gate1-health-checkpoint-v2"
-HEALTH_CHECKPOINT_SCHEMA_VERSION: Final = "gate1-health-checkpoint-v3"
+HEALTH_CHECKPOINT_V3_SCHEMA_VERSION: Final = "gate1-health-checkpoint-v3"
+HEALTH_CHECKPOINT_V4_SCHEMA_VERSION: Final = "gate1-health-checkpoint-v4"
+HEALTH_CHECKPOINT_SCHEMA_VERSION: Final = "gate1-health-checkpoint-v5"
 HEALTH_EVIDENCE_SUMMARY_VERSION: Final = "gate1-health-evidence-summary-v2"
+HEALTH_DECISION_REASON_MASK_SCHEMA: Final = "gate1-health-decision-reason-mask-v1"
+
+_HEALTH_CHECKPOINT_V5_JOURNAL_FIELDS: Final = frozenset(
+    {
+        "active_seal_jobs",
+        "active_seal_jobs_high_water",
+        "active_segment_events",
+        "active_segment_uncompressed_bytes",
+        "append_owner_seal_wait_nanoseconds",
+        "backpressure_failures",
+        "cleanup_latency_nanoseconds_max",
+        "compression_latency_nanoseconds_max",
+        "data_fsyncs",
+        "durability_group_size_high_water",
+        "durability_groups",
+        "durability_watermark_sequence",
+        "durable",
+        "failure_type",
+        "healthy",
+        "manifest_durable_transitions",
+        "manifest_durable_watermark_sequence",
+        "manifest_latency_nanoseconds_max",
+        "maximum_active_seal_jobs",
+        "maximum_pending_seal_age_nanoseconds",
+        "maximum_pending_uncompressed_bytes",
+        "maximum_unverified_segments",
+        "maximum_segment_events",
+        "maximum_segment_uncompressed_bytes",
+        "oldest_pending_seal_age_nanoseconds",
+        "pending_segments",
+        "pending_segments_high_water",
+        "pending_uncompressed_bytes",
+        "pending_uncompressed_bytes_high_water",
+        "queue_capacity",
+        "queue_depth",
+        "queue_high_water",
+        "rotation_durability_latency_nanoseconds_max",
+        "rotation_handoff_latency_nanoseconds_max",
+        "run_completion_sha256",
+        "seal_backpressure_failures",
+        "seal_jobs_started",
+        "seal_latency_nanoseconds_max",
+        "seal_queue_capacity",
+        "seal_queue_depth",
+        "seal_queue_high_water",
+        "sealed_bytes_durable_transitions",
+        "sealer_failures",
+        "segment_handoffs",
+        "source_partial_removed_transitions",
+        "total_unverified_segments",
+        "terminal",
+        "verification_latency_nanoseconds_max",
+        "verified_transitions",
+        "verified_watermark_sequence",
+        "writer_failures",
+    }
+)
 
 
 class HealthDecisionReason(StrEnum):
@@ -72,6 +131,72 @@ class HealthDecisionReason(StrEnum):
     DISK_HEADROOM_LOW = "DISK_HEADROOM_LOW"
 
 
+_HEALTH_DECISION_REASON_MASK_ORDER: Final = (
+    HealthDecisionReason.SOCKET_DISCONNECTED,
+    HealthDecisionReason.TARGET_NOT_EXPLICIT,
+    HealthDecisionReason.CODE_IDENTITY_UNAVAILABLE,
+    HealthDecisionReason.SOURCE_IDENTITY_UNAVAILABLE,
+    HealthDecisionReason.SOURCE_IDENTITY_MISMATCH,
+    HealthDecisionReason.SOURCE_TREE_DIRTY,
+    HealthDecisionReason.BOOK_NOT_HEALTHY,
+    HealthDecisionReason.INGRESS_DATA_LOSS,
+    HealthDecisionReason.INGRESS_QUEUE_SATURATED,
+    HealthDecisionReason.JOURNAL_UNHEALTHY,
+    HealthDecisionReason.JOURNAL_BACKPRESSURE,
+    HealthDecisionReason.ANALYTICAL_UNHEALTHY,
+    HealthDecisionReason.ANALYTICAL_QUEUE_SATURATED,
+    HealthDecisionReason.HEALTH_EVIDENCE_UNHEALTHY,
+    HealthDecisionReason.HEALTH_QUEUE_SATURATED,
+    HealthDecisionReason.AVAILABILITY_EVIDENCE_UNHEALTHY,
+    HealthDecisionReason.AVAILABILITY_QUEUE_SATURATED,
+    HealthDecisionReason.AVAILABILITY_RECONCILIATION_FAILED,
+    HealthDecisionReason.HTTP_INTEGRITY_UNAVAILABLE,
+    HealthDecisionReason.HTTP_FINAL_FAILURE,
+    HealthDecisionReason.AUDIT_MISMATCH,
+    HealthDecisionReason.AUDIT_DIVERGENCE_PENDING,
+    HealthDecisionReason.AUDIT_REPLACEMENT_CAPTURE_PENDING,
+    HealthDecisionReason.AUDIT_DIVERGENCE_UNRESOLVED,
+    HealthDecisionReason.AUDIT_DIVERGENCE_UNKNOWN,
+    HealthDecisionReason.AUDIT_LOCAL_BOOK_DEFECT,
+    HealthDecisionReason.AUDIT_DIVERGENCE_RECONCILIATION_FAILED,
+    HealthDecisionReason.AUDIT_TRIGGER_RECONCILIATION_FAILED,
+    HealthDecisionReason.AUDIT_FAILED,
+    HealthDecisionReason.AUDIT_RACE_BUDGET_EXHAUSTED,
+    HealthDecisionReason.PROTOCOL_DEVIATION,
+    HealthDecisionReason.RAW_RUN_CAP_REACHED,
+    HealthDecisionReason.DISK_HEADROOM_LOW,
+)
+if set(_HEALTH_DECISION_REASON_MASK_ORDER) != set(HealthDecisionReason):
+    raise RuntimeError("health-decision reason mask schema does not cover the finite enum")
+_HEALTH_DECISION_REASON_MASK_INDEX: Final = {
+    reason: index for index, reason in enumerate(_HEALTH_DECISION_REASON_MASK_ORDER)
+}
+
+
+def health_decision_reason_mask(reasons: Iterable[HealthDecisionReason]) -> int:
+    """Encode the finite append-only reason enum as an exact v4 bit mask."""
+
+    mask = 0
+    for reason in reasons:
+        mask |= 1 << _HEALTH_DECISION_REASON_MASK_INDEX[reason]
+    return mask
+
+
+def health_decision_reasons_from_mask(mask: object) -> tuple[HealthDecisionReason, ...]:
+    """Decode one v4 reason mask and reject bits outside the declared schema."""
+
+    if isinstance(mask, bool) or not isinstance(mask, int) or mask < 0:
+        raise ValueError("health-decision reason mask must be a non-negative integer")
+    maximum_mask = (1 << len(_HEALTH_DECISION_REASON_MASK_ORDER)) - 1
+    if mask & ~maximum_mask:
+        raise ValueError("health-decision reason mask contains unknown bits")
+    return tuple(
+        reason
+        for reason, index in _HEALTH_DECISION_REASON_MASK_INDEX.items()
+        if mask & (1 << index)
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class HealthDecisionInputs:
     explicit_target: bool
@@ -113,6 +238,9 @@ class HealthDecisionInputs:
     audit_local_book_defects: int = 0
     audit_divergence_lifecycle_reconciled: bool = True
     audit_trigger_reconciled: bool = True
+    audit_failures_current: int = 0
+    http_final_failures_current: int = 0
+    http_retry_budget_exhaustions_current: int = 0
 
     def __post_init__(self) -> None:
         counts = (
@@ -120,9 +248,12 @@ class HealthDecisionInputs:
             self.journal_backpressure_failures,
             self.audit_mismatches,
             self.audit_failures,
+            self.audit_failures_current,
             self.audit_race_budget_exhaustions,
             self.http_final_failures,
+            self.http_final_failures_current,
             self.http_retry_budget_exhaustions,
+            self.http_retry_budget_exhaustions_current,
             self.protocol_deviations,
             self.raw_run_bytes,
             self.free_disk_bytes,
@@ -220,13 +351,13 @@ def evaluate_health_decision(inputs: HealthDecisionInputs) -> HealthDecision:
         reasons.add(HealthDecisionReason.AUDIT_DIVERGENCE_RECONCILIATION_FAILED)
     if not inputs.audit_trigger_reconciled:
         reasons.add(HealthDecisionReason.AUDIT_TRIGGER_RECONCILIATION_FAILED)
-    if inputs.audit_failures:
+    if inputs.audit_failures or inputs.audit_failures_current:
         reasons.add(HealthDecisionReason.AUDIT_FAILED)
     if inputs.audit_race_budget_exhaustions:
         reasons.add(HealthDecisionReason.AUDIT_RACE_BUDGET_EXHAUSTED)
-    if inputs.http_final_failures:
+    if inputs.http_final_failures or inputs.http_final_failures_current:
         reasons.add(HealthDecisionReason.HTTP_FINAL_FAILURE)
-    if inputs.http_retry_budget_exhaustions:
+    if inputs.http_retry_budget_exhaustions or inputs.http_retry_budget_exhaustions_current:
         reasons.add(HealthDecisionReason.HTTP_INTEGRITY_UNAVAILABLE)
     if inputs.protocol_deviations:
         reasons.add(HealthDecisionReason.PROTOCOL_DEVIATION)
@@ -256,11 +387,9 @@ def evaluate_health_decision(inputs: HealthDecisionInputs) -> HealthDecision:
         HealthDecisionReason.AUDIT_DIVERGENCE_RECONCILIATION_FAILED,
         HealthDecisionReason.AUDIT_TRIGGER_RECONCILIATION_FAILED,
     }
-    # Audit, HTTP, and protocol counters are cumulative evidence, not
-    # current-state flags.
-    # Their typed reasons remain Gate-1-sticky, while current dependent-scope
-    # eligibility is represented by ``all_required_books_healthy`` (including
-    # the processor's audit-ineligible set) and current capture state.
+    # Current recoverable lifecycle state is visible but not sticky. Permanent
+    # or unreconciled state uses the legacy scalar and remains sticky. Cumulative
+    # observations stay in checkpoint evidence and never become state proxies.
     ordered = tuple(sorted(reasons, key=str))
     transient_gate_reasons = {
         HealthDecisionReason.SOCKET_DISCONNECTED,
@@ -268,7 +397,14 @@ def evaluate_health_decision(inputs: HealthDecisionInputs) -> HealthDecision:
         HealthDecisionReason.AUDIT_DIVERGENCE_PENDING,
         HealthDecisionReason.AUDIT_REPLACEMENT_CAPTURE_PENDING,
     }
-    sticky = tuple(sorted(reasons.difference(transient_gate_reasons), key=str))
+    sticky_reasons = reasons.difference(transient_gate_reasons)
+    if inputs.audit_failures == 0:
+        sticky_reasons.discard(HealthDecisionReason.AUDIT_FAILED)
+    if inputs.http_final_failures == 0:
+        sticky_reasons.discard(HealthDecisionReason.HTTP_FINAL_FAILURE)
+    if inputs.http_retry_budget_exhaustions == 0:
+        sticky_reasons.discard(HealthDecisionReason.HTTP_INTEGRITY_UNAVAILABLE)
+    sticky = tuple(sorted(sticky_reasons, key=str))
     capture_healthy = not reasons.intersection(capture_blockers)
     research_eligible = not reasons.intersection(research_blockers)
     gate1_eligible = not reasons and not sticky
@@ -344,6 +480,178 @@ class HealthCheckpoint:
             or self.gate1_sticky_reason_codes
         ):
             raise ValueError("Gate-1 eligibility cannot contradict scoped health decisions")
+        self._validate_v5_journal()
+        journal_healthy = self.journal["healthy"]
+        journal_unhealthy_reason = HealthDecisionReason.JOURNAL_UNHEALTHY in self.reason_codes
+        if journal_healthy == journal_unhealthy_reason:
+            raise ValueError("v5 journal health must agree with the typed health-decision reason")
+
+    def _validate_v5_journal(self) -> None:
+        journal = self.journal
+        if set(journal) != set(_HEALTH_CHECKPOINT_V5_JOURNAL_FIELDS):
+            raise ValueError("v5 health-checkpoint journal contains missing or unsupported fields")
+
+        def integer(name: str) -> int:
+            value = journal[name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"v5 health-checkpoint journal {name} must be non-negative")
+            return value
+
+        def optional_integer(name: str) -> int | None:
+            value = journal[name]
+            if value is None:
+                return None
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"v5 health-checkpoint journal {name} must be null or non-negative"
+                )
+            return value
+
+        integer_names = _HEALTH_CHECKPOINT_V5_JOURNAL_FIELDS - {
+            "durability_watermark_sequence",
+            "failure_type",
+            "healthy",
+            "manifest_durable_watermark_sequence",
+            "run_completion_sha256",
+            "terminal",
+            "verified_watermark_sequence",
+        }
+        values = {name: integer(name) for name in integer_names}
+        healthy = journal["healthy"]
+        failure_type = journal["failure_type"]
+        if not isinstance(healthy, bool):
+            raise ValueError("v5 health-checkpoint journal healthy must be boolean")
+        if failure_type is not None and (not isinstance(failure_type, str) or not failure_type):
+            raise ValueError(
+                "v5 health-checkpoint journal failure_type must be null or non-empty text"
+            )
+        durable = optional_integer("durability_watermark_sequence")
+        manifest = optional_integer("manifest_durable_watermark_sequence")
+        verified = optional_integer("verified_watermark_sequence")
+        terminal = journal["terminal"]
+        completion_sha256 = journal["run_completion_sha256"]
+        if not isinstance(terminal, bool):
+            raise ValueError("v5 health-checkpoint journal terminal must be boolean")
+        if completion_sha256 is not None and (
+            not isinstance(completion_sha256, str)
+            or len(completion_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in completion_sha256)
+        ):
+            raise ValueError(
+                "v5 health-checkpoint journal completion identity must be null or SHA-256 hex"
+            )
+        if not terminal and completion_sha256 is not None:
+            raise ValueError("periodic v5 journal evidence cannot claim run completion")
+        if manifest is not None and (durable is None or manifest > durable):
+            raise ValueError("v5 journal manifest watermark exceeds durable watermark")
+        if verified is not None and (manifest is None or verified > manifest):
+            raise ValueError("v5 journal verified watermark exceeds manifest watermark")
+        if not (
+            values["source_partial_removed_transitions"]
+            <= values["verified_transitions"]
+            <= values["manifest_durable_transitions"]
+            <= values["sealed_bytes_durable_transitions"]
+            <= values["seal_jobs_started"]
+            <= values["segment_handoffs"]
+        ):
+            raise ValueError("v5 journal lifecycle transition counts are out of order")
+        positive_capacities = (
+            "queue_capacity",
+            "seal_queue_capacity",
+            "maximum_unverified_segments",
+            "maximum_pending_uncompressed_bytes",
+            "maximum_pending_seal_age_nanoseconds",
+            "maximum_active_seal_jobs",
+            "maximum_segment_events",
+            "maximum_segment_uncompressed_bytes",
+        )
+        if any(values[name] <= 0 for name in positive_capacities):
+            raise ValueError("v5 journal configured capacities must be positive")
+        if (
+            values["queue_depth"] > values["queue_capacity"]
+            or not values["queue_depth"] <= values["queue_high_water"] <= values["queue_capacity"]
+            or values["seal_queue_depth"] > values["seal_queue_capacity"]
+            or not values["seal_queue_depth"]
+            <= values["seal_queue_high_water"]
+            <= values["seal_queue_capacity"]
+            or values["pending_segments"] > values["seal_queue_capacity"]
+            or not values["pending_segments"]
+            <= values["pending_segments_high_water"]
+            <= values["seal_queue_capacity"]
+            or values["total_unverified_segments"] > values["maximum_unverified_segments"]
+            or values["total_unverified_segments"] != values["pending_segments"]
+            or values["maximum_unverified_segments"] != values["seal_queue_capacity"]
+            or values["pending_uncompressed_bytes"] > values["maximum_pending_uncompressed_bytes"]
+            or not values["pending_uncompressed_bytes"]
+            <= values["pending_uncompressed_bytes_high_water"]
+            <= values["maximum_pending_uncompressed_bytes"]
+            or values["active_seal_jobs"] > values["maximum_active_seal_jobs"]
+            or not values["active_seal_jobs"]
+            <= values["active_seal_jobs_high_water"]
+            <= values["maximum_active_seal_jobs"]
+            or values["active_seal_jobs"] > values["pending_segments"]
+            or values["seal_queue_depth"] + values["active_seal_jobs"] > values["pending_segments"]
+            or values["active_segment_events"] > values["maximum_segment_events"]
+            or values["active_segment_uncompressed_bytes"]
+            > values["maximum_segment_uncompressed_bytes"]
+            or (values["active_segment_events"] == 0)
+            != (values["active_segment_uncompressed_bytes"] == 0)
+            or (values["pending_segments"] == 0) != (values["pending_uncompressed_bytes"] == 0)
+            or (
+                values["pending_segments"] == 0
+                and values["oldest_pending_seal_age_nanoseconds"] != 0
+            )
+            or values["durability_group_size_high_water"] > values["queue_capacity"]
+        ):
+            raise ValueError("v5 journal current ownership exceeds configured bounds")
+        if (
+            values["segment_handoffs"]
+            != values["source_partial_removed_transitions"] + values["pending_segments"]
+        ):
+            raise ValueError("v5 journal current ownership differs from lifecycle history")
+        if (values["manifest_durable_transitions"] == 0) != (manifest is None):
+            raise ValueError("v5 journal manifest watermark lacks its lifecycle transition")
+        if (values["verified_transitions"] == 0) != (verified is None):
+            raise ValueError("v5 journal verified watermark lacks its lifecycle transition")
+        age_exhausted = (
+            values["pending_segments"] > 0
+            and values["maximum_pending_seal_age_nanoseconds"] > 0
+            and values["oldest_pending_seal_age_nanoseconds"]
+            >= values["maximum_pending_seal_age_nanoseconds"]
+        )
+        if healthy and (
+            failure_type is not None
+            or values["writer_failures"]
+            or values["sealer_failures"]
+            or values["backpressure_failures"]
+            or values["seal_backpressure_failures"]
+            or values["append_owner_seal_wait_nanoseconds"]
+            or age_exhausted
+            or (
+                terminal
+                and (
+                    completion_sha256 is None
+                    or values["queue_depth"] != 0
+                    or values["seal_queue_depth"] != 0
+                    or values["pending_segments"] != 0
+                    or values["total_unverified_segments"] != 0
+                    or values["pending_uncompressed_bytes"] != 0
+                    or values["active_seal_jobs"] != 0
+                    or values["active_segment_events"] != 0
+                    or values["active_segment_uncompressed_bytes"] != 0
+                    or durable != manifest
+                    or manifest != verified
+                    or not (
+                        values["source_partial_removed_transitions"]
+                        == values["verified_transitions"]
+                        == values["manifest_durable_transitions"]
+                        == values["sealed_bytes_durable_transitions"]
+                        == values["segment_handoffs"]
+                    )
+                )
+            )
+        ):
+            raise ValueError("v5 journal healthy state contradicts failure evidence")
 
     def to_record(self) -> dict[str, object]:
         return {
@@ -356,8 +664,11 @@ class HealthCheckpoint:
             "decisions": {
                 "capture_healthy": self.capture_healthy,
                 "gate1_eligible_so_far": self.gate1_eligible_so_far,
-                "gate1_sticky_reason_codes": self.gate1_sticky_reason_codes,
-                "reason_codes": self.reason_codes,
+                "gate1_sticky_reason_mask": health_decision_reason_mask(
+                    self.gate1_sticky_reason_codes
+                ),
+                "reason_mask": health_decision_reason_mask(self.reason_codes),
+                "reason_mask_schema": HEALTH_DECISION_REASON_MASK_SCHEMA,
                 "research_eligible": self.research_eligible,
             },
             "emitted_at_utc_ns": self.emitted_at.nanoseconds_since_epoch,
@@ -405,6 +716,8 @@ class HealthEvidenceSummary:
     file_bytes: int
     content_sha256: str | None
     failure_type: str | None
+    terminal_accepted: int = 0
+    terminal_written: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -429,7 +742,7 @@ def _record_integer(record: Mapping[str, object], key: str) -> int:
 def validate_health_checkpoint_chronology(
     records: Iterable[Mapping[str, object]],
 ) -> HealthCheckpointChronology:
-    """Validate v2/v3 monotonic chronology without inventing timestamps for v1.
+    """Validate v2-v5 monotonic chronology without inventing timestamps for v1.
 
     Historical v1 files remain readable evidence, but their omitted monotonic
     emission timestamps are reported as unavailable and cannot satisfy the v2
@@ -462,6 +775,8 @@ def validate_health_checkpoint_chronology(
         )
     if version not in {
         HEALTH_CHECKPOINT_V2_SCHEMA_VERSION,
+        HEALTH_CHECKPOINT_V3_SCHEMA_VERSION,
+        HEALTH_CHECKPOINT_V4_SCHEMA_VERSION,
         HEALTH_CHECKPOINT_SCHEMA_VERSION,
     }:
         raise ValueError("unsupported health-checkpoint schema version")
@@ -537,6 +852,8 @@ class SupervisedHealthCheckpointWriter:
         self._descriptor: int | None = None
         self._file_identity: tuple[int, int] | None = None
         self._last_accepted_monotonic_ns: int | None = None
+        self._terminal_accepted = 0
+        self._terminal_written = 0
 
     async def start(self) -> None:
         if self._task is not None or self._closed:
@@ -572,6 +889,13 @@ class SupervisedHealthCheckpointWriter:
         if self._closed or not self._healthy:
             self._rejected += 1
             return False
+        terminal = checkpoint.journal["terminal"] is True
+        if self._terminal_accepted:
+            self._rejected += 1
+            self._degrade(
+                RuntimeError("health-checkpoint admission attempted after terminal evidence")
+            )
+            return False
         previous_ns = self._last_accepted_monotonic_ns
         if previous_ns is not None and checkpoint.emitted_monotonic.nanoseconds <= previous_ns:
             self._rejected += 1
@@ -584,6 +908,8 @@ class SupervisedHealthCheckpointWriter:
             self._degrade(RuntimeError("health-checkpoint queue saturated"))
             return False
         self._accepted += 1
+        if terminal:
+            self._terminal_accepted += 1
         self._last_accepted_monotonic_ns = checkpoint.emitted_monotonic.nanoseconds
         self._queue_high_water = max(self._queue_high_water, self._queue.qsize())
         return True
@@ -676,6 +1002,8 @@ class SupervisedHealthCheckpointWriter:
             try:
                 line = await asyncio.to_thread(self._line, command)
                 await asyncio.to_thread(self._append_line, line)
+                if command.journal["terminal"] is True:
+                    self._terminal_written += 1
             except BaseException as error:
                 if isinstance(error, (KeyboardInterrupt, SystemExit)):
                     raise
@@ -728,7 +1056,13 @@ class SupervisedHealthCheckpointWriter:
             collector_run_id=self._collector_run_id,
             path=published_path,
             completed=completed and self._healthy,
-            gate1_evidence_eligible=completed and self._healthy and self._written > 0,
+            gate1_evidence_eligible=(
+                completed
+                and self._healthy
+                and self._terminal_accepted == 1
+                and self._terminal_written == 1
+                and self._written == self._accepted
+            ),
             accepted=self._accepted,
             written=self._written,
             rejected=self._rejected,
@@ -736,6 +1070,8 @@ class SupervisedHealthCheckpointWriter:
             file_bytes=self._file_bytes,
             content_sha256=content_sha256,
             failure_type=self._failure_type,
+            terminal_accepted=self._terminal_accepted,
+            terminal_written=self._terminal_written,
         )
 
     @staticmethod
@@ -791,11 +1127,15 @@ class PeriodicHealthCheckpointEmitter:
 
         if self._closed or self._terminal_emission_attempted:
             return False
-        return self._build_and_enqueue()
+        return self._build_and_enqueue(terminal=False)
 
-    def _build_and_enqueue(self) -> bool:
+    def _build_and_enqueue(self, *, terminal: bool) -> bool:
         try:
             checkpoint = self._build()
+            if (checkpoint.journal["terminal"] is True) != terminal:
+                raise RuntimeError(
+                    "health-checkpoint producer built the wrong terminal discriminator"
+                )
         except BaseException as error:
             self._writer.record_failure(error)
             return False
@@ -840,7 +1180,7 @@ class PeriodicHealthCheckpointEmitter:
         if self._terminal_emission_attempted:
             raise RuntimeError("terminal health checkpoint was already attempted")
         self._terminal_emission_attempted = True
-        return self._build_and_enqueue()
+        return self._build_and_enqueue(terminal=True)
 
     async def close(self, *, completed: bool) -> HealthEvidenceSummary:
         if self._closed:
@@ -858,7 +1198,7 @@ class PeriodicHealthCheckpointEmitter:
             # Preserve the legacy close-time final checkpoint for callers that
             # did not explicitly seal a terminal capture boundary.
             self._closed = False
-            self._build_and_enqueue()
+            self._build_and_enqueue(terminal=True)
             self._closed = True
         return await self._writer.close(completed=completed)
 
@@ -867,6 +1207,9 @@ __all__ = [
     "HEALTH_CHECKPOINT_SCHEMA_VERSION",
     "HEALTH_CHECKPOINT_V1_SCHEMA_VERSION",
     "HEALTH_CHECKPOINT_V2_SCHEMA_VERSION",
+    "HEALTH_CHECKPOINT_V3_SCHEMA_VERSION",
+    "HEALTH_CHECKPOINT_V4_SCHEMA_VERSION",
+    "HEALTH_DECISION_REASON_MASK_SCHEMA",
     "HEALTH_EVIDENCE_SUMMARY_VERSION",
     "HealthCheckpoint",
     "HealthCheckpointChronology",
@@ -878,5 +1221,7 @@ __all__ = [
     "PeriodicHealthCheckpointEmitter",
     "SupervisedHealthCheckpointWriter",
     "evaluate_health_decision",
+    "health_decision_reason_mask",
+    "health_decision_reasons_from_mask",
     "validate_health_checkpoint_chronology",
 ]

@@ -108,6 +108,7 @@ class _CaptureFixture:
     def __init__(self, processor: _ProcessorFixture) -> None:
         self.processor = processor
         self.channels: list[str] = []
+        self.received_moments: list[tuple[UtcTimestamp, int]] = []
         self._books = 0
 
     async def preserve_then_process(
@@ -117,8 +118,14 @@ class _CaptureFixture:
         payload: bytes,
         transport_type: str,
         semantics_hash: str,
+        received_wall_time: UtcTimestamp | None = None,
+        received_monotonic_ns: int | None = None,
     ) -> ProcessedEnvelope:
         del transport_type, semantics_hash
+        if (received_wall_time is None) != (received_monotonic_ns is None):
+            raise AssertionError("fixture received an unpaired public-read return moment")
+        if received_wall_time is not None and received_monotonic_ns is not None:
+            self.received_moments.append((received_wall_time, received_monotonic_ns))
         self.channels.append(channel)
         if channel == GAMMA_MARKETS_KEYSET:
             self.processor.discovered_markets = parse_gamma_markets(payload).markets
@@ -334,6 +341,8 @@ async def test_explicit_bootstrap_never_discovers_and_binds_canonical_target(
         REST_BOOK,
         REST_BOOK,
     ]
+    assert len(capture.received_moments) == len(capture.channels)
+    assert all(monotonic_ns > 0 for _wall_time, monotonic_ns in capture.received_moments)
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,9 @@ journal_run_max_uncompressed_bytes = 4294967296
 journal_submit_timeout_seconds = 5.0
 journal_group_commit_max_events = 16
 journal_group_commit_max_delay_seconds = 0.0
+journal_seal_queue_capacity = 4
+journal_pending_seal_max_uncompressed_bytes = 268435456
+journal_pending_seal_max_age_seconds = 120.0
 parquet_batch_size = 1000
 analytical_queue_capacity = 1024
 analytical_record_max_bytes = 8388608
@@ -34,6 +37,13 @@ heartbeat_interval_seconds = 10.0
 reconnect_initial_seconds = 1.0
 reconnect_max_seconds = 15.0
 max_reconnect_attempts = 8
+# One initial post-resolution generation plus the eight reconnects above.
+audit_replacement_maximum_attempts = 9
+# Replacement supervision uses one fixed existing five-second freshness window;
+# transport reconnection retains its separate exponential backoff policy above.
+audit_replacement_retry_delay_seconds = 5.0
+# 75 seconds of configured reconnect sleeps plus nine five-second capture windows.
+audit_replacement_hard_deadline_seconds = 120.0
 maximum_http_response_bytes = 8388608
 maximum_websocket_message_bytes = 1048576
 maximum_ingress_queue_bytes = 67108864
@@ -70,10 +80,14 @@ maximum_capacity_evaluations = 4096
 checkpoint_interval_seconds = 10.0
 queue_capacity = 64
 maximum_checkpoints = 8192
-maximum_file_bytes = 67108864
+maximum_file_bytes = 71303168
 availability_queue_capacity = 64
 maximum_availability_intervals = 8192
 maximum_availability_file_bytes = 67108864
+availability_contribution_queue_capacity = 1024
+maximum_availability_contributions = 65536
+maximum_availability_contribution_file_bytes = 268435456
+maximum_availability_record_bytes = 65536
 minimum_free_disk_bytes = 1073741824
 
 [replay]

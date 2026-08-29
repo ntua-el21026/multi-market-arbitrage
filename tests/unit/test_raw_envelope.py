@@ -62,6 +62,7 @@ def test_raw_envelope_round_trip_preserves_arbitrary_bytes() -> None:
     assert restored.payload_bytes == payload
     assert restored.payload_sha256 == hashlib.sha256(payload).hexdigest()
     assert restored.to_json_line() == envelope.to_json_line()
+    assert RawEventEnvelope.from_json_line(envelope.to_json_line()[:-1]) == envelope
 
 
 def test_raw_envelope_round_trip_preserves_empty_payload() -> None:
@@ -88,6 +89,53 @@ def test_serialization_is_deterministic_for_metadata_insertion_order() -> None:
 def test_unallowlisted_transport_metadata_fails_closed() -> None:
     with pytest.raises(RawEnvelopeValidationError, match="not allowlisted"):
         make_envelope(metadata={"authorization": "Bearer secret"})
+
+
+def test_raw_envelope_rejects_boolean_ingest_sequence() -> None:
+    with pytest.raises(RawEnvelopeValidationError, match="ingest_seq must be an integer"):
+        make_envelope(sequence=cast(int, True))
+
+
+@pytest.mark.parametrize(
+    "metadata_key",
+    [
+        "classification_prepare_durable_monotonic_ns",
+        "classification_prepare_processed_monotonic_ns",
+    ],
+)
+def test_prepare_attestation_metadata_requires_exact_nonnegative_integer(
+    metadata_key: str,
+) -> None:
+    with pytest.raises(RawEnvelopeValidationError, match="must be an integer"):
+        make_envelope(metadata={metadata_key: True})
+    with pytest.raises(RawEnvelopeValidationError, match="must be >= 0"):
+        make_envelope(metadata={metadata_key: -1})
+
+
+def test_raw_envelope_json_decode_rejects_duplicate_object_keys() -> None:
+    canonical = make_envelope().to_json_line()
+    duplicate_top_level = canonical.replace(
+        b'"ingest_seq":7,',
+        b'"ingest_seq":7,"ingest_seq":7,',
+        1,
+    )
+    duplicate_nested = canonical.replace(
+        b'"transport_metadata_allowlist":{',
+        b'"transport_metadata_allowlist":{"compression":"duplicate",',
+        1,
+    )
+
+    for line in (duplicate_top_level, duplicate_nested):
+        with pytest.raises(RawEnvelopeValidationError, match="duplicate JSON object key"):
+            RawEventEnvelope.from_json_line(line)
+
+
+def test_raw_envelope_json_decode_rejects_noncanonical_line() -> None:
+    canonical = make_envelope().to_json_line()
+    noncanonical = canonical.replace(b"{", b"{ ", 1)
+
+    with pytest.raises(RawEnvelopeValidationError, match="canonical JSON encoding"):
+        RawEventEnvelope.from_json_line(noncanonical)
 
 
 def test_tampered_payload_is_detected_during_decode() -> None:

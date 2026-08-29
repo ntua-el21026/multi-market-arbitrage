@@ -4,20 +4,33 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import math
 import os
 import platform
-import resource
 import shutil
+import stat
 import subprocess
 import sys
 import time
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import cast
 
 from multi_market_arbitrage.core.config import Phase1Config
-from multi_market_arbitrage.observability import HistogramSnapshot, MetricKey, MetricsSnapshot
+from multi_market_arbitrage.core.ids import is_sha256_hex
+from multi_market_arbitrage.core.serialization import canonical_json_bytes
+from multi_market_arbitrage.observability import (
+    HEALTH_CHECKPOINT_SCHEMA_VERSION,
+    HEALTH_DECISION_REASON_MASK_SCHEMA,
+    HistogramSnapshot,
+    MetricKey,
+    MetricsSnapshot,
+    health_decision_reasons_from_mask,
+)
 from multi_market_arbitrage.research import (
     STDIO_STREAM_LOG_STORAGE_MODEL,
     BoundedTreeUsage,
@@ -36,6 +49,16 @@ from multi_market_arbitrage.research import (
     write_calibration_artifacts,
 )
 
+from .health import (
+    AUDIT_STAGE_TIMING_TELEMETRY_HISTOGRAM_FIELDS,
+    AUDIT_STAGE_TIMING_TELEMETRY_SCHEMA,
+    AUDIT_STAGE_TIMING_TELEMETRY_STAGES,
+    COMPOSITE_PEAK_RSS_SOURCE,
+    DARWIN_PYTHON_RU_MAXRSS_SOURCE,
+    LINUX_CURRENT_RSS_SOURCE,
+    LINUX_CURRENT_RSS_UNAVAILABLE_SOURCES,
+    LINUX_PYTHON_RU_MAXRSS_SOURCE,
+)
 from .observe import ObservationSummary, PolymarketObservationService
 
 
@@ -57,6 +80,274 @@ class _CalibrationPreparation:
     storage_before: BoundedTreeUsage
     analytical_before: BoundedTreeUsage
     environment: CalibrationEnvironment
+
+
+@dataclass(frozen=True, slots=True)
+class _HealthCheckpointSizes:
+    periodic_count: int
+    terminal_count: int
+    maximum_periodic_bytes: int
+    maximum_terminal_bytes: int
+    total_bytes: int
+    content_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedAuditStageHistogram:
+    maximum: float | None
+    minimum: float | None
+    p50: float | None
+    p95: float | None
+    p99: float | None
+    sample_count: int
+    total_count: int
+    total_sum: float
+
+
+_HEALTH_V5_TOP_LEVEL_FIELDS = frozenset(
+    {
+        "analytical",
+        "audit",
+        "books",
+        "capture",
+        "collector_run_id",
+        "config_hash",
+        "decisions",
+        "emitted_at_utc_ns",
+        "emitted_monotonic_epoch_id",
+        "emitted_monotonic_ns",
+        "git_commit",
+        "http",
+        "identity",
+        "ingress",
+        "journal",
+        "recovery",
+        "resources",
+        "scanner",
+        "schema_version",
+        "target",
+    }
+)
+_HEALTH_V5_MAPPING_FIELDS = frozenset(
+    {
+        "analytical",
+        "audit",
+        "capture",
+        "decisions",
+        "http",
+        "identity",
+        "ingress",
+        "journal",
+        "recovery",
+        "resources",
+        "scanner",
+        "target",
+    }
+)
+_HEALTH_V5_DECISION_FIELDS = frozenset(
+    {
+        "capture_healthy",
+        "gate1_eligible_so_far",
+        "gate1_sticky_reason_mask",
+        "reason_mask",
+        "reason_mask_schema",
+        "research_eligible",
+    }
+)
+_HEALTH_V5_CURRENT_RSS_FIELDS = frozenset(
+    {
+        "current_rss_bytes",
+        "current_rss_source",
+        "peak_rss_bytes",
+        "peak_rss_source",
+        "python_ru_maxrss_bytes",
+        "python_ru_maxrss_source",
+    }
+)
+_HEALTH_V5_NEW_RSS_FIELDS = frozenset(
+    {
+        "peak_rss_source",
+        "python_ru_maxrss_bytes",
+        "python_ru_maxrss_source",
+    }
+)
+HEALTH_V5_CURRENT_RSS_SEMANTICS = "current-composite-peak-and-explicit-python-ru-maxrss"
+HEALTH_V5_LEGACY_RSS_SEMANTICS = "legacy-peak-rss-is-python-ru-maxrss"
+
+_AUDIT_STAGE_INDEX = {
+    stage: index for index, (stage, _metric_name) in enumerate(AUDIT_STAGE_TIMING_TELEMETRY_STAGES)
+}
+_AUDIT_CLASSIFICATION_PIPELINE_STAGES = (
+    "barrier_wait",
+    "raw_durability",
+    "raw_response_durable_to_processed",
+    "raw_response_processing",
+    "prepare_construction",
+    "prepare_durability",
+    "prepare_durable_to_processed",
+    "prepare_processing",
+    "response_to_prepare_decision",
+    "attestation_durability",
+    "attestation_durable_to_processed",
+    "attestation_processing",
+    "response_to_attestation",
+    "legacy_total_response_to_classification",
+)
+_AUDIT_CUMULATIVE_RESPONSE_STAGES = (
+    "response_to_prepare_decision",
+    "response_to_attestation",
+    "legacy_total_response_to_classification",
+)
+
+if len(_AUDIT_STAGE_INDEX) != len(AUDIT_STAGE_TIMING_TELEMETRY_STAGES):
+    raise RuntimeError("audit-stage timing schema contains a duplicate stage")
+if not set(_AUDIT_CLASSIFICATION_PIPELINE_STAGES).issubset(_AUDIT_STAGE_INDEX):
+    raise RuntimeError("audit-stage timing schema omits required classification stages")
+
+
+def _finite_nonnegative_number(value: object, *, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise RuntimeError(f"calibration audit-stage {field} is not numeric")
+    converted = float(value)
+    if not math.isfinite(converted) or converted < 0:
+        raise RuntimeError(f"calibration audit-stage {field} is not finite and non-negative")
+    return converted
+
+
+def _validate_audit_stage_histogram_row(
+    row: object,
+    *,
+    stage: str,
+) -> _ValidatedAuditStageHistogram:
+    if not isinstance(row, list):
+        raise RuntimeError("calibration audit-stage timing row shape is invalid")
+    raw_row = cast(list[object], row)
+    if len(raw_row) != len(AUDIT_STAGE_TIMING_TELEMETRY_HISTOGRAM_FIELDS):
+        raise RuntimeError("calibration audit-stage timing row shape is invalid")
+    values: dict[str, object] = dict(
+        zip(AUDIT_STAGE_TIMING_TELEMETRY_HISTOGRAM_FIELDS, raw_row, strict=True)
+    )
+    sample_count = values["sample_count"]
+    total_count = values["total_count"]
+    if (
+        isinstance(sample_count, bool)
+        or not isinstance(sample_count, int)
+        or sample_count < 0
+        or isinstance(total_count, bool)
+        or not isinstance(total_count, int)
+        or total_count < sample_count
+    ):
+        raise RuntimeError("calibration audit-stage histogram counts are invalid")
+    total_sum = _finite_nonnegative_number(
+        values["total_sum"],
+        field=f"{stage} total_sum",
+    )
+    quantile_names = ("minimum", "p50", "p95", "p99", "maximum")
+    raw_quantiles: tuple[object, ...] = tuple(values[name] for name in quantile_names)
+    if sample_count == 0:
+        if total_count != 0 or total_sum != 0 or any(value is not None for value in raw_quantiles):
+            raise RuntimeError("calibration empty audit-stage histogram is inconsistent")
+        quantiles: tuple[float | None, ...] = (None, None, None, None, None)
+    else:
+        if total_count == 0 or any(value is None for value in raw_quantiles):
+            raise RuntimeError("calibration populated audit-stage histogram is incomplete")
+        populated = tuple(
+            _finite_nonnegative_number(value, field=f"{stage} {name}")
+            for name, value in zip(quantile_names, raw_quantiles, strict=True)
+        )
+        if tuple(sorted(populated)) != populated:
+            raise RuntimeError("calibration audit-stage histogram quantiles are unordered")
+        quantiles = populated
+    minimum, p50, p95, p99, maximum = quantiles
+    return _ValidatedAuditStageHistogram(
+        maximum=maximum,
+        minimum=minimum,
+        p50=p50,
+        p95=p95,
+        p99=p99,
+        sample_count=sample_count,
+        total_count=total_count,
+        total_sum=total_sum,
+    )
+
+
+def _validate_health_v5_audit_stage_timing(
+    audit: dict[str, object],
+    *,
+    previous: tuple[_ValidatedAuditStageHistogram, ...] | None,
+    terminal: bool,
+) -> tuple[_ValidatedAuditStageHistogram, ...]:
+    table_value = audit.get("stage_timing_nanoseconds")
+    if not isinstance(table_value, dict):
+        raise RuntimeError("calibration health-v5 audit-stage timing table is missing or malformed")
+    table = cast(dict[object, object], table_value)
+    if set(table) != {"rows", "schema"}:
+        raise RuntimeError("calibration health-v5 audit-stage timing table is missing or malformed")
+    if table.get("schema") != AUDIT_STAGE_TIMING_TELEMETRY_SCHEMA:
+        raise RuntimeError("calibration health-v5 audit-stage timing schema differs")
+    raw_rows_value = table.get("rows")
+    if not isinstance(raw_rows_value, list):
+        raise RuntimeError("calibration health-v5 audit-stage timing row inventory differs")
+    raw_rows = cast(list[object], raw_rows_value)
+    if len(raw_rows) != len(AUDIT_STAGE_TIMING_TELEMETRY_STAGES):
+        raise RuntimeError("calibration health-v5 audit-stage timing row inventory differs")
+    rows = tuple(
+        _validate_audit_stage_histogram_row(row, stage=stage)
+        for row, (stage, _metric_name) in zip(
+            raw_rows,
+            AUDIT_STAGE_TIMING_TELEMETRY_STAGES,
+            strict=True,
+        )
+    )
+    if previous is not None:
+        for prior, current in zip(previous, rows, strict=True):
+            if (
+                current.sample_count < prior.sample_count
+                or current.total_count < prior.total_count
+                or current.total_sum < prior.total_sum
+            ):
+                raise RuntimeError("calibration audit-stage cumulative histogram regressed")
+            if prior.minimum is not None and (
+                current.minimum is None or current.minimum > prior.minimum
+            ):
+                raise RuntimeError("calibration audit-stage cumulative minimum regressed")
+            if prior.maximum is not None and (
+                current.maximum is None or current.maximum < prior.maximum
+            ):
+                raise RuntimeError("calibration audit-stage cumulative maximum regressed")
+            if current.total_count == prior.total_count and current != prior:
+                raise RuntimeError("calibration unchanged audit-stage count changed its histogram")
+    if not terminal:
+        return rows
+
+    pipeline = tuple(
+        rows[_AUDIT_STAGE_INDEX[stage]] for stage in _AUDIT_CLASSIFICATION_PIPELINE_STAGES
+    )
+    required_count = pipeline[0].total_count
+    if required_count <= 0:
+        raise RuntimeError("calibration terminal audit-stage timing lacks required samples")
+    if any(row.total_count != required_count for row in pipeline):
+        raise RuntimeError("calibration terminal audit-stage timing counts do not reconcile")
+    prepare, attestation, legacy = tuple(
+        rows[_AUDIT_STAGE_INDEX[stage]] for stage in _AUDIT_CUMULATIVE_RESPONSE_STAGES
+    )
+    if not prepare.total_sum < attestation.total_sum <= legacy.total_sum:
+        raise RuntimeError("calibration cumulative audit-stage timing totals are not distinct")
+    for field in ("minimum", "p50", "p95", "p99", "maximum", "total_sum"):
+        prepare_value = getattr(prepare, field)
+        attestation_value = getattr(attestation, field)
+        legacy_value = getattr(legacy, field)
+        if (
+            prepare_value is None
+            or attestation_value is None
+            or legacy_value is None
+            or not prepare_value <= attestation_value <= legacy_value
+        ):
+            raise RuntimeError("calibration cumulative audit-stage timing order is invalid")
+    network = rows[_AUDIT_STAGE_INDEX["network"]]
+    if network.total_count < required_count:
+        raise RuntimeError("calibration audit-stage network count is below classified responses")
+    return rows
 
 
 def _sha256_file(path: Path) -> str:
@@ -316,6 +607,319 @@ def _delta(after: BoundedTreeUsage, before: BoundedTreeUsage) -> BoundedTreeUsag
     )
 
 
+def _duration_nanoseconds(duration_seconds: float) -> int:
+    value = Decimal(str(duration_seconds)) * Decimal(1_000_000_000)
+    integral = value.to_integral_value()
+    if value != integral or integral <= 0:
+        raise ValueError("calibration duration must resolve to positive whole nanoseconds")
+    return int(integral)
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _health_v5_rss_semantics(
+    resources: Mapping[str, object],
+    *,
+    require_current_contract: bool,
+) -> str:
+    """Classify legacy v5 RSS evidence or validate the current exact contract."""
+
+    present_new_fields = _HEALTH_V5_NEW_RSS_FIELDS.intersection(resources)
+    if not present_new_fields:
+        legacy_fields = {"current_rss_bytes", "current_rss_source", "peak_rss_bytes"}
+        if not legacy_fields.issubset(resources):
+            raise RuntimeError("health-v5 RSS evidence is incomplete")
+        legacy_current = resources["current_rss_bytes"]
+        legacy_peak = resources["peak_rss_bytes"]
+        legacy_current_source = resources["current_rss_source"]
+        if (
+            (
+                legacy_current is not None
+                and (
+                    isinstance(legacy_current, bool)
+                    or not isinstance(legacy_current, int)
+                    or legacy_current < 0
+                )
+            )
+            or isinstance(legacy_peak, bool)
+            or not isinstance(legacy_peak, int)
+            or legacy_peak < 0
+            or not isinstance(legacy_current_source, str)
+            or not legacy_current_source
+        ):
+            raise RuntimeError("legacy health-v5 RSS evidence is malformed")
+        if require_current_contract:
+            raise RuntimeError("current exact health-v5 RSS source fields are missing")
+        return HEALTH_V5_LEGACY_RSS_SEMANTICS
+    if present_new_fields != _HEALTH_V5_NEW_RSS_FIELDS or not (
+        _HEALTH_V5_CURRENT_RSS_FIELDS.issubset(resources)
+    ):
+        raise RuntimeError("health-v5 RSS evidence mixes legacy and current fields")
+
+    current_rss = resources["current_rss_bytes"]
+    peak_rss = resources["peak_rss_bytes"]
+    python_ru_maxrss = resources["python_ru_maxrss_bytes"]
+    if current_rss is not None and (
+        isinstance(current_rss, bool) or not isinstance(current_rss, int) or current_rss < 0
+    ):
+        raise RuntimeError("health-v5 current RSS value is malformed")
+    if (
+        isinstance(peak_rss, bool)
+        or not isinstance(peak_rss, int)
+        or peak_rss < 0
+        or isinstance(python_ru_maxrss, bool)
+        or not isinstance(python_ru_maxrss, int)
+        or python_ru_maxrss < 0
+    ):
+        raise RuntimeError("health-v5 peak or Python ru_maxrss value is malformed")
+    expected_peak_rss = max(python_ru_maxrss, current_rss or 0)
+    if peak_rss != expected_peak_rss:
+        raise RuntimeError("health-v5 composite peak RSS is incoherent")
+    current_rss_source = resources["current_rss_source"]
+    peak_rss_source = resources["peak_rss_source"]
+    python_ru_maxrss_source = resources["python_ru_maxrss_source"]
+    source_fields = (current_rss_source, peak_rss_source, python_ru_maxrss_source)
+    if any(
+        not isinstance(source, str) or not source or len(source.encode("utf-8")) > 256
+        for source in source_fields
+    ):
+        raise RuntimeError("health-v5 RSS source is malformed")
+    if peak_rss_source != COMPOSITE_PEAK_RSS_SOURCE:
+        raise RuntimeError("health-v5 composite peak RSS source differs")
+    if python_ru_maxrss_source == LINUX_PYTHON_RU_MAXRSS_SOURCE:
+        if current_rss is None:
+            if current_rss_source not in LINUX_CURRENT_RSS_UNAVAILABLE_SOURCES:
+                raise RuntimeError("health-v5 Linux current RSS source/value differs")
+        elif current_rss_source != LINUX_CURRENT_RSS_SOURCE:
+            raise RuntimeError("health-v5 Linux current RSS source/value differs")
+    elif python_ru_maxrss_source == DARWIN_PYTHON_RU_MAXRSS_SOURCE:
+        if current_rss is not None or current_rss_source != "UNAVAILABLE_PLATFORM:darwin":
+            raise RuntimeError("health-v5 Darwin current RSS source/value differs")
+    else:
+        raise RuntimeError("health-v5 Python ru_maxrss source differs")
+    if require_current_contract and python_ru_maxrss_source != LINUX_PYTHON_RU_MAXRSS_SOURCE:
+        raise RuntimeError("current exact health-v5 qualification requires Linux RSS sources")
+    return HEALTH_V5_CURRENT_RSS_SEMANTICS
+
+
+def _health_checkpoint_sizes(
+    path: Path,
+    *,
+    expected_bytes: int,
+    expected_records: int,
+    expected_terminal_records: int,
+    expected_collector_run_id: str,
+    expected_content_sha256: str | None,
+    expected_git_commit: str,
+    expected_config_hash: str,
+    expected_code_version: str,
+    expected_runtime_role: str,
+    expected_target: dict[str, object],
+    expected_terminal_utc_ns: int,
+) -> _HealthCheckpointSizes:
+    """Measure the completed health JSONL without projecting terminal bytes as periodic."""
+
+    if expected_content_sha256 is None or not is_sha256_hex(expected_content_sha256):
+        raise RuntimeError("calibration health evidence lacks its writer SHA-256 identity")
+    periodic_count = 0
+    terminal_count = 0
+    maximum_periodic_bytes = 0
+    maximum_terminal_bytes = 0
+    total_bytes = 0
+    terminal_seen = False
+    previous_monotonic_ns: int | None = None
+    previous_audit_stage_timing: tuple[_ValidatedAuditStageHistogram, ...] | None = None
+    digest = hashlib.sha256()
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise RuntimeError(
+            "calibration health evidence cannot be opened without following"
+        ) from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise RuntimeError("calibration health evidence file identity is invalid")
+        path_before = os.stat(path, follow_symlinks=False)
+        descriptor_identity = (before.st_dev, before.st_ino)
+        if descriptor_identity != (path_before.st_dev, path_before.st_ino):
+            raise RuntimeError("calibration health evidence path identity differs")
+        if before.st_size != expected_bytes:
+            raise RuntimeError("calibration health byte inventory does not reconcile")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            for line in stream:
+                digest.update(line)
+                if terminal_seen:
+                    raise RuntimeError("calibration terminal health record is not last")
+                if not line or not line.endswith(b"\n"):
+                    raise RuntimeError("calibration health evidence contains an incomplete record")
+                try:
+                    parsed = json.loads(line, object_pairs_hook=_reject_duplicate_json_keys)
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+                    raise RuntimeError("calibration health evidence is malformed") from error
+                if not isinstance(parsed, dict):
+                    raise RuntimeError("calibration health evidence record is not an object")
+                record = cast(dict[str, object], parsed)
+                if set(record) != set(_HEALTH_V5_TOP_LEVEL_FIELDS):
+                    raise RuntimeError("calibration health-v5 record shape is incomplete")
+                if any(not isinstance(record[field], dict) for field in _HEALTH_V5_MAPPING_FIELDS):
+                    raise RuntimeError("calibration health-v5 record group is not an object")
+                books_value = record["books"]
+                if not isinstance(books_value, list):
+                    raise RuntimeError("calibration health-v5 books group is malformed")
+                books = cast(list[object], books_value)
+                if any(not isinstance(book, dict) for book in books):
+                    raise RuntimeError("calibration health-v5 books group is malformed")
+                if record["schema_version"] != HEALTH_CHECKPOINT_SCHEMA_VERSION:
+                    raise RuntimeError("calibration health evidence is not current health-v5")
+                _health_v5_rss_semantics(
+                    cast(dict[str, object], record["resources"]),
+                    require_current_contract=True,
+                )
+                if record["collector_run_id"] != expected_collector_run_id:
+                    raise RuntimeError("calibration health evidence run identity differs")
+                if record["git_commit"] != expected_git_commit:
+                    raise RuntimeError("calibration health evidence source identity differs")
+                if record["config_hash"] != expected_config_hash:
+                    raise RuntimeError("calibration health evidence config identity differs")
+                if canonical_json_bytes(record, allow_floats=True) + b"\n" != line:
+                    raise RuntimeError("calibration health evidence is not canonical JSONL")
+                epoch = record["emitted_monotonic_epoch_id"]
+                monotonic_ns = record["emitted_monotonic_ns"]
+                emitted_at_utc_ns = record["emitted_at_utc_ns"]
+                if epoch != expected_collector_run_id:
+                    raise RuntimeError("calibration health evidence monotonic epoch differs")
+                if (
+                    isinstance(monotonic_ns, bool)
+                    or not isinstance(monotonic_ns, int)
+                    or monotonic_ns < 0
+                    or (previous_monotonic_ns is not None and monotonic_ns <= previous_monotonic_ns)
+                ):
+                    raise RuntimeError(
+                        "calibration health evidence monotonic chronology is invalid"
+                    )
+                if (
+                    isinstance(emitted_at_utc_ns, bool)
+                    or not isinstance(emitted_at_utc_ns, int)
+                    or emitted_at_utc_ns < 0
+                ):
+                    raise RuntimeError("calibration health evidence UTC timestamp is invalid")
+                previous_monotonic_ns = monotonic_ns
+                identity = cast(dict[str, object], record["identity"])
+                if set(identity) != {"code_version", "runtime_role"} or identity != {
+                    "code_version": expected_code_version,
+                    "runtime_role": expected_runtime_role,
+                }:
+                    raise RuntimeError("calibration health-v5 producer identity differs")
+                if canonical_json_bytes(
+                    record["target"], allow_floats=True
+                ) != canonical_json_bytes(expected_target, allow_floats=True):
+                    raise RuntimeError("calibration health-v5 target identity differs")
+                decisions = cast(dict[str, object], record["decisions"])
+                if set(decisions) != set(_HEALTH_V5_DECISION_FIELDS):
+                    raise RuntimeError("calibration health-v5 decisions group is malformed")
+                if any(
+                    not isinstance(decisions[field], bool)
+                    for field in ("capture_healthy", "gate1_eligible_so_far", "research_eligible")
+                ):
+                    raise RuntimeError("calibration health-v5 scoped decisions are malformed")
+                if any(
+                    isinstance(decisions[field], bool)
+                    or not isinstance(decisions[field], int)
+                    or cast(int, decisions[field]) < 0
+                    for field in ("gate1_sticky_reason_mask", "reason_mask")
+                ):
+                    raise RuntimeError("calibration health-v5 decision masks are malformed")
+                if decisions["reason_mask_schema"] != HEALTH_DECISION_REASON_MASK_SCHEMA:
+                    raise RuntimeError("calibration health-v5 decision-mask schema differs")
+                try:
+                    reason_codes = health_decision_reasons_from_mask(decisions["reason_mask"])
+                    sticky_reason_codes = health_decision_reasons_from_mask(
+                        decisions["gate1_sticky_reason_mask"]
+                    )
+                except ValueError as error:
+                    raise RuntimeError("calibration health-v5 decision mask is invalid") from error
+                if decisions["gate1_eligible_so_far"] and (
+                    not decisions["capture_healthy"]
+                    or not decisions["research_eligible"]
+                    or reason_codes
+                    or sticky_reason_codes
+                ):
+                    raise RuntimeError("calibration health-v5 scoped decisions contradict")
+                journal = cast(dict[str, object], record["journal"])
+                terminal = journal.get("terminal")
+                if not isinstance(terminal, bool):
+                    raise RuntimeError("calibration health evidence lacks typed terminal identity")
+                previous_audit_stage_timing = _validate_health_v5_audit_stage_timing(
+                    cast(dict[str, object], record["audit"]),
+                    previous=previous_audit_stage_timing,
+                    terminal=terminal,
+                )
+                line_bytes = len(line)
+                total_bytes += line_bytes
+                if terminal:
+                    if emitted_at_utc_ns != expected_terminal_utc_ns:
+                        raise RuntimeError("calibration terminal health cutoff identity differs")
+                    terminal_seen = True
+                    terminal_count += 1
+                    maximum_terminal_bytes = max(maximum_terminal_bytes, line_bytes)
+                else:
+                    periodic_count += 1
+                    maximum_periodic_bytes = max(maximum_periodic_bytes, line_bytes)
+        after = os.fstat(descriptor)
+        stable_fields_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_nlink,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        stable_fields_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_nlink,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        path_after = os.stat(path, follow_symlinks=False)
+        if stable_fields_before != stable_fields_after or descriptor_identity != (
+            path_after.st_dev,
+            path_after.st_ino,
+        ):
+            raise RuntimeError("calibration health evidence changed while being measured")
+    except OSError as error:
+        raise RuntimeError("calibration health evidence identity cannot be verified") from error
+    finally:
+        os.close(descriptor)
+    content_sha256 = digest.hexdigest()
+    if content_sha256 != expected_content_sha256:
+        raise RuntimeError("calibration health evidence SHA-256 identity differs")
+    if total_bytes != expected_bytes:
+        raise RuntimeError("calibration health byte inventory does not reconcile")
+    if periodic_count + terminal_count != expected_records:
+        raise RuntimeError("calibration health record inventory does not reconcile")
+    if expected_terminal_records != 1 or terminal_count != expected_terminal_records:
+        raise RuntimeError("calibration terminal health inventory does not reconcile")
+    return _HealthCheckpointSizes(
+        periodic_count=periodic_count,
+        terminal_count=terminal_count,
+        maximum_periodic_bytes=maximum_periodic_bytes,
+        maximum_terminal_bytes=maximum_terminal_bytes,
+        total_bytes=total_bytes,
+        content_sha256=content_sha256,
+    )
+
+
 def _measurement(
     *,
     config: Phase1Config,
@@ -325,7 +929,14 @@ def _measurement(
     analytical_before: BoundedTreeUsage,
     analytical_after: BoundedTreeUsage,
     cpu_time_ns: int,
+    current_rss_bytes: int | None,
+    current_rss_source: str,
     peak_rss_bytes: int,
+    peak_rss_source: str,
+    python_ru_maxrss_bytes: int,
+    python_ru_maxrss_source: str,
+    requested_duration_ns: int,
+    health_checkpoint_sizes: _HealthCheckpointSizes,
 ) -> CalibrationMeasurements:
     storage_delta = _delta(storage_after, storage_before)
     analytical_delta = _delta(analytical_after, analytical_before)
@@ -335,7 +946,9 @@ def _measurement(
     )
     final = summary.health_decision
     return CalibrationMeasurements(
+        requested_duration_ns=requested_duration_ns,
         actual_duration_ns=summary.websocket_observation_nanoseconds,
+        completed_run_duration_ns=summary.actual_duration_nanoseconds,
         websocket_messages=summary.runtime_health.ingress.received,
         websocket_bytes=summary.runtime_health.ingress.received_bytes,
         durable_raw_records=summary.journal_metrics.durable,
@@ -386,9 +999,19 @@ def _measurement(
         audit_failed=summary.processor.rest_audit_failed,
         audit_retries=audit_retries,
         cpu_time_ns=cpu_time_ns,
+        current_rss_bytes=current_rss_bytes,
+        current_rss_source=current_rss_source,
         peak_rss_bytes=peak_rss_bytes,
+        peak_rss_source=peak_rss_source,
+        python_ru_maxrss_bytes=python_ru_maxrss_bytes,
+        python_ru_maxrss_source=python_ru_maxrss_source,
         analytical_bytes=analytical_delta.bytes,
         health_bytes=summary.health_evidence.file_bytes,
+        health_content_sha256=health_checkpoint_sizes.content_sha256,
+        health_periodic_checkpoints=health_checkpoint_sizes.periodic_count,
+        health_terminal_checkpoints=health_checkpoint_sizes.terminal_count,
+        health_maximum_periodic_checkpoint_bytes=(health_checkpoint_sizes.maximum_periodic_bytes),
+        health_maximum_terminal_checkpoint_bytes=(health_checkpoint_sizes.maximum_terminal_bytes),
         log_bytes=0,
         log_storage_model=STDIO_STREAM_LOG_STORAGE_MODEL,
         artifacts_created=storage_delta.regular_files,
@@ -423,6 +1046,7 @@ async def run_polymarket_calibration(
         character not in "0123456789abcdef" for character in code_commit
     ):
         raise ValueError("calibration requires an exact lowercase Git SHA")
+    requested_duration_ns = _duration_nanoseconds(duration_seconds)
     workspace = await asyncio.to_thread(workspace_root.resolve)
     await asyncio.to_thread(
         _verify_clean_source_checkout,
@@ -446,8 +1070,6 @@ async def run_polymarket_calibration(
         gamma_market_id=gamma_market_id,
     )
     cpu_time_ns = time.process_time_ns() - cpu_started_ns
-    usage = resource.getrusage(resource.RUSAGE_SELF)
-    peak_rss_bytes = int(usage.ru_maxrss) * (1024 if sys.platform.startswith("linux") else 1)
     storage_after, analytical_after, free_disk_bytes = await asyncio.to_thread(
         _post_run_usage,
         prepared.storage_root,
@@ -456,6 +1078,24 @@ async def run_polymarket_calibration(
     target = summary.target
     if target is None or not target.gate1_explicit:
         raise RuntimeError("calibration observation did not resolve the explicit target")
+    terminal_process_resources = summary.terminal_process_resources
+    if terminal_process_resources is None:
+        raise RuntimeError("calibration observation lacks terminal process-resource evidence")
+    health_checkpoint_sizes = await asyncio.to_thread(
+        _health_checkpoint_sizes,
+        summary.health_evidence.path,
+        expected_bytes=summary.health_evidence.file_bytes,
+        expected_records=summary.health_evidence.written,
+        expected_terminal_records=summary.health_evidence.terminal_written,
+        expected_collector_run_id=summary.collector_run_id.value,
+        expected_content_sha256=summary.health_evidence.content_sha256,
+        expected_git_commit=code_commit,
+        expected_config_hash=config.config_hash.value,
+        expected_code_version=config.system.code_version,
+        expected_runtime_role=config.system.runtime_role.value,
+        expected_target=target.to_record(),
+        expected_terminal_utc_ns=summary.ended_at.nanoseconds_since_epoch,
+    )
     if summary.websocket_observation_nanoseconds <= 0:
         raise RuntimeError("calibration did not establish a bounded WebSocket window")
     identity = CalibrationIdentity(
@@ -486,13 +1126,24 @@ async def run_polymarket_calibration(
         analytical_before=prepared.analytical_before,
         analytical_after=analytical_after,
         cpu_time_ns=cpu_time_ns,
-        peak_rss_bytes=peak_rss_bytes,
+        current_rss_bytes=terminal_process_resources.current_rss_bytes,
+        current_rss_source=terminal_process_resources.current_rss_source,
+        peak_rss_bytes=terminal_process_resources.peak_rss_bytes,
+        peak_rss_source=terminal_process_resources.peak_rss_source,
+        python_ru_maxrss_bytes=terminal_process_resources.python_ru_maxrss_bytes,
+        python_ru_maxrss_source=terminal_process_resources.python_ru_maxrss_source,
+        requested_duration_ns=requested_duration_ns,
+        health_checkpoint_sizes=health_checkpoint_sizes,
     )
     limits = CalibrationLimits(
         raw_run_cap_bytes=config.storage.journal_run_max_uncompressed_bytes,
         journal_segment_max_events=config.storage.journal_segment_max_events,
         journal_segment_max_uncompressed_bytes=(
             config.storage.journal_segment_max_uncompressed_bytes
+        ),
+        journal_seal_queue_capacity=config.storage.journal_seal_queue_capacity,
+        journal_pending_seal_max_uncompressed_bytes=(
+            config.storage.journal_pending_seal_max_uncompressed_bytes
         ),
         free_disk_bytes=free_disk_bytes,
         minimum_free_disk_reserve_bytes=config.health.minimum_free_disk_bytes,

@@ -39,6 +39,7 @@ from multi_market_arbitrage.core.config import (  # noqa: E402
 )
 from multi_market_arbitrage.core.exact import ExactDecimal, Price, Quantity  # noqa: E402
 from multi_market_arbitrage.core.ids import (  # noqa: E402
+    CanonicalEventId,
     CollectorRunId,
     ConnectionId,
     IngestId,
@@ -61,11 +62,13 @@ from multi_market_arbitrage.observability import (  # noqa: E402
     HealthCheckpoint,
     HealthDecision,
     HealthDecisionInputs,
+    HealthDecisionReason,
     evaluate_health_decision,
 )
 from multi_market_arbitrage.pipeline import (  # noqa: E402
     CLOB_MARKET_PREFIX,
     CONTROL_REST_AUDIT_CLASSIFY,
+    CONTROL_REST_AUDIT_FAILED,
     CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
     CONTROL_REST_AUDIT_START,
     GAMMA_MARKETS_KEYSET,
@@ -74,7 +77,8 @@ from multi_market_arbitrage.pipeline import (  # noqa: E402
     WS_MARKET,
     AuditBookIdentity,
     AuditClassificationCommand,
-    AuditDivergencePending,
+    AuditFailureCommand,
+    AuditFailureReason,
     AuditMismatchCause,
     AuditOutcome,
     AuditStartEvidence,
@@ -88,15 +92,60 @@ from multi_market_arbitrage.pipeline import (  # noqa: E402
 )
 from multi_market_arbitrage.pipeline.audit import (  # noqa: E402
     AuditExactDepthDifference,
+    AuditFaultResolution,
+    AuditFaultStatus,
     AuditMismatchDiagnostic,
     audit_exact_depth_identity,
+    audit_fault_origin,
+    initial_audit_fault_status,
 )
 from multi_market_arbitrage.pipeline.health import (  # noqa: E402
+    ANALYTICAL_FRAGMENT_RETENTION_TELEMETRY_ROW_FIELDS,
+    ANALYTICAL_FRAGMENT_RETENTION_TELEMETRY_SCHEMA,
+    AUDIT_DIVERGENCE_PENDING_REPRESENTATIVE_ROW_FIELDS,
     AUDIT_DIVERGENCE_PENDING_REPRESENTATIVE_SCHEMA,
+    AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVE_ROW_FIELDS,
     AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVE_SCHEMA,
+    AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_CODEBOOKS,
+    AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_ROW_FIELDS,
+    AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_SCHEMA,
+    AUDIT_HTTP_ENDPOINT_TELEMETRY_ROW_FIELDS,
+    AUDIT_HTTP_ENDPOINT_TELEMETRY_SCHEMA,
+    AUDIT_MISMATCH_REPRESENTATIVE_TELEMETRY_ROW_FIELDS,
+    AUDIT_MISMATCH_REPRESENTATIVE_TELEMETRY_SCHEMA,
+    AUDIT_STAGE_TIMING_TELEMETRY_HISTOGRAM_FIELDS,
+    AUDIT_STAGE_TIMING_TELEMETRY_SCHEMA,
+    AUDIT_STAGE_TIMING_TELEMETRY_STAGES,
+    COMPOSITE_PEAK_RSS_SOURCE,
+    MAXIMUM_REPORTED_PYTHON_ALLOCATION_GROUPS,
+    MAXIMUM_REPORTED_RESOURCE_DISCONTINUITIES,
+    PROCESS_RESOURCE_DISCONTINUITY_TELEMETRY_ROW_FIELDS,
+    PROCESS_RESOURCE_DISCONTINUITY_TELEMETRY_SCHEMA,
+    PROCESSOR_HISTORY_CHAIN_TELEMETRY_FIELDS,
+    PROCESSOR_HISTORY_CHAIN_TELEMETRY_SCHEMA,
+    PROCESSOR_RETENTION_TELEMETRY_ROW_FIELDS,
+    PROCESSOR_RETENTION_TELEMETRY_SCHEMA,
+    PUBLIC_READ_ENDPOINT_TELEMETRY_ROW_FIELDS,
+    PUBLIC_READ_ENDPOINT_TELEMETRY_SCHEMA,
+    REPORTED_TOP_TRANSITION_HEALTH_TELEMETRY_SCHEMA,
+    normalize_python_ru_maxrss_bytes,
 )
 from multi_market_arbitrage.pipeline.health import (  # noqa: E402
     MAXIMUM_AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVES as MAXIMUM_RESOLUTION_REPRESENTATIVES,
+)
+from multi_market_arbitrage.pipeline.processor import (  # noqa: E402
+    MAXIMUM_ACTIVE_AUDIT_FAULTS,
+    MAXIMUM_AUDIT_FAULT_CURRENT_REPRESENTATIVES,
+    ProcessorOperationalSnapshot,
+    ProcessorRetentionDomain,
+    ProcessorRetentionSnapshot,
+)
+from multi_market_arbitrage.pipeline.transitions import (  # noqa: E402
+    ReportedTopTransition,
+    ReportedTopTransitionBaselineEvidence,
+    ReportedTopTransitionEntrySource,
+    ReportedTopTransitionReason,
+    ReportedTopTransitionStatus,
 )
 from multi_market_arbitrage.research import (  # noqa: E402
     AuditMismatchCausalRelation,
@@ -104,11 +153,21 @@ from multi_market_arbitrage.research import (  # noqa: E402
     AuditMismatchObservation,
     build_audit_mismatch_lineage_report,
 )
-from multi_market_arbitrage.state import ImmutableOrderBookSnapshot  # noqa: E402
 from multi_market_arbitrage.state.order_books.models import BookLevel  # noqa: E402
+from multi_market_arbitrage.venues.polymarket import (  # noqa: E402
+    PolymarketEndpointClass,
+    PolymarketHttpFailureCategory,
+    PolymarketRetryAfterDisposition,
+    PolymarketRetryBlockedReason,
+)
 
-RESULT_SCHEMA = "mma-gate1-audit-divergence-benchmark-v1"
+RESULT_SCHEMA = "mma-gate1-audit-divergence-benchmark-v2"
 WORKLOAD_VERSION = "adr-0054-production-paths-v2"
+LINUX_PROC_STATUS_CURRENT_RSS_SOURCE = "linux-proc-self-status-vmrss-kib-times-1024"
+LINUX_PROC_STATUS_CURRENT_RSS_OS_ERROR_SOURCE = "UNAVAILABLE:OSError:linux-proc-self-status-vmrss"
+LINUX_PROC_STATUS_CURRENT_RSS_VALUE_ERROR_SOURCE = (
+    "UNAVAILABLE:ValueError:linux-proc-self-status-vmrss"
+)
 DEFAULT_WARMUPS = 5
 DEFAULT_REPETITIONS = 30
 DEFAULT_CAUSAL_REPETITIONS = 10
@@ -119,12 +178,13 @@ REPLAY_PRICE_CHANGE_EVENTS = 128
 SIX_HOUR_SECONDS = 21_600
 SIX_HOUR_CHECKPOINT_CADENCE_SECONDS = 10
 SIX_HOUR_CHECKPOINT_COUNT = math.ceil(SIX_HOUR_SECONDS / SIX_HOUR_CHECKPOINT_CADENCE_SECONDS) + 1
-HEALTH_EVIDENCE_MAXIMUM_BYTES = 64 * 1024 * 1024
+HEALTH_EVIDENCE_MAXIMUM_BYTES = 68 * 1024 * 1024
 HEALTH_EVIDENCE_MAXIMUM_RECORDS = 8_192
+MINIMUM_SIX_HOUR_FILE_HEADROOM_BYTES = 2 * 1024 * 1024
 MAXIMUM_PENDING_DIVERGENCES = 2
-SINGLE_TARGET_MAXIMUM_PENDING_DIVERGENCES = 1
+SINGLE_TARGET_MAXIMUM_PENDING_DIVERGENCES = 2
 MAXIMUM_MISMATCH_CAUSE_REPRESENTATIVES = len(AuditMismatchCause)
-CAPACITY_PENDING_SATURATION_KIND = "BOUNDED_SYNTHETIC_PROCESSOR_SUMMARY"
+CAPACITY_PENDING_SATURATION_KIND = "PRODUCTION_SINGLE_TARGET_PROCESSOR"
 
 _PROCESSOR_RUN = CollectorRunId("gate1-audit-divergence-benchmark")
 _PROCESSOR_CONNECTION = ConnectionId("gate1-audit-divergence-benchmark-connection")
@@ -140,6 +200,407 @@ type BenchmarkValue = object
 type Validation = dict[str, object]
 type PreparedOperation = tuple[Callable[[], BenchmarkValue], Callable[[BenchmarkValue], Validation]]
 type OperationFactory = Callable[[], PreparedOperation]
+
+_EXPECTED_PENDING_COMPACT_FIELDS = (
+    "pending_record_sha256",
+    "divergence_id",
+    "request_id",
+    "instrument_id",
+    "market_id",
+    "audit_start_ingest_id",
+    "audit_start_payload_sha256",
+    "classification_ingest_id",
+    "classification_payload_sha256",
+    "response_ingest_id",
+    "response_payload_sha256",
+    "cause",
+    "depth_difference_sha256",
+    "local_book_economic_sha256",
+    "normalized_rest_content_sha256",
+)
+_EXPECTED_RESOLUTION_COMPACT_FIELDS = (
+    "resolution_record_sha256",
+    "divergence_id",
+    "request_id",
+    "instrument_id",
+    "market_id",
+    "audit_start_ingest_id",
+    "audit_start_payload_sha256",
+    "classification_ingest_id",
+    "classification_payload_sha256",
+    "mismatch_response_ingest_id",
+    "mismatch_response_payload_sha256",
+    "authoritative_snapshot_ingest_id",
+    "authoritative_snapshot_payload_sha256",
+    "cause",
+    "depth_difference_sha256",
+    "local_book_economic_sha256",
+    "normalized_rest_content_sha256",
+    "recovered_book_economic_sha256",
+    "resolved_monotonic_ns",
+    "status",
+)
+_EXPECTED_MISMATCH_FIELDS = (
+    "cause",
+    "diagnostic_sha256",
+    "context_evidence_count",
+    "instrument_id",
+    "response_ingest_id",
+    "response_payload_sha256",
+)
+_EXPECTED_AUDIT_STAGE_HISTOGRAM_FIELDS = (
+    "maximum",
+    "minimum",
+    "p50",
+    "p95",
+    "p99",
+    "sample_count",
+    "total_count",
+    "total_sum",
+)
+_EXPECTED_AUDIT_STAGES = (
+    ("barrier_wait", "mma_rest_audit_stage_barrier_wait_ns"),
+    (
+        "prepare_construction",
+        "mma_rest_audit_stage_classification_construction_ns",
+    ),
+    ("prepare_durability", "mma_rest_audit_stage_classification_durability_ns"),
+    (
+        "prepare_durable_to_processed",
+        "mma_rest_audit_stage_classification_durable_to_processed_ns",
+    ),
+    ("prepare_processing", "mma_rest_audit_stage_classification_processing_ns"),
+    ("handoff_delay", "mma_rest_audit_stage_handoff_delay_ns"),
+    ("network", "mma_rest_audit_http_latency_ns"),
+    ("raw_durability", "mma_rest_audit_stage_raw_durability_ns"),
+    (
+        "raw_response_durable_to_processed",
+        "mma_rest_audit_stage_raw_response_durable_to_processed_ns",
+    ),
+    ("raw_response_processing", "mma_rest_audit_stage_raw_response_processing_ns"),
+    ("response_cleanup", "mma_rest_audit_stage_response_cleanup_ns"),
+    (
+        "response_to_prepare_decision",
+        "mma_rest_audit_stage_response_to_prepare_decision_ns",
+    ),
+    (
+        "attestation_durability",
+        "mma_rest_audit_stage_classification_attestation_durability_ns",
+    ),
+    (
+        "attestation_durable_to_processed",
+        "mma_rest_audit_stage_classification_attestation_durable_to_processed_ns",
+    ),
+    (
+        "attestation_processing",
+        "mma_rest_audit_stage_classification_attestation_processing_ns",
+    ),
+    (
+        "response_to_attestation",
+        "mma_rest_audit_stage_response_to_attestation_ns",
+    ),
+    (
+        "legacy_total_response_to_classification",
+        "mma_rest_audit_classification_latency_ns",
+    ),
+)
+_EXPECTED_AUDIT_HTTP_FIELDS = (
+    "endpoint_class",
+    "current",
+    "observed",
+    "permanent",
+    "resolved",
+    "retry_exhaustions_current",
+    "retry_exhaustions_observed",
+    "retry_exhaustions_permanent",
+    "retry_exhaustions_resolved",
+)
+_EXPECTED_PUBLIC_HTTP_FIELDS = (
+    "endpoint_class",
+    "requests",
+    "attempts",
+    "first_attempt_successes",
+    "retries",
+    "status_1xx",
+    "status_2xx",
+    "status_3xx",
+    "status_4xx",
+    "status_5xx",
+    "timeouts",
+    "temporary_network_errors",
+    "throttle_observations",
+    "retry_after_observations",
+    "retry_after_parsed_observations",
+    "retry_after_malformed_observations",
+    "cumulative_backoff_seconds",
+    "exhausted_retry_budget",
+    "final_failures",
+    "local_rate_limit_waits",
+    "local_rate_limit_wait_seconds",
+    "latency_maximum",
+    "latency_minimum",
+    "latency_p50",
+    "latency_p95",
+    "latency_p99",
+    "latency_sample_count",
+    "latency_total_count",
+    "latency_total_sum",
+)
+_EXPECTED_HTTP_ENDPOINTS = frozenset(
+    endpoint.value
+    for endpoint in PolymarketEndpointClass
+    if endpoint is not PolymarketEndpointClass.MARKET_WEBSOCKET
+)
+_MAXIMUM_TELEMETRY_COUNTER = 9_223_372_036_854_775_807
+_MAXIMUM_TELEMETRY_SECONDS = 10_000_000_000.0
+
+
+def _object_tuple(value: object) -> tuple[object, ...] | None:
+    if not isinstance(value, tuple):
+        return None
+    return cast(tuple[object, ...], value)
+
+
+def _table_rows(
+    value: object,
+    *,
+    schema: str,
+    row_fields: tuple[str, ...],
+    expected_row_fields: tuple[str, ...] | None = None,
+) -> tuple[object, ...]:
+    """Decode an exact positional table and bind its independent row contract."""
+
+    if expected_row_fields is not None and row_fields != expected_row_fields:
+        raise RuntimeError("capacity checkpoint compact evidence field contract changed")
+    if not isinstance(value, dict):
+        raise RuntimeError("capacity checkpoint compact evidence table is invalid")
+    table = cast(dict[str, object], value)
+    rows = table.get("rows")
+    if table.get("schema") != schema or not isinstance(rows, tuple):
+        raise RuntimeError("capacity checkpoint compact evidence schema is invalid")
+    typed_rows = cast(tuple[object, ...], rows)
+    if any(
+        (typed_row := _object_tuple(row)) is None or len(typed_row) != len(row_fields)
+        for row in typed_rows
+    ):
+        raise RuntimeError("capacity checkpoint compact evidence row is invalid")
+    return typed_rows
+
+
+def _row_record(fields: tuple[str, ...], value: object) -> dict[str, object] | None:
+    row = _object_tuple(value)
+    if row is None or len(row) != len(fields):
+        return None
+    return dict(zip(fields, row, strict=True))
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _nonnegative_integer(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _nonnegative_number(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
+def _compact_rows_omit_nested_fields(
+    rows: tuple[object, ...],
+    *,
+    row_fields: tuple[str, ...],
+    expected_row_fields: tuple[str, ...],
+    forbidden_fields: frozenset[str],
+) -> bool:
+    """Prove compactness from the exact schema and every encoded row value."""
+
+    if row_fields != expected_row_fields or forbidden_fields.intersection(row_fields):
+        return False
+    return all(
+        (row := _object_tuple(value)) is not None
+        and len(row) == len(row_fields)
+        and all(item is None or isinstance(item, (str, int, float, bool)) for item in row)
+        for value in rows
+    )
+
+
+def _histogram_row_exact(record: dict[str, object], *, prefix: str = "") -> bool:
+    sample_count = record.get(f"{prefix}sample_count")
+    total_count = record.get(f"{prefix}total_count")
+    total_sum = record.get(f"{prefix}total_sum")
+    if (
+        not _nonnegative_integer(sample_count)
+        or not _nonnegative_integer(total_count)
+        or not _nonnegative_number(total_sum)
+        or cast(int, sample_count) > cast(int, total_count)
+    ):
+        return False
+    quantile_names = ("minimum", "p50", "p95", "p99", "maximum")
+    quantiles = tuple(record.get(f"{prefix}{name}") for name in quantile_names)
+    if sample_count == 0:
+        return total_count == 0 and total_sum == 0 and all(item is None for item in quantiles)
+    if not all(_nonnegative_number(item) for item in quantiles):
+        return False
+    minimum, p50, p95, p99, maximum = cast(tuple[float, float, float, float, float], quantiles)
+    return minimum <= p50 <= p95 <= p99 <= maximum
+
+
+def _mismatch_rows_exact(rows: tuple[object, ...], counts: object) -> bool:
+    if AUDIT_MISMATCH_REPRESENTATIVE_TELEMETRY_ROW_FIELDS != _EXPECTED_MISMATCH_FIELDS:
+        return False
+    records = tuple(
+        _row_record(AUDIT_MISMATCH_REPRESENTATIVE_TELEMETRY_ROW_FIELDS, row) for row in rows
+    )
+    if not isinstance(counts, dict):
+        return False
+    typed_counts = cast(dict[object, object], counts)
+    expected_causes = {cause.value for cause in AuditMismatchCause}
+    causes = tuple(record.get("cause") if record is not None else None for record in records)
+    return (
+        len(records) == len(expected_causes)
+        and len(set(causes)) == len(causes)
+        and set(causes) == expected_causes
+        and set(typed_counts) == expected_causes
+        and all(
+            _nonnegative_integer(value) and cast(int, value) > 0 for value in typed_counts.values()
+        )
+        and all(
+            record is not None
+            and _is_sha256(record["diagnostic_sha256"])
+            and _is_sha256(record["response_payload_sha256"])
+            and _nonnegative_integer(record["context_evidence_count"])
+            and all(
+                isinstance(record[field], str) and bool(record[field])
+                for field in ("instrument_id", "response_ingest_id")
+            )
+            for record in records
+        )
+    )
+
+
+def _audit_stage_rows_exact(rows: tuple[object, ...]) -> bool:
+    if (
+        AUDIT_STAGE_TIMING_TELEMETRY_HISTOGRAM_FIELDS != _EXPECTED_AUDIT_STAGE_HISTOGRAM_FIELDS
+        or AUDIT_STAGE_TIMING_TELEMETRY_STAGES != _EXPECTED_AUDIT_STAGES
+        or len(rows) != len(_EXPECTED_AUDIT_STAGES)
+    ):
+        return False
+    records = tuple(_row_record(AUDIT_STAGE_TIMING_TELEMETRY_HISTOGRAM_FIELDS, row) for row in rows)
+    return all(
+        record is not None
+        and _histogram_row_exact(record)
+        and cast(int, record["sample_count"]) > 0
+        for record in records
+    )
+
+
+def _audit_http_rows_exact(rows: tuple[object, ...]) -> bool:
+    if AUDIT_HTTP_ENDPOINT_TELEMETRY_ROW_FIELDS != _EXPECTED_AUDIT_HTTP_FIELDS:
+        return False
+    records = tuple(_row_record(AUDIT_HTTP_ENDPOINT_TELEMETRY_ROW_FIELDS, row) for row in rows)
+    if any(record is None for record in records):
+        return False
+    typed_records = cast(tuple[dict[str, object], ...], records)
+    endpoints = tuple(record["endpoint_class"] for record in typed_records)
+    if not all(isinstance(endpoint, str) for endpoint in endpoints):
+        return False
+    typed_endpoints = cast(tuple[str, ...], endpoints)
+    count_names = _EXPECTED_AUDIT_HTTP_FIELDS[1:]
+
+    def exact_record(record: dict[str, object]) -> bool:
+        if not all(
+            _nonnegative_integer(record[name])
+            and cast(int, record[name]) <= _MAXIMUM_TELEMETRY_COUNTER
+            for name in count_names
+        ):
+            return False
+        current = cast(int, record["current"])
+        observed = cast(int, record["observed"])
+        permanent = cast(int, record["permanent"])
+        resolved = cast(int, record["resolved"])
+        retry_current = cast(int, record["retry_exhaustions_current"])
+        retry_observed = cast(int, record["retry_exhaustions_observed"])
+        retry_permanent = cast(int, record["retry_exhaustions_permanent"])
+        retry_resolved = cast(int, record["retry_exhaustions_resolved"])
+        return (
+            observed == current + resolved + permanent
+            and retry_observed == retry_current + retry_resolved + retry_permanent
+            and retry_observed <= observed
+            and retry_current <= current
+            and retry_resolved <= resolved
+            and retry_permanent <= permanent
+        )
+
+    return (
+        len(typed_records) == len(_EXPECTED_HTTP_ENDPOINTS)
+        and len(set(typed_endpoints)) == len(typed_endpoints)
+        and frozenset(typed_endpoints) == _EXPECTED_HTTP_ENDPOINTS
+        and all(exact_record(record) for record in typed_records)
+    )
+
+
+def _public_http_rows_exact(rows: tuple[object, ...]) -> bool:
+    if PUBLIC_READ_ENDPOINT_TELEMETRY_ROW_FIELDS != _EXPECTED_PUBLIC_HTTP_FIELDS:
+        return False
+    records = tuple(_row_record(PUBLIC_READ_ENDPOINT_TELEMETRY_ROW_FIELDS, row) for row in rows)
+    if any(record is None for record in records):
+        return False
+    typed_records = cast(tuple[dict[str, object], ...], records)
+    endpoints = tuple(record["endpoint_class"] for record in typed_records)
+    if not all(isinstance(endpoint, str) for endpoint in endpoints):
+        return False
+    typed_endpoints = cast(tuple[str, ...], endpoints)
+    counter_names = (
+        "requests",
+        "attempts",
+        "first_attempt_successes",
+        "retries",
+        "status_1xx",
+        "status_2xx",
+        "status_3xx",
+        "status_4xx",
+        "status_5xx",
+        "timeouts",
+        "temporary_network_errors",
+        "throttle_observations",
+        "retry_after_observations",
+        "retry_after_parsed_observations",
+        "retry_after_malformed_observations",
+        "exhausted_retry_budget",
+        "final_failures",
+        "local_rate_limit_waits",
+    )
+
+    def exact_record(record: dict[str, object]) -> bool:
+        return (
+            all(
+                _nonnegative_integer(record[name])
+                and cast(int, record[name]) <= _MAXIMUM_TELEMETRY_COUNTER
+                for name in counter_names
+            )
+            and _nonnegative_number(record["cumulative_backoff_seconds"])
+            and cast(float, record["cumulative_backoff_seconds"]) <= _MAXIMUM_TELEMETRY_SECONDS
+            and _nonnegative_number(record["local_rate_limit_wait_seconds"])
+            and cast(float, record["local_rate_limit_wait_seconds"]) <= _MAXIMUM_TELEMETRY_SECONDS
+            and _histogram_row_exact(record, prefix="latency_")
+        )
+
+    return (
+        len(typed_records) == len(_EXPECTED_HTTP_ENDPOINTS)
+        and len(set(typed_endpoints)) == len(typed_endpoints)
+        and frozenset(typed_endpoints) == _EXPECTED_HTTP_ENDPOINTS
+        and all(exact_record(record) for record in typed_records)
+    )
 
 
 def _sha256_file(path: Path) -> str:
@@ -988,6 +1449,18 @@ def _summary_factory(config: Phase1Config) -> OperationFactory:
 
 
 def _maximum_lifecycle_processor(config: Phase1Config) -> CanonicalProcessor:
+    return _maximum_single_target_recovery_processor(config, resolve_pending=False)
+
+
+def _maximum_replacement_capture_processor(config: Phase1Config) -> CanonicalProcessor:
+    return _maximum_single_target_recovery_processor(config, resolve_pending=True)
+
+
+def _maximum_single_target_recovery_processor(
+    config: Phase1Config,
+    *,
+    resolve_pending: bool,
+) -> CanonicalProcessor:
     state = _resolved_lifecycle_state(
         config,
         resolution_count=MAXIMUM_RESOLUTION_REPRESENTATIVES,
@@ -997,17 +1470,28 @@ def _maximum_lifecycle_processor(config: Phase1Config) -> CanonicalProcessor:
     original_yes = _fixture("polymarket_rest_book_yes.json")
     changed_yes = _replace_quantity(original_yes, price="0.40", old="10", new="11")
     pending_yes = changed_yes if state.current_yes_payload == original_yes else original_yes
-    for native_asset_id, request_id, payload, trigger in (
+    specifications = (
         (
             "token-yes",
             "pending-divergence-yes",
             pending_yes,
             AuditTriggerReason.PERIODIC,
         ),
-    ):
+        (
+            "token-no",
+            "pending-divergence-no",
+            _replace_quantity(_no_book_payload(), price="0.30", old="20", new="21"),
+            AuditTriggerReason.FRESHNESS_GUARD,
+        ),
+    )
+    starts: list[tuple[AuditStartEvidence, bytes]] = []
+    # Both starts must be durably staged before either mismatch is classified.
+    # Once one divergence opens, market-scoped recovery correctly blocks a new
+    # sibling start; two already-staged per-instrument requests remain valid.
+    for offset, (native_asset_id, request_id, payload, trigger) in enumerate(specifications):
         start, start_envelope = _audit_start(
             processor,
-            sequence,
+            sequence + offset,
             request_id=request_id,
             native_asset_id=native_asset_id,
             trigger_reason=trigger,
@@ -1017,19 +1501,301 @@ def _maximum_lifecycle_processor(config: Phase1Config) -> CanonicalProcessor:
             processor.process_replayed(start_envelope),
             label=f"{request_id} start",
         )
-        mismatch = processor.process_replayed(_audit_response(sequence + 1, start, payload))
-        _require_success(mismatch, label=f"{request_id} mismatch")
-        sequence += 2
+        starts.append((start, payload))
+    sequence += len(starts)
+    for offset, (start, payload) in enumerate(starts):
+        mismatch = processor.process_replayed(_audit_response(sequence + offset, start, payload))
+        _require_success(mismatch, label=f"{start.request_id} mismatch")
+    sequence += len(starts)
+    if resolve_pending:
+        for offset, (_start, payload) in enumerate(starts):
+            _require_success(
+                processor.process_replayed(
+                    _envelope(_PROCESSOR_RUN, sequence + offset, REST_BOOK, payload)
+                ),
+                label="capacity authoritative resnapshot",
+            )
     summary = processor.summary()
+    expected_pending = 0 if resolve_pending else SINGLE_TARGET_MAXIMUM_PENDING_DIVERGENCES
+    expected_captures = SINGLE_TARGET_MAXIMUM_PENDING_DIVERGENCES if resolve_pending else 0
     if (
-        summary.audit_divergences_pending != SINGLE_TARGET_MAXIMUM_PENDING_DIVERGENCES
-        or len(summary.audit_divergence_pending_records)
-        != SINGLE_TARGET_MAXIMUM_PENDING_DIVERGENCES
-        or len(summary.audit_divergence_resolution_records) != MAXIMUM_RESOLUTION_REPRESENTATIVES
+        summary.audit_divergences_pending != expected_pending
+        or len(summary.audit_divergence_pending_records) != expected_pending
+        or summary.audit_replacement_captures_pending != expected_captures
+        or len(summary.audit_divergence_resolution_records)
+        != MAXIMUM_RESOLUTION_REPRESENTATIVES + expected_captures
+        or summary.audit_divergences_resolved_by_authoritative_resnapshot
+        != MAXIMUM_RESOLUTION_REPRESENTATIVES + expected_captures
+        or summary.audit_ineligible_books != SINGLE_TARGET_MAXIMUM_PENDING_DIVERGENCES
         or not summary.audit_divergence_lifecycle_reconciled
     ):
         raise RuntimeError("maximum lifecycle processor did not reconcile")
     return processor
+
+
+def _maximum_current_fault_snapshot(config: Phase1Config) -> ProcessorOperationalSnapshot:
+    """Build two production CURRENT faults, one for each explicit-target instrument."""
+
+    processor = _bootstrapped_processor(config)
+    sequence = 4
+    for index, (native_asset_id, endpoint_class) in enumerate(
+        (
+            ("token-yes", PolymarketEndpointClass.CLOB_BOOK),
+            ("token-no", PolymarketEndpointClass.CLOB_BOOK),
+        )
+    ):
+        request_id = f"capacity-current-fault-{index}-" + "r" * 103
+        start, intent = _audit_start(
+            processor,
+            sequence,
+            request_id=request_id,
+            native_asset_id=native_asset_id,
+        )
+        _require_success(processor.process_replayed(intent), label="capacity fault start")
+        command = AuditFailureCommand(
+            request_id=start.request_id,
+            reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+            error_type="PolymarketHttpStatusError:HTTP_STATUS",
+            endpoint_class=endpoint_class,
+            category=PolymarketHttpFailureCategory.HTTP_STATUS,
+            retryable=True,
+            attempt=config.polymarket.public_reads.maximum_attempts,
+            status_code=503,
+            retry_after_nanoseconds=int(
+                config.polymarket.public_reads.maximum_retry_after_seconds * 1_000_000_000
+            ),
+            retry_after_disposition=PolymarketRetryAfterDisposition.PARSED,
+            retry_exhausted=True,
+            retry_blocked_reason=PolymarketRetryBlockedReason.ATTEMPTS_EXHAUSTED,
+        )
+        _require_success(
+            processor.process_replayed(
+                _envelope(
+                    _PROCESSOR_RUN,
+                    sequence + 1,
+                    CONTROL_REST_AUDIT_FAILED,
+                    command.to_payload(),
+                    connection_id=start.connection_id,
+                )
+            ),
+            label="capacity current fault",
+        )
+        sequence += 2
+    snapshot = processor.operational_snapshot()
+    if (
+        snapshot.audit_faults_current != MAXIMUM_AUDIT_FAULT_CURRENT_REPRESENTATIVES
+        or len(snapshot.audit_fault_current_representatives)
+        != MAXIMUM_AUDIT_FAULT_CURRENT_REPRESENTATIVES
+        or snapshot.audit_fault_current_representatives_truncated
+        or not snapshot.audit_fault_lifecycle_reconciled
+    ):
+        raise RuntimeError("capacity current-fault lifecycle did not saturate and reconcile")
+    current_records = snapshot.audit_fault_current_representatives
+    resolution_source = RawSourceRef(
+        ingest_id=IngestId("capacity-fault-resolution-source"),
+        payload_sha256="f" * 64,
+    )
+    resolved = replace(
+        current_records[0],
+        fault_id=canonical_sha256(
+            {"base": current_records[0].fault_id, "status": AuditFaultStatus.RESOLVED}
+        ),
+        request_id="resolved-" + "r" * 119,
+        status=AuditFaultStatus.RESOLVED,
+        blocks_current_scope=False,
+        resolution=AuditFaultResolution.LATER_FENCED_MATCH,
+        resolution_source=resolution_source,
+        resolved_at=UtcTimestamp(current_records[0].observed_at.nanoseconds_since_epoch + 1),
+        resolved_monotonic_ns=current_records[0].observed_monotonic_ns + 1,
+    )
+    permanent_command = AuditFailureCommand(
+        request_id="permanent-" + "p" * 118,
+        reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+        error_type="PolymarketHttpStatusError:HTTP_STATUS",
+        endpoint_class=PolymarketEndpointClass.CLOB_BOOK,
+        category=PolymarketHttpFailureCategory.HTTP_STATUS,
+        retryable=False,
+        attempt=1,
+        status_code=404,
+        retry_after_disposition=PolymarketRetryAfterDisposition.ABSENT,
+        retry_exhausted=False,
+    )
+    permanent_origin = audit_fault_origin(permanent_command)
+    if initial_audit_fault_status(permanent_command, origin=permanent_origin) is not (
+        AuditFaultStatus.PERMANENT
+    ):
+        raise RuntimeError("capacity permanent fault metadata is not classifier-truthful")
+    permanent = replace(
+        current_records[1],
+        fault_id=canonical_sha256(
+            {"base": current_records[1].fault_id, "status": AuditFaultStatus.PERMANENT}
+        ),
+        request_id=permanent_command.request_id,
+        error_type=cast(str, permanent_command.error_type),
+        origin=permanent_origin,
+        status=AuditFaultStatus.PERMANENT,
+        endpoint_class=permanent_command.endpoint_class,
+        category=permanent_command.category,
+        retryable=permanent_command.retryable,
+        attempt=permanent_command.attempt,
+        status_code=permanent_command.status_code,
+        retry_after_nanoseconds=permanent_command.retry_after_nanoseconds,
+        retry_after_disposition=permanent_command.retry_after_disposition,
+        retry_exhausted=permanent_command.retry_exhausted,
+        retry_blocked_reason=permanent_command.retry_blocked_reason,
+    )
+    if any(record.status is not AuditFaultStatus.CURRENT for record in current_records):
+        raise RuntimeError("capacity current fault metadata is not classifier-truthful")
+    if permanent.status is not initial_audit_fault_status(
+        permanent_command,
+        origin=permanent_origin,
+    ):
+        raise RuntimeError("capacity permanent representative status is not truthful")
+    if (
+        resolved.status is not AuditFaultStatus.RESOLVED
+        or resolved.resolution is None
+        or resolved.resolution_source is None
+    ):
+        raise RuntimeError("capacity resolved representative is incomplete")
+    saturated_current_faults = MAXIMUM_ACTIVE_AUDIT_FAULTS
+    saturated_observed_faults = saturated_current_faults + 2
+    endpoint_snapshots = tuple(
+        replace(
+            item,
+            observed=saturated_observed_faults,
+            current=saturated_current_faults,
+            resolved=1,
+            permanent=1,
+            retry_exhaustions_observed=saturated_observed_faults,
+            retry_exhaustions_current=saturated_current_faults,
+            retry_exhaustions_resolved=1,
+            retry_exhaustions_permanent=1,
+        )
+        if item.endpoint_class is PolymarketEndpointClass.CLOB_BOOK
+        else item
+        for item in snapshot.audit_http_endpoint_snapshots
+    )
+    retention = tuple(
+        replace(
+            item,
+            retained=item.capacity,
+            total=saturated_observed_faults + 1,
+            truncated=True,
+        )
+        if item.domain is ProcessorRetentionDomain.AUDIT_FAULT_LIFECYCLES
+        else item
+        for item in snapshot.retention
+    )
+    return replace(
+        snapshot,
+        rest_audits=saturated_observed_faults,
+        rest_audit_failed=saturated_observed_faults,
+        audit_start_trigger_counts=tuple(
+            (
+                trigger,
+                saturated_observed_faults if trigger is AuditTriggerReason.PERIODIC else count,
+            )
+            for trigger, count in snapshot.audit_start_trigger_counts
+        ),
+        audit_outcome_trigger_counts=tuple(
+            (
+                trigger,
+                outcome,
+                saturated_observed_faults
+                if trigger is AuditTriggerReason.PERIODIC and outcome is AuditOutcome.FAILED
+                else count,
+            )
+            for trigger, outcome, count in snapshot.audit_outcome_trigger_counts
+        ),
+        audit_faults_observed=saturated_observed_faults,
+        audit_faults_current=saturated_current_faults,
+        audit_faults_resolved=1,
+        audit_faults_permanent=1,
+        audit_http_faults_observed=saturated_observed_faults,
+        audit_http_faults_resolved=1,
+        audit_http_faults_permanent=1,
+        audit_http_retry_exhaustions_observed=saturated_observed_faults,
+        audit_http_retry_exhaustions_resolved=1,
+        audit_http_retry_exhaustions_permanent=1,
+        audit_http_endpoint_snapshots=endpoint_snapshots,
+        audit_fault_lifecycle_representatives=tuple(
+            sorted(
+                (current_records[-1], permanent, resolved),
+                key=lambda record: record.status.value,
+            )
+        ),
+        audit_fault_current_representatives_truncated=True,
+        retention=retention,
+    )
+
+
+def _maximum_reported_top_transitions(
+    snapshot: ProcessorOperationalSnapshot,
+    config: Phase1Config,
+) -> tuple[ReportedTopTransition, ...]:
+    books = snapshot.books
+    if len(books) != 2:
+        raise RuntimeError("capacity transition saturation requires exactly two target books")
+    epoch_id = "gate1-audit-divergence-capacity"
+    raw_source = RawSourceRef(
+        ingest_id=IngestId("capacity-reported-top-source"),
+        payload_sha256="d" * 64,
+    )
+    canonical_event_id = CanonicalEventId("c" * 64)
+    bid = Price.parse("0." + "1" * 126)
+    ask = Price.parse("0." + "9" * 126)
+    baseline = ReportedTopTransitionBaselineEvidence(
+        connection_id=_PROCESSOR_CONNECTION,
+        monotonic_epoch_id=epoch_id,
+        admission_ordinal=9_223_372_036_854_775_807,
+        ingest_seq=9_223_372_036_854_775_807,
+        received_at=UtcTimestamp(1_787_198_400_000_000_000),
+        received_monotonic_ns=1,
+        source_raw_refs=(raw_source,),
+        source_canonical_event_ids=(canonical_event_id,),
+        instrument_states=tuple(
+            (book.instrument_id, 9_223_372_036_854_775_807, "e" * 64, bid, ask) for book in books
+        ),
+    )
+    return tuple(
+        ReportedTopTransition(
+            transition_id=canonical_sha256(
+                {"index": index, "schema": "capacity-reported-top-transition"}
+            ),
+            instrument_id=book.instrument_id,
+            market_id=book.market_id,
+            target_best_bid=bid,
+            target_best_ask=ask,
+            starting_best_bid=bid,
+            starting_best_ask=ask,
+            starting_generation=9_223_372_036_854_775_807,
+            starting_economic_sha256="a" * 64,
+            first_source_raw_refs=(raw_source,),
+            latest_source_raw_refs=(raw_source,),
+            first_source_canonical_event_id=canonical_event_id,
+            latest_source_canonical_event_id=canonical_event_id,
+            connection_id=_PROCESSOR_CONNECTION,
+            monotonic_epoch_id=epoch_id,
+            first_admission_ordinal=1,
+            latest_admission_ordinal=9_223_372_036_854_775_807,
+            first_ingest_seq=1,
+            latest_ingest_seq=9_223_372_036_854_775_807,
+            first_received_at=UtcTimestamp(1_787_198_400_000_000_000),
+            latest_received_at=UtcTimestamp(1_787_198_400_000_000_001),
+            first_received_monotonic_ns=1,
+            latest_received_monotonic_ns=4_999_999_999,
+            accepted_frame_count=1,
+            maximum_frames=config.polymarket.reported_top_transition_max_frames,
+            maximum_duration_ns=round(
+                config.polymarket.reported_top_transition_max_seconds * 1_000_000_000
+            ),
+            entry_source=ReportedTopTransitionEntrySource.POST_SNAPSHOT_CATCH_UP,
+            baseline_evidence=baseline,
+            status=ReportedTopTransitionStatus.PENDING,
+            reason=ReportedTopTransitionReason.POST_SNAPSHOT_PAIRED_CATCH_UP,
+        )
+        for index, book in enumerate(books)
+    )
 
 
 def _causal_envelope(
@@ -1472,36 +2238,211 @@ def _measure_replacement_release_series(
     }
 
 
-def _current_rss_bytes() -> int | None:
+def _current_rss_bytes() -> tuple[int | None, str]:
+    if not sys.platform.startswith("linux"):
+        return None, f"UNAVAILABLE_PLATFORM:{sys.platform}"
     try:
         lines = Path("/proc/self/status").read_text(encoding="utf-8").splitlines()
     except OSError:
-        return None
+        return None, LINUX_PROC_STATUS_CURRENT_RSS_OS_ERROR_SOURCE
     for line in lines:
         if line.startswith("VmRSS:"):
             fields = line.split()
             if len(fields) == 3 and fields[2] == "kB":
-                return int(fields[1]) * 1024
-    return None
+                try:
+                    return int(fields[1]) * 1024, LINUX_PROC_STATUS_CURRENT_RSS_SOURCE
+                except ValueError:
+                    return None, LINUX_PROC_STATUS_CURRENT_RSS_VALUE_ERROR_SOURCE
+    return None, LINUX_PROC_STATUS_CURRENT_RSS_VALUE_ERROR_SOURCE
 
 
-def _peak_rss_bytes() -> int:
-    value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    return value if sys.platform == "darwin" else value * 1024
+def _rss_measurement() -> dict[str, int | str | None]:
+    current_rss_bytes, current_rss_source = _current_rss_bytes()
+    python_ru_maxrss_bytes, python_ru_maxrss_source = normalize_python_ru_maxrss_bytes(
+        int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    )
+    return {
+        "current_rss_bytes": current_rss_bytes,
+        "current_rss_source": current_rss_source,
+        "python_ru_maxrss_bytes": python_ru_maxrss_bytes,
+        "python_ru_maxrss_source": python_ru_maxrss_source,
+        "same_sample_composite_peak_bytes": max(
+            python_ru_maxrss_bytes,
+            current_rss_bytes or 0,
+        ),
+        "same_sample_composite_peak_source": COMPOSITE_PEAK_RSS_SOURCE,
+    }
 
 
 class _CapacityProcessorView:
     """Read-only production serializer input with bounded synthetic saturation."""
 
-    def __init__(self, processor: CanonicalProcessor, summary: ProcessorSummary) -> None:
+    def __init__(
+        self,
+        processor: CanonicalProcessor,
+        summary: ProcessorSummary,
+        fault_snapshot: ProcessorOperationalSnapshot,
+        config: Phase1Config,
+    ) -> None:
         self._processor = processor
         self._summary = summary
+        self._fault_snapshot = fault_snapshot
+        self._config = config
 
     def summary(self) -> ProcessorSummary:
         return self._summary
 
-    def snapshots(self) -> tuple[ImmutableOrderBookSnapshot, ...]:
-        return self._processor.snapshots()
+    def operational_snapshot(self) -> ProcessorOperationalSnapshot:
+        summary = self._summary
+        snapshot = self._processor.operational_snapshot()
+        fault_snapshot = self._fault_snapshot
+        audit_ineligible_instruments = self.audit_ineligible_instruments
+        fault_retention = fault_snapshot.retention_for(
+            ProcessorRetentionDomain.AUDIT_FAULT_LIFECYCLES
+        )
+
+        def capacity_retention(
+            item: ProcessorRetentionSnapshot,
+        ) -> ProcessorRetentionSnapshot:
+            retained = item.retained
+            capacity = item.capacity
+            total = item.total
+            truncated = item.truncated
+            if item.domain is ProcessorRetentionDomain.AUDIT_MISMATCH_DIAGNOSTICS:
+                retained = len(summary.audit_mismatch_diagnostics)
+                capacity = max(capacity, retained)
+                total = summary.rest_audit_mismatches
+                truncated = summary.audit_mismatch_diagnostics_truncated
+            elif item.domain is ProcessorRetentionDomain.AUDIT_DIVERGENCE_RESOLUTIONS:
+                retained = len(summary.audit_divergence_resolution_records)
+                capacity = max(capacity, retained)
+                total = summary.audit_divergences_resolved_by_authoritative_resnapshot
+                truncated = summary.audit_divergence_resolution_records_truncated
+            elif item.domain is ProcessorRetentionDomain.AUDIT_OUTCOMES:
+                total = summary.rest_audits + fault_snapshot.rest_audits
+                truncated = total > retained
+            elif item.domain is ProcessorRetentionDomain.AUDIT_FAULT_LIFECYCLES:
+                retained = fault_retention.retained
+                capacity = fault_retention.capacity
+                total = fault_retention.total
+                truncated = fault_retention.truncated
+                item = fault_retention
+            return replace(
+                item,
+                retained=retained,
+                capacity=capacity,
+                total=total,
+                truncated=truncated,
+            )
+
+        retention = tuple(capacity_retention(item) for item in snapshot.retention)
+        latest_by_cause = {
+            diagnostic.cause: diagnostic for diagnostic in summary.audit_mismatch_diagnostics
+        }
+        reported_top_transitions = _maximum_reported_top_transitions(snapshot, self._config)
+        start_counts = dict(summary.audit_start_trigger_counts)
+        for trigger, count in fault_snapshot.audit_start_trigger_counts:
+            start_counts[trigger] += count
+        outcome_counts = {
+            (trigger, outcome): count
+            for trigger, outcome, count in summary.audit_outcome_trigger_counts
+        }
+        for trigger, outcome, count in fault_snapshot.audit_outcome_trigger_counts:
+            outcome_counts[(trigger, outcome)] += count
+        return replace(
+            snapshot,
+            rest_audits=summary.rest_audits + fault_snapshot.rest_audits,
+            rest_audit_matches=summary.rest_audit_matches,
+            rest_audit_mismatches=summary.rest_audit_mismatches,
+            rest_audit_raced=summary.rest_audit_raced,
+            rest_audit_failed=fault_snapshot.rest_audit_failed,
+            audit_mismatch_cause_counts=summary.audit_mismatch_cause_counts,
+            audit_start_trigger_counts=tuple(
+                (trigger, start_counts[trigger])
+                for trigger in sorted(start_counts, key=lambda item: item.value)
+            ),
+            audit_outcome_trigger_counts=tuple(
+                (trigger, outcome, outcome_counts[(trigger, outcome)])
+                for trigger, outcome in sorted(
+                    outcome_counts,
+                    key=lambda item: (item[0].value, item[1].value),
+                )
+            ),
+            audit_divergences_observed=summary.audit_divergences_observed,
+            audit_divergences_resolved_by_authoritative_resnapshot=(
+                summary.audit_divergences_resolved_by_authoritative_resnapshot
+            ),
+            audit_divergences_resolved_same_generation=(
+                summary.audit_divergences_resolved_same_generation
+            ),
+            audit_divergences_pending=summary.audit_divergences_pending,
+            audit_divergences_unresolved=summary.audit_divergences_unresolved,
+            audit_divergences_unknown=summary.audit_divergences_unknown,
+            audit_local_book_defects=summary.audit_local_book_defects,
+            audit_divergence_lifecycle_reconciled=(summary.audit_divergence_lifecycle_reconciled),
+            # Divergence lifecycle and availability authority must come from
+            # the same real processor state; the independent fault snapshot
+            # contributes only fault-lifecycle saturation below.
+            audit_availability_authority=summary.audit_availability_authority,
+            audit_faults_observed=fault_snapshot.audit_faults_observed,
+            audit_faults_current=fault_snapshot.audit_faults_current,
+            audit_faults_resolved=fault_snapshot.audit_faults_resolved,
+            audit_faults_permanent=fault_snapshot.audit_faults_permanent,
+            audit_http_faults_observed=fault_snapshot.audit_http_faults_observed,
+            audit_http_faults_resolved=fault_snapshot.audit_http_faults_resolved,
+            audit_http_faults_permanent=fault_snapshot.audit_http_faults_permanent,
+            audit_http_retry_exhaustions_observed=(
+                fault_snapshot.audit_http_retry_exhaustions_observed
+            ),
+            audit_http_retry_exhaustions_resolved=(
+                fault_snapshot.audit_http_retry_exhaustions_resolved
+            ),
+            audit_http_retry_exhaustions_permanent=(
+                fault_snapshot.audit_http_retry_exhaustions_permanent
+            ),
+            audit_http_endpoint_snapshots=fault_snapshot.audit_http_endpoint_snapshots,
+            audit_fault_lifecycle_reconciled=fault_snapshot.audit_fault_lifecycle_reconciled,
+            audit_replacement_captures_pending=summary.audit_replacement_captures_pending,
+            audit_replacement_capture_authority=(summary.audit_replacement_capture_authority),
+            pending_rest_audits=summary.pending_rest_audits,
+            audit_ineligible_books=len(audit_ineligible_instruments),
+            audit_ineligible_instruments=audit_ineligible_instruments,
+            audit_divergence_pending_records=summary.audit_divergence_pending_records,
+            audit_divergence_resolution_representatives=(
+                summary.audit_divergence_resolution_records[-1:]
+            ),
+            audit_mismatch_diagnostic_representatives=tuple(
+                latest_by_cause[cause]
+                for cause in sorted(latest_by_cause, key=lambda item: item.value)
+            ),
+            audit_fault_current_representative_capacity=(
+                fault_snapshot.audit_fault_current_representative_capacity
+            ),
+            audit_fault_current_instrument_ids=(fault_snapshot.audit_fault_current_instrument_ids),
+            audit_fault_current_representatives=(
+                fault_snapshot.audit_fault_current_representatives
+            ),
+            audit_fault_current_representatives_truncated=(
+                fault_snapshot.audit_fault_current_representatives_truncated
+            ),
+            audit_fault_lifecycle_representatives=(
+                fault_snapshot.audit_fault_lifecycle_representatives
+            ),
+            audit_fault_lifecycle_chain_sha256=(fault_snapshot.audit_fault_lifecycle_chain_sha256),
+            reported_top_transitions_started=9_223_372_036_854_775_807,
+            reported_top_transitions_converged=9_223_372_036_854_775_807,
+            reported_top_transitions_superseded=9_223_372_036_854_775_807,
+            reported_top_transitions_resnapshotted=9_223_372_036_854_775_807,
+            reported_top_transitions_expired=9_223_372_036_854_775_807,
+            reported_top_transitions_invalidated=9_223_372_036_854_775_807,
+            reported_top_transition_frames=9_223_372_036_854_775_807,
+            reported_top_transition_duration_total_ns=9_223_372_036_854_775_807,
+            reported_top_transition_duration_max_ns=9_223_372_036_854_775_807,
+            reported_top_transition_duration_lower_bound_count=9_223_372_036_854_775_807,
+            pending_reported_top_transitions=len(reported_top_transitions),
+            reported_top_transitions=reported_top_transitions,
+            retention=retention,
+        )
 
     @property
     def discovered_markets(self) -> tuple[object, ...]:
@@ -1527,56 +2468,15 @@ class _CapacityProcessorView:
         )
 
 
-def _supplemental_capacity_pending(config: Phase1Config) -> AuditDivergencePending:
-    """Build a second exact pending record in an independent valid lifecycle."""
-
-    processor = _bootstrapped_processor(config)
-    start, start_envelope = _audit_start(
-        processor,
-        4,
-        request_id="capacity-secondary-pending",
-        native_asset_id="token-no",
-        trigger_reason=AuditTriggerReason.FRESHNESS_GUARD,
-    )
-    _require_success(
-        processor.process_replayed(start_envelope),
-        label="capacity secondary pending start",
-    )
-    mismatch_payload = _replace_quantity(
-        _no_book_payload(),
-        price="0.30",
-        old="20",
-        new="21",
-    )
-    _require_success(
-        processor.process_replayed(_audit_response(5, start, mismatch_payload)),
-        label="capacity secondary pending mismatch",
-    )
-    summary = processor.summary()
-    if (
-        summary.audit_divergences_pending != 1
-        or len(summary.audit_divergence_pending_records) != 1
-        or not summary.audit_divergence_lifecycle_reconciled
-    ):
-        raise RuntimeError("capacity secondary pending lifecycle did not reconcile")
-    return summary.audit_divergence_pending_records[0]
-
-
 def _maximum_cause_summary(
     summary: ProcessorSummary,
-    supplemental_pending: AuditDivergencePending,
 ) -> ProcessorSummary:
     """Saturate the compact one-per-cause health representatives.
 
-    Every retained pending/resolution record comes from a valid processor
-    lifecycle.  The two pending records are combined only in this bounded
-    synthetic ``ProcessorSummary`` because one configured process can retain
-    two requests while the current Gate-1 target's market-scoped recovery makes
-    only one simultaneously reachable.  Cumulative totals are raised to the
-    minimum history capable of retaining every finite mismatch-cause
-    representative, with older resolution records explicitly marked
-    truncated.  This is conservative health-file sizing, not replay evidence
-    for invented historical events.
+    Every retained pending/resolution record comes from one valid production
+    processor lifecycle. Cumulative totals are raised only to size the finite
+    one-per-cause representative table, with older resolution records
+    explicitly marked truncated.
     """
 
     if not summary.audit_mismatch_diagnostics:
@@ -1584,19 +2484,15 @@ def _maximum_cause_summary(
     source = summary.audit_mismatch_diagnostics[-1]
     diagnostics = tuple(replace(source, cause=cause) for cause in AuditMismatchCause)
     mismatch_count = len(diagnostics)
-    pending_records = tuple(
-        sorted(
-            (*summary.audit_divergence_pending_records, supplemental_pending),
-            key=lambda record: record.divergence_id,
-        )
-    )
+    pending_records = summary.audit_divergence_pending_records
     pending_ids = {record.divergence_id for record in pending_records}
     resolution_ids = {
         record.divergence_id for record in summary.audit_divergence_resolution_records
     }
     if (
-        len(pending_records) != MAXIMUM_PENDING_DIVERGENCES
-        or len(pending_ids) != MAXIMUM_PENDING_DIVERGENCES
+        len(pending_records) != summary.audit_divergences_pending
+        or len(pending_records) > MAXIMUM_PENDING_DIVERGENCES
+        or len(pending_ids) != len(pending_records)
         or not pending_ids.isdisjoint(resolution_ids)
     ):
         raise RuntimeError("capacity pending saturation lacks distinct exact identities")
@@ -1647,7 +2543,10 @@ def _maximum_cause_summary(
         audit_divergences_unknown=1,
         audit_local_book_defects=1,
         audit_divergence_lifecycle_reconciled=True,
-        audit_ineligible_books=len({record.instrument_id for record in pending_records}),
+        audit_ineligible_books=max(
+            summary.audit_ineligible_books,
+            len({record.instrument_id for record in pending_records}),
+        ),
         audit_mismatch_diagnostics=diagnostics,
         audit_mismatch_diagnostics_truncated=False,
         audit_divergence_pending_records=pending_records,
@@ -1660,6 +2559,9 @@ def _maximum_cause_summary(
 def _capacity_checkpoint(
     processor: CanonicalProcessor,
     config: Phase1Config,
+    *,
+    host_source_unknown: bool = False,
+    terminal: bool,
 ) -> HealthCheckpoint:
     """Build the production checkpoint for the conservative maximum evidence shape."""
 
@@ -1667,31 +2569,67 @@ def _capacity_checkpoint(
         processor,
         _maximum_cause_summary(
             processor.summary(),
-            _supplemental_capacity_pending(config),
         ),
+        _maximum_current_fault_snapshot(config),
+        config,
     )
     return _production_checkpoint_builder(
         run_id=CollectorRunId("gate1-audit-divergence-capacity"),
         git_commit="a" * 40,
         processor_override=cast(CanonicalProcessor, view),
+        capacity_telemetry=True,
+        capacity_host_source_unknown=host_source_unknown,
+        terminal=terminal,
     )()
 
 
-def _capacity_projection(*, maximum_checkpoint_bytes: int) -> dict[str, int | bool]:
-    if maximum_checkpoint_bytes <= 0:
+def _capacity_projection(
+    *,
+    maximum_periodic_checkpoint_bytes: int,
+    maximum_terminal_checkpoint_bytes: int,
+) -> dict[str, int | bool]:
+    if min(maximum_periodic_checkpoint_bytes, maximum_terminal_checkpoint_bytes) <= 0:
         raise ValueError("maximum checkpoint bytes must be positive")
-    projected_bytes = SIX_HOUR_CHECKPOINT_COUNT * maximum_checkpoint_bytes
+    periodic_checkpoint_count = SIX_HOUR_CHECKPOINT_COUNT - 1
+    terminal_checkpoint_count = 1
+    projected_periodic_bytes = periodic_checkpoint_count * maximum_periodic_checkpoint_bytes
+    projected_terminal_bytes = terminal_checkpoint_count * maximum_terminal_checkpoint_bytes
+    projected_bytes = projected_periodic_bytes + projected_terminal_bytes
     return {
         "cadence_seconds": SIX_HOUR_CHECKPOINT_CADENCE_SECONDS,
         "checkpoint_count": SIX_HOUR_CHECKPOINT_COUNT,
-        "maximum_checkpoint_bytes": maximum_checkpoint_bytes,
+        "maximum_periodic_checkpoint_bytes": maximum_periodic_checkpoint_bytes,
+        "maximum_terminal_checkpoint_bytes": maximum_terminal_checkpoint_bytes,
         "maximum_file_bytes": HEALTH_EVIDENCE_MAXIMUM_BYTES,
         "maximum_records": HEALTH_EVIDENCE_MAXIMUM_RECORDS,
+        "periodic_checkpoint_count": periodic_checkpoint_count,
+        "projected_periodic_bytes": projected_periodic_bytes,
+        "projected_terminal_bytes": projected_terminal_bytes,
         "projected_file_bytes": projected_bytes,
         "remaining_file_bytes": HEALTH_EVIDENCE_MAXIMUM_BYTES - projected_bytes,
+        "terminal_checkpoint_count": terminal_checkpoint_count,
         "within_file_bound": projected_bytes <= HEALTH_EVIDENCE_MAXIMUM_BYTES,
         "within_record_bound": (SIX_HOUR_CHECKPOINT_COUNT <= HEALTH_EVIDENCE_MAXIMUM_RECORDS),
     }
+
+
+def _maximum_periodic_checkpoint_bytes_acceptance(
+    *,
+    maximum_terminal_checkpoint_bytes: int,
+) -> int:
+    """Derive the periodic ceiling while preserving the exact file reserve."""
+
+    if maximum_terminal_checkpoint_bytes <= 0:
+        raise ValueError("maximum terminal checkpoint bytes must be positive")
+    periodic_checkpoint_count = SIX_HOUR_CHECKPOINT_COUNT - 1
+    periodic_budget = (
+        HEALTH_EVIDENCE_MAXIMUM_BYTES
+        - MINIMUM_SIX_HOUR_FILE_HEADROOM_BYTES
+        - maximum_terminal_checkpoint_bytes
+    )
+    if periodic_budget <= 0:
+        return 0
+    return periodic_budget // periodic_checkpoint_count
 
 
 def _capacity_evidence_shape(checkpoint: HealthCheckpoint) -> dict[str, int | str | bool]:
@@ -1707,89 +2645,164 @@ def _capacity_evidence_shape(checkpoint: HealthCheckpoint) -> dict[str, int | st
     mismatch = cast(dict[str, object], mismatch_value)
     divergences = cast(dict[str, object], divergence_value)
     current_eligibility = cast(dict[str, object], current_eligibility_value)
-    mismatch_representatives_value = mismatch.get("representatives")
-    pending_records_value = divergences.get("pending_records")
-    resolution_records_value = divergences.get("resolution_records")
-    if (
-        not isinstance(mismatch_representatives_value, tuple)
-        or not isinstance(pending_records_value, tuple)
-        or not isinstance(resolution_records_value, tuple)
-    ):
-        raise RuntimeError("capacity checkpoint audit representative bounds are invalid")
-    mismatch_representatives = cast(tuple[object, ...], mismatch_representatives_value)
-    pending_records = cast(tuple[object, ...], pending_records_value)
-    resolution_records = cast(tuple[object, ...], resolution_records_value)
-    if len(resolution_records) != MAXIMUM_RESOLUTION_REPRESENTATIVES:
-        raise RuntimeError("capacity checkpoint resolution representative bound is invalid")
-    representative_value = resolution_records[0]
-    if not isinstance(representative_value, dict):
-        raise RuntimeError("capacity checkpoint resolution representative is invalid")
-    representative = cast(dict[str, object], representative_value)
-    authoritative_value = representative.get("authoritative_recovery")
-    mismatch_resolution_value = representative.get("mismatch")
-    if not isinstance(authoritative_value, dict) or not isinstance(mismatch_resolution_value, dict):
-        raise RuntimeError("compact resolution representative lacks exact evidence")
-    authoritative = cast(dict[str, object], authoritative_value)
-    resolution_mismatch = cast(dict[str, object], mismatch_resolution_value)
-    raw_links_complete = all(
-        value is not None
-        for value in (
-            cast(dict[str, object], representative["audit_start"])["control_source"],
-            cast(dict[str, object], representative["classification"])["source"],
-            authoritative.get("snapshot_source"),
-            resolution_mismatch.get("response_source"),
-        )
-    )
-    exact_identities_complete = all(
-        isinstance(value, str) and len(value) == 64
-        for value in (
-            resolution_mismatch.get("depth_difference_sha256"),
-            resolution_mismatch.get("local_book_economic_sha256"),
-            resolution_mismatch.get("normalized_rest_content_sha256"),
-            cast(dict[str, object], authoritative["rest_book"]).get("normalized_content_sha256"),
-            cast(dict[str, object], representative["recovered_book"]).get(
-                "economic_content_sha256"
-            ),
-        )
-    )
+    processor_operational_value = checkpoint.resources.get("processor_operational")
+    if not isinstance(processor_operational_value, dict):
+        raise RuntimeError("capacity checkpoint omitted processor operational evidence")
+    processor_operational = cast(dict[str, object], processor_operational_value)
+    retention_value = processor_operational.get("retention")
+    if not isinstance(retention_value, dict):
+        raise RuntimeError("capacity checkpoint processor retention table is invalid")
+    retention = cast(dict[str, object], retention_value)
+    retention_rows_value = retention.get("rows")
+    if not isinstance(retention_rows_value, tuple):
+        raise RuntimeError("capacity checkpoint processor retention rows are invalid")
+    retention_rows = cast(tuple[object, ...], retention_rows_value)
 
-    def pending_raw_links_and_identities_complete(value: object) -> bool:
-        if not isinstance(value, dict):
+    def exact_retention_row(value: object) -> bool:
+        row = _object_tuple(value)
+        if row is None or len(row) != len(PROCESSOR_RETENTION_TELEMETRY_ROW_FIELDS):
             return False
-        record = cast(dict[str, object], value)
-        divergence_id = record.get("divergence_id")
-        audit_start = record.get("audit_start")
-        classification = record.get("classification")
-        mismatch = record.get("mismatch")
-        if not (
-            isinstance(audit_start, dict)
-            and isinstance(classification, dict)
-            and isinstance(mismatch, dict)
-        ):
-            return False
-        audit_start_record = cast(dict[str, object], audit_start)
-        classification_record = cast(dict[str, object], classification)
-        mismatch_record = cast(dict[str, object], mismatch)
-        return (
-            isinstance(divergence_id, str)
-            and len(divergence_id) == 64
-            and record.get("schema") == AUDIT_DIVERGENCE_PENDING_REPRESENTATIVE_SCHEMA
-            and audit_start_record.get("control_source") is not None
-            and classification_record.get("source") is not None
-            and mismatch_record.get("response_source") is not None
-            and all(
-                isinstance(mismatch_record.get(key), str)
-                and len(cast(str, mismatch_record[key])) == 64
-                for key in (
-                    "depth_difference_sha256",
-                    "local_book_economic_sha256",
-                    "normalized_rest_content_sha256",
-                )
+        record: dict[str, object] = dict(
+            zip(PROCESSOR_RETENTION_TELEMETRY_ROW_FIELDS, row, strict=True)
+        )
+        counts: tuple[object, ...] = tuple(
+            record[name] for name in ("retained", "capacity", "total")
+        )
+        byte_values: tuple[object, ...] = tuple(
+            record[name]
+            for name in (
+                "container_shallow_bytes",
+                "representative_object_shallow_bytes",
+                "estimated_retained_bytes",
             )
         )
+        if not all(isinstance(item, int) and not isinstance(item, bool) for item in counts):
+            return False
+        if not all(isinstance(item, int) and not isinstance(item, bool) for item in byte_values):
+            return False
+        retained, capacity, total = cast(tuple[int, int, int], counts)
+        container_bytes, representative_bytes, estimated_bytes = cast(
+            tuple[int, int, int], byte_values
+        )
+        truncated = record["truncated"]
+        return (
+            isinstance(record["domain"], str)
+            and isinstance(truncated, bool)
+            and 0 <= retained <= capacity
+            and retained <= total
+            and truncated == (total > retained)
+            and min(container_bytes, representative_bytes) >= 0
+            and estimated_bytes == container_bytes + retained * representative_bytes
+        )
 
+    retention_domains_list: list[object] = []
+    for value in retention_rows:
+        row = _object_tuple(value)
+        if row:
+            retention_domains_list.append(row[0])
+    retention_domains = tuple(retention_domains_list)
+    processor_retention_exact = (
+        retention.get("schema") == PROCESSOR_RETENTION_TELEMETRY_SCHEMA
+        and isinstance(retention.get("byte_estimate_method"), str)
+        and len(retention_rows) == len(ProcessorRetentionDomain)
+        and len(set(retention_domains)) == len(retention_domains)
+        and set(retention_domains) == {domain.value for domain in ProcessorRetentionDomain}
+        and all(exact_retention_row(row) for row in retention_rows)
+    )
+    retention_by_domain: dict[str, dict[str, object]] = {}
+    for value in retention_rows:
+        row = _object_tuple(value)
+        if row is not None and len(row) == len(PROCESSOR_RETENTION_TELEMETRY_ROW_FIELDS):
+            record: dict[str, object] = dict(
+                zip(PROCESSOR_RETENTION_TELEMETRY_ROW_FIELDS, row, strict=True)
+            )
+            domain = record.get("domain")
+            if isinstance(domain, str):
+                retention_by_domain[domain] = record
+    fault_lifecycle_retention = retention_by_domain.get(
+        ProcessorRetentionDomain.AUDIT_FAULT_LIFECYCLES.value,
+        {},
+    )
+
+    mismatch_rows = _table_rows(
+        mismatch.get("representatives"),
+        schema=AUDIT_MISMATCH_REPRESENTATIVE_TELEMETRY_SCHEMA,
+        row_fields=AUDIT_MISMATCH_REPRESENTATIVE_TELEMETRY_ROW_FIELDS,
+        expected_row_fields=_EXPECTED_MISMATCH_FIELDS,
+    )
+    pending_records = _table_rows(
+        divergences.get("pending_records"),
+        schema=AUDIT_DIVERGENCE_PENDING_REPRESENTATIVE_SCHEMA,
+        row_fields=AUDIT_DIVERGENCE_PENDING_REPRESENTATIVE_ROW_FIELDS,
+        expected_row_fields=_EXPECTED_PENDING_COMPACT_FIELDS,
+    )
+    resolution_records = _table_rows(
+        divergences.get("resolution_records"),
+        schema=AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVE_SCHEMA,
+        row_fields=AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVE_ROW_FIELDS,
+        expected_row_fields=_EXPECTED_RESOLUTION_COMPACT_FIELDS,
+    )
+
+    pending_row_records = tuple(
+        _row_record(AUDIT_DIVERGENCE_PENDING_REPRESENTATIVE_ROW_FIELDS, row)
+        for row in pending_records
+    )
+    resolution_row_records = tuple(
+        _row_record(AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVE_ROW_FIELDS, row)
+        for row in resolution_records
+    )
     pending_evidence_complete = all(
-        pending_raw_links_and_identities_complete(record) for record in pending_records
+        record is not None
+        and all(
+            _is_sha256(record[field])
+            for field in (
+                "pending_record_sha256",
+                "divergence_id",
+                "audit_start_payload_sha256",
+                "classification_payload_sha256",
+                "response_payload_sha256",
+                "depth_difference_sha256",
+                "local_book_economic_sha256",
+                "normalized_rest_content_sha256",
+            )
+        )
+        and all(
+            isinstance(record[field], str) and bool(record[field])
+            for field in (
+                "audit_start_ingest_id",
+                "classification_ingest_id",
+                "response_ingest_id",
+            )
+        )
+        for record in pending_row_records
+    )
+    resolution_evidence_complete = all(
+        record is not None
+        and all(
+            _is_sha256(record[field])
+            for field in (
+                "resolution_record_sha256",
+                "divergence_id",
+                "audit_start_payload_sha256",
+                "classification_payload_sha256",
+                "mismatch_response_payload_sha256",
+                "authoritative_snapshot_payload_sha256",
+                "depth_difference_sha256",
+                "local_book_economic_sha256",
+                "normalized_rest_content_sha256",
+                "recovered_book_economic_sha256",
+            )
+        )
+        and all(
+            isinstance(record[field], str) and bool(record[field])
+            for field in (
+                "audit_start_ingest_id",
+                "classification_ingest_id",
+                "mismatch_response_ingest_id",
+                "authoritative_snapshot_ingest_id",
+            )
+        )
+        for record in resolution_row_records
     )
     current_eligibility_saturated = (
         current_eligibility.get("eligible") is False
@@ -1799,23 +2812,208 @@ def _capacity_evidence_shape(checkpoint: HealthCheckpoint) -> dict[str, int | st
         == MAXIMUM_PENDING_DIVERGENCES
         and current_eligibility.get("required_ineligible_book_count") == MAXIMUM_PENDING_DIVERGENCES
     )
+    replacement_capture_saturated = (
+        current_eligibility.get("eligible") is False
+        and current_eligibility.get("evidence_reconciled") is True
+        and current_eligibility.get("pending_divergence_count") == 0
+        and current_eligibility.get("replacement_capture_count")
+        == SINGLE_TARGET_MAXIMUM_PENDING_DIVERGENCES
+        and current_eligibility.get("processor_ineligible_book_count")
+        == SINGLE_TARGET_MAXIMUM_PENDING_DIVERGENCES
+        and current_eligibility.get("required_ineligible_book_count")
+        == SINGLE_TARGET_MAXIMUM_PENDING_DIVERGENCES
+    )
+    fault_lifecycles = cast(dict[str, object], checkpoint.audit["fault_lifecycles"])
+    current_fault_rows = _table_rows(
+        fault_lifecycles.get("current_representatives"),
+        schema=AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_SCHEMA,
+        row_fields=AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_ROW_FIELDS,
+    )
+    terminal_fault_rows = _table_rows(
+        fault_lifecycles.get("status_representatives"),
+        schema=AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_SCHEMA,
+        row_fields=AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_ROW_FIELDS,
+    )
+    fault_codebooks = dict(AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_CODEBOOKS)
+
+    def fault_code_rows_exact(rows: tuple[object, ...]) -> bool:
+        for value in rows:
+            row = _object_tuple(value)
+            if row is None:
+                return False
+            for field, values in AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_CODEBOOKS:
+                encoded = row[AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_ROW_FIELDS.index(field)]
+                if encoded is None and field in {"endpoint_class", "category", "resolution"}:
+                    continue
+                if (
+                    not isinstance(encoded, int)
+                    or isinstance(encoded, bool)
+                    or not 0 <= encoded < len(values)
+                ):
+                    return False
+        return True
+
+    fault_dictionary_coding_exact = fault_code_rows_exact(
+        current_fault_rows
+    ) and fault_code_rows_exact(terminal_fault_rows)
+    fault_statuses: set[object] = set()
+    for value in (*current_fault_rows, *terminal_fault_rows):
+        row = _object_tuple(value)
+        if row is not None:
+            status_code = row[AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_ROW_FIELDS.index("status")]
+            if isinstance(status_code, int) and not isinstance(status_code, bool):
+                statuses = fault_codebooks["status"]
+                if 0 <= status_code < len(statuses):
+                    fault_statuses.add(statuses[status_code])
+    fragment_rows = _table_rows(
+        checkpoint.analytical.get("fragment_retention"),
+        schema=ANALYTICAL_FRAGMENT_RETENTION_TELEMETRY_SCHEMA,
+        row_fields=ANALYTICAL_FRAGMENT_RETENTION_TELEMETRY_ROW_FIELDS,
+    )
+    public_http_rows = _table_rows(
+        checkpoint.http.get("endpoints"),
+        schema=PUBLIC_READ_ENDPOINT_TELEMETRY_SCHEMA,
+        row_fields=PUBLIC_READ_ENDPOINT_TELEMETRY_ROW_FIELDS,
+        expected_row_fields=_EXPECTED_PUBLIC_HTTP_FIELDS,
+    )
+    audit_http_rows = _table_rows(
+        fault_lifecycles.get("public_http_endpoints"),
+        schema=AUDIT_HTTP_ENDPOINT_TELEMETRY_SCHEMA,
+        row_fields=AUDIT_HTTP_ENDPOINT_TELEMETRY_ROW_FIELDS,
+        expected_row_fields=_EXPECTED_AUDIT_HTTP_FIELDS,
+    )
+    rss_trend = cast(dict[str, object], checkpoint.resources["rss_trend"])
+    rss_rows = _table_rows(
+        rss_trend.get("major_discontinuities"),
+        schema=PROCESS_RESOURCE_DISCONTINUITY_TELEMETRY_SCHEMA,
+        row_fields=PROCESS_RESOURCE_DISCONTINUITY_TELEMETRY_ROW_FIELDS,
+    )
+    stage_rows = _table_rows(
+        checkpoint.audit.get("stage_timing_nanoseconds"),
+        schema=AUDIT_STAGE_TIMING_TELEMETRY_SCHEMA,
+        row_fields=AUDIT_STAGE_TIMING_TELEMETRY_HISTOGRAM_FIELDS,
+        expected_row_fields=_EXPECTED_AUDIT_STAGE_HISTOGRAM_FIELDS,
+    )
+    history_chains = cast(dict[str, object], processor_operational["history_chains"])
+    history_values = history_chains.get("values")
+    history_value_tuple = _object_tuple(history_values)
+    memory_allocators = cast(dict[str, object], checkpoint.resources["memory_allocators"])
+    host_runtime_identity = cast(dict[str, object], checkpoint.resources["host_runtime_identity"])
+    host_unknown_fields = host_runtime_identity.get("unknown_fields")
+    reported_top = cast(dict[str, object], checkpoint.audit["reported_top_transitions"])
     return {
+        "analytical_fragment_retention_row_count": len(fragment_rows),
+        "analytical_fragment_retention_schema": cast(
+            str,
+            cast(dict[str, object], checkpoint.analytical["fragment_retention"])["schema"],
+        ),
+        "audit_fault_current_representative_count": len(current_fault_rows),
+        "audit_fault_current_count": cast(int, fault_lifecycles["current"]),
+        "audit_fault_current_representative_capacity": cast(
+            int, fault_lifecycles["current_representative_capacity"]
+        ),
+        "audit_fault_current_representatives_truncated": cast(
+            bool, fault_lifecycles["current_representatives_truncated"]
+        ),
+        "audit_fault_evidence_reconciled": cast(bool, fault_lifecycles["evidence_reconciled"]),
+        "audit_fault_representative_dictionary_coded_field_count": len(
+            AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_CODEBOOKS
+        ),
+        "audit_fault_representative_dictionary_coding_exact": (fault_dictionary_coding_exact),
+        "audit_fault_lifecycle_representative_schema": (
+            AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_SCHEMA
+        ),
+        "audit_fault_lifecycle_retention_capacity": cast(
+            int, fault_lifecycle_retention.get("capacity", -1)
+        ),
+        "audit_fault_lifecycle_retention_retained": cast(
+            int, fault_lifecycle_retention.get("retained", -1)
+        ),
+        "audit_fault_lifecycle_retention_total": cast(
+            int, fault_lifecycle_retention.get("total", -1)
+        ),
+        "audit_fault_lifecycle_retention_truncated": cast(
+            bool, fault_lifecycle_retention.get("truncated", False)
+        ),
+        "audit_fault_status_representative_count": len(terminal_fault_rows),
+        "audit_fault_status_set_complete": fault_statuses
+        == {status.value for status in AuditFaultStatus},
+        "audit_http_endpoint_row_count": len(audit_http_rows),
+        "audit_http_endpoint_rows_exact": _audit_http_rows_exact(audit_http_rows),
+        "audit_http_endpoint_schema": AUDIT_HTTP_ENDPOINT_TELEMETRY_SCHEMA,
+        "audit_stage_timing_populated": _audit_stage_rows_exact(stage_rows),
+        "audit_stage_timing_rows_exact": _audit_stage_rows_exact(stage_rows),
+        "audit_stage_timing_row_count": len(stage_rows),
         "compact_resolution_omits_nested_observed_divergence": (
-            "observed_divergence" not in representative
+            _compact_rows_omit_nested_fields(
+                resolution_records,
+                row_fields=AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVE_ROW_FIELDS,
+                expected_row_fields=_EXPECTED_RESOLUTION_COMPACT_FIELDS,
+                forbidden_fields=frozenset({"observed_divergence"}),
+            )
         ),
-        "compact_pending_omits_nested_audit_outcome": all(
-            isinstance(value, dict) and "audit_outcome" not in value for value in pending_records
+        "compact_pending_omits_nested_audit_outcome": _compact_rows_omit_nested_fields(
+            pending_records,
+            row_fields=AUDIT_DIVERGENCE_PENDING_REPRESENTATIVE_ROW_FIELDS,
+            expected_row_fields=_EXPECTED_PENDING_COMPACT_FIELDS,
+            forbidden_fields=frozenset({"audit_outcome"}),
         ),
-        "exact_identities_complete": exact_identities_complete,
         "current_eligibility_saturated": current_eligibility_saturated,
-        "mismatch_cause_representative_count": len(mismatch_representatives),
+        "decision_reason_count": len(checkpoint.reason_codes),
+        "decision_sticky_reason_count": len(checkpoint.gate1_sticky_reason_codes),
+        "exact_identities_complete": resolution_evidence_complete,
+        "mismatch_cause_representative_count": len(mismatch_rows),
+        "mismatch_cause_rows_exact": _mismatch_rows_exact(mismatch_rows, mismatch.get("counts")),
         "pending_record_count": len(pending_records),
         "pending_representative_schema": AUDIT_DIVERGENCE_PENDING_REPRESENTATIVE_SCHEMA,
         "pending_raw_links_and_identities_complete": pending_evidence_complete,
         "pending_saturation_kind": CAPACITY_PENDING_SATURATION_KIND,
-        "raw_links_complete": raw_links_complete,
+        "processor_history_chain_count": (
+            len(history_value_tuple) if history_value_tuple is not None else -1
+        ),
+        "processor_history_chains_exact": (
+            history_chains.get("schema") == PROCESSOR_HISTORY_CHAIN_TELEMETRY_SCHEMA
+            and history_value_tuple is not None
+            and len(history_value_tuple) == len(PROCESSOR_HISTORY_CHAIN_TELEMETRY_FIELDS)
+            and all(_is_sha256(value) for value in history_value_tuple)
+        ),
+        "processor_retention_exact": processor_retention_exact,
+        "processor_retention_row_count": len(retention_rows),
+        "processor_retention_schema": cast(str, retention.get("schema")),
+        "public_http_endpoint_row_count": len(public_http_rows),
+        "public_http_endpoint_rows_exact": _public_http_rows_exact(public_http_rows),
+        "public_http_endpoint_schema": PUBLIC_READ_ENDPOINT_TELEMETRY_SCHEMA,
+        "python_allocation_group_count": len(
+            cast(tuple[object, ...], memory_allocators["python_allocation_groups"])
+        ),
+        "reported_top_transition_count": sum(
+            book["reported_top_transition"] is not None for book in checkpoint.books
+        ),
+        "reported_top_transition_schema": cast(str, reported_top["current_record_schema"]),
+        "raw_links_complete": resolution_evidence_complete,
+        "replacement_capture_count": cast(
+            int, current_eligibility.get("replacement_capture_count", -1)
+        ),
+        "replacement_capture_saturated": replacement_capture_saturated,
         "resolution_representative_count": len(resolution_records),
-        "resolution_representative_schema": cast(str, representative.get("schema")),
+        "resolution_representative_schema": AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVE_SCHEMA,
+        "rss_discontinuity_row_count": len(rss_rows),
+        "rss_discontinuity_schema": PROCESS_RESOURCE_DISCONTINUITY_TELEMETRY_SCHEMA,
+        "resource_allocator_fields_populated": all(
+            memory_allocators.get(field) is not None
+            for field in (
+                "native_allocator_residual_bytes",
+                "pyarrow_current_bytes",
+                "pyarrow_peak_bytes",
+                "python_tracemalloc_current_bytes",
+                "python_tracemalloc_peak_bytes",
+            )
+        ),
+        "host_identity_unknown_field_count": (
+            len(host_unknown_tuple)
+            if (host_unknown_tuple := _object_tuple(host_unknown_fields)) is not None
+            else -1
+        ),
     }
 
 
@@ -1854,8 +3052,7 @@ def run_benchmark(
 
     if warmups < 0 or min(repetitions, causal_repetitions, replay_repetitions) <= 0:
         raise ValueError("warmups must be non-negative and repetitions must be positive")
-    rss_before = _current_rss_bytes()
-    peak_rss_before = _peak_rss_bytes()
+    rss_before = _rss_measurement()
     config = load_phase1_config(REPOSITORY / "config" / "phase1.toml")
     if config.health.checkpoint_interval_seconds != SIX_HOUR_CHECKPOINT_CADENCE_SECONDS:
         raise RuntimeError("configured health cadence differs from the Gate-1 projection")
@@ -1956,17 +3153,155 @@ def run_benchmark(
     }
 
     lifecycle_processor = _maximum_lifecycle_processor(config)
-    capacity_checkpoint = _capacity_checkpoint(lifecycle_processor, config)
-    checkpoint_bytes = len(
+    capacity_checkpoint = _capacity_checkpoint(lifecycle_processor, config, terminal=False)
+    terminal_capacity_checkpoint = _capacity_checkpoint(
+        lifecycle_processor,
+        config,
+        terminal=True,
+    )
+    unknown_host_capacity_checkpoint = _capacity_checkpoint(
+        lifecycle_processor,
+        config,
+        host_source_unknown=True,
+        terminal=False,
+    )
+    unknown_host_terminal_capacity_checkpoint = _capacity_checkpoint(
+        lifecycle_processor,
+        config,
+        host_source_unknown=True,
+        terminal=True,
+    )
+    replacement_capture_processor = _maximum_replacement_capture_processor(config)
+    replacement_capture_capacity_checkpoint = _capacity_checkpoint(
+        replacement_capture_processor,
+        config,
+        terminal=False,
+    )
+    replacement_capture_terminal_capacity_checkpoint = _capacity_checkpoint(
+        replacement_capture_processor,
+        config,
+        terminal=True,
+    )
+    unknown_host_replacement_capture_capacity_checkpoint = _capacity_checkpoint(
+        replacement_capture_processor,
+        config,
+        host_source_unknown=True,
+        terminal=False,
+    )
+    unknown_host_replacement_capture_terminal_capacity_checkpoint = _capacity_checkpoint(
+        replacement_capture_processor,
+        config,
+        host_source_unknown=True,
+        terminal=True,
+    )
+    known_host_periodic_checkpoint_bytes = len(
         canonical_json_bytes(capacity_checkpoint.to_record(), allow_floats=True) + b"\n"
     )
-    capacity = _capacity_projection(maximum_checkpoint_bytes=checkpoint_bytes)
+    known_host_terminal_checkpoint_bytes = len(
+        canonical_json_bytes(terminal_capacity_checkpoint.to_record(), allow_floats=True) + b"\n"
+    )
+    unknown_host_periodic_checkpoint_bytes = len(
+        canonical_json_bytes(unknown_host_capacity_checkpoint.to_record(), allow_floats=True)
+        + b"\n"
+    )
+    unknown_host_terminal_checkpoint_bytes = len(
+        canonical_json_bytes(
+            unknown_host_terminal_capacity_checkpoint.to_record(),
+            allow_floats=True,
+        )
+        + b"\n"
+    )
+    replacement_capture_periodic_checkpoint_bytes = len(
+        canonical_json_bytes(
+            replacement_capture_capacity_checkpoint.to_record(),
+            allow_floats=True,
+        )
+        + b"\n"
+    )
+    replacement_capture_terminal_checkpoint_bytes = len(
+        canonical_json_bytes(
+            replacement_capture_terminal_capacity_checkpoint.to_record(),
+            allow_floats=True,
+        )
+        + b"\n"
+    )
+    unknown_host_replacement_capture_periodic_checkpoint_bytes = len(
+        canonical_json_bytes(
+            unknown_host_replacement_capture_capacity_checkpoint.to_record(),
+            allow_floats=True,
+        )
+        + b"\n"
+    )
+    unknown_host_replacement_capture_terminal_checkpoint_bytes = len(
+        canonical_json_bytes(
+            unknown_host_replacement_capture_terminal_capacity_checkpoint.to_record(),
+            allow_floats=True,
+        )
+        + b"\n"
+    )
+    periodic_checkpoint_bytes = max(
+        known_host_periodic_checkpoint_bytes,
+        unknown_host_periodic_checkpoint_bytes,
+        replacement_capture_periodic_checkpoint_bytes,
+        unknown_host_replacement_capture_periodic_checkpoint_bytes,
+    )
+    terminal_checkpoint_bytes = max(
+        known_host_terminal_checkpoint_bytes,
+        unknown_host_terminal_checkpoint_bytes,
+        replacement_capture_terminal_checkpoint_bytes,
+        unknown_host_replacement_capture_terminal_checkpoint_bytes,
+    )
+    capacity = _capacity_projection(
+        maximum_periodic_checkpoint_bytes=periodic_checkpoint_bytes,
+        maximum_terminal_checkpoint_bytes=terminal_checkpoint_bytes,
+    )
+    capacity.update(
+        {
+            "known_host_periodic_checkpoint_bytes": known_host_periodic_checkpoint_bytes,
+            "known_host_terminal_checkpoint_bytes": known_host_terminal_checkpoint_bytes,
+            "unknown_host_periodic_checkpoint_bytes": unknown_host_periodic_checkpoint_bytes,
+            "unknown_host_terminal_checkpoint_bytes": unknown_host_terminal_checkpoint_bytes,
+            "unknown_host_periodic_delta_bytes": (
+                unknown_host_periodic_checkpoint_bytes - known_host_periodic_checkpoint_bytes
+            ),
+            "unknown_host_terminal_delta_bytes": (
+                unknown_host_terminal_checkpoint_bytes - known_host_terminal_checkpoint_bytes
+            ),
+            "unknown_host_source_field_count": 9,
+            "replacement_capture_periodic_checkpoint_bytes": (
+                replacement_capture_periodic_checkpoint_bytes
+            ),
+            "replacement_capture_terminal_checkpoint_bytes": (
+                replacement_capture_terminal_checkpoint_bytes
+            ),
+            "unknown_host_replacement_capture_periodic_checkpoint_bytes": (
+                unknown_host_replacement_capture_periodic_checkpoint_bytes
+            ),
+            "unknown_host_replacement_capture_terminal_checkpoint_bytes": (
+                unknown_host_replacement_capture_terminal_checkpoint_bytes
+            ),
+        }
+    )
     capacity_shape = _capacity_evidence_shape(capacity_checkpoint)
-    if not capacity["within_file_bound"] or not capacity["within_record_bound"]:
+    terminal_capacity_shape = _capacity_evidence_shape(terminal_capacity_checkpoint)
+    unknown_host_capacity_shape = _capacity_evidence_shape(unknown_host_capacity_checkpoint)
+    replacement_capture_capacity_shape = _capacity_evidence_shape(
+        replacement_capture_capacity_checkpoint
+    )
+    periodic_checkpoint_bytes_acceptance = _maximum_periodic_checkpoint_bytes_acceptance(
+        maximum_terminal_checkpoint_bytes=terminal_checkpoint_bytes
+    )
+    if (
+        not capacity["within_file_bound"]
+        or not capacity["within_record_bound"]
+        or periodic_checkpoint_bytes > periodic_checkpoint_bytes_acceptance
+        or cast(int, capacity["remaining_file_bytes"]) < MINIMUM_SIX_HOUR_FILE_HEADROOM_BYTES
+    ):
         raise RuntimeError("six-hour health checkpoint projection exceeds a configured bound")
     if (
         capacity_shape["mismatch_cause_representative_count"]
         != MAXIMUM_MISMATCH_CAUSE_REPRESENTATIVES
+        or not capacity_shape["mismatch_cause_rows_exact"]
         or capacity_shape["pending_record_count"] != MAXIMUM_PENDING_DIVERGENCES
         or capacity_shape["resolution_representative_schema"]
         != AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVE_SCHEMA
@@ -1979,10 +3314,63 @@ def run_benchmark(
         or not capacity_shape["current_eligibility_saturated"]
         or not capacity_shape["compact_pending_omits_nested_audit_outcome"]
         or not capacity_shape["compact_resolution_omits_nested_observed_divergence"]
+        or not capacity_shape["processor_retention_exact"]
+        or capacity_shape["processor_retention_row_count"] != len(ProcessorRetentionDomain)
+        or capacity_shape["processor_retention_schema"] != PROCESSOR_RETENTION_TELEMETRY_SCHEMA
+        or capacity_shape["analytical_fragment_retention_row_count"] != 3
+        or capacity_shape["analytical_fragment_retention_schema"]
+        != ANALYTICAL_FRAGMENT_RETENTION_TELEMETRY_SCHEMA
+        or capacity_shape["audit_fault_current_representative_count"]
+        != MAXIMUM_AUDIT_FAULT_CURRENT_REPRESENTATIVES
+        or capacity_shape["audit_fault_current_representative_capacity"]
+        != MAXIMUM_AUDIT_FAULT_CURRENT_REPRESENTATIVES
+        or capacity_shape["audit_fault_current_count"] != MAXIMUM_ACTIVE_AUDIT_FAULTS
+        or not capacity_shape["audit_fault_current_representatives_truncated"]
+        or not capacity_shape["audit_fault_evidence_reconciled"]
+        or capacity_shape["audit_fault_representative_dictionary_coded_field_count"]
+        != len(AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_CODEBOOKS)
+        or not capacity_shape["audit_fault_representative_dictionary_coding_exact"]
+        or not capacity_shape["audit_fault_status_set_complete"]
+        or capacity_shape["audit_fault_status_representative_count"] != len(AuditFaultStatus)
+        or capacity_shape["audit_fault_lifecycle_retention_capacity"] != 64
+        or capacity_shape["audit_fault_lifecycle_retention_retained"] != 64
+        or capacity_shape["audit_fault_lifecycle_retention_total"]
+        != MAXIMUM_ACTIVE_AUDIT_FAULTS + 3
+        or not capacity_shape["audit_fault_lifecycle_retention_truncated"]
+        or capacity_shape["audit_http_endpoint_row_count"] != 5
+        or not capacity_shape["audit_http_endpoint_rows_exact"]
+        or not capacity_shape["audit_stage_timing_populated"]
+        or not capacity_shape["audit_stage_timing_rows_exact"]
+        or capacity_shape["audit_stage_timing_row_count"]
+        != len(AUDIT_STAGE_TIMING_TELEMETRY_STAGES)
+        or capacity_shape["decision_reason_count"] != len(HealthDecisionReason)
+        or capacity_shape["decision_sticky_reason_count"] != len(HealthDecisionReason) - 4
+        or not capacity_shape["processor_history_chains_exact"]
+        or capacity_shape["public_http_endpoint_row_count"] != 5
+        or not capacity_shape["public_http_endpoint_rows_exact"]
+        or capacity_shape["reported_top_transition_count"] != 2
+        or capacity_shape["reported_top_transition_schema"]
+        != REPORTED_TOP_TRANSITION_HEALTH_TELEMETRY_SCHEMA
+        or capacity_shape["rss_discontinuity_row_count"]
+        != MAXIMUM_REPORTED_RESOURCE_DISCONTINUITIES
+        or not capacity_shape["resource_allocator_fields_populated"]
+        or capacity_shape["python_allocation_group_count"] != 0
+        or terminal_capacity_shape["python_allocation_group_count"]
+        != MAXIMUM_REPORTED_PYTHON_ALLOCATION_GROUPS
+        or capacity_shape["host_identity_unknown_field_count"] != 0
+        or unknown_host_capacity_shape["host_identity_unknown_field_count"] != 9
+        or not replacement_capture_capacity_shape["replacement_capture_saturated"]
+        or replacement_capture_capacity_shape["replacement_capture_count"]
+        != SINGLE_TARGET_MAXIMUM_PENDING_DIVERGENCES
     ):
         raise RuntimeError("six-hour capacity checkpoint did not saturate exact evidence")
-    rss_after = _current_rss_bytes()
-    peak_rss_after = _peak_rss_bytes()
+    rss_after = _rss_measurement()
+    current_rss_before = cast(int | None, rss_before["current_rss_bytes"])
+    current_rss_after = cast(int | None, rss_after["current_rss_bytes"])
+    python_ru_maxrss_before = cast(int, rss_before["python_ru_maxrss_bytes"])
+    python_ru_maxrss_after = cast(int, rss_after["python_ru_maxrss_bytes"])
+    composite_peak_before = cast(int, rss_before["same_sample_composite_peak_bytes"])
+    composite_peak_after = cast(int, rss_after["same_sample_composite_peak_bytes"])
     result: dict[str, object] = {
         "bounds": {
             "exact_levels_per_side": EXACT_LEVELS_PER_SIDE,
@@ -1992,9 +3380,13 @@ def run_benchmark(
             ),
             "maximum_mismatch_cause_representatives": (MAXIMUM_MISMATCH_CAUSE_REPRESENTATIVES),
             "maximum_resolution_representatives": MAXIMUM_RESOLUTION_REPRESENTATIVES,
+            "maximum_periodic_checkpoint_bytes_acceptance": (periodic_checkpoint_bytes_acceptance),
+            "minimum_six_hour_file_headroom_bytes": (MINIMUM_SIX_HOUR_FILE_HEADROOM_BYTES),
             "pending_update_path": "NOT_IMPLEMENTED_BY_ADR_0054_IMMEDIATE_RESNAPSHOT",
         },
         "capacity_evidence_shape": capacity_shape,
+        "replacement_capture_capacity_evidence_shape": (replacement_capture_capacity_shape),
+        "terminal_capacity_evidence_shape": terminal_capacity_shape,
         "capacity_projection": capacity,
         "identity": {
             "config_sha256": config.config_hash.value,
@@ -2010,14 +3402,17 @@ def run_benchmark(
         },
         "replay_throughput": replay_throughput,
         "resources": {
-            "current_rss_after_bytes": rss_after,
-            "current_rss_before_bytes": rss_before,
+            "after": rss_after,
+            "before": rss_before,
             "current_rss_delta_bytes": (
-                None if rss_before is None or rss_after is None else rss_after - rss_before
+                None
+                if current_rss_before is None or current_rss_after is None
+                else current_rss_after - current_rss_before
             ),
-            "peak_rss_after_bytes": peak_rss_after,
-            "peak_rss_before_bytes": peak_rss_before,
-            "peak_rss_delta_bytes": peak_rss_after - peak_rss_before,
+            "python_ru_maxrss_delta_bytes": (python_ru_maxrss_after - python_ru_maxrss_before),
+            "same_sample_composite_peak_delta_bytes": (
+                composite_peak_after - composite_peak_before
+            ),
             "rss_scope": "single benchmark process; allocation probes are reported per series",
         },
         "schema_version": RESULT_SCHEMA,
@@ -2034,13 +3429,18 @@ def _render_report(result: dict[str, object]) -> str:
     capacity_shape = cast(dict[str, object], result["capacity_evidence_shape"])
     replay = cast(dict[str, object], result["replay_throughput"])
     resources = cast(dict[str, object], result["resources"])
+    before_resources = cast(dict[str, object], resources["before"])
+    after_resources = cast(dict[str, object], resources["after"])
     series = cast(tuple[dict[str, object], ...], result["series"])
     lines = [
         "# Gate-1 audit-divergence performance benchmark",
         "",
         f"- Schema: `{result['schema_version']}`",
         f"- Six-hour checkpoint count: {capacity['checkpoint_count']}",
-        f"- Conservative maximum checkpoint: {capacity['maximum_checkpoint_bytes']} bytes",
+        "- Conservative maximum periodic checkpoint: "
+        f"{capacity['maximum_periodic_checkpoint_bytes']} bytes",
+        "- Conservative maximum terminal checkpoint: "
+        f"{capacity['maximum_terminal_checkpoint_bytes']} bytes",
         f"- Projected checkpoint bytes: {capacity['projected_file_bytes']} / "
         f"{capacity['maximum_file_bytes']}",
         f"- Remaining checkpoint-file margin: {capacity['remaining_file_bytes']} bytes",
@@ -2055,10 +3455,18 @@ def _render_report(result: dict[str, object]) -> str:
         f"- Compact resolution schema: `{capacity_shape['resolution_representative_schema']}`",
         f"- Replay workload: {replay['source_event_count']} events; "
         f"{replay['events_per_second_at_median']} events/s at median",
-        f"- Current RSS before/after: {resources['current_rss_before_bytes']} / "
-        f"{resources['current_rss_after_bytes']} bytes",
-        f"- Peak RSS before/after: {resources['peak_rss_before_bytes']} / "
-        f"{resources['peak_rss_after_bytes']} bytes",
+        f"- Current RSS before/after: {before_resources['current_rss_bytes']} / "
+        f"{after_resources['current_rss_bytes']} bytes "
+        f"(`{before_resources['current_rss_source']}` / "
+        f"`{after_resources['current_rss_source']}`)",
+        f"- Python ru_maxrss before/after: {before_resources['python_ru_maxrss_bytes']} / "
+        f"{after_resources['python_ru_maxrss_bytes']} bytes "
+        f"(`{before_resources['python_ru_maxrss_source']}` / "
+        f"`{after_resources['python_ru_maxrss_source']}`)",
+        "- Same-sample composite peak before/after: "
+        f"{before_resources['same_sample_composite_peak_bytes']} / "
+        f"{after_resources['same_sample_composite_peak_bytes']} bytes "
+        f"(`{after_resources['same_sample_composite_peak_source']}`)",
         "",
         "| Series | Repetitions | p50 ns | p95 ns | p99 ns | Peak traced delta bytes |",
         "|---|---:|---:|---:|---:|---:|",

@@ -20,6 +20,7 @@ from multi_market_arbitrage.core.provenance import Provenance
 from multi_market_arbitrage.core.serialization import (
     CanonicalSerializationError,
     canonical_json_bytes,
+    canonical_sequence_sha256,
     canonical_sha256,
 )
 from multi_market_arbitrage.core.time import MonotonicTimestamp, UtcTimestamp
@@ -87,6 +88,28 @@ def test_canonical_serialization_is_order_independent_and_float_closed() -> None
     assert canonical_sha256(left) == canonical_sha256(right)
     with pytest.raises(CanonicalSerializationError):
         canonical_json_bytes({"financial": 0.1})
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        (),
+        ({"b": 2, "a": ["x", 1]},),
+        ({"unicode": "\u03c4\u03b9\u03bc\u03ae"}, {"bytes": b"payload"}, None, True),
+    ],
+)
+def test_streaming_canonical_sequence_hash_is_byte_identical(
+    values: tuple[object, ...],
+) -> None:
+    assert canonical_sequence_sha256(values) == canonical_sha256(values)
+
+
+@pytest.mark.parametrize("value", ["abc", b"abc", bytearray(b"abc")])
+def test_streaming_canonical_sequence_hash_rejects_scalar_like_sequences(
+    value: str | bytes | bytearray,
+) -> None:
+    with pytest.raises(CanonicalSerializationError, match="scalar-like"):
+        canonical_sequence_sha256(value)
 
 
 def test_utc_timestamp_preserves_nanoseconds_in_canonical_text() -> None:

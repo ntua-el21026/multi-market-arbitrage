@@ -31,16 +31,27 @@ def test_committed_phase1_configuration_loads_strictly() -> None:
     assert config.polymarket.snapshot_audit_freshness_guard_seconds == 4.0
     assert config.polymarket.snapshot_audit_race_retry_quiet_seconds == 0.25
     assert config.polymarket.snapshot_audit_max_race_retries == 4
+    assert config.polymarket.audit_replacement_maximum_attempts == 9
+    assert config.polymarket.audit_replacement_retry_delay_seconds == 5.0
+    assert config.polymarket.audit_replacement_hard_deadline_seconds == 120.0
     assert config.polymarket.public_reads.maximum_attempts == 3
     assert config.polymarket.public_reads.gamma_markets_requests_per_window == 30
     assert config.polymarket.public_reads.rate_limit_checked_on.isoformat() == "2026-08-22"
     assert config.scanner.maximum_capacity_evaluations == 4096
     assert config.health.checkpoint_interval_seconds == 10.0
+    assert config.health.maximum_file_bytes == 68 * 1024 * 1024
     assert config.health.availability_queue_capacity == 64
     assert config.health.maximum_availability_intervals == 8192
     assert config.health.maximum_availability_file_bytes == 64 * 1024 * 1024
+    assert config.health.availability_contribution_queue_capacity == 1024
+    assert config.health.maximum_availability_contributions == 65536
+    assert config.health.maximum_availability_contribution_file_bytes == 256 * 1024 * 1024
+    assert config.health.maximum_availability_record_bytes == 64 * 1024
     assert config.storage.journal_segment_max_uncompressed_bytes == 64 * 1024 * 1024
     assert config.storage.journal_run_max_uncompressed_bytes == 4 * 1024 * 1024 * 1024
+    assert config.storage.journal_seal_queue_capacity == 4
+    assert config.storage.journal_pending_seal_max_uncompressed_bytes == 256 * 1024 * 1024
+    assert config.storage.journal_pending_seal_max_age_seconds == 120.0
     assert config.storage.analytical_record_max_bytes == 8 * 1024 * 1024
     assert config.storage.analytical_buffer_max_bytes == 64 * 1024 * 1024
     assert len(config.config_hash.value) == 64
@@ -165,6 +176,126 @@ def test_threshold_and_timing_cross_field_validation() -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     [
+        ("audit_replacement_maximum_attempts", 0),
+        ("audit_replacement_maximum_attempts", 65),
+        ("audit_replacement_maximum_attempts", 9.0),
+        ("audit_replacement_retry_delay_seconds", 0.0),
+        ("audit_replacement_retry_delay_seconds", 60.1),
+        ("audit_replacement_retry_delay_seconds", True),
+        ("audit_replacement_hard_deadline_seconds", 0.0),
+        ("audit_replacement_hard_deadline_seconds", 300.1),
+        ("audit_replacement_hard_deadline_seconds", True),
+    ],
+)
+def test_audit_replacement_policy_is_strict_and_hard_bounded(
+    field: str,
+    value: int | float,
+) -> None:
+    raw = _raw_config()
+    polymarket = _section(raw, "polymarket")
+    polymarket[field] = value
+    raw["polymarket"] = polymarket
+    with pytest.raises(ValidationError):
+        Phase1Config.from_mapping(raw)
+
+
+def test_audit_replacement_policy_obeys_freshness_and_run_deadlines() -> None:
+    raw = _raw_config()
+    polymarket = _section(raw, "polymarket")
+    polymarket["audit_replacement_retry_delay_seconds"] = 5.1
+    raw["polymarket"] = polymarket
+    with pytest.raises(
+        ValidationError,
+        match="audit replacement retry delay cannot exceed maximum book age",
+    ):
+        Phase1Config.from_mapping(raw)
+
+    raw = _raw_config()
+    polymarket = _section(raw, "polymarket")
+    polymarket["audit_replacement_retry_delay_seconds"] = 5.0
+    polymarket["audit_replacement_hard_deadline_seconds"] = 5.0
+    raw["polymarket"] = polymarket
+    with pytest.raises(
+        ValidationError,
+        match="audit replacement retry delay must be below its hard deadline",
+    ):
+        Phase1Config.from_mapping(raw)
+
+    raw = _raw_config()
+    system = _section(raw, "system")
+    system["maximum_observation_duration_seconds"] = 119.0
+    raw["system"] = system
+    with pytest.raises(
+        ValidationError,
+        match="audit replacement hard deadline cannot exceed the run deadline",
+    ):
+        Phase1Config.from_mapping(raw)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "audit_replacement_maximum_attempts",
+        "audit_replacement_retry_delay_seconds",
+        "audit_replacement_hard_deadline_seconds",
+    ],
+)
+def test_audit_replacement_policy_bounds_are_explicit(field: str) -> None:
+    raw = _raw_config()
+    polymarket = _section(raw, "polymarket")
+    polymarket.pop(field)
+    raw["polymarket"] = polymarket
+    with pytest.raises(ValidationError):
+        Phase1Config.from_mapping(raw)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("availability_contribution_queue_capacity", 0),
+        ("availability_contribution_queue_capacity", 65_537),
+        ("availability_contribution_queue_capacity", 1024.0),
+        ("maximum_availability_contributions", 0),
+        ("maximum_availability_contributions", 2_000_001),
+        ("maximum_availability_contribution_file_bytes", 0),
+        ("maximum_availability_contribution_file_bytes", 256 * 1024 * 1024 + 1),
+        ("maximum_availability_record_bytes", 0),
+        ("maximum_availability_record_bytes", 1024 * 1024 + 1),
+    ],
+)
+def test_availability_contribution_writer_policy_is_strict_and_hard_bounded(
+    field: str,
+    value: int | float,
+) -> None:
+    raw = _raw_config()
+    health = _section(raw, "health")
+    health[field] = value
+    raw["health"] = health
+    with pytest.raises(ValidationError):
+        Phase1Config.from_mapping(raw)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "availability_contribution_queue_capacity",
+        "maximum_availability_contributions",
+        "maximum_availability_contribution_file_bytes",
+        "maximum_availability_record_bytes",
+    ],
+)
+def test_availability_contribution_writer_bounds_are_explicit(field: str) -> None:
+    raw = _raw_config()
+    health = _section(raw, "health")
+    health.pop(field)
+    raw["health"] = health
+    with pytest.raises(ValidationError):
+        Phase1Config.from_mapping(raw)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
         ("request_timeout_seconds", 60.1),
         ("maximum_http_response_bytes", 8 * 1024 * 1024 + 1),
         ("maximum_websocket_message_bytes", 1024 * 1024 + 1),
@@ -209,6 +340,10 @@ def test_public_read_policy_is_strict_and_hard_bounded(field: str, value: object
         ("journal_segment_max_uncompressed_bytes", 512 * 1024 * 1024 + 1),
         ("journal_run_max_uncompressed_bytes", 32 * 1024 * 1024),
         ("journal_run_max_uncompressed_bytes", 4 * 1024 * 1024 * 1024 + 1),
+        ("journal_seal_queue_capacity", 65),
+        ("journal_pending_seal_max_uncompressed_bytes", 32 * 1024 * 1024),
+        ("journal_pending_seal_max_uncompressed_bytes", 257 * 1024 * 1024),
+        ("journal_pending_seal_max_uncompressed_bytes", 4 * 1024 * 1024 * 1024 + 1),
     ],
 )
 def test_journal_byte_limits_are_hard_bounded(field: str, value: int) -> None:

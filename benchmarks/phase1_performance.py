@@ -30,7 +30,9 @@ FIXTURES = REPO / "tests" / "golden" / "fixtures"
 FROZEN_COMMIT = "e7d69aedc328ceda220120377307d5ebcc1a80d9"
 BASELINE_HARNESS_SHA256 = "8f10c2f1881a987c9c2439396ae82e2e6adb88c343dde500a25654559672cb87"
 EXPECTED_FIXTURE_SET_SHA256 = "9e52a576eb7f6874d9c494e093aee8e61fb56ab0d33e7ca302bc5a1d1d4ae70c"
-RESULT_SCHEMA = "mma-phase1-performance-final-c-v2"
+RESULT_SCHEMA = "mma-phase1-performance-final-c-v3"
+CURRENT_RSS_KIB_SOURCE = "linux-proc-self-status-vmrss-kib"
+PYTHON_RU_MAXRSS_KIB_SOURCE = "python-resource-getrusage-rusage-self-ru-maxrss-linux-kib"
 SOURCE_SNAPSHOT_EXCLUSIONS = frozenset({"docs/PHASE_1_PERFORMANCE_BASELINE.md"})
 COMPARABLE_SERIES_NAMES = (
     "socket_receive_to_raw_envelope_proxy",
@@ -317,10 +319,18 @@ def require(condition: bool, message: str) -> None:
 
 
 def current_rss_kib() -> int:
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("current-RSS benchmark evidence requires Linux procfs")
     for line in Path("/proc/self/status").read_text().splitlines():
         if line.startswith("VmRSS:"):
             return int(line.split()[1])
     raise RuntimeError("VmRSS absent from /proc/self/status")
+
+
+def python_ru_maxrss_kib() -> int:
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("Python ru_maxrss KiB evidence requires Linux")
+    return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
 
 
 def quantile_nearest_rank(values: Sequence[int], fraction: float) -> int:
@@ -364,7 +374,9 @@ def summarize_samples(
         "measurement_cpu_ns": cpu_ns,
         "process_cpu_to_wall_ratio": cpu_ns / wall_ns if wall_ns else None,
         "rss_kib_after": current_rss_kib(),
-        "process_peak_rss_kib_after": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        "rss_kib_after_source": CURRENT_RSS_KIB_SOURCE,
+        "python_ru_maxrss_kib_after": python_ru_maxrss_kib(),
+        "python_ru_maxrss_kib_after_source": PYTHON_RU_MAXRSS_KIB_SOURCE,
     }
     if extra:
         result["extra"] = dict(extra)
@@ -1612,7 +1624,9 @@ async def production_journal_candidate_trial(
         "events_per_second": scenario.event_count * 1_000_000_000 / wall_ns,
         "cpu_to_wall_ratio": cpu_ns / wall_ns,
         "rss_kib_before": rss_before,
+        "rss_kib_before_source": CURRENT_RSS_KIB_SOURCE,
         "rss_kib_after": current_rss_kib(),
+        "rss_kib_after_source": CURRENT_RSS_KIB_SOURCE,
         "latency_samples_ns": latencies,
         "latency_ns": {name: distribution_ns(samples) for name, samples in latencies.items()},
         "writer_metrics": asdict(metrics),
@@ -1684,6 +1698,7 @@ async def production_journal_candidate_benchmarks(out: Path) -> dict[str, Any]:
                     "cpu_ns": total_cpu,
                     "cpu_to_wall_ratio": total_cpu / total_wall,
                     "rss_kib_after_max": max(int(trial["rss_kib_after"]) for trial in selected),
+                    "rss_kib_after_max_source": CURRENT_RSS_KIB_SOURCE,
                     "queue_high_water": max(
                         int(trial["writer_metrics"]["queue_high_water"]) for trial in selected
                     ),
@@ -2648,6 +2663,7 @@ def provenance_lineage_stress_benchmark() -> tuple[list[dict[str, Any]], dict[st
                     name: distribution_ns(block_samples[name]) for name in stage_names
                 },
                 "rss_kib_after": current_rss_kib(),
+                "rss_kib_after_source": CURRENT_RSS_KIB_SOURCE,
             }
         )
     total_cpu_ns = time.process_time_ns() - cpu_start
@@ -2733,7 +2749,9 @@ def provenance_lineage_stress_benchmark() -> tuple[list[dict[str, Any]], dict[st
         "wall_ns": total_wall_ns,
         "cpu_ns": total_cpu_ns,
         "rss_kib_before": rss_before,
+        "rss_kib_before_source": CURRENT_RSS_KIB_SOURCE,
         "rss_kib_after": current_rss_kib(),
+        "rss_kib_after_source": CURRENT_RSS_KIB_SOURCE,
         "blocks": block_timings,
     }
     return series, validation
@@ -3142,7 +3160,13 @@ def machine_metadata(out: Path, source_identity: Mapping[str, Any]) -> dict[str,
             "clock": "time.perf_counter_ns (monotonic, highest available resolution)",
             "cpu_clock": "time.process_time_ns",
             "percentile_method": "nearest-rank: sorted[ceil(q*n)-1]",
-            "rss": "current VmRSS from /proc/self/status; process peak from getrusage.ru_maxrss",
+            "rss": (
+                "current VmRSS KiB from /proc/self/status is distinct from Python "
+                "getrusage(RUSAGE_SELF).ru_maxrss KiB; neither is relabeled as an "
+                "externally sampled peak"
+            ),
+            "rss_kib_after_source": CURRENT_RSS_KIB_SOURCE,
+            "python_ru_maxrss_kib_after_source": PYTHON_RU_MAXRSS_KIB_SOURCE,
             "execution": (
                 "single Python process; externally pinned using taskset when command line "
                 "records it"

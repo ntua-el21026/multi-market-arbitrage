@@ -20,15 +20,10 @@ from .models import (
 
 
 def fsync_directory(path: Path) -> None:
-    """Persist directory-entry changes on platforms that expose directory fsync."""
+    """Persist directory-entry changes or fail without claiming durability."""
 
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError:
-        # Some supported filesystems do not expose directory descriptors.  File
-        # data is still synced; callers must not infer stronger guarantees there.
-        return
+    descriptor = os.open(path, flags)
     try:
         os.fsync(descriptor)
     finally:
@@ -53,27 +48,43 @@ def atomic_write_bytes(path: Path, content: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _parse_complete_lines(lines: list[bytes], path: Path) -> list[RawEventEnvelope]:
-    envelopes: list[RawEventEnvelope] = []
-    prior_sequence: int | None = None
-    collector_run_id: CollectorRunId | None = None
-    for line_number, line in enumerate(lines, start=1):
-        try:
-            envelope = RawEventEnvelope.from_json_line(line)
-        except RawEnvelopeValidationError as exc:
-            raise JournalRecoveryError(
-                f"interior journal record {line_number} is invalid in {path}; "
-                "original evidence was left untouched"
-            ) from exc
-        if collector_run_id is None:
-            collector_run_id = envelope.collector_run_id
-        elif envelope.collector_run_id != collector_run_id:
-            raise JournalRecoveryError(f"partial segment mixes collector runs: {path}")
-        if prior_sequence is not None and envelope.ingest_seq != prior_sequence + 1:
-            raise JournalRecoveryError(f"partial segment sequence is not contiguous: {path}")
-        prior_sequence = envelope.ingest_seq
-        envelopes.append(envelope)
-    return envelopes
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError as exc:
+        raise JournalRecoveryError(f"cannot read recovery evidence: {path}") from exc
+    return digest.hexdigest()
+
+
+def _assert_source_unchanged(path: Path, *, byte_count: int, digest: str) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise JournalRecoveryError(f"partial recovery input changed during scan: {path}")
+    try:
+        current_size = path.stat().st_size
+    except OSError as exc:
+        raise JournalRecoveryError(f"cannot stat partial recovery input: {path}") from exc
+    if current_size != byte_count or _sha256_file(path) != digest:
+        raise JournalRecoveryError(f"partial recovery input changed during scan: {path}")
+
+
+def _tail_evidence_matches(path: Path, expected: bytes) -> bool:
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        if path.stat().st_size != len(expected):
+            return False
+        offset = 0
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                if chunk != expected[offset : offset + len(chunk)]:
+                    return False
+                offset += len(chunk)
+    except OSError:
+        return False
+    return offset == len(expected)
 
 
 def recover_partial_file(
@@ -83,7 +94,7 @@ def recover_partial_file(
 
     A syntactically complete final record missing only its line terminator is
     repaired.  An incomplete tail is copied byte-for-byte to a content-addressed
-    evidence sidecar before the active segment is atomically truncated.
+    evidence sidecar before the active segment is durably truncated.
     """
 
     if not path.name.endswith(".jsonl.partial"):
@@ -92,19 +103,55 @@ def recover_partial_file(
         raise JournalRecoveryError("partial recovery byte limit is invalid")
     if path.is_symlink() or not path.is_file():
         raise JournalRecoveryError(f"partial recovery input is not a regular file: {path}")
-    with path.open("rb") as handle:
-        original = handle.read(max_bytes + 1)
-    if len(original) > max_bytes:
-        raise JournalRecoveryError(f"partial segment exceeds recovery byte limit: {path}")
-    final_newline = original.rfind(b"\n")
-    if final_newline < 0:
-        complete_prefix = b""
-        tail = original
-    else:
-        complete_prefix = original[: final_newline + 1]
-        tail = original[final_newline + 1 :]
-    complete_lines = complete_prefix.splitlines(keepends=True)
-    envelopes = _parse_complete_lines(complete_lines, path)
+    original_digest = hashlib.sha256()
+    retained_digest = hashlib.sha256()
+    original_bytes = 0
+    retained_bytes = 0
+    recovered_records = 0
+    first_ingest_seq: int | None = None
+    last_ingest_seq: int | None = None
+    collector_run_id: CollectorRunId | None = None
+    tail = b""
+    try:
+        with path.open("rb") as handle:
+            line_number = 0
+            while True:
+                remaining = max_bytes - original_bytes
+                line = handle.readline(remaining + 1)
+                if len(line) > remaining:
+                    raise JournalRecoveryError(
+                        f"partial segment exceeds recovery byte limit: {path}"
+                    )
+                if not line:
+                    break
+                line_number += 1
+                original_bytes += len(line)
+                original_digest.update(line)
+                if not line.endswith(b"\n"):
+                    tail = line
+                    break
+                try:
+                    envelope = RawEventEnvelope.from_json_line(line)
+                except RawEnvelopeValidationError as exc:
+                    raise JournalRecoveryError(
+                        f"interior journal record {line_number} is invalid in {path}; "
+                        "original evidence was left untouched"
+                    ) from exc
+                if collector_run_id is None:
+                    collector_run_id = envelope.collector_run_id
+                    first_ingest_seq = envelope.ingest_seq
+                elif envelope.collector_run_id != collector_run_id:
+                    raise JournalRecoveryError(f"partial segment mixes collector runs: {path}")
+                if last_ingest_seq is not None and envelope.ingest_seq != last_ingest_seq + 1:
+                    raise JournalRecoveryError(
+                        f"partial segment sequence is not contiguous: {path}"
+                    )
+                last_ingest_seq = envelope.ingest_seq
+                recovered_records += 1
+                retained_bytes += len(line)
+                retained_digest.update(line)
+    except OSError as exc:
+        raise JournalRecoveryError(f"cannot scan partial recovery input: {path}") from exc
 
     repaired_missing_newline = False
     truncated_tail = b""
@@ -114,37 +161,74 @@ def recover_partial_file(
         except RawEnvelopeValidationError:
             truncated_tail = tail
         else:
-            if envelopes and tail_envelope.collector_run_id != envelopes[0].collector_run_id:
+            if collector_run_id is not None and tail_envelope.collector_run_id != collector_run_id:
                 raise JournalRecoveryError(f"partial tail belongs to a different run: {path}")
-            if envelopes and tail_envelope.ingest_seq != envelopes[-1].ingest_seq + 1:
+            if last_ingest_seq is not None and tail_envelope.ingest_seq != last_ingest_seq + 1:
                 raise JournalRecoveryError(f"partial tail sequence is not contiguous: {path}")
-            envelopes.append(tail_envelope)
-            complete_prefix += tail + b"\n"
+            if collector_run_id is None:
+                collector_run_id = tail_envelope.collector_run_id
+                first_ingest_seq = tail_envelope.ingest_seq
+            last_ingest_seq = tail_envelope.ingest_seq
+            recovered_records += 1
+            retained_bytes += len(tail) + 1
+            retained_digest.update(tail)
+            retained_digest.update(b"\n")
             repaired_missing_newline = True
 
     tail_hash = hashlib.sha256(truncated_tail).hexdigest() if truncated_tail else None
     tail_path: Path | None = None
     if truncated_tail:
         tail_path = path.with_name(f"{path.name}.truncated-tail.{tail_hash}.bin")
-        if tail_path.exists():
-            if tail_path.read_bytes() != truncated_tail:
+        if tail_path.exists() or tail_path.is_symlink():
+            if not _tail_evidence_matches(tail_path, truncated_tail):
                 raise JournalRecoveryError(f"truncated-tail evidence collision: {tail_path}")
         else:
             atomic_write_bytes(tail_path, truncated_tail)
 
     if repaired_missing_newline or truncated_tail:
-        atomic_write_bytes(path, complete_prefix)
+        _assert_source_unchanged(
+            path,
+            byte_count=original_bytes,
+            digest=original_digest.hexdigest(),
+        )
+    if repaired_missing_newline:
+        try:
+            with path.open("ab") as handle:
+                handle.write(b"\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as exc:
+            raise JournalRecoveryError(
+                f"cannot repair partial segment line terminator: {path}"
+            ) from exc
+    elif truncated_tail:
+        try:
+            with path.open("r+b") as handle:
+                handle.truncate(retained_bytes)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as exc:
+            raise JournalRecoveryError(f"cannot truncate partial segment tail: {path}") from exc
+    if repaired_missing_newline or truncated_tail:
+        try:
+            recovered_size = path.stat().st_size
+        except OSError as exc:
+            raise JournalRecoveryError(f"cannot stat recovered partial segment: {path}") from exc
+        if recovered_size != retained_bytes or _sha256_file(path) != retained_digest.hexdigest():
+            raise JournalRecoveryError(
+                f"recovered partial segment identity does not match retained prefix: {path}"
+            )
 
     report_path = path.with_name(f"{path.name}.recovery.json")
     report_record: dict[str, object] = {
-        "first_ingest_seq": envelopes[0].ingest_seq if envelopes else None,
-        "last_ingest_seq": envelopes[-1].ingest_seq if envelopes else None,
+        "first_ingest_seq": first_ingest_seq,
+        "last_ingest_seq": last_ingest_seq,
         "partial_path": path.name,
         "recovered_at_utc_ns": UtcTimestamp.now().nanoseconds_since_epoch,
-        "recovered_records": len(envelopes),
+        "recovered_records": recovered_records,
         "repaired_missing_newline": repaired_missing_newline,
         "report_version": "journal-recovery-v1",
-        "retained_prefix_sha256": hashlib.sha256(complete_prefix).hexdigest(),
+        "retained_prefix_sha256": retained_digest.hexdigest(),
         "tail_evidence_path": tail_path.name if tail_path is not None else None,
         "truncated_tail_bytes": len(truncated_tail),
         "truncated_tail_sha256": tail_hash,
@@ -152,9 +236,9 @@ def recover_partial_file(
     atomic_write_bytes(report_path, canonical_json_bytes(report_record) + b"\n")
     return RecoveryReport(
         partial_path=path,
-        recovered_records=len(envelopes),
-        first_ingest_seq=envelopes[0].ingest_seq if envelopes else None,
-        last_ingest_seq=envelopes[-1].ingest_seq if envelopes else None,
+        recovered_records=recovered_records,
+        first_ingest_seq=first_ingest_seq,
+        last_ingest_seq=last_ingest_seq,
         repaired_missing_newline=repaired_missing_newline,
         truncated_tail_bytes=len(truncated_tail),
         truncated_tail_sha256=tail_hash,

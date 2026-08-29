@@ -13,9 +13,18 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY / "src"))
 
 from multi_market_arbitrage.core.serialization import canonical_json_bytes  # noqa: E402
+from multi_market_arbitrage.pipeline.health import (  # noqa: E402
+    COMPOSITE_PEAK_RSS_SOURCE,
+    normalize_python_ru_maxrss_bytes,
+)
 from multi_market_arbitrage.research import build_scan_report  # noqa: E402
 
-SCHEMA_VERSION = "gate1-scan-report-benchmark-v1"
+SCHEMA_VERSION = "gate1-scan-report-benchmark-v2"
+LINUX_PROC_STATUS_CURRENT_RSS_SOURCE = "linux-proc-self-status-vmrss-kib-times-1024"
+LINUX_PROC_STATUS_CURRENT_RSS_OS_ERROR_SOURCE = "UNAVAILABLE:OSError:linux-proc-self-status-vmrss"
+LINUX_PROC_STATUS_CURRENT_RSS_VALUE_ERROR_SOURCE = (
+    "UNAVAILABLE:ValueError:linux-proc-self-status-vmrss"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,8 +38,15 @@ class ScanReportBenchmark:
     wall_nanoseconds: int
     cpu_nanoseconds: int
     current_rss_before_bytes: int | None
+    current_rss_before_source: str
     current_rss_after_bytes: int | None
-    peak_rss_bytes: int
+    current_rss_after_source: str
+    python_ru_maxrss_before_bytes: int
+    python_ru_maxrss_after_bytes: int
+    python_ru_maxrss_source: str
+    same_sample_composite_peak_before_bytes: int
+    same_sample_composite_peak_after_bytes: int
+    same_sample_composite_peak_source: str
     source_compressed_bytes: int
     source_full_materialized_bytes: int
     source_selected_materialized_bytes: int
@@ -46,20 +62,39 @@ class ScanReportBenchmark:
     temporary_storage: str
 
 
-def _current_rss_bytes() -> int | None:
+def _current_rss_bytes() -> tuple[int | None, str]:
+    if not sys.platform.startswith("linux"):
+        return None, f"UNAVAILABLE_PLATFORM:{sys.platform}"
     try:
         lines = Path("/proc/self/status").read_text(encoding="ascii").splitlines()
     except OSError:
-        return None
+        return None, LINUX_PROC_STATUS_CURRENT_RSS_OS_ERROR_SOURCE
     for line in lines:
         if line.startswith("VmRSS:"):
             fields = line.split()
             if len(fields) == 3 and fields[2] == "kB":
                 try:
-                    return int(fields[1]) * 1024
+                    return (
+                        int(fields[1]) * 1024,
+                        LINUX_PROC_STATUS_CURRENT_RSS_SOURCE,
+                    )
                 except ValueError:
-                    return None
-    return None
+                    return None, LINUX_PROC_STATUS_CURRENT_RSS_VALUE_ERROR_SOURCE
+    return None, LINUX_PROC_STATUS_CURRENT_RSS_VALUE_ERROR_SOURCE
+
+
+def _rss_measurement() -> tuple[int | None, str, int, str, int]:
+    current_rss_bytes, current_rss_source = _current_rss_bytes()
+    python_ru_maxrss_bytes, python_ru_maxrss_source = normalize_python_ru_maxrss_bytes(
+        int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    )
+    return (
+        current_rss_bytes,
+        current_rss_source,
+        python_ru_maxrss_bytes,
+        python_ru_maxrss_source,
+        max(current_rss_bytes or 0, python_ru_maxrss_bytes),
+    )
 
 
 def _whole_units_per_second(units: int, elapsed_nanoseconds: int) -> int:
@@ -74,13 +109,27 @@ def benchmark_scan_report(analytical_root: Path) -> ScanReportBenchmark:
     """Measure one production report build in the calling process."""
 
     root = analytical_root.resolve()
-    current_before = _current_rss_bytes()
+    (
+        current_before,
+        current_before_source,
+        python_ru_maxrss_before,
+        python_ru_maxrss_before_source,
+        composite_peak_before,
+    ) = _rss_measurement()
     wall_start = time.perf_counter_ns()
     cpu_start = time.process_time_ns()
     report = build_scan_report(root)
     cpu_nanoseconds = time.process_time_ns() - cpu_start
     wall_nanoseconds = time.perf_counter_ns() - wall_start
-    current_after = _current_rss_bytes()
+    (
+        current_after,
+        current_after_source,
+        python_ru_maxrss_after,
+        python_ru_maxrss_after_source,
+        composite_peak_after,
+    ) = _rss_measurement()
+    if python_ru_maxrss_after_source != python_ru_maxrss_before_source:
+        raise RuntimeError("Python ru_maxrss source changed during the scan benchmark")
     output_bytes = len(canonical_json_bytes(report)) + 1
     resources = report.resources
     return ScanReportBenchmark(
@@ -93,8 +142,15 @@ def benchmark_scan_report(analytical_root: Path) -> ScanReportBenchmark:
         wall_nanoseconds=wall_nanoseconds,
         cpu_nanoseconds=cpu_nanoseconds,
         current_rss_before_bytes=current_before,
+        current_rss_before_source=current_before_source,
         current_rss_after_bytes=current_after,
-        peak_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
+        current_rss_after_source=current_after_source,
+        python_ru_maxrss_before_bytes=python_ru_maxrss_before,
+        python_ru_maxrss_after_bytes=python_ru_maxrss_after,
+        python_ru_maxrss_source=python_ru_maxrss_after_source,
+        same_sample_composite_peak_before_bytes=composite_peak_before,
+        same_sample_composite_peak_after_bytes=composite_peak_after,
+        same_sample_composite_peak_source=COMPOSITE_PEAK_RSS_SOURCE,
         source_compressed_bytes=resources.compressed_bytes,
         source_full_materialized_bytes=resources.full_materialized_bytes,
         source_selected_materialized_bytes=resources.selected_materialized_bytes,
@@ -131,6 +187,7 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "LINUX_PROC_STATUS_CURRENT_RSS_SOURCE",
     "SCHEMA_VERSION",
     "ScanReportBenchmark",
     "_whole_units_per_second",

@@ -103,6 +103,9 @@ class StorageConfig(_StrictFrozenModel):
     journal_submit_timeout_seconds: PositiveFiniteFloat
     journal_group_commit_max_events: PositiveStrictInt = 1
     journal_group_commit_max_delay_seconds: NonNegativeFiniteFloat = 0.0
+    journal_seal_queue_capacity: PositiveStrictInt = 4
+    journal_pending_seal_max_uncompressed_bytes: PositiveStrictInt = 256 * 1024 * 1024
+    journal_pending_seal_max_age_seconds: PositiveFiniteFloat = 120.0
     parquet_batch_size: PositiveStrictInt
     analytical_queue_capacity: PositiveStrictInt = 1_024
     analytical_record_max_bytes: PositiveStrictInt = 8 * 1024 * 1024
@@ -153,6 +156,22 @@ class StorageConfig(_StrictFrozenModel):
             raise ValueError("single-event journal commits cannot configure a batching delay")
         if self.journal_run_max_uncompressed_bytes > 4 * 1024 * 1024 * 1024:
             raise ValueError("journal run byte limit cannot exceed the 4 GiB replay safety cap")
+        if self.journal_seal_queue_capacity > 64:
+            raise ValueError("journal_seal_queue_capacity cannot exceed 64")
+        if not (
+            self.journal_segment_max_uncompressed_bytes
+            <= self.journal_pending_seal_max_uncompressed_bytes
+            <= self.journal_run_max_uncompressed_bytes
+        ):
+            raise ValueError(
+                "journal pending-seal bytes must cover one segment and remain within the run cap"
+            )
+        if self.journal_pending_seal_max_uncompressed_bytes > (
+            self.journal_seal_queue_capacity * self.journal_segment_max_uncompressed_bytes
+        ):
+            raise ValueError(
+                "journal pending-seal bytes cannot exceed queue capacity times segment size"
+            )
         if self.analytical_record_max_bytes > self.analytical_buffer_max_bytes:
             raise ValueError(
                 "analytical record byte limit cannot exceed the analytical buffer byte limit"
@@ -252,6 +271,18 @@ class PolymarketConfig(_StrictFrozenModel):
     reported_top_transition_max_seconds: PositiveFiniteFloat = 2.0
     public_reads: PublicReadConfig
     snapshot_audit_max_race_retries: Annotated[int, Field(strict=True, ge=0, le=16)] = 4
+    audit_replacement_maximum_attempts: Annotated[
+        int,
+        Field(strict=True, ge=1, le=64),
+    ]
+    audit_replacement_retry_delay_seconds: Annotated[
+        float,
+        Field(strict=True, gt=0, le=60.0, allow_inf_nan=False),
+    ]
+    audit_replacement_hard_deadline_seconds: Annotated[
+        float,
+        Field(strict=True, gt=0, le=300.0, allow_inf_nan=False),
+    ]
 
     @model_validator(mode="after")
     def _reported_top_transition_bounds(self) -> Self:
@@ -273,6 +304,11 @@ class PolymarketConfig(_StrictFrozenModel):
     def _reconnect_bounds(self) -> Self:
         if self.reconnect_initial_seconds > self.reconnect_max_seconds:
             raise ValueError("reconnect_initial_seconds cannot exceed reconnect_max_seconds")
+        if (
+            self.audit_replacement_retry_delay_seconds
+            >= self.audit_replacement_hard_deadline_seconds
+        ):
+            raise ValueError("audit replacement retry delay must be below its hard deadline")
         return self
 
     @model_validator(mode="after")
@@ -338,10 +374,14 @@ class HealthConfig(_StrictFrozenModel):
     checkpoint_interval_seconds: PositiveFiniteFloat = 10.0
     queue_capacity: PositiveStrictInt = 64
     maximum_checkpoints: PositiveStrictInt = 8_192
-    maximum_file_bytes: PositiveStrictInt = 64 * 1024 * 1024
+    maximum_file_bytes: PositiveStrictInt = 68 * 1024 * 1024
     availability_queue_capacity: PositiveStrictInt = 64
     maximum_availability_intervals: PositiveStrictInt = 8_192
     maximum_availability_file_bytes: PositiveStrictInt = 64 * 1024 * 1024
+    availability_contribution_queue_capacity: PositiveStrictInt
+    maximum_availability_contributions: PositiveStrictInt
+    maximum_availability_contribution_file_bytes: PositiveStrictInt
+    maximum_availability_record_bytes: PositiveStrictInt
     minimum_free_disk_bytes: PositiveStrictInt = 1024 * 1024 * 1024
 
     @model_validator(mode="after")
@@ -354,6 +394,27 @@ class HealthConfig(_StrictFrozenModel):
             raise ValueError("health evidence file cannot exceed 256 MiB")
         if self.maximum_availability_file_bytes > 256 * 1024 * 1024:
             raise ValueError("availability evidence file cannot exceed 256 MiB")
+        if self.availability_contribution_queue_capacity > 65_536:
+            raise ValueError("availability contribution queue capacity cannot exceed 65536")
+        if self.maximum_availability_contributions > 2_000_000:
+            raise ValueError("availability contribution count cannot exceed 2000000")
+        if self.maximum_availability_contribution_file_bytes > 256 * 1024 * 1024:
+            raise ValueError("availability contribution evidence file cannot exceed 256 MiB")
+        if self.maximum_availability_record_bytes > 1024 * 1024:
+            raise ValueError("availability evidence record cannot exceed 1 MiB")
+        if self.availability_contribution_queue_capacity > self.maximum_availability_contributions:
+            raise ValueError(
+                "availability contribution queue capacity cannot exceed its record bound"
+            )
+        if self.maximum_availability_contributions < self.maximum_availability_intervals:
+            raise ValueError(
+                "availability contribution record bound cannot be below its interval bound"
+            )
+        if self.maximum_availability_record_bytes > min(
+            self.maximum_availability_file_bytes,
+            self.maximum_availability_contribution_file_bytes,
+        ):
+            raise ValueError("availability record bound cannot exceed either evidence file bound")
         return self
 
 
@@ -401,6 +462,16 @@ class Phase1Config(_StrictFrozenModel):
             > self.scanner.maximum_book_age_seconds
         ):
             raise ValueError("reported-top transition duration cannot exceed maximum book age")
+        if (
+            self.polymarket.audit_replacement_retry_delay_seconds
+            > self.scanner.maximum_book_age_seconds
+        ):
+            raise ValueError("audit replacement retry delay cannot exceed maximum book age")
+        if (
+            self.polymarket.audit_replacement_hard_deadline_seconds
+            > self.system.maximum_observation_duration_seconds
+        ):
+            raise ValueError("audit replacement hard deadline cannot exceed the run deadline")
         return self
 
     @classmethod

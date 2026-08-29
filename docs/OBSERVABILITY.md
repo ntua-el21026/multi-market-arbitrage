@@ -59,7 +59,12 @@ Phase-1 Polymarket additionally records:
 - socket generations, disconnects, reconnects and unavailable time;
 - exact typed unavailable intervals;
 - receive→ingress, ingress dwell and receive→durable latency;
-- journal group/fsync behavior;
+- journal group/`fsync`, rotation handoff, ordered seal, and verified-drain
+  behavior;
+- append/seal queue current/high-water/capacity, pending count/bytes/age,
+  active seal job, segment lifecycle transitions, independent durability/
+  manifest/verification progress, stage failures, and maximum rotation-period
+  raw durability latency;
 - parse/protocol/invariant failures;
 - book and reported-top transition state;
 - audit barrier lag, explicit current audit eligibility, versioned trigger,
@@ -141,18 +146,19 @@ UNSAFE
 
 A healthy process does not imply healthy capture, books, persistence, research, risk authority or future live readiness.
 
-## 8. Gate-1 health checkpoint v3
+## 8. Gate-1 health checkpoint v5
 
-The observer emits `gate1-health-checkpoint-v3`. Historical v1 and v2 records
-remain readable as the schemas that produced them. The compatibility validator
-never upgrades their content or synthesizes missing chronology, trigger, or
-divergence-lifecycle evidence. In particular, the first soak's v1 chronology
-remains explicitly unavailable.
+The observer emits `gate1-health-checkpoint-v5`. Historical v1-v4 records remain
+readable as the schemas that produced them. The compatibility validator never
+upgrades their content or synthesizes missing chronology, trigger, divergence-
+dimension, fault-closure, contribution, retention, lifecycle, or journal-seal
+evidence. In particular, the first soak's v1 chronology and every pre-v5
+checkpoint's seal ownership/lifecycle remain explicitly unavailable.
 
-Every v3 record contains:
+Every v5 record contains:
 
 ```text
-schema_version = gate1-health-checkpoint-v3
+schema_version = gate1-health-checkpoint-v5
 collector_run_id
 emitted_at_utc_ns
 emitted_monotonic_epoch_id
@@ -175,6 +181,47 @@ resources
 decisions
 ```
 
+ADR-0057 retains every v4 group and decision meaning. The `journal` group adds
+mandatory compact state for:
+
+```text
+append queue depth / high-water / capacity
+seal queue depth / high-water / capacity
+pending segment count / high-water / capacity
+pending uncompressed bytes / high-water / capacity
+oldest pending age / maximum age
+active seal jobs / high-water / maximum
+segment handoff / lifecycle-transition counts
+sealer / pending-backpressure failures
+durable / manifest-durable / verified progress
+rotation handoff / compression / manifest / verification / cleanup latency
+append-owner wait attributable to ordinary seal work
+maximum raw-durability latency while a prior segment is pending
+```
+
+Pending counts and bytes include the in-service job, not only queue waiters.
+Recovered oldest age includes elapsed UTC since the original validated handoff
+at the recovery sample and thereafter advances from the current process's
+monotonic clock; restart never resets it, and filesystem time is not authority.
+The compact checkpoint never serializes pending raw records or segment-sized
+inventories. Clean terminal evidence requires zero pending/in-service work and
+exact completion-head reconciliation. V5 explicitly distinguishes periodic
+from terminal records and binds a successfully drained terminal record to the
+exact raw completion-head SHA-256. Capture, book, public-read, and resource
+clocks remain frozen at the acquisition cutoff, but the one terminal record is
+built only after raw completion and analytical/availability owner closure. It
+must be durably written last; missing, duplicate, non-last, pre-drain, or
+completion-unbound terminal evidence is ineligible.
+
+Maximum measured v5 serialization is 31,573 bytes for a periodic checkpoint and
+45,217 bytes for the terminal checkpoint. The unchanged ten-second six-hour
+schedule projects 68,242,897 bytes. A 68 MiB (71,303,168-byte) file cap leaves
+3,060,271 bytes of headroom, above the required 2 MiB. The derived periodic
+file-budget ceiling is 32,018 bytes, leaving an exact 445-byte capacity-
+qualification margin above the 31,573-byte measured maximum; it is not an
+observed-record acceptance bound. Checkpoint count, cadence, completeness, and
+fail-closed writer semantics are unchanged.
+
 Each book record includes health, generation, freshness, reference versions and any unresolved `ReportedTopTransition` identity/status/bounds.
 
 Each checkpoint distinguishes:
@@ -183,20 +230,42 @@ Each checkpoint distinguishes:
 capture_healthy
 research_eligible
 gate1_eligible_so_far
-reason_codes
-gate1_sticky_reason_codes
+reason_mask
+gate1_sticky_reason_mask
+reason_mask_schema = gate1-health-decision-reason-mask-v1
 ```
 
-`reason_codes` is the complete decision state at that checkpoint. The separate
-`gate1_sticky_reason_codes` field carries only reasons whose occurrence is a
+The in-memory `reason_codes` set is the complete decision state at that
+checkpoint; v5 serializes it exactly as `reason_mask`. The in-memory
+`gate1_sticky_reason_codes` set is serialized as `gate1_sticky_reason_mask` and
+carries only reasons whose occurrence is a
 permanent blocker for the candidate run. A socket/book outage, pending
 divergence, or `AUDIT_REPLACEMENT_CAPTURE_PENDING` blocks current eligibility
 while present, but does not remain sticky merely because a later checkpoint
 proves complete recovery. Data loss, terminal unresolved divergence including
-an incomplete terminal replacement capture, new-contract unknown divergence,
-local-book defect, failed recovery, and evidence/replay/reconciliation
-inconsistency remain sticky. Historical mismatch count is evidence, not a
-current-state proxy.
+an incomplete terminal replacement capture, unsupported generic/new-contract
+unknown, internal reconstruction indeterminacy/defect, local-book defect,
+locally caused PREPARE durability/processing deadline miss, failed recovery, and
+evidence/replay/reconciliation inconsistency remain sticky. Historical
+mismatch/HTTP/audit-failure counts are evidence, not current-state proxies. A
+fully evidenced recovered external transient and an externally unattributed
+divergence satisfying ADR-0055 may clear current gating without erasing history.
+
+The mask schema is append-only. Bit positions 0 through 32 are, in order:
+`SOCKET_DISCONNECTED`, `TARGET_NOT_EXPLICIT`, `CODE_IDENTITY_UNAVAILABLE`,
+`SOURCE_IDENTITY_UNAVAILABLE`, `SOURCE_IDENTITY_MISMATCH`, `SOURCE_TREE_DIRTY`,
+`BOOK_NOT_HEALTHY`, `INGRESS_DATA_LOSS`, `INGRESS_QUEUE_SATURATED`,
+`JOURNAL_UNHEALTHY`, `JOURNAL_BACKPRESSURE`, `ANALYTICAL_UNHEALTHY`,
+`ANALYTICAL_QUEUE_SATURATED`, `HEALTH_EVIDENCE_UNHEALTHY`,
+`HEALTH_QUEUE_SATURATED`, `AVAILABILITY_EVIDENCE_UNHEALTHY`,
+`AVAILABILITY_QUEUE_SATURATED`, `AVAILABILITY_RECONCILIATION_FAILED`,
+`HTTP_INTEGRITY_UNAVAILABLE`, `HTTP_FINAL_FAILURE`, `AUDIT_MISMATCH`,
+`AUDIT_DIVERGENCE_PENDING`, `AUDIT_REPLACEMENT_CAPTURE_PENDING`,
+`AUDIT_DIVERGENCE_UNRESOLVED`, `AUDIT_DIVERGENCE_UNKNOWN`,
+`AUDIT_LOCAL_BOOK_DEFECT`, `AUDIT_DIVERGENCE_RECONCILIATION_FAILED`,
+`AUDIT_TRIGGER_RECONCILIATION_FAILED`, `AUDIT_FAILED`,
+`AUDIT_RACE_BUDGET_EXHAUSTED`, `PROTOCOL_DEVIATION`, `RAW_RUN_CAP_REACHED`, and
+`DISK_HEADROOM_LOW`. Readers reject undeclared high bits rather than guessing.
 
 The audit group separately exposes:
 
@@ -209,15 +278,70 @@ The audit group separately exposes:
 - current `replacement_captures_pending` and terminal-only
   `replacement_captures_unresolved` counts;
 - authoritative-resnapshot and reserved same-generation resolution counts;
-- new-contract unknown and local-book-defect counts;
+- unsupported generic/new-contract unknown and local-book-defect counts;
 - bounded compact pending representatives, one latest compact resolution
   representative, and a deterministic lifecycle chain;
 - audit starts by trigger and outcomes by `(trigger, outcome)`;
 - lifecycle and trigger reconciliation booleans.
 
+The deterministic offline mismatch-lineage report separately emits typed
+observation facts, independent received-prefix integrity results, external
+causal attribution, and recovery states. Periodic checkpoint v5 does not
+synthesize those post-run dimensions.
+
+Within `audit`, the nested `fault_lifecycles` group separately exposes observed,
+current, resolved, and permanent counts; at most two active-current
+representatives plus explicit capacity/truncation; one bounded latest historical
+representative for each of `CURRENT`, `PERMANENT`, and `RESOLVED`; lifecycle-
+chain identity; and reconciliation. A recovered external transient
+remains in cumulative history; only explicit current and sticky state governs
+eligibility.
+
 The checkpoint is Gate-eligible only when these finite totals and identities
 reconcile. A fully evidenced authoritative resolution remains visible but is
 not automatically a sticky blocker under ADR-0054.
+
+Periodic construction consumes an immutable `ProcessorOperationalSnapshot`.
+Its work is bounded by current books, finite matrices, current pending/recovery
+state, compact representatives, and already-maintained incremental chains. It
+does not construct/copy complete scan or audit histories, invoke full
+`ProcessorSummary`, or compute a terminal hash. Parity with the eventual full
+summary is tested field by field.
+
+`resources.processor_operational` retains the finite history-chain identities
+and the schema-tagged `mma-processor-retention-telemetry-table-v1`. Its rows
+are ordered as `domain`, `retained`, `capacity`, `total`, `truncated`,
+`container_shallow_bytes`, `representative_object_shallow_bytes`, and
+`estimated_retained_bytes`; the shared `byte_estimate_method` is encoded once.
+This removes repeated JSON keys without dropping any per-domain value. These
+are O(1) projections of incrementally maintained state, not serialized
+histories.
+
+Other repeated finite v5 families use schema-tagged positional tables as well:
+analytical fragment retention, audit/public HTTP endpoints, audit-stage timing,
+RSS discontinuities, audit mismatch representatives, audit-fault lifecycle
+representatives, and processor history chains. Reported-top transitions use a
+schema-tagged fixed vector. The authoritative field orders are immutable
+exported constants in `pipeline.health`; readers validate the schema and row
+length before decoding. Values are compacted, not omitted.
+
+The audit-stage table is exactly
+`mma-audit-stage-timing-telemetry-table-v2`, with 17 ordered rows:
+`barrier_wait`, `prepare_construction`, `prepare_durability`,
+`prepare_durable_to_processed`, `prepare_processing`, `handoff_delay`,
+`network`, `raw_durability`, `raw_response_durable_to_processed`,
+`raw_response_processing`, `response_cleanup`,
+`response_to_prepare_decision`, `attestation_durability`,
+`attestation_durable_to_processed`, `attestation_processing`,
+`response_to_attestation`, and `legacy_total_response_to_classification`.
+`response_to_prepare_decision` measures response receipt through canonical
+PREPARE processing completion using
+`mma_rest_audit_stage_response_to_prepare_decision_ns`;
+`response_to_attestation` measures response receipt through canonical final
+ATTEST processing completion using
+`mma_rest_audit_stage_response_to_attestation_ns`. Both are independently
+observed end-to-end histograms. They cannot be inferred from component
+percentiles or replaced by the legacy total.
 
 Periodic checkpoints project every bounded current pending divergence as a
 compact raw-linked `gate1-audit-divergence-pending-representative-v1` and retain
@@ -226,10 +350,15 @@ at most one deterministic latest
 truncation explicitly. These representatives preserve exact join identities,
 raw-source links, chronology, local/REST/recovered-book identities and depth-
 difference identity without repeating full nested diagnostics in every
-checkpoint. This is a checkpoint-size bound only: complete bounded pending and
-resolution objects remain in the processor summary and terminal hash, while
-cumulative totals, the complete lifecycle history chain and reconciliation are
-authoritative and cannot be truncated.
+checkpoint. This is a checkpoint-size bound only: complete current pending/
+recovery objects remain terminal authority, while cumulative totals, durable
+raw/control links, the complete lifecycle history chain, and reconciliation are
+authoritative and cannot be truncated. Completed recent full-object histories
+are diagnostic samples; their configured capacity does not define new-schema
+semantic identity. New full summaries identify that contract as
+`mma-canonical-processor-terminal-v3`; it adds finite recovery-reason counts and
+the ordered recovery-request chain to the version-2 retention-independent
+contract. Historical terminal identities retain their original interpretation.
 
 `git_commit` is either an exact 40-character lowercase hexadecimal commit that
 equals `git rev-parse HEAD` in the resolved repository, or `null`. Sentinel,
@@ -258,8 +387,12 @@ must not extend the claimed observation duration.
 
 ## 9. Availability interval ledger
 
-The observer writes a separate homogeneous
-`gate1-availability-interval-v1` JSONL ledger. Each record is:
+The observer writes a versioned logical availability-interval stream. The
+interval ID is assigned at open, before any contributor can reference it. The
+record below is carried by `gate1-availability-interval-v2`. Existing
+`gate1-availability-interval-v1` records are immutable, do not
+acquire `contributor_count` or `contributor_digest`, and cannot be used to infer
+those fields. Each completed or terminal-cutoff target record includes:
 
 ```text
 AvailabilityInterval
@@ -282,20 +415,23 @@ AvailabilityInterval
 ├── affected_scopes
 ├── recovery_action
 ├── recovery_outcome
+├── contributor_count
+├── contributor_digest
 ├── research_eligibility_restored
 └── open_at_shutdown
 ```
 
-Cause types are:
-
-- external connection/transport;
-- protocol/schema/invariant;
-- reported-top transition expiry;
-- audit mismatch/resynchronization;
-- backpressure/resource;
-- target lifecycle;
-- planned operator shutdown;
-- unknown.
+For current recovery-generated intervals, `cause_type` is the initiating
+`RecoveryResyncReason`: `AUDIT_MISMATCH_RECOVERY`,
+`REPORTED_TOP_TRANSITION_FAILURE`, `FRESHNESS_EXPIRY`, `REFERENCE_REFRESH`,
+`TRANSPORT_DISCONNECT`, `CANONICAL_STATE_INVALIDATION`,
+`SCHEMA_PROTOCOL_ERROR`, `BACKPRESSURE_RESOURCE`, `TARGET_LIFECYCLE`, or
+`UNKNOWN`. `reason_code` separately retains the lower-level initiating code,
+such as `STALE_SNAPSHOT` or `UNKNOWN_PRECISION`. Planned operator shutdown is
+an availability cause outside the resynchronization taxonomy. Immutable v1
+records with the older coarse cause labels remain readable, but current routes
+never emit those legacy labels. A known route is never collapsed into the
+generic protocol/schema cause; a genuine unknown remains explicit.
 
 Routine REST auditing is never classified as WebSocket downtime.
 
@@ -329,11 +465,14 @@ book receive timestamp is present, nonfuture and no older than
 `scanner.maximum_book_age`, and that every required canonical book is healthy.
 Complete v2 capture remains pending/ineligible and all of its replacement
 snapshots have emitted zero scans at this point. The coordinator next preserves
-`mma.control.rest-audit-replacement-release.v1` at that same boundary and waits
+`mma.control.rest-audit-replacement-release.v2` at that same boundary and waits
 for successful canonical processing. Only that accepted durable control may
-clear replacement-capture pending, clear audit ineligibility and produce the
-recovery scan. The interval then closes with exactly the control envelope's
-decision UTC/monotonic time, not a later post-durability clock sample, and carries
+clear replacement-capture pending, clear audit ineligibility, produce the
+recovery scan, and close the mismatch contributor at exactly the control
+envelope's decision UTC/monotonic time, not a later post-durability clock sample.
+The global interval closes at that boundary only if removing this contributor
+makes the entire active-contributor set empty; otherwise the shared interval
+remains open for the other active causes. A closed interval carries
 `research_eligibility_restored=true` only after pending is zero, every required
 book is healthy, explicit current audit eligibility is true, and
 scanner/research eligibility is restored. At shutdown an unrecovered interval
@@ -346,11 +485,17 @@ Pre-decision input therefore cannot be overtaken. A generation end strictly
 after the decision is recorded as a separate later interruption and does not
 rewrite the accepted boundary. Same-market multi-capture controls are ordered by
 instrument; intermediate controls retain the group blocker and emit zero scans,
-and only the final accepted control can close the interval and scan.
+and only the final accepted control can close the mismatch contributor and scan.
+It closes the global interval only when no other contributor remains active.
 
-The ledger has its own non-blocking 64-command queue, 8,192-record limit, and
-64 MiB file bound. A supervised owner serializes, appends, and `fsync`s outside
-the capture path, then atomically publishes the partial file only after clean
+Phase implementation/configuration independently bounds unresolved active
+contributors, interval and completed-contributor queue/record/file capacity, and
+per-record size. Exact current values remain in `config/phase1.toml`,
+`PHASE_1_IMPLEMENTATION.md` and the Gate-1 specifications rather than becoming
+global observability constants.
+Derived-evidence admission is non-blocking and bounded. A supervised single
+owner per logical stream serializes, appends and durably persists outside the
+capture path, then atomically publishes a final artifact only after clean
 completion. An unrecovered interval is bounded at the exact terminal capture
 cutoff and marked `open_at_shutdown`.
 
@@ -361,14 +506,68 @@ freshness/transition expiry, or acquisition termination for transport failure.
 Later coordination or durability work does not move that start.
 
 Runtime/writer summaries reconcile record count, unavailable duration, longest
-interval, and shutdown-open count exactly; the offline reconciliation helper
-also rejects mixed runs, duplicate IDs, overlaps, and non-terminal open
-intervals. Missing, contradictory, saturated, or failed interval evidence
-blocks automatic Gate evidence eligibility without contaminating raw capture.
+interval, shutdown-open count, contributor count/digest and sequence/hash chains
+exactly. The offline reconciliation helper also rejects mixed runs, duplicate
+IDs, overlaps, non-terminal open intervals, orphan/duplicate contributors,
+completed contributors still active, or duration different from the union of
+active-contributor periods. Missing, contradictory, saturated, partial-as-final,
+or failed interval evidence blocks automatic Gate evidence eligibility without
+contaminating raw capture.
 
 The paired health benchmark covers production interval construction and
 serialization, non-blocking enqueue producer CPU, actual
 enqueue-through-`fsync` latency, and observed JSONL byte growth per interval.
+
+### 9.1 Availability interval contributions
+
+ADR-0055 producers retain the historical
+`gate1-availability-interval-contribution-v1` contract. ADR-0056 producers use
+`gate1-availability-interval-contribution-v2`; they do not assign new fields or
+semantics to contribution-v1. Each active entry has one deterministic causal
+key: audit request/divergence, public-read fault lifecycle, transport
+interruption, reported-top transition, reference recovery, resource/writer
+fault, or target lifecycle. Every entry references the stable global interval ID
+assigned when that interval opened. Repeated symptoms update one bounded
+observation count and deterministic evidence digest/chain; they never duplicate
+an unresolved key.
+
+The active map contains unresolved lifecycles only. When its own authoritative
+lifecycle resolves, a contributor freezes one immutable completed record,
+hands it independently to bounded durable derived-evidence persistence and is
+removed from active authority even if another cause keeps the global interval
+open. The record retains its interval/causal identity, exact start/end,
+request/divergence/instrument/market identities where applicable, raw sources,
+cause/scopes, resolution/release evidence and opener-versus-join status. Active-
+contributor capacity is distinct from cumulative completed count, artifact/file
+inventory and byte capacity.
+
+Contributors may overlap while global intervals remain non-overlapping. Global
+unavailable duration is the union of periods with a nonempty active set, not the
+contribution sum; per-instrument and per-scope unavailable duration is derived
+from contributions. At shutdown every remaining active contributor receives
+explicit open-at-shutdown evidence at the exact paired cutoff and remains
+Gate-sticky; research eligibility is not restored.
+
+Logical interval and contribution streams may share one composite derived-
+evidence owner or use separately supervised bounded owners. Each stream has one
+mutable owner, non-blocking admission, explicit partial output, durable writes
+and atomic clean completion. Cross-stream reconciliation rejects a missing
+binding, orphan, duplicate causal key, wrong source/instrument, interval mismatch,
+completed contributor still active, count/digest mismatch, union-duration
+mismatch or sequence/hash-chain mismatch. Failure or saturation blocks automatic
+Gate eligibility without blocking raw capture. Existing
+`gate1-availability-interval-v1` and
+`gate1-availability-interval-contribution-v1` files remain immutable. Current
+publication uses `gate1-availability-interval-v2`,
+`gate1-availability-interval-contribution-v2`,
+`gate1-availability-evidence-summary-v2`,
+`gate1-availability-evidence-completion-v2` and
+`gate1-availability-evidence-reconciliation-v2`. Readers report direct
+coverage, stable causal key, active/completed classification, observation count/
+digest, independent completion/publication order, interval contributor count/
+digest, replacement attempt count/bound, first/latest/next-retry times, hard/run
+deadlines, last typed failure, attempt chain and typed pre-shutdown exhaustion as
+unavailable/not retained rather than synthesizing records or fields.
 
 ## 10. Reported-top transition observability
 
@@ -415,11 +614,27 @@ after resnapshot. Its cause is one of:
 - `LOCAL_BOOK_DEFECT`;
 - `UNKNOWN`.
 
+ADR-0055 additionally records orthogonal versioned dimensions:
+
+- observation fact, including `EXACT_FULL_DEPTH_DIVERGENCE`;
+- internal received-prefix integrity;
+- external causal attribution; and
+- recovery state.
+
+The independent bounded prefix oracle begins with the exact full WebSocket
+snapshot and applies ordered exact quantity-bearing frames through the response
+watermark using mutation structures independent of the production book owner.
+Production/oracle equality establishes
+`PROVEN_RECEIVED_PREFIX_RECONSTRUCTION`, not an external transport cause.
+`EXTERNAL_CAUSE_UNATTRIBUTED` is distinct from `UNKNOWN`; internal defect or
+indeterminacy remains sticky.
+
 The diagnostic binds local and normalized REST identities, exact depth hashes
 and difference counts/digest, at most 16 representative level differences,
 bounded local/REST raw-source summaries, the response source, and at most 16
-context identities. The processor retains at most 4,096 full recent
-diagnostics, reports truncation, maintains cumulative cause counts, and commits
+context identities. The processor retains a configured bounded diagnostic
+sample of full recent diagnostics, reports occupancy/truncation, maintains
+cumulative cause counts, and commits
 those counts plus the audit-outcome chain to terminal identity. A checkpoint
 copies only the counts, their reconciliation with total mismatches, truncation
 state, and one deterministic representative per cause. Successful recovery
@@ -456,8 +671,21 @@ monotonic epoch and be nonfuture and within `scanner.maximum_book_age` at the
 decision; the observer's independent post-processing freshness check and all
 required canonical-book health checks must pass first.
 
+The recovery record also carries one stable recovery identity, bounded attempt
+count, first/latest attempt times, next retry deadline, hard recovery deadline,
+the enclosing run deadline, required/captured instrument state, last typed
+failure and a deterministic evidence chain. Strict finite attempt, retry-delay
+and hard-recovery bounds are Phase-1 configuration/specification values, all
+subordinate to the run deadline. A permitted new connection
+generation updates this same recovery and causal contributor. Attempt or
+deadline exhaustion records typed unresolved evidence, keeps contributor,
+interval and eligibility state open, and transitions to fail-closed degraded or
+terminal behavior; it never creates a duplicate contributor or remains
+indefinitely pending. Numeric limits are phase configuration/specification
+values justified by measurement.
+
 The coordinator then durably journals
-`mma.control.rest-audit-replacement-release.v1` at that exact sampled paired
+`mma.control.rest-audit-replacement-release.v2` at that exact sampled paired
 UTC/monotonic decision boundary. Its bounded self-contained payload carries the
 full canonical capture preimage and SHA-256: divergence/market identity,
 original/replacement connection, complete required-instrument set, and every
@@ -473,6 +701,11 @@ book health, and only then clears state and permits the
 recovery scan. The availability ledger uses that identical decision wall/
 monotonic time after successful control processing.
 
+An unsupported generic `UNKNOWN`, internal reconstruction defect/indeterminacy,
+or local-book defect blocks release. `EXTERNAL_CAUSE_UNATTRIBUTED` does not block
+release only when independent prefix proof and all ADR-0055 recovery,
+contribution, interval, replay, and rebuild evidence reconcile.
+
 Stale, future-relative and cross-epoch snapshot sources are pruned rather than
 completing the record. A missing v2 control or a malformed, noncanonical,
 capture-mismatched, wrong-connection, future, cross-epoch or stale control is
@@ -484,14 +717,15 @@ terminal-hash serialization without a synthesized control. That is replay-only
 compatibility; new producers cannot emit v1 state or select auto-release, and
 v2 replay cannot synthesize an omitted control.
 
-Cumulative observed, resolution, unknown and local-defect counts are separate
+Cumulative observation facts, internal-integrity results, external-attribution
+results, resolution, unsupported-unknown and local-defect counts are separate
 from current divergence-pending and replacement-capture-pending state. Periodic
 health evaluates both pending states as nonsticky current blockers; terminal
 evaluation makes any remainder unresolved and Gate-sticky. The lifecycle chain,
-full totals, exact replacement-capture state, and complete bounded pending and
-resolution objects are deterministic processor-summary and terminal-hash
-inputs; representative projection may not truncate totals, chain identity, or
-terminal authority.
+full totals, exact replacement-capture state, and complete current pending/
+recovery objects are deterministic processor-summary and terminal-hash inputs;
+representative projection or diagnostic-sample eviction may not truncate totals,
+chain identity, or terminal authority.
 
 The periodic checkpoint projection emits up to the bounded set of current
 compact pending representatives and one compact latest resolution
@@ -501,8 +735,8 @@ projection as complete lifecycle history.
 
 ### 11.2 Offline causal lineage
 
-The retained mismatch-lineage reporter classifies exact matching-state
-relationships with this finite vocabulary:
+The retained historical mismatch-lineage reporter classifies exact matching-
+state relationships with this finite vocabulary:
 
 ```text
 SAME_GENERATION_NATURAL_CONVERGENCE
@@ -521,6 +755,15 @@ exact full-depth state, matching raw source, signed monotonic chronology and
 recovery stages. `RECOVERY_GENERATION_MATCH` is recovery evidence, never proof
 of natural same-generation convergence. Venue timestamps and hashes are
 diagnostic only.
+
+New reports preserve that historical relationship result and separately emit
+the ADR-0055 observation, internal-prefix, external-attribution, and recovery
+dimensions. `SAME_GENERATION_CONFLICT_BEFORE_CONVERGENCE` remains readable as
+historical vocabulary; new external attribution uses
+`SAME_GENERATION_CONFLICT`. A relationship that cannot identify an external
+cause becomes `EXTERNAL_CAUSE_UNATTRIBUTED` only when the independent internal
+oracle result is available; it is never inferred from a recovery-generation
+match.
 
 ### 11.3 Audit trigger evidence
 
@@ -548,13 +791,77 @@ supply a modern per-trigger breakdown. Only v2 runs may satisfy that requirement
 and their mismatch/race/failure rates, request load, freshness-budget margin,
 and resulting research-eligible coverage must be reported by trigger.
 
+### 11.4 Public-read fault lifecycles
+
+Every final HTTP/audit failure or retry exhaustion emits immutable historical
+fact evidence. Current-schema failures also emit explicit current lifecycle
+authority. The lifecycle binds audit-start schema, exact failure-evidence kind,
+actual nullable source schema, endpoint,
+request/attempt, instrument/market, status/error, response and classification
+stage chronology, affected scopes, explicit current-scope-blocking authority,
+fail-closed transition, recovery identity and close chronology.
+
+A later exact audit, authoritative resnapshot, or complete replacement release
+may close an external transient lifecycle only when it proves current integrity
+for the affected scope. Recoverable admission additionally requires
+failure-v2 evidence, proven external origin, `retryable=true`, and
+`TIMEOUT`, `NETWORK`, or `HTTP_STATUS` 408/425/429/500/502/503/504. Retry
+exhaustion alone does not qualify. Failure-v1, protocol/indeterminate,
+non-retryable, and other-status faults are permanent. Cumulative facts and lost
+coverage remain. Unresolved required integrity failure, a locally caused
+PREPARE durability/processing deadline miss, internal/permanent failure, missing
+coverage, and
+lifecycle/recovery inconsistency remain Gate-sticky.
+
+Failure-v1 and classification-v1 records are permanent cumulative and Gate-
+sticky but have `blocks_current_scope=false` and no resolution, regardless of
+their bound start. Failure-v2 and newly emitted classification-v2 records carry
+current authority. Direct REST-response and unversioned invalidation sources
+record a null source schema and use their exact start schema as authority.
+Fault identity binds source kind, actual nullable schema, start schema, and the
+exact Boolean. A release discounts sibling ineligibility only when every cause
+is proved historical-only; it does not erase that evidence.
+
+V2 audit HTTP controls accept only the `CLOB_BOOK` endpoint and a truthful final
+category/status/retry matrix. `HTTP_STATUS` must carry a non-2xx status with
+whitelist-derived retryability; other categories may carry only no status or a
+2xx response reached before the transport/body failure. Contradictory
+Retry-After, exhaustion, or retry-blocked evidence is rejected before lifecycle
+or per-endpoint reconciliation.
+
 ## 12. Long-run resource evidence
 
 One supervised off-loop sampler publishes process/resource snapshots at the
 health cadence. On Linux, current RSS is resident pages from
 `/proc/self/statm` multiplied by the runtime page size; other platforms or read
-failures produce `null` with an explicit source string. Peak `ru_maxrss` is
-normalized to bytes and is never substituted for current RSS.
+failures produce `null` with an explicit source string. Python
+`resource.getrusage(RUSAGE_SELF).ru_maxrss` is normalized to bytes and published
+separately as `python_ru_maxrss_bytes` with `python_ru_maxrss_source`; it is not
+treated as the same kernel measurement as current RSS. The backward-compatible
+`peak_rss_bytes` field is the conservative maximum of that normalized
+`ru_maxrss` value and the same snapshot's current RSS (when available), so it is
+internally coherent and can never be below either input. `peak_rss_source`
+states this composite definition explicitly.
+
+Component-memory evidence keeps its independently sampled `/proc` current-RSS
+peak and `/proc/self/smaps` current-process attribution under separate names and
+source definitions. Those measurements may be compared within their own
+definitions, but neither is asserted to equal Python `ru_maxrss` or the
+compatibility `peak_rss_bytes` composite.
+
+Historical health-v5 records produced before this additive clarification lack
+`peak_rss_source`, `python_ru_maxrss_bytes`, and `python_ru_maxrss_source`.
+Readers may retain those records only under the explicit legacy interpretation
+that `peak_rss_bytes` is normalized Python `ru_maxrss`; they must never relabel
+that value as the composite peak. A current exact-source candidate health-v5
+record must contain all three additive fields, must label the composite source,
+and must satisfy
+`peak_rss_bytes == max(current_rss_bytes or 0, python_ru_maxrss_bytes)`. Linux
+uses the exact `/proc/self/statm` current-RSS source and normalizes Python
+`ru_maxrss` from KiB; a failed Linux current-RSS read has one of the exact typed
+`UNAVAILABLE:OSError` or `UNAVAILABLE:ValueError` labels. Darwin publishes
+`UNAVAILABLE_PLATFORM:darwin` for current RSS and treats Python `ru_maxrss` as
+bytes. Other platforms fail closed rather than guessing raw units.
 
 The sampler keeps constant-memory OLS current-RSS slope evidence plus sample
 counts, first/last monotonic times, start/end/maximum RSS, largest absolute
@@ -564,6 +871,37 @@ itself proof of a leak. Terminal evidence freezes the cache at the capture
 cutoff, and the builder rejects any sample, trend bound, or discontinuity later
 than the checkpoint monotonic timestamp. If the cache has no pre-cutoff sample,
 health evidence is ineligible; a later sample is never backdated.
+
+Periodic resource evidence also reports operational-snapshot p50/p95/p99/max
+latency; recent-history occupancy/capacity/total/truncation and an O(1) shallow
+retained-byte estimate by domain; cheap `tracemalloc.get_traced_memory()`
+current/peak bytes; PyArrow pool current/peak bytes; and Python/RSS linear
+trends. The first periodic checkpoint that observes any diagnostic-history
+eviction freezes the post-saturation marker; later off-loop resource samples
+feed separate constant-memory Python/RSS OLS slopes.
+
+Periodic/acquisition work never calls `tracemalloc.take_snapshot()`: that is a
+process-global live-allocation traversal whose GIL hold can grow with runtime
+state. After capture cutoff and after the periodic resource sampler stops, one
+terminal resource capture records at most 12 filename allocation-group
+representatives in `ObservationSummary.terminal_process_resources`, with its
+own post-cutoff monotonic timestamp. It does not overwrite or backdate the
+cutoff-bounded terminal health checkpoint. Failure of this required terminal
+diagnostic degrades health evidence and is explicit in
+`terminal_process_resource_failure_type`. Offline capacity evidence separately
+reports full terminal-summary p50/p95/p99/max latency and deep retained bytes.
+The v5 analytical group reports current/high-water buffered records and bytes,
+flush count, flushed-record count, and process-wide PyArrow current/peak
+allocated bytes. It also reports exactly three bounded fragment-retention
+records (`reference`, `canonical_events`, and `complete_set_scans`): current-run
+SHA count/capacity, verified physical inventory at writer open, conservative
+dataset reservations, the fixed 4,096-fragment dataset ceiling, and O(1)
+shallow retained/max-byte estimates. These SHA inventories are terminal
+authority and are never truncated; writer admission fails before any fragment
+write that could exceed the ceiling. Operational-snapshot cost must remain approximately constant
+as diagnostic histories saturate. Full terminal-summary and deep-allocation
+work occurs only after capture cutoff and remains inside explicit work/memory
+bounds.
 
 `gate1-host-runtime-identity-v1` is captured once and embedded in resources. It
 binds code/config/lock, exact Python build/GIL/executable, resolved `uv`, host,

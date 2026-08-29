@@ -42,6 +42,11 @@ ALLOWED_TRANSPORT_METADATA_KEYS: Final[frozenset[str]] = frozenset(
         "audit_attempt",
         "barrier_websocket_ordinal",
         "classification_deferred",
+        "classification_prepare_durable_monotonic_ns",
+        "classification_prepare_ingest_id",
+        "classification_prepare_payload_sha256",
+        "classification_prepare_processed_monotonic_ns",
+        "classification_protocol",
         "classification_monotonic_ns",
         "coordinator_failure_reason",
         "hard_expiry_monotonic_ns",
@@ -52,6 +57,13 @@ ALLOWED_TRANSPORT_METADATA_KEYS: Final[frozenset[str]] = frozenset(
         "websocket_message_type",
         "websocket_admission_ordinal",
         "websocket_opcode",
+    }
+)
+
+_INTEGER_ATTESTATION_METADATA_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "classification_prepare_durable_monotonic_ns",
+        "classification_prepare_processed_monotonic_ns",
     }
 )
 
@@ -95,7 +107,13 @@ def _normalize_transport_metadata(
     for key, value in metadata.items():
         if key not in ALLOWED_TRANSPORT_METADATA_KEYS:
             raise RawEnvelopeValidationError(f"transport metadata key is not allowlisted: {key}")
-        if isinstance(value, str):
+        if key in _INTEGER_ATTESTATION_METADATA_KEYS:
+            value = _require_integer(
+                value,
+                f"transport metadata value for {key}",
+                minimum=0,
+            )
+        elif isinstance(value, str):
             if len(value) > 2048:
                 raise RawEnvelopeValidationError(f"transport metadata value is too long: {key}")
             if any(ord(character) < 32 and character not in "\t" for character in value):
@@ -111,6 +129,19 @@ def _normalize_transport_metadata(
         normalized.append((key, value))
     normalized.sort(key=lambda item: item[0])
     return tuple(normalized)
+
+
+def _reject_duplicate_json_object_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    decoded: dict[str, object] = {}
+    for key, value in pairs:
+        if key in decoded:
+            raise RawEnvelopeValidationError(
+                f"journal record contains duplicate JSON object key: {key}"
+            )
+        decoded[key] = value
+    return decoded
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,8 +172,7 @@ class RawEventEnvelope:
             raise RawEnvelopeValidationError(
                 f"unsupported raw envelope format: {self.format_version}"
             )
-        if self.ingest_seq < 0:
-            raise RawEnvelopeValidationError("ingest_seq must be non-negative")
+        _require_integer(self.ingest_seq, "ingest_seq", minimum=0)
         _require_nonempty_text(self.channel, "channel")
         _require_nonempty_text(self.transport_type, "transport_type")
         _require_nonempty_text(self.payload_encoding, "payload_encoding")
@@ -253,7 +283,7 @@ class RawEventEnvelope:
 
         raw = line[:-1] if line.endswith(b"\n") else line
         try:
-            decoded = json.loads(raw)
+            decoded = json.loads(raw, object_pairs_hook=_reject_duplicate_json_object_keys)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise RawEnvelopeValidationError("journal record is not valid UTF-8 JSON") from exc
         if not isinstance(decoded, dict):
@@ -312,7 +342,7 @@ class RawEventEnvelope:
         semantics_hash = _require_nonempty_text(
             record["subscription_semantics_hash"], "subscription_semantics_hash"
         )
-        return cls(
+        envelope = cls(
             format_version=_require_nonempty_text(record["format_version"], "format_version"),
             ingest_id=IngestId(_require_nonempty_text(record["ingest_id"], "ingest_id")),
             collector_run_id=CollectorRunId(collector_run_text),
@@ -349,6 +379,9 @@ class RawEventEnvelope:
             payload_encoding=_require_nonempty_text(record["payload_encoding"], "payload_encoding"),
             payload_bytes=payload,
         )
+        if raw != canonical_json_bytes(envelope.to_record()):
+            raise RawEnvelopeValidationError("journal record must use canonical JSON encoding")
+        return envelope
 
 
 __all__ = [

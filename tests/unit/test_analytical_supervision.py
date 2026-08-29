@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import threading
 from pathlib import Path
 from typing import cast
 
@@ -30,6 +31,7 @@ from multi_market_arbitrage.research import (
     ResearchOutputSummary,
     SupervisedAnalyticalOutputs,
 )
+from multi_market_arbitrage.storage import AnalyticalDatasetWriter
 
 
 class _FaultingOutputs:
@@ -145,6 +147,111 @@ async def test_analytical_queue_saturation_is_explicit_and_bounded(tmp_path: Pat
     assert summary.rejected_records >= 2  # rejected trigger plus drained accepted command
     assert summary.queue_high_water == 1
     assert sink.aborted is True
+
+
+@pytest.mark.asyncio
+async def test_analytical_runtime_reports_buffers_flushes_and_pyarrow_memory(
+    tmp_path: Path,
+) -> None:
+    persistent = Phase1AnalyticalOutputs(
+        root=tmp_path,
+        partition_date="2026-08-24",
+        batch_size=1,
+        collector_run_id=CollectorRunId("runtime-telemetry"),
+        code_commit="fixture",
+        code_version="test",
+        config_hash=hashlib.sha256(b"config").hexdigest(),
+    )
+    supervised = SupervisedAnalyticalOutputs(persistent, queue_capacity=2)
+    await supervised.start()
+    try:
+        supervised.append_canonical(_event())
+        for _ in range(500):
+            snapshot = supervised.runtime_snapshot
+            if snapshot.processed_records == 1:
+                break
+            await asyncio.sleep(0.01)
+
+        snapshot = supervised.runtime_snapshot
+        assert snapshot.processed_records == 1
+        assert snapshot.buffered_records == 0
+        assert snapshot.buffered_bytes == 0
+        assert snapshot.buffered_records_high_water == 1
+        assert snapshot.buffered_bytes_high_water > 0
+        assert snapshot.flushes == 1
+        assert snapshot.flushed_records == 1
+        assert snapshot.pyarrow_current_bytes >= 0
+        assert snapshot.pyarrow_peak_bytes >= snapshot.pyarrow_current_bytes
+        retention = {item.domain: item for item in snapshot.fragment_retention}
+        assert set(retention) == {
+            "canonical_events",
+            "complete_set_scans",
+            "reference",
+        }
+        canonical = retention["canonical_events"]
+        assert canonical.retained == 1
+        assert canonical.capacity == canonical.maximum_dataset_fragments == 4_096
+        assert canonical.dataset_fragments_at_open == 0
+        assert canonical.dataset_fragment_reservations == 1
+        assert canonical.estimated_retained_bytes <= canonical.maximum_estimated_retained_bytes
+    finally:
+        await supervised.close()
+
+
+@pytest.mark.asyncio
+async def test_slow_analytical_flush_stays_off_the_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = asyncio.get_running_loop()
+    flush_entered = asyncio.Event()
+    release_flush = threading.Event()
+    original_flush = AnalyticalDatasetWriter.flush
+
+    def gated_flush(writer: AnalyticalDatasetWriter) -> object:
+        if writer.buffered_records:
+            loop.call_soon_threadsafe(flush_entered.set)
+            if not release_flush.wait(timeout=5):
+                raise TimeoutError("test did not release the analytical flush")
+        return original_flush(writer)
+
+    monkeypatch.setattr(AnalyticalDatasetWriter, "flush", gated_flush)
+    persistent = Phase1AnalyticalOutputs(
+        root=tmp_path,
+        partition_date="2026-08-24",
+        batch_size=1,
+        collector_run_id=CollectorRunId("slow-analytical-flush"),
+        code_commit="fixture",
+        code_version="test",
+        config_hash=hashlib.sha256(b"config").hexdigest(),
+    )
+    supervised = SupervisedAnalyticalOutputs(persistent, queue_capacity=2)
+    await supervised.start()
+    summary: ResearchOutputSummary | None = None
+    try:
+        supervised.append_canonical(_event())
+        async with asyncio.timeout(5):
+            await flush_entered.wait()
+
+        # The physical Parquet flush is blocked in the storage worker.  A new
+        # event-loop callback must still run, while no analytical completion is
+        # claimed before the flush is released.
+        event_loop_advanced = asyncio.Event()
+        loop.call_soon(event_loop_advanced.set)
+        async with asyncio.timeout(1):
+            await event_loop_advanced.wait()
+        blocked = supervised.runtime_snapshot
+        assert blocked.accepted_records == 1
+        assert blocked.processed_records == 0
+        assert blocked.flushes == 0
+    finally:
+        release_flush.set()
+        summary = await supervised.close()
+
+    assert summary.health == "HEALTHY"
+    assert summary.research_eligible
+    assert summary.accepted_records == summary.processed_records == 1
+    assert persistent.operational_snapshot().flushes == 1
 
 
 @pytest.mark.parametrize("fault", ["parquet", "fsync", "manifest"])

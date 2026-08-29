@@ -16,11 +16,16 @@ import hashlib
 import json
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol, cast
 
+from multi_market_arbitrage.availability_authority import (
+    AuditAvailabilityBinding,
+    audit_availability_chain_extend,
+    audit_availability_chain_seed,
+)
 from multi_market_arbitrage.core.exact import ExactDecimal, Price, Quantity
 from multi_market_arbitrage.core.ids import (
     CollectorRunId,
@@ -34,13 +39,21 @@ from multi_market_arbitrage.core.provenance import RawSourceRef
 from multi_market_arbitrage.core.serialization import canonical_json_bytes, canonical_sha256
 from multi_market_arbitrage.ingestion import RawEventEnvelope
 from multi_market_arbitrage.journal import JournalReader
+from multi_market_arbitrage.observability.availability import (
+    PublishedAvailabilityEvidenceReconciliation,
+)
 from multi_market_arbitrage.pipeline.audit import (
-    AUDIT_CLASSIFICATION_SCHEMA,
+    AUDIT_CLASSIFICATION_PREPARE_ATTEST_PROTOCOL,
+    AUDIT_CLASSIFICATION_PREPARE_SCHEMA,
+    AUDIT_CLASSIFICATION_V1_SCHEMA,
+    AUDIT_CLASSIFICATION_V2_SCHEMA,
     AUDIT_MISMATCH_MAX_LEVELS_PER_SIDE,
     AUDIT_MISMATCH_MAX_RAW_SOURCES,
     AUDIT_START_V1_SCHEMA,
     AUDIT_START_V2_SCHEMA,
     AuditBookIdentity,
+    AuditDivergencePending,
+    AuditDivergenceResolution,
     AuditExactDepthDifference,
     AuditExactDepthIdentity,
     AuditMismatchCause,
@@ -52,10 +65,17 @@ from multi_market_arbitrage.pipeline.audit import (
 )
 from multi_market_arbitrage.pipeline.channels import (
     CONTROL_REST_AUDIT_CLASSIFY,
+    CONTROL_REST_AUDIT_CLASSIFY_PREPARE,
+    CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
+    CONTROL_REST_AUDIT_REPLACEMENT_RELEASE_V2,
     CONTROL_REST_AUDIT_START,
     REST_BOOK,
     REST_BOOK_AUDIT,
     WS_MARKET,
+)
+from multi_market_arbitrage.pipeline.processor import (
+    AuditDivergenceEligibilityRestoration,
+    ProcessedEnvelope,
 )
 from multi_market_arbitrage.pipeline.transitions import ReportedTopTransition
 from multi_market_arbitrage.state.order_books.models import BookLevel
@@ -71,7 +91,7 @@ from multi_market_arbitrage.venues.polymarket.schemas import (
     parse_rest_book,
 )
 
-AUDIT_MISMATCH_LINEAGE_REPORT_SCHEMA = "phase1-audit-mismatch-lineage-report-v2"
+AUDIT_MISMATCH_LINEAGE_REPORT_SCHEMA = "phase1-audit-mismatch-lineage-report-v3"
 _JOURNAL_IDENTITY_DOMAIN = b"mma-audit-mismatch-journal-identity-v2\0"
 _RESULT_SEQUENCE_DOMAIN = b"mma-audit-mismatch-result-sequence-v2\0"
 
@@ -157,7 +177,46 @@ class AuditRecoveryEvidenceStatus(StrEnum):
     RAW_JOURNAL = "RAW_JOURNAL"
     RAW_JOURNAL_INFERENCE = "RAW_JOURNAL_INFERENCE"
     DETERMINISTIC_REPLAY = "DETERMINISTIC_REPLAY"
+    PUBLISHED_LEDGER_RECONCILIATION = "PUBLISHED_LEDGER_RECONCILIATION"
     NOT_RETAINED = "NOT_RETAINED"
+
+
+class AuditObservationFact(StrEnum):
+    """The mismatch fact established at the fenced audit barrier."""
+
+    EXACT_FULL_DEPTH_DIVERGENCE = "EXACT_FULL_DEPTH_DIVERGENCE"
+    REFERENCE_SCALAR_DIVERGENCE = "REFERENCE_SCALAR_DIVERGENCE"
+    OTHER_TYPED_OBSERVATION = "OTHER_TYPED_OBSERVATION"
+
+
+class AuditReceivedPrefixIntegrity(StrEnum):
+    """Independent verdict for the production state at the received prefix."""
+
+    PROVEN_RECEIVED_PREFIX_RECONSTRUCTION = "PROVEN_RECEIVED_PREFIX_RECONSTRUCTION"
+    INTERNAL_RECONSTRUCTION_DEFECT = "INTERNAL_RECONSTRUCTION_DEFECT"
+    INTERNAL_RECONSTRUCTION_INDETERMINATE = "INTERNAL_RECONSTRUCTION_INDETERMINATE"
+
+
+class AuditExternalCausalAttribution(StrEnum):
+    """Externally observed relation or causally supportable attribution."""
+
+    SAME_GENERATION_NATURAL_CONVERGENCE = "SAME_GENERATION_NATURAL_CONVERGENCE"
+    SAME_GENERATION_CONFLICT = "SAME_GENERATION_CONFLICT"
+    RECOVERY_GENERATION_MATCH = "RECOVERY_GENERATION_MATCH"
+    PRIOR_STATE_MATCH = "PRIOR_STATE_MATCH"
+    PERSISTENT_DIVERGENCE = "PERSISTENT_DIVERGENCE"
+    EXTERNAL_CAUSE_UNATTRIBUTED = "EXTERNAL_CAUSE_UNATTRIBUTED"
+    NOT_FOUND = "NOT_FOUND"
+
+
+class AuditRecoveryState(StrEnum):
+    """Current recovery state, separate from the historical divergence fact."""
+
+    PENDING = "PENDING"
+    RESOLVED_BY_AUTHORITATIVE_RESNAPSHOT = "RESOLVED_BY_AUTHORITATIVE_RESNAPSHOT"
+    REPLACEMENT_CAPTURE_PENDING = "REPLACEMENT_CAPTURE_PENDING"
+    ELIGIBILITY_RESTORED = "ELIGIBILITY_RESTORED"
+    UNRESOLVED = "UNRESOLVED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,8 +447,438 @@ class AuditRecoveryChronology:
     resync_initiation: AuditRecoveryStageEvidence
     rest_resnapshot: AuditRecoveryStageEvidence
     replacement_websocket_generation: AuditRecoveryStageEvidence
+    replacement_release: AuditRecoveryStageEvidence
     recovery_completion: AuditRecoveryStageEvidence
     research_eligibility_restoration: AuditRecoveryStageEvidence
+
+
+@dataclass(frozen=True, slots=True)
+class AuditMismatchReplayRecoveryAuthority:
+    """Exact per-divergence lifecycle facts streamed by deterministic replay."""
+
+    collector_run_id: CollectorRunId
+    classification_ingest_seq: int
+    observed_divergence: AuditDivergencePending
+    recorded_starting_book: AuditBookIdentity
+    replay_starting_book_generation_rebased: bool
+    authoritative_resolution: AuditDivergenceResolution | None = None
+    resolution_stage: AuditRecoveryStageEvidence | None = None
+    eligibility_restoration: AuditDivergenceEligibilityRestoration | None = None
+    replacement_release_stage: AuditRecoveryStageEvidence | None = None
+
+    def __post_init__(self) -> None:
+        if self.classification_ingest_seq < 0:
+            raise AuditMismatchReportError(
+                "replay recovery classification sequence cannot be negative"
+            )
+        effective_starting_book = self.observed_divergence.audit_outcome.starting_book
+        same_economic_book = (
+            self.recorded_starting_book.instrument_id == effective_starting_book.instrument_id
+            and self.recorded_starting_book.economic_content_sha256
+            == effective_starting_book.economic_content_sha256
+        )
+        if self.replay_starting_book_generation_rebased:
+            if (
+                self.observed_divergence.audit_outcome.audit_start_schema != AUDIT_START_V1_SCHEMA
+                or self.recorded_starting_book == effective_starting_book
+                or not same_economic_book
+            ):
+                raise AuditMismatchReportError(
+                    "replay starting-book generation rebase lacks exact legacy authority"
+                )
+        elif self.recorded_starting_book != effective_starting_book:
+            raise AuditMismatchReportError(
+                "replay starting book differs without explicit generation-rebase authority"
+            )
+        resolution = self.authoritative_resolution
+        if (resolution is None) != (self.resolution_stage is None):
+            raise AuditMismatchReportError(
+                "replay recovery resolution and stage must be retained together"
+            )
+        if resolution is not None:
+            stage = cast(AuditRecoveryStageEvidence, self.resolution_stage)
+            if (
+                resolution.observed_divergence != self.observed_divergence
+                or stage.status is not AuditRecoveryEvidenceStatus.DETERMINISTIC_REPLAY
+                or stage.source != resolution.authoritative_snapshot_source
+                or stage.received_monotonic_ns != resolution.resolved_monotonic_ns
+                or stage.exact_depth_identity != resolution.authoritative_rest_book.depth
+                or stage.event_type != "authoritative_rest_resnapshot"
+            ):
+                raise AuditMismatchReportError(
+                    "replay recovery resolution differs from its exact streamed stage"
+                )
+        restoration = self.eligibility_restoration
+        if (restoration is None) != (self.replacement_release_stage is None):
+            raise AuditMismatchReportError(
+                "replay replacement release and stage must be retained together"
+            )
+        if restoration is not None:
+            stage = cast(AuditRecoveryStageEvidence, self.replacement_release_stage)
+            if resolution is None:
+                raise AuditMismatchReportError(
+                    "replay replacement release requires authoritative resolution"
+                )
+            if self.observed_divergence.audit_outcome.audit_start_schema != AUDIT_START_V2_SCHEMA:
+                raise AuditMismatchReportError(
+                    "historical v1 divergence cannot gain replacement-release authority"
+                )
+            diagnostic = self.observed_divergence.audit_outcome.mismatch_diagnostic
+            if diagnostic is None:  # pragma: no cover - pending divergence rejects this
+                raise AuditMismatchReportError(
+                    "replay replacement release lacks mismatch response authority"
+                )
+            expected_binding = AuditAvailabilityBinding(
+                request_id=self.observed_divergence.request_id,
+                divergence_id=self.observed_divergence.divergence_id,
+                instrument_id=self.observed_divergence.instrument_id.value,
+                market_id=self.observed_divergence.market_id.value,
+                audit_start_source=self.observed_divergence.audit_start_control_source,
+                audit_response_source=diagnostic.response_source,
+                audit_classification_source=self.observed_divergence.classification_source,
+                authoritative_resolution_source=resolution.authoritative_snapshot_source,
+                replacement_release_source=restoration.replacement_release_source,
+            )
+            if (
+                restoration.divergence_id != self.observed_divergence.divergence_id
+                or restoration.request_id != self.observed_divergence.request_id
+                or restoration.instrument_id != self.observed_divergence.instrument_id
+                or restoration.market_id != self.observed_divergence.market_id
+                or restoration.authoritative_snapshot_source
+                != resolution.authoritative_snapshot_source
+                or stage.status is not AuditRecoveryEvidenceStatus.DETERMINISTIC_REPLAY
+                or stage.source != restoration.replacement_release_source
+                or stage.ingest_seq != restoration.restored_ingest_seq
+                or stage.connection_id != restoration.replacement_connection_id
+                or stage.received_monotonic_ns != restoration.restored_monotonic.nanoseconds
+                or stage.event_type != "audit_replacement_release"
+                or restoration.availability_binding != expected_binding
+            ):
+                raise AuditMismatchReportError(
+                    "replay replacement release differs from its exact divergence authority"
+                )
+
+
+@dataclass(slots=True)
+class _ReplayRecoveryWorking:
+    classification_ingest_seq: int
+    observed_divergence: AuditDivergencePending
+    recorded_starting_book: AuditBookIdentity
+    replay_starting_book_generation_rebased: bool
+    authoritative_resolution: AuditDivergenceResolution | None = None
+    resolution_stage: AuditRecoveryStageEvidence | None = None
+    eligibility_restoration: AuditDivergenceEligibilityRestoration | None = None
+    replacement_release_stage: AuditRecoveryStageEvidence | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RecordedReplayAuditStart:
+    request_id: str
+    source: RawSourceRef
+    schema: str
+    starting_book: AuditBookIdentity
+
+
+class AuditMismatchReplayRecoveryCollector:
+    """Bounded observer collecting only requested mismatch lifecycle authority.
+
+    The collector implements :class:`ReplayEnvelopeObserver` structurally. It
+    never reads processor summary history, so resolution retention capacity
+    cannot truncate a 262-mismatch replay. State is bounded by the supplied
+    observation set or ``maximum_observations`` when discovering exact typed
+    mismatches from the stream; no raw envelopes are retained.
+    """
+
+    def __init__(
+        self,
+        collector_run_id: CollectorRunId,
+        observations: Sequence[AuditMismatchObservation] | None = None,
+        *,
+        maximum_observations: int = 4_096,
+    ) -> None:
+        if maximum_observations <= 0:
+            raise AuditMismatchReportResourceError(
+                "replay recovery observation bound must be positive"
+            )
+        if observations is not None and len(observations) > maximum_observations:
+            raise AuditMismatchReportResourceError(
+                "replay recovery observations exceed their bound"
+            )
+        targets: dict[tuple[int, InstrumentId], RawSourceRef | None] = {}
+        observations_by_target: dict[tuple[int, InstrumentId], AuditMismatchObservation] = {}
+        for observation in () if observations is None else observations:
+            key = (observation.classification_ingest_seq, observation.instrument_id)
+            if key in targets:
+                raise AuditMismatchReportError(
+                    "replay recovery observations repeat one classification target"
+                )
+            targets[key] = observation.classification_source
+            observations_by_target[key] = observation
+        self._collector_run_id = collector_run_id
+        self._discover_observations = observations is None
+        self._maximum_observations = maximum_observations
+        self._targets = targets
+        self._observations_by_target = observations_by_target
+        self._working_by_target: dict[tuple[int, InstrumentId], _ReplayRecoveryWorking] = {}
+        self._working_by_divergence: dict[str, _ReplayRecoveryWorking] = {}
+        self._recorded_starts_by_request: dict[str, _RecordedReplayAuditStart] = {}
+
+    def observe_replayed_envelope(
+        self,
+        envelope: RawEventEnvelope,
+        processed: ProcessedEnvelope,
+    ) -> None:
+        if envelope.collector_run_id != self._collector_run_id:
+            raise AuditMismatchReportError("replay recovery stream mixes collector runs")
+        if processed.ingest_seq != envelope.ingest_seq:
+            raise AuditMismatchReportError(
+                "replay recovery stream differs from its processed envelope"
+            )
+        envelope_source = _source(envelope)
+        if envelope.channel == CONTROL_REST_AUDIT_START and processed.success:
+            recorded_start = _recorded_replay_audit_start(envelope)
+            if recorded_start.request_id in self._recorded_starts_by_request:
+                raise AuditMismatchReportError(
+                    "streamed replay repeats one active audit-start request"
+                )
+            if len(self._recorded_starts_by_request) >= self._maximum_observations:
+                raise AuditMismatchReportResourceError(
+                    "streamed replay active audit starts exceed their configured bound"
+                )
+            self._recorded_starts_by_request[recorded_start.request_id] = recorded_start
+        for pending in processed.audit_divergences_opened:
+            key = (envelope.ingest_seq, pending.instrument_id)
+            if self._discover_observations and key not in self._targets:
+                if len(self._targets) >= self._maximum_observations:
+                    raise AuditMismatchReportResourceError(
+                        "streamed mismatch observations exceed their configured bound"
+                    )
+                diagnostic = pending.audit_outcome.mismatch_diagnostic
+                if diagnostic is None:  # pragma: no cover - typed pending rejects this
+                    raise AuditMismatchReportError(
+                        "streamed mismatch divergence lacks its exact diagnostic"
+                    )
+                self._targets[key] = envelope_source
+                self._observations_by_target[key] = AuditMismatchObservation.from_exact(
+                    classification_ingest_seq=envelope.ingest_seq,
+                    instrument_id=pending.instrument_id,
+                    exact_depth_difference=diagnostic.exact_depth_difference,
+                    native_asset_id=pending.audit_outcome.native_asset_id,
+                    classification_source=envelope_source,
+                )
+            if key not in self._targets:
+                continue
+            expected_source = self._targets[key]
+            if (
+                pending.classification_source != envelope_source
+                or (expected_source is not None and expected_source != envelope_source)
+                or key in self._working_by_target
+                or pending.divergence_id in self._working_by_divergence
+            ):
+                raise AuditMismatchReportError(
+                    "streamed divergence open differs from its requested classification"
+                )
+            recorded_start = self._recorded_starts_by_request.get(pending.request_id)
+            if recorded_start is None:
+                raise AuditMismatchReportError(
+                    "streamed divergence lacks its exact recorded audit start"
+                )
+            effective_starting_book = pending.audit_outcome.starting_book
+            generation_rebased = recorded_start.starting_book != effective_starting_book
+            if (
+                recorded_start.source != pending.audit_start_control_source
+                or recorded_start.schema != pending.audit_outcome.audit_start_schema
+            ):
+                raise AuditMismatchReportError(
+                    "streamed divergence differs from its recorded audit start"
+                )
+            working = _ReplayRecoveryWorking(
+                classification_ingest_seq=envelope.ingest_seq,
+                observed_divergence=pending,
+                recorded_starting_book=recorded_start.starting_book,
+                replay_starting_book_generation_rebased=generation_rebased,
+            )
+            self._working_by_target[key] = working
+            self._working_by_divergence[pending.divergence_id] = working
+        for resolution in processed.audit_divergences_resolved:
+            working = self._working_by_divergence.get(resolution.divergence_id)
+            if working is None:
+                continue
+            if working.authoritative_resolution is not None:
+                raise AuditMismatchReportError(
+                    "replay recovery stream resolves one divergence more than once"
+                )
+            if resolution.authoritative_snapshot_source != envelope_source:
+                raise AuditMismatchReportError(
+                    "streamed divergence resolution differs from its raw envelope"
+                )
+            working.authoritative_resolution = resolution
+            working.resolution_stage = AuditRecoveryStageEvidence(
+                status=AuditRecoveryEvidenceStatus.DETERMINISTIC_REPLAY,
+                reason=(
+                    "deterministic replay accepted this separately journaled REST_BOOK "
+                    "as the exact healthy authoritative baseline"
+                ),
+                ingest_seq=envelope.ingest_seq,
+                source=envelope_source,
+                connection_id=envelope.connection_id,
+                subscription_id=envelope.subscription_id,
+                received_monotonic_ns=envelope.received_monotonic.nanoseconds,
+                event_type="authoritative_rest_resnapshot",
+                exact_depth_identity=resolution.authoritative_rest_book.depth,
+            )
+        for restoration in processed.audit_divergences_eligibility_restored:
+            working = self._working_by_divergence.get(restoration.divergence_id)
+            if working is None:
+                continue
+            if working.eligibility_restoration is not None:
+                raise AuditMismatchReportError(
+                    "replay recovery stream releases one divergence more than once"
+                )
+            if (
+                restoration.replacement_release_source != envelope_source
+                or restoration.restored_ingest_seq != envelope.ingest_seq
+            ):
+                raise AuditMismatchReportError(
+                    "streamed replacement release differs from its raw envelope"
+                )
+            working.eligibility_restoration = restoration
+            working.replacement_release_stage = AuditRecoveryStageEvidence(
+                status=AuditRecoveryEvidenceStatus.DETERMINISTIC_REPLAY,
+                reason=(
+                    "deterministic replay accepted the exact durable v2 replacement-release "
+                    "control and its fully released availability binding"
+                ),
+                ingest_seq=envelope.ingest_seq,
+                source=envelope_source,
+                connection_id=envelope.connection_id,
+                subscription_id=envelope.subscription_id,
+                received_monotonic_ns=envelope.received_monotonic.nanoseconds,
+                event_type="audit_replacement_release",
+            )
+        completed_requests = {outcome.request_id for outcome in processed.audit_outcomes}
+        completed_requests.update(
+            pending.request_id for pending in processed.audit_divergences_opened
+        )
+        for request_id in completed_requests:
+            if self._recorded_starts_by_request.pop(request_id, None) is None:
+                raise AuditMismatchReportError(
+                    "streamed audit outcome lacks its exact recorded start"
+                )
+
+    @property
+    def observations(self) -> tuple[AuditMismatchObservation, ...]:
+        if len(self._working_by_target) != len(self._targets):
+            raise AuditMismatchReportError(
+                "deterministic replay did not open every requested mismatch divergence"
+            )
+        return tuple(
+            observation
+            for _, observation in sorted(
+                self._observations_by_target.items(),
+                key=lambda item: item[0][0],
+            )
+        )
+
+    @property
+    def authorities(self) -> tuple[AuditMismatchReplayRecoveryAuthority, ...]:
+        if len(self._working_by_target) != len(self._targets):
+            raise AuditMismatchReportError(
+                "deterministic replay did not open every requested mismatch divergence"
+            )
+        return tuple(
+            AuditMismatchReplayRecoveryAuthority(
+                collector_run_id=self._collector_run_id,
+                classification_ingest_seq=working.classification_ingest_seq,
+                observed_divergence=working.observed_divergence,
+                recorded_starting_book=working.recorded_starting_book,
+                replay_starting_book_generation_rebased=(
+                    working.replay_starting_book_generation_rebased
+                ),
+                authoritative_resolution=working.authoritative_resolution,
+                resolution_stage=working.resolution_stage,
+                eligibility_restoration=working.eligibility_restoration,
+                replacement_release_stage=working.replacement_release_stage,
+            )
+            for _, working in sorted(
+                self._working_by_target.items(),
+                key=lambda item: item[0][0],
+            )
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AuditReceivedPrefixOracleEvidence:
+    """Bounded evidence from the independent exact-quantity reference oracle."""
+
+    response_boundary_admission_ordinal: int | None
+    production_local_depth_identity: AuditExactDepthIdentity | None
+    reconstructed_depth_identity: AuditExactDepthIdentity | None
+    last_applied_admission_ordinal: int | None
+    exact_frame_count: int
+    source_chain: AuditRawSourceSummary
+    unresolved_evidence: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            self.response_boundary_admission_ordinal is not None
+            and self.response_boundary_admission_ordinal < 0
+        ):
+            raise AuditMismatchReportError("oracle response boundary cannot be negative")
+        if (
+            self.last_applied_admission_ordinal is not None
+            and self.last_applied_admission_ordinal < 0
+        ):
+            raise AuditMismatchReportError("oracle admission ordinal cannot be negative")
+        if self.exact_frame_count < 0:
+            raise AuditMismatchReportError("oracle exact-frame count cannot be negative")
+        if self.exact_frame_count != self.source_chain.source_count:
+            raise AuditMismatchReportError("oracle exact-frame count and source chain disagree")
+        if tuple(sorted(set(self.unresolved_evidence))) != self.unresolved_evidence:
+            raise AuditMismatchReportError(
+                "oracle unresolved evidence must be sorted and deduplicated"
+            )
+        if self.reconstructed_depth_identity is not None and self.exact_frame_count == 0:
+            raise AuditMismatchReportError("oracle depth identity requires exact raw frames")
+
+
+@dataclass(frozen=True, slots=True)
+class AuditMismatchEvidenceDimensions:
+    """Orthogonal facts that must not be collapsed into one causal verdict."""
+
+    observation_fact: AuditObservationFact
+    internal_received_prefix_integrity: AuditReceivedPrefixIntegrity
+    external_evidence_relation: AuditExternalCausalAttribution
+    external_causal_attribution: AuditExternalCausalAttribution
+    recovery_state: AuditRecoveryState
+    received_prefix_oracle: AuditReceivedPrefixOracleEvidence
+
+    def __post_init__(self) -> None:
+        oracle = self.received_prefix_oracle
+        expected = oracle.production_local_depth_identity
+        reconstructed = oracle.reconstructed_depth_identity
+        if self.internal_received_prefix_integrity is (
+            AuditReceivedPrefixIntegrity.PROVEN_RECEIVED_PREFIX_RECONSTRUCTION
+        ):
+            if expected is None or reconstructed is None or expected != reconstructed:
+                raise AuditMismatchReportError(
+                    "proven received-prefix integrity requires equal exact identities"
+                )
+            if oracle.unresolved_evidence:
+                raise AuditMismatchReportError(
+                    "proven received-prefix integrity cannot retain oracle gaps"
+                )
+        elif self.internal_received_prefix_integrity is (
+            AuditReceivedPrefixIntegrity.INTERNAL_RECONSTRUCTION_DEFECT
+        ):
+            if expected is None or reconstructed is None or expected == reconstructed:
+                raise AuditMismatchReportError(
+                    "an internal reconstruction defect requires unequal exact identities"
+                )
+        elif not oracle.unresolved_evidence:
+            raise AuditMismatchReportError(
+                "indeterminate received-prefix integrity requires explicit evidence gaps"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,6 +911,8 @@ class AuditMismatchLineageResult:
     start_admission_ordinal: int
     start_processed_ordinal: int
     starting_book: AuditBookIdentity
+    replay_effective_starting_book: AuditBookIdentity | None
+    replay_starting_book_generation_rebased: bool | None
     starting_exact_depth_identity: AuditExactDepthIdentity | None
     response_boundary_admission_ordinal: int | None
     barrier_processed_ordinal: int | None
@@ -452,6 +943,30 @@ class AuditMismatchLineageResult:
     venue_timestamp_diagnostic_equal: bool | None
     recovery_chronology: AuditRecoveryChronology
     unresolved_evidence: tuple[str, ...]
+    evidence_dimensions: AuditMismatchEvidenceDimensions
+
+    def __post_init__(self) -> None:
+        effective = self.replay_effective_starting_book
+        rebased = self.replay_starting_book_generation_rebased
+        if (effective is None) != (rebased is None):
+            raise AuditMismatchReportError(
+                "replay starting-book identity and rebase verdict must be retained together"
+            )
+        if effective is None:
+            return
+        same_economic_book = (
+            effective.instrument_id == self.starting_book.instrument_id
+            and effective.economic_content_sha256 == self.starting_book.economic_content_sha256
+        )
+        if rebased:
+            if effective == self.starting_book or not same_economic_book:
+                raise AuditMismatchReportError(
+                    "reported starting-book rebase changes economic identity"
+                )
+        elif effective != self.starting_book:
+            raise AuditMismatchReportError(
+                "reported starting book differs without a generation rebase"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -498,6 +1013,7 @@ class _ResolvedObservation:
     response_ingest_seq: int | None = None
     start_ingest_seq: int | None = None
     start_source: RawSourceRef | None = None
+    audit_start_schema: str | None = None
     response_source: RawSourceRef | None = None
     native_asset_id: str | None = None
     attempt: int | None = None
@@ -509,9 +1025,16 @@ class _ResolvedObservation:
     reported_transition_first_source: RawSourceRef | None = None
     reported_transition_latest_source: RawSourceRef | None = None
     request_started_monotonic_ns: int | None = None
+    classification_schema: str | None = None
     classification_monotonic_ns: int | None = None
     classification_received_monotonic_ns: int | None = None
+    classification_hard_expiry_monotonic_ns: int | None = None
+    classification_attestation: _ClassificationAttestation | None = None
+    classification_prepare_source: RawSourceRef | None = None
+    classification_prepare_received_monotonic_ns: int | None = None
+    classification_prepare_durable_monotonic_ns: int | None = None
     response_received_monotonic_ns: int | None = None
+    response_deadline_monotonic_ns: int | None = None
     starting_admission_ordinal: int | None = None
     starting_processed_ordinal: int | None = None
     starting_book: AuditBookIdentity | None = None
@@ -520,6 +1043,15 @@ class _ResolvedObservation:
     start_socket_generation: int | None = None
     first_rest_resnapshot: _RecoveryRawStage | None = None
     first_replacement_websocket: _RecoveryRawStage | None = None
+    replay_recovery_authority: AuditMismatchReplayRecoveryAuthority | None = None
+    published_availability_binding: AuditAvailabilityBinding | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ClassificationAttestation:
+    expected_prepare_source: RawSourceRef
+    durable_monotonic_ns: int
+    processed_monotonic_ns: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -602,6 +1134,21 @@ class _CausalMatch:
 
 
 @dataclass(slots=True)
+class _ReceivedPrefixOracle:
+    """Connection-scoped reference state independent of the production owner."""
+
+    bids: dict[ExactDecimal, ExactDecimal] | None
+    asks: dict[ExactDecimal, ExactDecimal] | None
+    sources: list[RawSourceRef]
+    source_ids: set[IngestId]
+    exact_frame_count: int
+    last_applied_admission_ordinal: int | None
+    last_seen_admission_ordinal: int | None
+    last_seen_source: IngestId | None
+    unresolved_evidence: set[str]
+
+
+@dataclass(slots=True)
 class _WorkingLineage:
     resolved: _ResolvedObservation
     matching_prior: _ExactAction | None = None
@@ -627,6 +1174,7 @@ class _WorkingLineage:
     causal_original_post_frames: int = 0
     causal_replacement_seen: bool = False
     causal_rest_resnapshot_candidate_seen: bool = False
+    received_prefix_oracle: _ReceivedPrefixOracle | None = None
 
 
 @dataclass(slots=True)
@@ -682,6 +1230,66 @@ def _canonical_control(payload: bytes, *, context: str) -> dict[str, object]:
     if canonical_json_bytes(control) != payload:
         raise AuditMismatchReportError(f"{context} is not canonically encoded")
     return control
+
+
+def _recorded_replay_audit_start(envelope: RawEventEnvelope) -> _RecordedReplayAuditStart:
+    """Bind the immutable start book before replay-only generation compatibility."""
+
+    control = _canonical_control(envelope.payload_bytes, context="replay audit start")
+    schema = _text(control.get("schema"), field="replay audit start schema", maximum=128)
+    common_keys = {
+        "attempt",
+        "connection_id",
+        "instrument_id",
+        "native_asset_id",
+        "request_id",
+        "request_started_monotonic_ns",
+        "schema",
+        "starting_admission_ordinal",
+        "starting_book_economic_sha256",
+        "starting_book_generation",
+        "starting_processed_ordinal",
+    }
+    if schema == AUDIT_START_V1_SCHEMA:
+        expected_keys = common_keys
+    elif schema == AUDIT_START_V2_SCHEMA:
+        expected_keys = {*common_keys, "trigger_reason"}
+    else:
+        raise AuditMismatchReportError("replay audit start schema is unsupported")
+    if set(control) != expected_keys:
+        raise AuditMismatchReportError("replay audit start schema is invalid")
+    if (
+        _text(control.get("connection_id"), field="replay audit start connection")
+        != envelope.connection_id.value
+    ):
+        raise AuditMismatchReportError("replay audit start belongs to another connection")
+    try:
+        starting_book = AuditBookIdentity(
+            instrument_id=InstrumentId(
+                _text(control.get("instrument_id"), field="replay audit start instrument")
+            ),
+            generation=_integer(
+                control.get("starting_book_generation"),
+                field="replay audit start book generation",
+            ),
+            economic_content_sha256=_text(
+                control.get("starting_book_economic_sha256"),
+                field="replay audit start economic identity",
+                maximum=64,
+            ),
+        )
+    except ValueError as error:
+        raise AuditMismatchReportError("replay audit start book identity is invalid") from error
+    return _RecordedReplayAuditStart(
+        request_id=_text(
+            control.get("request_id"),
+            field="replay audit start request ID",
+            maximum=128,
+        ),
+        source=_source(envelope),
+        schema=schema,
+        starting_book=starting_book,
+    )
 
 
 def _journal_identity_update(digest: _Digest, envelope: RawEventEnvelope) -> None:
@@ -970,6 +1578,169 @@ def _apply_action(
     if action.source.ingest_id not in working.subsequent_source_ids:
         working.subsequent_source_ids.add(action.source.ingest_id)
         working.subsequent_sources.append(action.source)
+
+
+def _received_prefix_oracle(working: _WorkingLineage) -> _ReceivedPrefixOracle:
+    oracle = working.received_prefix_oracle
+    if oracle is None:
+        oracle = _ReceivedPrefixOracle(
+            bids=None,
+            asks=None,
+            sources=[],
+            source_ids=set(),
+            exact_frame_count=0,
+            last_applied_admission_ordinal=None,
+            last_seen_admission_ordinal=None,
+            last_seen_source=None,
+            unresolved_evidence=set(),
+        )
+        working.received_prefix_oracle = oracle
+    return oracle
+
+
+def _discard_received_prefix_oracle_book(
+    oracle: _ReceivedPrefixOracle,
+    *,
+    tracker: _LevelResourceTracker,
+    limits: AuditMismatchReportLimits,
+) -> None:
+    before = (
+        0 if oracle.bids is None or oracle.asks is None else len(oracle.bids) + len(oracle.asks)
+    )
+    oracle.bids = None
+    oracle.asks = None
+    tracker.replace(before, 0, limits.maximum_total_retained_level_values)
+
+
+def _apply_received_prefix_oracle_action(
+    working: _WorkingLineage,
+    action: _ExactAction,
+    *,
+    tracker: _LevelResourceTracker,
+    limits: AuditMismatchReportLimits,
+) -> None:
+    """Rebuild the exact admitted prefix with a deliberately separate mutation path.
+
+    The oracle uses plain ``ExactDecimal -> ExactDecimal`` quantity maps.  It
+    neither calls ``CanonicalL2BookOwner`` nor shares ``_CausalBook`` state or
+    its mutation helper.  The production audit barrier supplies the inclusive
+    admission watermark; raw journal order supplies the deterministic action
+    order within that received prefix.
+    """
+
+    resolved = working.resolved
+    if resolved.classification_connection is None:
+        raise AuditMismatchReportError("oracle classification connection is unavailable")
+    if action.connection_id != ConnectionId(resolved.classification_connection):
+        return
+
+    oracle = _received_prefix_oracle(working)
+    classification_seq = resolved.observation.classification_ingest_seq
+    admission = action.admission_ordinal
+    boundary = resolved.response_boundary_ordinal
+
+    if action.position.ingest_seq > classification_seq:
+        if admission is not None and boundary is not None and admission <= boundary:
+            oracle.unresolved_evidence.add("ORACLE_PREFIX_ACTION_RETAINED_AFTER_CLASSIFICATION")
+        return
+
+    if admission is None or admission < 0:
+        # An unwatermarked action before a valid anchor is superseded by that
+        # anchor.  Once anchored, however, it may have mutated the exact
+        # barrier state and therefore makes the received prefix indeterminate.
+        if oracle.bids is not None and oracle.asks is not None:
+            oracle.unresolved_evidence.add("ORACLE_ADMISSION_ORDINAL_NOT_RETAINED")
+        return
+
+    if oracle.last_seen_source != action.source.ingest_id:
+        if (
+            oracle.last_seen_admission_ordinal is not None
+            and admission <= oracle.last_seen_admission_ordinal
+        ):
+            oracle.unresolved_evidence.add("ORACLE_ADMISSION_ORDER_INVALID")
+        oracle.last_seen_source = action.source.ingest_id
+        oracle.last_seen_admission_ordinal = admission
+    elif oracle.last_seen_admission_ordinal != admission:
+        oracle.unresolved_evidence.add("ORACLE_SOURCE_ADMISSION_IDENTITY_INCONSISTENT")
+
+    if boundary is None or admission > boundary:
+        return
+
+    if action.replacement_bids is not None and action.replacement_asks is not None:
+        before = (
+            0 if oracle.bids is None or oracle.asks is None else len(oracle.bids) + len(oracle.asks)
+        )
+        # A complete later snapshot is a new exact oracle anchor, so bounded
+        # mutation history preceding it is no longer required for the final
+        # barrier identity.
+        oracle.bids = {level.price.value: level.quantity.value for level in action.replacement_bids}
+        oracle.asks = {level.price.value: level.quantity.value for level in action.replacement_asks}
+        oracle.sources = [action.source]
+        oracle.source_ids = {action.source.ingest_id}
+        oracle.exact_frame_count = 1
+        oracle.last_applied_admission_ordinal = admission
+        oracle.unresolved_evidence.discard("ORACLE_EXACT_FRAME_BOUND_EXCEEDED")
+        tracker.replace(
+            before,
+            len(oracle.bids) + len(oracle.asks),
+            limits.maximum_total_retained_level_values,
+        )
+        return
+
+    if oracle.bids is None or oracle.asks is None:
+        return
+    if action.side is None or action.price is None or action.quantity is None:
+        raise AuditMismatchReportError("oracle exact WebSocket action is incomplete")
+
+    if action.source.ingest_id not in oracle.source_ids:
+        if oracle.exact_frame_count >= limits.maximum_exact_frames_per_observation:
+            oracle.unresolved_evidence.add("ORACLE_EXACT_FRAME_BOUND_EXCEEDED")
+            _discard_received_prefix_oracle_book(
+                oracle,
+                tracker=tracker,
+                limits=limits,
+            )
+            return
+        oracle.source_ids.add(action.source.ingest_id)
+        oracle.sources.append(action.source)
+        oracle.exact_frame_count += 1
+
+    before = len(oracle.bids) + len(oracle.asks)
+    side = oracle.bids if action.side is NativeSide.BUY else oracle.asks
+    price = action.price.value
+    quantity = action.quantity.value
+    if quantity:
+        side[price] = quantity
+    else:
+        side.pop(price, None)
+    tracker.replace(
+        before,
+        len(oracle.bids) + len(oracle.asks),
+        limits.maximum_total_retained_level_values,
+    )
+    oracle.last_applied_admission_ordinal = admission
+
+
+def _received_prefix_oracle_depth(
+    oracle: _ReceivedPrefixOracle,
+) -> AuditExactDepthIdentity | None:
+    """Materialize only the oracle's bounded exact identity, independently."""
+
+    if oracle.bids is None or oracle.asks is None:
+        return None
+    bids = tuple(
+        BookLevel(price=Price(price), quantity=Quantity(quantity))
+        for price, quantity in sorted(
+            oracle.bids.items(),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+    )
+    asks = tuple(
+        BookLevel(price=Price(price), quantity=Quantity(quantity))
+        for price, quantity in sorted(oracle.asks.items(), key=lambda item: item[0])
+    )
+    return audit_exact_depth_identity(bids, asks)
 
 
 def _causal_depth(book: _CausalBook) -> tuple[tuple[BookLevel, ...], tuple[BookLevel, ...]]:
@@ -1311,15 +2082,30 @@ def _recovery_chronology(resolved: _ResolvedObservation) -> AuditRecoveryChronol
             replacement,
             reason="first raw WebSocket evidence for the asset on a later socket generation",
         )
-    if resnapshot is None:
+    replay_authority = resolved.replay_recovery_authority
+    resolution_stage = None if replay_authority is None else replay_authority.resolution_stage
+    release_stage = None if replay_authority is None else replay_authority.replacement_release_stage
+    if resolution_stage is not None:
+        resnapshot_stage = replace(
+            resolution_stage,
+            reason=(
+                "deterministic replay accepted this exact REST_BOOK as the authoritative "
+                "healthy post-divergence baseline"
+            ),
+        )
+        completion = replace(
+            resolution_stage,
+            reason=(
+                "deterministic replay bound the accepted REST_BOOK to the exact divergence "
+                "and recovered canonical book identity"
+            ),
+        )
+    elif resnapshot is None:
         resnapshot_stage = _absent_recovery_stage(
             "no raw REST_BOOK recovery candidate for this asset is retained after classification"
         )
         completion = _absent_recovery_stage(
             "no canonical replay outcome proves deterministic recovery completion"
-        )
-        restoration = _absent_recovery_stage(
-            "no retained availability evidence proves global research eligibility restoration"
         )
     else:
         resnapshot_stage = _raw_recovery_stage(
@@ -1333,10 +2119,53 @@ def _recovery_chronology(resolved: _ResolvedObservation) -> AuditRecoveryChronol
             "raw REST_BOOK does not prove successful canonical application, a healthy exact "
             "baseline, or deterministic replay completion"
         )
+    if release_stage is None:
+        if resolved.audit_start_schema == AUDIT_START_V1_SCHEMA:
+            replacement_release = _absent_recovery_stage(
+                "historical v1 audit state predates durable replacement-release authority"
+            )
+        else:
+            replacement_release = _absent_recovery_stage(
+                "no exact accepted durable v2 replacement-release control is retained"
+            )
+    else:
+        replacement_release = release_stage
+    published_binding = resolved.published_availability_binding
+    replay_restoration = (
+        None if replay_authority is None else replay_authority.eligibility_restoration
+    )
+    if (
+        release_stage is not None
+        and replay_restoration is not None
+        and published_binding == replay_restoration.availability_binding
+    ):
+        restoration = replace(
+            release_stage,
+            status=AuditRecoveryEvidenceStatus.PUBLISHED_LEDGER_RECONCILIATION,
+            reason=(
+                "the exact released replay binding is present in a successfully published and "
+                "reconciled availability-contribution ledger"
+            ),
+        )
+    elif resolved.audit_start_schema == AUDIT_START_V1_SCHEMA:
         restoration = _absent_recovery_stage(
-            "raw REST_BOOK is only a recovery candidate; neither instrument-baseline "
-            "restoration nor global research eligibility is proven without canonical "
-            "replay and typed availability-ledger evidence"
+            "historical v1 recovery remains legacy-unverifiable for replacement release and "
+            "availability-contribution restoration"
+        )
+    elif release_stage is not None:
+        restoration = _absent_recovery_stage(
+            "accepted replacement release lacks the exact separately supplied successfully "
+            "published and reconciled availability-contribution binding"
+        )
+    elif resolution_stage is not None:
+        restoration = _absent_recovery_stage(
+            "authoritative resnapshot completed, but durable replacement release and published "
+            "availability-contribution restoration are not proven"
+        )
+    else:
+        restoration = _absent_recovery_stage(
+            "no retained replay and published-ledger authority proves global research "
+            "eligibility restoration"
         )
     return AuditRecoveryChronology(
         mismatch_classification=classification,
@@ -1346,8 +2175,131 @@ def _recovery_chronology(resolved: _ResolvedObservation) -> AuditRecoveryChronol
         resync_initiation=replay_resync,
         rest_resnapshot=resnapshot_stage,
         replacement_websocket_generation=replacement_stage,
+        replacement_release=replacement_release,
         recovery_completion=completion,
         research_eligibility_restoration=restoration,
+    )
+
+
+def _observation_fact(observation: AuditMismatchObservation) -> AuditObservationFact:
+    exact = observation.exact_depth_difference
+    if exact is None:
+        return AuditObservationFact.OTHER_TYPED_OBSERVATION
+    if exact.difference_count:
+        return AuditObservationFact.EXACT_FULL_DEPTH_DIVERGENCE
+    return AuditObservationFact.REFERENCE_SCALAR_DIVERGENCE
+
+
+def _external_evidence_relation(
+    causal_relation: AuditMismatchCausalRelation,
+) -> AuditExternalCausalAttribution:
+    if causal_relation is AuditMismatchCausalRelation.SAME_GENERATION_NATURAL_CONVERGENCE:
+        return AuditExternalCausalAttribution.SAME_GENERATION_NATURAL_CONVERGENCE
+    if causal_relation is (AuditMismatchCausalRelation.SAME_GENERATION_CONFLICT_BEFORE_CONVERGENCE):
+        return AuditExternalCausalAttribution.SAME_GENERATION_CONFLICT
+    if causal_relation is AuditMismatchCausalRelation.RECOVERY_GENERATION_MATCH:
+        return AuditExternalCausalAttribution.RECOVERY_GENERATION_MATCH
+    if causal_relation is AuditMismatchCausalRelation.PRIOR_STATE_MATCH:
+        return AuditExternalCausalAttribution.PRIOR_STATE_MATCH
+    if causal_relation is AuditMismatchCausalRelation.PERSISTENT_DIVERGENCE:
+        return AuditExternalCausalAttribution.PERSISTENT_DIVERGENCE
+    return AuditExternalCausalAttribution.NOT_FOUND
+
+
+def _external_causal_attribution(
+    causal_relation: AuditMismatchCausalRelation,
+    integrity: AuditReceivedPrefixIntegrity,
+) -> AuditExternalCausalAttribution:
+    """Return only causal claims supported by the retained transport evidence.
+
+    A later recovery-generation match, prior match, persistent divergence, or
+    conflict is an observed relation, not proof of why REST and WebSocket
+    transports disagreed at the barrier.  The orthogonal model retains that
+    relation separately while leaving the external root cause explicit and
+    unattributed.
+    """
+
+    if integrity is not (AuditReceivedPrefixIntegrity.PROVEN_RECEIVED_PREFIX_RECONSTRUCTION):
+        return AuditExternalCausalAttribution.NOT_FOUND
+    if causal_relation is AuditMismatchCausalRelation.SAME_GENERATION_NATURAL_CONVERGENCE:
+        return AuditExternalCausalAttribution.SAME_GENERATION_NATURAL_CONVERGENCE
+    return AuditExternalCausalAttribution.EXTERNAL_CAUSE_UNATTRIBUTED
+
+
+def _recovery_state(chronology: AuditRecoveryChronology) -> AuditRecoveryState:
+    if chronology.research_eligibility_restoration.status is not (
+        AuditRecoveryEvidenceStatus.NOT_RETAINED
+    ):
+        return AuditRecoveryState.ELIGIBILITY_RESTORED
+    if chronology.recovery_completion.status is not AuditRecoveryEvidenceStatus.NOT_RETAINED:
+        return AuditRecoveryState.RESOLVED_BY_AUTHORITATIVE_RESNAPSHOT
+    if (
+        chronology.rest_resnapshot.status is AuditRecoveryEvidenceStatus.DETERMINISTIC_REPLAY
+        and chronology.replacement_websocket_generation.status
+        is AuditRecoveryEvidenceStatus.NOT_RETAINED
+    ):
+        return AuditRecoveryState.REPLACEMENT_CAPTURE_PENDING
+    if (
+        chronology.rest_resnapshot.status is not AuditRecoveryEvidenceStatus.NOT_RETAINED
+        or chronology.replacement_websocket_generation.status
+        is not AuditRecoveryEvidenceStatus.NOT_RETAINED
+    ):
+        return AuditRecoveryState.UNRESOLVED
+    return AuditRecoveryState.PENDING
+
+
+def _evidence_dimensions(
+    working: _WorkingLineage,
+    *,
+    causal_relation: AuditMismatchCausalRelation,
+    recovery_chronology: AuditRecoveryChronology,
+) -> AuditMismatchEvidenceDimensions:
+    observation = working.resolved.observation
+    exact = observation.exact_depth_difference
+    oracle = working.received_prefix_oracle
+    boundary = working.resolved.response_boundary_ordinal
+    expected = None if exact is None else exact.local_depth
+    reconstructed = None if oracle is None else _received_prefix_oracle_depth(oracle)
+    gaps = set[str]() if oracle is None else set(oracle.unresolved_evidence)
+    if boundary is None:
+        gaps.add("ORACLE_RESPONSE_BOUNDARY_NOT_RETAINED")
+    if working.resolved.barrier_processed_ordinal is None:
+        gaps.add("ORACLE_BARRIER_PROCESSED_ORDINAL_NOT_RETAINED")
+    if expected is None:
+        gaps.add("ORACLE_PRODUCTION_LOCAL_DEPTH_IDENTITY_NOT_RETAINED")
+    if reconstructed is None:
+        gaps.add("ORACLE_EXACT_FULL_SNAPSHOT_ANCHOR_NOT_FOUND")
+
+    if gaps:
+        integrity = AuditReceivedPrefixIntegrity.INTERNAL_RECONSTRUCTION_INDETERMINATE
+    elif expected == reconstructed:
+        integrity = AuditReceivedPrefixIntegrity.PROVEN_RECEIVED_PREFIX_RECONSTRUCTION
+    else:
+        integrity = AuditReceivedPrefixIntegrity.INTERNAL_RECONSTRUCTION_DEFECT
+
+    sources: tuple[RawSourceRef, ...] = () if oracle is None else tuple(oracle.sources)
+    frame_count = 0 if oracle is None else oracle.exact_frame_count
+    oracle_evidence = AuditReceivedPrefixOracleEvidence(
+        response_boundary_admission_ordinal=boundary,
+        production_local_depth_identity=expected,
+        reconstructed_depth_identity=reconstructed,
+        last_applied_admission_ordinal=(
+            None if oracle is None else oracle.last_applied_admission_ordinal
+        ),
+        exact_frame_count=frame_count,
+        source_chain=summarize_audit_raw_sources(sources),
+        unresolved_evidence=tuple(sorted(gaps)),
+    )
+    return AuditMismatchEvidenceDimensions(
+        observation_fact=_observation_fact(observation),
+        internal_received_prefix_integrity=integrity,
+        external_evidence_relation=_external_evidence_relation(causal_relation),
+        external_causal_attribution=_external_causal_attribution(
+            causal_relation,
+            integrity,
+        ),
+        recovery_state=_recovery_state(recovery_chronology),
+        received_prefix_oracle=oracle_evidence,
     )
 
 
@@ -1684,6 +2636,13 @@ def _build_result(working: _WorkingLineage) -> AuditMismatchLineageResult:
         if matching_received_monotonic_ns is None
         else matching_received_monotonic_ns - resolved.classification_received_monotonic_ns
     )
+    recovery_chronology = _recovery_chronology(resolved)
+    evidence_dimensions = _evidence_dimensions(
+        working,
+        causal_relation=causal_relation,
+        recovery_chronology=recovery_chronology,
+    )
+    replay_authority = resolved.replay_recovery_authority
 
     return AuditMismatchLineageResult(
         classification_ingest_seq=observation.classification_ingest_seq,
@@ -1714,6 +2673,16 @@ def _build_result(working: _WorkingLineage) -> AuditMismatchLineageResult:
         start_admission_ordinal=resolved.starting_admission_ordinal,
         start_processed_ordinal=resolved.starting_processed_ordinal,
         starting_book=resolved.starting_book,
+        replay_effective_starting_book=(
+            None
+            if replay_authority is None
+            else replay_authority.observed_divergence.audit_outcome.starting_book
+        ),
+        replay_starting_book_generation_rebased=(
+            None
+            if replay_authority is None
+            else replay_authority.replay_starting_book_generation_rebased
+        ),
         starting_exact_depth_identity=None if exact is None else exact.local_depth,
         response_boundary_admission_ordinal=resolved.response_boundary_ordinal,
         barrier_processed_ordinal=resolved.barrier_processed_ordinal,
@@ -1755,9 +2724,80 @@ def _build_result(working: _WorkingLineage) -> AuditMismatchLineageResult:
         ),
         venue_hash_diagnostic_equal=venue_hash_equal,
         venue_timestamp_diagnostic_equal=venue_timestamp_equal,
-        recovery_chronology=_recovery_chronology(resolved),
+        recovery_chronology=recovery_chronology,
         unresolved_evidence=tuple(sorted(evidence_gaps)),
+        evidence_dimensions=evidence_dimensions,
     )
+
+
+def _reconciled_published_binding_map(
+    reconciliation: PublishedAvailabilityEvidenceReconciliation | None,
+    bindings: Sequence[AuditAvailabilityBinding] | None,
+    expected_replay_bindings: Sequence[AuditAvailabilityBinding],
+) -> dict[str, AuditAvailabilityBinding]:
+    if reconciliation is None and bindings is None:
+        return {}
+    if reconciliation is None or bindings is None:
+        raise AuditMismatchReportError(
+            "published availability reconciliation and ordered bindings must be supplied together"
+        )
+    contribution = reconciliation.contribution_reconciliation
+    interval = reconciliation.interval_reconciliation
+    if (
+        reconciliation.reconciled
+        and not reconciliation.discrepancies
+        and interval is None
+        and contribution is None
+    ):
+        # Availability v2 reconciliation is represented by the aggregate
+        # success flag and discrepancies because its richer many-to-one result
+        # is not losslessly expressible in the historical v1 summary slots.
+        # The reporter independently reloads every v2 contribution before
+        # reaching this boundary, so exact replay-binding equality remains the
+        # final authority check below.
+        pass
+    elif (
+        interval is None
+        or contribution is None
+        or not reconciliation.reconciled
+        or not interval.reconciled
+        or not contribution.reconciled
+    ):
+        raise AuditMismatchReportError(
+            "published availability evidence is not successfully reconciled"
+        )
+    ordered = tuple(bindings)
+    if contribution is not None:
+        if len(ordered) != contribution.audit_mismatch_contribution_count:
+            raise AuditMismatchReportError(
+                "published availability binding count differs from its reconciliation"
+            )
+        chain = audit_availability_chain_seed("contribution")
+        for binding in ordered:
+            chain = audit_availability_chain_extend(chain, "contribution", binding)
+        if chain != contribution.audit_mismatch_binding_chain_sha256:
+            raise AuditMismatchReportError(
+                "published availability binding chain differs from its reconciliation"
+            )
+    by_divergence = {binding.divergence_id: binding for binding in ordered}
+    if len(by_divergence) != len(ordered):
+        raise AuditMismatchReportError("published availability bindings repeat one divergence")
+    expected = tuple(expected_replay_bindings)
+    expected_by_divergence = {binding.divergence_id: binding for binding in expected}
+    if len(expected_by_divergence) != len(expected):
+        raise AuditMismatchReportError("replay availability restorations repeat one divergence")
+    if set(by_divergence) != set(expected_by_divergence):
+        raise AuditMismatchReportError(
+            "published availability bindings do not exactly cover replay restorations"
+        )
+    if any(
+        by_divergence[divergence_id] != expected_binding
+        for divergence_id, expected_binding in expected_by_divergence.items()
+    ):
+        raise AuditMismatchReportError(
+            "published availability bindings differ from replay restorations"
+        )
+    return by_divergence
 
 
 def build_audit_mismatch_lineage_report(
@@ -1766,6 +2806,11 @@ def build_audit_mismatch_lineage_report(
     observations: Sequence[AuditMismatchObservation],
     *,
     limits: AuditMismatchReportLimits | None = None,
+    replay_recovery_authorities: Sequence[AuditMismatchReplayRecoveryAuthority] | None = None,
+    published_availability_reconciliation: (
+        PublishedAvailabilityEvidenceReconciliation | None
+    ) = None,
+    reconciled_published_availability_bindings: Sequence[AuditAvailabilityBinding] | None = None,
 ) -> AuditMismatchLineageReport:
     """Join mismatch observations to a replayable raw journal without writes.
 
@@ -1784,11 +2829,52 @@ def build_audit_mismatch_lineage_report(
     ordered = tuple(sorted(observations, key=lambda item: item.classification_ingest_seq))
     if len({item.classification_ingest_seq for item in ordered}) != len(ordered):
         raise AuditMismatchReportError("mismatch observations repeat a classification sequence")
+    authority_by_classification: dict[int, AuditMismatchReplayRecoveryAuthority] = {}
+    if replay_recovery_authorities is not None:
+        authorities = tuple(replay_recovery_authorities)
+        if len(authorities) != len(ordered):
+            raise AuditMismatchReportError(
+                "replay recovery authority count differs from mismatch observations"
+            )
+        authority_by_classification = {item.classification_ingest_seq: item for item in authorities}
+        if len(authority_by_classification) != len(authorities):
+            raise AuditMismatchReportError(
+                "replay recovery authorities repeat a classification sequence"
+            )
+        if set(authority_by_classification) != {item.classification_ingest_seq for item in ordered}:
+            raise AuditMismatchReportError(
+                "replay recovery authorities do not cover the requested observations"
+            )
+        if any(item.collector_run_id != collector_run_id for item in authorities):
+            raise AuditMismatchReportError("replay recovery authority belongs to another run")
+    published_binding_by_divergence = _reconciled_published_binding_map(
+        published_availability_reconciliation,
+        reconciled_published_availability_bindings,
+        tuple(
+            restoration.availability_binding
+            for authority in authority_by_classification.values()
+            if (restoration := authority.eligibility_restoration) is not None
+        ),
+    )
     resolved = [_ResolvedObservation(observation=item) for item in ordered]
     by_classification = {item.observation.classification_ingest_seq: item for item in resolved}
     reported_first_by_sequence: dict[int, list[_ResolvedObservation]] = {}
     reported_latest_by_sequence: dict[int, list[_ResolvedObservation]] = {}
     connection_generations: dict[ConnectionId, int] = {}
+    replay_stage_by_sequence: dict[int, AuditRecoveryStageEvidence] = {}
+    for authority in authority_by_classification.values():
+        for stage in (
+            authority.resolution_stage,
+            authority.replacement_release_stage,
+        ):
+            if stage is None or stage.ingest_seq is None:
+                continue
+            if stage.ingest_seq in replay_stage_by_sequence:
+                raise AuditMismatchReportError(
+                    "replay recovery stages reuse one raw ingest sequence"
+                )
+            replay_stage_by_sequence[stage.ingest_seq] = stage
+    seen_replay_stage_sequences: set[int] = set()
     for item in resolved:
         transition = item.observation.reported_top_transition
         if transition is None:
@@ -1797,6 +2883,32 @@ def build_audit_mismatch_lineage_report(
         reported_latest_by_sequence.setdefault(transition.latest_ingest_seq, []).append(item)
 
     def bind_classification(envelope: RawEventEnvelope) -> None:
+        if envelope.received_monotonic.epoch_id != collector_run_id.value:
+            raise AuditMismatchReportError(
+                "audit mismatch raw evidence changes the run monotonic epoch"
+            )
+        replay_stage = replay_stage_by_sequence.get(envelope.ingest_seq)
+        if replay_stage is not None:
+            if (
+                replay_stage.source != _source(envelope)
+                or replay_stage.connection_id != envelope.connection_id
+                or replay_stage.subscription_id != envelope.subscription_id
+                or replay_stage.received_monotonic_ns != envelope.received_monotonic.nanoseconds
+            ):
+                raise AuditMismatchReportError(
+                    "replay recovery stage differs from the report raw journal"
+                )
+            expected_channels = (
+                {REST_BOOK}
+                if replay_stage.event_type == "authoritative_rest_resnapshot"
+                else {
+                    CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
+                    CONTROL_REST_AUDIT_REPLACEMENT_RELEASE_V2,
+                }
+            )
+            if envelope.channel not in expected_channels:
+                raise AuditMismatchReportError("replay recovery stage has the wrong raw channel")
+            seen_replay_stage_sequences.add(envelope.ingest_seq)
         if envelope.channel == WS_MARKET and envelope.connection_id not in connection_generations:
             connection_generations[envelope.connection_id] = len(connection_generations) + 1
         reported_source = None
@@ -1852,6 +2964,26 @@ def build_audit_mismatch_lineage_report(
             raise AuditMismatchReportError(
                 "mismatch observation does not identify an audit classification control"
             )
+        control = _canonical_control(
+            envelope.payload_bytes,
+            context="audit classification control",
+        )
+        if set(control) != {
+            "classification_monotonic_ns",
+            "hard_expiry_monotonic_ns",
+            "request_id",
+            "response_ingest_seq",
+            "schema",
+        } or control.get("schema") not in {
+            AUDIT_CLASSIFICATION_V1_SCHEMA,
+            AUDIT_CLASSIFICATION_V2_SCHEMA,
+        }:
+            raise AuditMismatchReportError("audit classification control schema is invalid")
+        request_id = _text(
+            control.get("request_id"),
+            field="classification request ID",
+            maximum=128,
+        )
         source = _source(envelope)
         expected = item.observation.classification_source
         if expected is not None and source != expected:
@@ -1861,26 +2993,10 @@ def build_audit_mismatch_lineage_report(
             raise AuditMismatchReportError(
                 "reported-top transition and audit classification connections disagree"
             )
-        control = _canonical_control(
-            envelope.payload_bytes,
-            context="audit classification control",
-        )
-        if (
-            set(control)
-            != {
-                "classification_monotonic_ns",
-                "hard_expiry_monotonic_ns",
-                "request_id",
-                "response_ingest_seq",
-                "schema",
-            }
-            or control.get("schema") != AUDIT_CLASSIFICATION_SCHEMA
-        ):
-            raise AuditMismatchReportError("audit classification control schema is invalid")
         item.classification_source = source
         item.classification_connection = envelope.connection_id.value
         item.classification_subscription_id = envelope.subscription_id
-        item.request_id = _text(control.get("request_id"), field="classification request ID")
+        item.request_id = request_id
         item.response_ingest_seq = _integer(
             control.get("response_ingest_seq"),
             field="classification response ingest sequence",
@@ -1890,20 +3006,95 @@ def build_audit_mismatch_lineage_report(
             field="classification monotonic time",
         )
         classification_received_monotonic_ns = envelope.received_monotonic.nanoseconds
-        if classification_monotonic_ns != classification_received_monotonic_ns:
-            raise AuditMismatchReportError(
-                "audit classification timestamp differs from raw receive evidence"
-            )
         hard_expiry_monotonic_ns = _integer(
             control.get("hard_expiry_monotonic_ns"),
             field="audit hard expiry",
         )
+        schema = cast(str, control.get("schema"))
+        prepare_metadata_keys = {
+            "classification_prepare_durable_monotonic_ns",
+            "classification_prepare_ingest_id",
+            "classification_prepare_payload_sha256",
+            "classification_prepare_processed_monotonic_ns",
+        }
+        has_prepare_attestation = bool(
+            prepare_metadata_keys.intersection(envelope.transport_metadata)
+        )
+        if schema == AUDIT_CLASSIFICATION_V1_SCHEMA:
+            if has_prepare_attestation:
+                raise AuditMismatchReportError(
+                    "legacy audit classification cannot attest a preparation"
+                )
+            if classification_monotonic_ns != classification_received_monotonic_ns:
+                raise AuditMismatchReportError(
+                    "audit classification timestamp differs from raw receive evidence"
+                )
+        elif not has_prepare_attestation:
+            if classification_monotonic_ns != classification_received_monotonic_ns:
+                raise AuditMismatchReportError(
+                    "audit classification timestamp differs from raw receive evidence"
+                )
+        else:
+            metadata = envelope.transport_metadata
+            expected_metadata_keys = {
+                "classification_prepare_durable_monotonic_ns",
+                "classification_prepare_ingest_id",
+                "classification_prepare_payload_sha256",
+                "classification_prepare_processed_monotonic_ns",
+                "request_id",
+            }
+            if set(metadata) != expected_metadata_keys:
+                raise AuditMismatchReportError(
+                    "audit classification attestation metadata is not exact"
+                )
+            prepare_ingest_id = _text(
+                metadata.get("classification_prepare_ingest_id"),
+                field="classification preparation ingest ID",
+                maximum=128,
+            )
+            prepare_payload_sha256 = _text(
+                metadata.get("classification_prepare_payload_sha256"),
+                field="classification preparation payload hash",
+                maximum=64,
+            )
+            if not is_sha256_hex(prepare_payload_sha256):
+                raise AuditMismatchReportError("classification preparation payload hash is invalid")
+            durable_monotonic_ns = _integer(
+                metadata.get("classification_prepare_durable_monotonic_ns"),
+                field="classification preparation durability time",
+            )
+            processed_monotonic_ns = _integer(
+                metadata.get("classification_prepare_processed_monotonic_ns"),
+                field="classification preparation processing time",
+            )
+            if (
+                metadata.get("request_id") != request_id
+                or not durable_monotonic_ns
+                <= processed_monotonic_ns
+                == classification_monotonic_ns
+                <= classification_received_monotonic_ns
+                or durable_monotonic_ns >= hard_expiry_monotonic_ns
+                or processed_monotonic_ns >= hard_expiry_monotonic_ns
+            ):
+                raise AuditMismatchReportError(
+                    "audit classification PREPARE/ATTEST evidence does not reconcile"
+                )
+            item.classification_attestation = _ClassificationAttestation(
+                expected_prepare_source=RawSourceRef(
+                    ingest_id=IngestId(prepare_ingest_id),
+                    payload_sha256=prepare_payload_sha256,
+                ),
+                durable_monotonic_ns=durable_monotonic_ns,
+                processed_monotonic_ns=processed_monotonic_ns,
+            )
         if classification_monotonic_ns >= hard_expiry_monotonic_ns:
             raise AuditMismatchReportError(
                 "a MISMATCH classification reached or exceeded its hard expiry"
             )
+        item.classification_schema = schema
         item.classification_monotonic_ns = classification_monotonic_ns
         item.classification_received_monotonic_ns = classification_received_monotonic_ns
+        item.classification_hard_expiry_monotonic_ns = hard_expiry_monotonic_ns
 
     first_pass = _scan_pass(
         envelope_factory,
@@ -1911,8 +3102,19 @@ def build_audit_mismatch_lineage_report(
         limits=selected_limits,
         visit=bind_classification,
     )
-    if any(item.classification_source is None for item in resolved):
+    if any(
+        item.classification_source is None
+        or item.classification_schema is None
+        or item.request_id is None
+        or item.response_ingest_seq is None
+        or item.classification_monotonic_ns is None
+        or item.classification_received_monotonic_ns is None
+        or item.classification_hard_expiry_monotonic_ns is None
+        for item in resolved
+    ):
         raise AuditMismatchReportError("one or more classification controls are absent")
+    if seen_replay_stage_sequences != set(replay_stage_by_sequence):
+        raise AuditMismatchReportError("one or more replay recovery raw sources are absent")
     if any(
         item.observation.reported_top_transition is not None
         and (
@@ -1932,6 +3134,90 @@ def build_audit_mismatch_lineage_report(
 
     def bind_start_and_response(envelope: RawEventEnvelope) -> None:
         nonlocal retained_rest_levels
+        if envelope.channel == CONTROL_REST_AUDIT_CLASSIFY_PREPARE:
+            metadata_request = envelope.transport_metadata.get("request_id")
+            if not isinstance(metadata_request, str):
+                return
+            prepared_item = request_ids.get(metadata_request)
+            if prepared_item is None:
+                return
+            attestation = prepared_item.classification_attestation
+            if attestation is None:
+                raise AuditMismatchReportError(
+                    "direct audit classification has an unexpected preparation"
+                )
+            if prepared_item.classification_prepare_source is not None:
+                raise AuditMismatchReportError(
+                    "audit classification request has multiple preparations"
+                )
+            control = _canonical_control(
+                envelope.payload_bytes,
+                context="audit classification preparation control",
+            )
+            if (
+                set(control)
+                != {
+                    "hard_expiry_monotonic_ns",
+                    "request_id",
+                    "response_ingest_seq",
+                    "schema",
+                }
+                or control.get("schema") != AUDIT_CLASSIFICATION_PREPARE_SCHEMA
+            ):
+                raise AuditMismatchReportError(
+                    "audit classification preparation control schema is invalid"
+                )
+            request_id = _text(
+                control.get("request_id"),
+                field="classification preparation request ID",
+                maximum=128,
+            )
+            if request_id != metadata_request or envelope.transport_metadata != {
+                "request_id": request_id
+            }:
+                raise AuditMismatchReportError(
+                    "audit classification preparation metadata is not exact"
+                )
+            response_ingest_seq = _integer(
+                control.get("response_ingest_seq"),
+                field="classification preparation response ingest sequence",
+            )
+            hard_expiry_monotonic_ns = _integer(
+                control.get("hard_expiry_monotonic_ns"),
+                field="classification preparation hard expiry",
+            )
+            actual_source = _source(envelope)
+            classification_ingest_seq = prepared_item.observation.classification_ingest_seq
+            classification_monotonic_ns = cast(int, prepared_item.classification_monotonic_ns)
+            classification_received_monotonic_ns = cast(
+                int, prepared_item.classification_received_monotonic_ns
+            )
+            if (
+                actual_source != attestation.expected_prepare_source
+                or response_ingest_seq != prepared_item.response_ingest_seq
+                or hard_expiry_monotonic_ns != prepared_item.classification_hard_expiry_monotonic_ns
+                or envelope.connection_id.value != prepared_item.classification_connection
+                or envelope.received_monotonic.epoch_id != collector_run_id.value
+                or not response_ingest_seq < envelope.ingest_seq < classification_ingest_seq
+                or not envelope.received_monotonic.nanoseconds
+                <= attestation.durable_monotonic_ns
+                <= attestation.processed_monotonic_ns
+                == classification_monotonic_ns
+                <= classification_received_monotonic_ns
+                or attestation.durable_monotonic_ns >= hard_expiry_monotonic_ns
+                or attestation.processed_monotonic_ns >= hard_expiry_monotonic_ns
+            ):
+                raise AuditMismatchReportError(
+                    "audit classification PREPARE/ATTEST evidence does not reconcile"
+                )
+            prepared_item.classification_prepare_source = actual_source
+            prepared_item.classification_prepare_received_monotonic_ns = (
+                envelope.received_monotonic.nanoseconds
+            )
+            prepared_item.classification_prepare_durable_monotonic_ns = (
+                attestation.durable_monotonic_ns
+            )
+            return
         response_item = response_sequences.get(envelope.ingest_seq)
         if response_item is not None:
             if envelope.channel != REST_BOOK_AUDIT:
@@ -2066,6 +3352,7 @@ def build_audit_mismatch_lineage_report(
             raise AuditMismatchReportError("audit start connection identity is inconsistent")
         start_item.start_ingest_seq = envelope.ingest_seq
         start_item.start_source = _source(envelope)
+        start_item.audit_start_schema = cast(str, schema)
         native_asset_id = _text(control.get("native_asset_id"), field="audit start native asset ID")
         if start_item.observation.native_asset_id is not None and (
             start_item.observation.native_asset_id != native_asset_id
@@ -2079,6 +3366,54 @@ def build_audit_mismatch_lineage_report(
         start_item.request_started_monotonic_ns = _integer(
             control.get("request_started_monotonic_ns"), field="request start time"
         )
+        if start_item.request_started_monotonic_ns != envelope.received_monotonic.nanoseconds:
+            raise AuditMismatchReportError(
+                "audit start timestamp differs from raw receive evidence"
+            )
+        if start_item.classification_attestation is not None:
+            metadata = envelope.transport_metadata
+            expected_metadata_keys = {
+                "audit_attempt",
+                "classification_protocol",
+                "hard_expiry_monotonic_ns",
+                "request_id",
+                "response_deadline_monotonic_ns",
+                "run_deadline_monotonic_ns",
+            }
+            if set(metadata) != expected_metadata_keys:
+                raise AuditMismatchReportError("prepare/attest audit start metadata is not exact")
+            hard_expiry_ns = _integer(
+                metadata.get("hard_expiry_monotonic_ns"),
+                field="audit start hard expiry",
+            )
+            response_deadline_ns = _integer(
+                metadata.get("response_deadline_monotonic_ns"),
+                field="audit start response deadline",
+            )
+            run_deadline_ns = _integer(
+                metadata.get("run_deadline_monotonic_ns"),
+                field="audit start run deadline",
+            )
+            if (
+                schema != AUDIT_START_V2_SCHEMA
+                or metadata.get("classification_protocol")
+                != AUDIT_CLASSIFICATION_PREPARE_ATTEST_PROTOCOL
+                or metadata.get("request_id") != metadata_request
+                or _integer(metadata.get("audit_attempt"), field="audit start attempt") != attempt
+                or hard_expiry_ns != start_item.classification_hard_expiry_monotonic_ns
+                or response_deadline_ns != min(hard_expiry_ns, run_deadline_ns)
+                or start_item.request_started_monotonic_ns >= hard_expiry_ns
+                or start_item.request_started_monotonic_ns >= response_deadline_ns
+                or start_item.request_started_monotonic_ns >= run_deadline_ns
+            ):
+                raise AuditMismatchReportError(
+                    "prepare/attest audit start authority does not reconcile"
+                )
+            start_item.response_deadline_monotonic_ns = response_deadline_ns
+        elif envelope.transport_metadata.get("classification_protocol") is not None:
+            raise AuditMismatchReportError(
+                "audit start selects prepare/attest without retained preparation evidence"
+            )
         start_item.starting_admission_ordinal = _integer(
             control.get("starting_admission_ordinal"), field="starting admission ordinal"
         )
@@ -2110,8 +3445,16 @@ def build_audit_mismatch_lineage_report(
     _require_equal_passes(first_pass, second_pass)
     for item in resolved:
         if (
+            item.classification_attestation is not None
+            and item.classification_prepare_source is None
+        ):
+            raise AuditMismatchReportError(
+                "current audit classification lacks its durable preparation"
+            )
+        if (
             item.start_ingest_seq is None
             or item.start_source is None
+            or item.audit_start_schema is None
             or item.response_source is None
             or item.rest is None
             or item.rest_depth_identity is None
@@ -2155,12 +3498,104 @@ def build_audit_mismatch_lineage_report(
         if not (
             item.request_started_monotonic_ns
             <= item.response_received_monotonic_ns
+            <= item.classification_monotonic_ns
             <= item.classification_received_monotonic_ns
         ):
             raise AuditMismatchReportError("audit raw monotonic chronology is invalid")
+        if (
+            item.classification_prepare_received_monotonic_ns is not None
+            and item.response_received_monotonic_ns
+            > item.classification_prepare_received_monotonic_ns
+        ):
+            raise AuditMismatchReportError(
+                "audit response receipt follows its classification preparation"
+            )
+        if item.response_deadline_monotonic_ns is not None and (
+            item.response_received_monotonic_ns >= item.response_deadline_monotonic_ns
+        ):
+            raise AuditMismatchReportError(
+                "audit response receipt reached or exceeded its response deadline"
+            )
         item.start_socket_generation = connection_generations.get(
             ConnectionId(cast(str, item.classification_connection))
         )
+        authority = authority_by_classification.get(item.observation.classification_ingest_seq)
+        if authority is None:
+            continue
+        pending = authority.observed_divergence
+        diagnostic = pending.audit_outcome.mismatch_diagnostic
+        if diagnostic is None:  # pragma: no cover - typed pending rejects this
+            raise AuditMismatchReportError("replay divergence lost mismatch evidence")
+        cross_bound_fields = tuple(
+            name
+            for name, differs in (
+                (
+                    "instrument_id",
+                    pending.instrument_id != item.observation.instrument_id,
+                ),
+                ("request_id", pending.request_id != item.request_id),
+                (
+                    "audit_start_control_source",
+                    pending.audit_start_control_source != item.start_source,
+                ),
+                (
+                    "classification_source",
+                    pending.classification_source != item.classification_source,
+                ),
+                (
+                    "classification_received_monotonic_ns",
+                    pending.classification_received_monotonic_ns
+                    != item.classification_received_monotonic_ns,
+                ),
+                (
+                    "audit_start_schema",
+                    pending.audit_outcome.audit_start_schema != item.audit_start_schema,
+                ),
+                (
+                    "native_asset_id",
+                    pending.audit_outcome.native_asset_id != item.native_asset_id,
+                ),
+                ("attempt", pending.audit_outcome.attempt != item.attempt),
+                (
+                    "request_started_monotonic_ns",
+                    pending.audit_outcome.request_started_monotonic_ns
+                    != item.request_started_monotonic_ns,
+                ),
+                (
+                    "recorded_starting_book",
+                    authority.recorded_starting_book != item.starting_book,
+                ),
+                ("response_source", diagnostic.response_source != item.response_source),
+                (
+                    "response_received_monotonic_ns",
+                    pending.audit_outcome.response_received_monotonic_ns
+                    != item.response_received_monotonic_ns,
+                ),
+                (
+                    "exact_depth_difference",
+                    item.observation.exact_depth_difference is not None
+                    and diagnostic.exact_depth_difference
+                    != item.observation.exact_depth_difference,
+                ),
+            )
+            if differs
+        )
+        if cross_bound_fields:
+            raise AuditMismatchReportError(
+                "replay recovery authority is cross-bound to different mismatch evidence: "
+                + ",".join(cross_bound_fields)
+            )
+        item.replay_recovery_authority = authority
+        published_binding = published_binding_by_divergence.get(pending.divergence_id)
+        restoration = authority.eligibility_restoration
+        if published_binding is not None and (
+            restoration is None or published_binding != restoration.availability_binding
+        ):
+            raise AuditMismatchReportError(
+                "published availability authority differs from deterministic replay"
+            )
+        if restoration is not None and published_binding is not None:
+            item.published_availability_binding = published_binding
 
     working = [_WorkingLineage(resolved=item) for item in resolved]
     by_asset: dict[str, list[_WorkingLineage]] = {}
@@ -2261,6 +3696,12 @@ def build_audit_mismatch_lineage_report(
                         item.matching_reference_future = action
                     continue
 
+                _apply_received_prefix_oracle_action(
+                    item,
+                    action,
+                    tracker=tracker,
+                    limits=selected_limits,
+                )
                 start_connection = ConnectionId(cast(str, resolved_item.classification_connection))
                 start_generation = resolved_item.start_socket_generation
                 action_generation = connection_generations.get(action.connection_id)
@@ -2465,6 +3906,11 @@ def build_journal_audit_mismatch_lineage_report(
     observations: Sequence[AuditMismatchObservation],
     *,
     limits: AuditMismatchReportLimits | None = None,
+    replay_recovery_authorities: Sequence[AuditMismatchReplayRecoveryAuthority] | None = None,
+    published_availability_reconciliation: (
+        PublishedAvailabilityEvidenceReconciliation | None
+    ) = None,
+    reconciled_published_availability_bindings: Sequence[AuditAvailabilityBinding] | None = None,
 ) -> AuditMismatchLineageReport:
     """Read one explicit sealed journal run and build a post-hoc report."""
 
@@ -2481,6 +3927,9 @@ def build_journal_audit_mismatch_lineage_report(
         collector_run_id,
         observations,
         limits=limits,
+        replay_recovery_authorities=replay_recovery_authorities,
+        published_availability_reconciliation=published_availability_reconciliation,
+        reconciled_published_availability_bindings=(reconciled_published_availability_bindings),
     )
 
 
@@ -2612,6 +4061,7 @@ def load_instrumented_replay_mismatch_observations(
 __all__ = [
     "AUDIT_MISMATCH_LINEAGE_REPORT_SCHEMA",
     "AuditEqualityProof",
+    "AuditExternalCausalAttribution",
     "AuditMatchingStateRepresentation",
     "AuditMismatchCausalRelation",
     "AuditMismatchCauseCount",
@@ -2620,13 +4070,18 @@ __all__ = [
     "AuditMismatchLineageReport",
     "AuditMismatchLineageResult",
     "AuditMismatchObservation",
+    "AuditMismatchReplayRecoveryAuthority",
+    "AuditMismatchReplayRecoveryCollector",
     "AuditMismatchReportError",
     "AuditMismatchReportLimits",
     "AuditMismatchReportResourceError",
     "AuditMismatchReportResources",
+    "AuditObservationFact",
+    "AuditReceivedPrefixIntegrity",
     "AuditRecoveryChronology",
     "AuditRecoveryEvidenceStatus",
     "AuditRecoveryStageEvidence",
+    "AuditRecoveryState",
     "AuditVenueStateRelation",
     "build_audit_mismatch_lineage_report",
     "build_journal_audit_mismatch_lineage_report",

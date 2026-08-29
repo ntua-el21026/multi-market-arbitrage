@@ -203,6 +203,24 @@ def test_snapshot_replaces_state_and_sorts_independent_of_wire_order() -> None:
     assert owner.economic_content_sha256() == snapshot.economic_content_sha256()
 
 
+def test_operational_metadata_properties_do_not_construct_depth_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _bundle()
+    owner = CanonicalL2BookOwner(bundle, bundle.instruments[0].instrument_id)
+    owner.invalidate(InvalidationReason.DISCONNECT)
+
+    def forbidden_snapshot() -> None:
+        raise AssertionError("scalar operational metadata must not construct book depth")
+
+    monkeypatch.setattr(owner, "snapshot", forbidden_snapshot)
+
+    assert owner.invalidation_reason is InvalidationReason.DISCONNECT
+    assert owner.market_version_id == bundle.market.version_id
+    assert owner.precision_rule_version_id == bundle.precision.version_id
+    assert owner.cost_rule_set_version_id == bundle.cost_rule_set.version_id
+
+
 def test_price_change_size_is_absolute_and_duplicate_is_idempotent() -> None:
     bundle = _bundle()
     owner = CanonicalL2BookOwner(bundle, bundle.instruments[0].instrument_id)

@@ -21,6 +21,7 @@ from multi_market_arbitrage.core.ids import (
     SubscriptionId,
     WriterId,
 )
+from multi_market_arbitrage.core.provenance import RawSourceRef
 from multi_market_arbitrage.core.time import MonotonicTimestamp, UtcTimestamp
 from multi_market_arbitrage.ingestion import RawEventEnvelope
 from multi_market_arbitrage.journal import (
@@ -50,7 +51,12 @@ from multi_market_arbitrage.pipeline import (
 from multi_market_arbitrage.pipeline import observe as observe_module
 from multi_market_arbitrage.pipeline.health import ObservationRuntimeHealth
 from multi_market_arbitrage.pipeline.observe import PolymarketObservationService
-from multi_market_arbitrage.pipeline.processor import ProcessedEnvelope, ReferenceRefreshRequest
+from multi_market_arbitrage.pipeline.processor import (
+    ProcessedEnvelope,
+    ProcessorRecoveryReason,
+    ProcessorRecoveryRequest,
+    ReferenceRefreshRequest,
+)
 from multi_market_arbitrage.reference import POLYMARKET_VENUE_ID
 from multi_market_arbitrage.replay import (
     ReplayTerminalHashMismatch,
@@ -1078,12 +1084,58 @@ async def test_ingress_overflow_is_journaled_and_forces_rest_resnapshot(
     )
 
     class _AcceptingProcessor:
+        audit_replacement_captures_pending = 0
+        audit_replacement_recovery_authorities: tuple[()] = ()
+
+        @staticmethod
+        def audit_replacement_attempt_start_commands(**kwargs: object) -> tuple[()]:
+            del kwargs
+            return ()
+
+        @staticmethod
+        def audit_replacement_next_action_deadline_ns(**kwargs: object) -> None:
+            del kwargs
+
+        @staticmethod
+        def audit_replacement_deadline_commands(**kwargs: object) -> tuple[()]:
+            del kwargs
+            return ()
+
+        @staticmethod
+        def audit_replacement_attempt_abandon_commands(**kwargs: object) -> tuple[()]:
+            del kwargs
+            return ()
+
+        @staticmethod
+        def audit_replacement_terminal_commands(**kwargs: object) -> tuple[()]:
+            del kwargs
+            return ()
+
         def process_durable(
             self,
             envelope: RawEventEnvelope,
             receipt: JournalReceipt,
         ) -> ProcessedEnvelope:
             assert receipt.ingest_id == envelope.ingest_id
+            backpressure_recovery = (
+                (
+                    ProcessorRecoveryRequest(
+                        reason=ProcessorRecoveryReason.BACKPRESSURE_RESOURCE,
+                        source=RawSourceRef(
+                            ingest_id=envelope.ingest_id,
+                            payload_sha256=envelope.payload_sha256,
+                        ),
+                        affected_instrument_ids=(
+                            InstrumentId("token-yes"),
+                            InstrumentId("token-no"),
+                        ),
+                        original_reason_code=(InvalidationReason.BACKPRESSURE_DATA_LOSS.value),
+                        effective_invalidation_reason=(InvalidationReason.BACKPRESSURE_DATA_LOSS),
+                    ),
+                )
+                if envelope.channel == CONTROL_BOOK_INVALIDATION
+                else ()
+            )
             return ProcessedEnvelope(
                 ingest_seq=envelope.ingest_seq,
                 success=True,
@@ -1095,6 +1147,7 @@ async def test_ingress_overflow_is_journaled_and_forces_rest_resnapshot(
                 book_freshness_updates=(),
                 scan_triggers=(),
                 error_type=None,
+                recovery_requests=backpressure_recovery,
             )
 
         def on_backpressure(self) -> None:
@@ -1156,9 +1209,21 @@ async def test_ingress_overflow_is_journaled_and_forces_rest_resnapshot(
         capture: object,
         selected: tuple[GammaMarket, ...],
         deadline: float | None = None,
+        deadline_monotonic_ns: int | None = None,
         refresh_reference: bool = True,
+        runtime_health: ObservationRuntimeHealth | None = None,
+        replacement_deadline_supervisor: object | None = None,
     ) -> None:
-        del service, client, capture, deadline, refresh_reference
+        del (
+            service,
+            client,
+            capture,
+            deadline,
+            deadline_monotonic_ns,
+            refresh_reference,
+            runtime_health,
+            replacement_deadline_supervisor,
+        )
         resnapshots.append(tuple(market.gamma_market_id for market in selected))
 
     monkeypatch.setattr(
@@ -1259,6 +1324,8 @@ async def test_continuous_audit_fences_response_without_replacing_socket_generat
             self.admitted = 0
             self.emit_economic_update = False
             self.frame_admitted = asyncio.Event()
+            self.frame_requested = asyncio.Event()
+            self.emit_through = 0
             self.subscription_semantics_sha256 = hashlib.sha256(
                 b"continuous-audit-fixture"
             ).hexdigest()
@@ -1270,25 +1337,27 @@ async def test_continuous_audit_fences_response_without_replacing_socket_generat
             ready: asyncio.Event,
         ) -> None:
             ready.set()
-            for _ in range(100):
-                await asyncio.sleep(0.003)
-                payload = (
-                    _fixture("polymarket_ws_price_change.json")
-                    if self.emit_economic_update
-                    else _fixture("polymarket_ws_last_trade.json")
-                )
-                self.emit_economic_update = False
-                admit(
-                    ReceivedWebSocketMessage(
-                        payload_bytes=payload,
-                        received_wall_time=UtcTimestamp.now(),
-                        received_monotonic_ns=observe_module.time.monotonic_ns(),
-                        message_type="TEXT",
+            while True:
+                await self.frame_requested.wait()
+                self.frame_requested.clear()
+                while self.admitted < self.emit_through:
+                    await asyncio.sleep(0)
+                    payload = (
+                        _fixture("polymarket_ws_price_change.json")
+                        if self.emit_economic_update
+                        else _fixture("polymarket_ws_last_trade.json")
                     )
-                )
-                self.admitted += 1
-                self.frame_admitted.set()
-            await asyncio.Event().wait()
+                    self.emit_economic_update = False
+                    admit(
+                        ReceivedWebSocketMessage(
+                            payload_bytes=payload,
+                            received_wall_time=UtcTimestamp.now(),
+                            received_monotonic_ns=observe_module.time.monotonic_ns(),
+                            message_type="TEXT",
+                        )
+                    )
+                    self.admitted += 1
+                    self.frame_admitted.set()
 
     class _AuditClient:
         def __init__(self) -> None:
@@ -1312,6 +1381,8 @@ async def test_continuous_audit_fences_response_without_replacing_socket_generat
             if asset_id == "token-yes" and asset_attempt == 1:
                 socket.emit_economic_update = True
             before = socket.admitted
+            socket.emit_through = max(socket.emit_through, before + 2)
+            socket.frame_requested.set()
             while socket.admitted < before + 2:
                 socket.frame_admitted.clear()
                 if socket.admitted < before + 2:
@@ -1389,14 +1460,19 @@ async def test_continuous_audit_fences_response_without_replacing_socket_generat
     client = _AuditClient()
     runtime_health = ObservationRuntimeHealth()
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + 0.2
+    # The contract under test is the ordered FAILED -> RACED -> MATCH audit
+    # lifecycle, not completion within a sub-second host-performance budget.
+    # Leave enough wall-clock headroom for the journal fsyncs on slower CI
+    # runners while retaining the exact typed run-deadline exit.
+    remaining_seconds = 5.0
+    deadline = loop.time() + remaining_seconds
     generation = await service._run_generation(  # pyright: ignore[reportPrivateUsage]
         client=cast(PolymarketPublicClient, client),
         capture=capture,
         selected=(selected,),
         asset_ids=selected.clob_token_ids,
         deadline=deadline,
-        deadline_ns=observe_module.time.monotonic_ns() + 200_000_000,
+        deadline_ns=observe_module.time.monotonic_ns() + int(remaining_seconds * 1e9),
         periodic_audit_due_ns=observe_module.time.monotonic_ns(),
         connection_id=ConnectionId("continuous-audit-socket"),
         subscription_id=SubscriptionId("continuous-audit-subscription"),
@@ -1620,11 +1696,33 @@ async def test_successful_state_invalidation_resync_is_not_a_protocol_deviation(
     class _SuccessfulInvalidationCapture:
         def __init__(self) -> None:
             now_ns = observe_module.time.monotonic_ns()
+            self.collector_run_id = CollectorRunId("successful-state-invalidation-run")
             self.book_freshness_receive_ns = (now_ns, now_ns)
             self.book_freshness_receive_ns_by_instrument = {
                 InstrumentId(asset_id): now_ns for asset_id in ("token-yes", "token-no")
             }
             self.processor = self
+            self.audit_replacement_captures_pending = 0
+            self.audit_replacement_recovery_authorities: tuple[()] = ()
+
+        @staticmethod
+        def audit_replacement_attempt_start_commands(**kwargs: object) -> tuple[()]:
+            del kwargs
+            return ()
+
+        @staticmethod
+        def audit_replacement_next_action_deadline_ns(**kwargs: object) -> None:
+            del kwargs
+
+        @staticmethod
+        def audit_replacement_attempt_abandon_commands(**kwargs: object) -> tuple[()]:
+            del kwargs
+            return ()
+
+        @staticmethod
+        def audit_replacement_terminal_commands(**kwargs: object) -> tuple[()]:
+            del kwargs
+            return ()
 
         @staticmethod
         def audit_book_identity(native_asset_id: str) -> object:
@@ -1802,6 +1900,7 @@ async def test_refresh_requests_are_selected_market_bounded_and_coalesced(
             ReferenceRefreshRequest(
                 source_event_id=CanonicalEventId(f"refresh-{index}"),
                 event_type=CanonicalEventType.TICK_SIZE_CHANGE,
+                recovery_reason=ProcessorRecoveryReason.REFERENCE_REFRESH,
                 market_id=None,
                 native_market_id=selected.gamma_market_id,
                 native_condition_id=selected.condition_id,
@@ -1812,6 +1911,7 @@ async def test_refresh_requests_are_selected_market_bounded_and_coalesced(
         ReferenceRefreshRequest(
             source_event_id=CanonicalEventId("refresh-unrelated"),
             event_type=CanonicalEventType.TICK_SIZE_CHANGE,
+            recovery_reason=ProcessorRecoveryReason.REFERENCE_REFRESH,
             market_id=None,
             native_market_id="unrelated-market",
             native_condition_id="unrelated-condition",
@@ -1829,8 +1929,9 @@ async def test_refresh_requests_are_selected_market_bounded_and_coalesced(
         gamma_market_id: str,
         fallback: GammaMarket | None = None,
         deadline: float | None = None,
+        deadline_monotonic_ns: int | None = None,
     ) -> None:
-        del service, client, capture, fallback
+        del service, client, capture, fallback, deadline_monotonic_ns
         refreshed.append((gamma_market_id, deadline))
 
     async def record_snapshot(
@@ -1840,9 +1941,19 @@ async def test_refresh_requests_are_selected_market_bounded_and_coalesced(
         capture: object,
         selected: tuple[GammaMarket, ...],
         deadline: float | None = None,
+        deadline_monotonic_ns: int | None = None,
         refresh_reference: bool = True,
+        runtime_health: ObservationRuntimeHealth | None = None,
+        replacement_deadline_supervisor: object | None = None,
     ) -> None:
-        del service, client, capture
+        del (
+            service,
+            client,
+            capture,
+            deadline_monotonic_ns,
+            runtime_health,
+            replacement_deadline_supervisor,
+        )
         snapshots.append(
             (tuple(market.gamma_market_id for market in selected), deadline, refresh_reference)
         )
@@ -1921,6 +2032,8 @@ async def test_remote_deadline_is_adapter_owned_but_not_applied_to_payload_prese
         def __init__(self, result: ProcessedEnvelope) -> None:
             self.result = result
             self.payload: bytes | None = None
+            self.received_wall_time: UtcTimestamp | None = None
+            self.received_monotonic_ns: int | None = None
 
         async def preserve_then_process(
             self,
@@ -1929,9 +2042,13 @@ async def test_remote_deadline_is_adapter_owned_but_not_applied_to_payload_prese
             payload: bytes,
             transport_type: str,
             semantics_hash: str,
+            received_wall_time: UtcTimestamp | None = None,
+            received_monotonic_ns: int | None = None,
         ) -> ProcessedEnvelope:
             del channel, transport_type, semantics_hash
             self.payload = payload
+            self.received_wall_time = received_wall_time
+            self.received_monotonic_ns = received_monotonic_ns
             await asyncio.sleep(0.02)
             return self.result
 
@@ -1970,6 +2087,8 @@ async def test_remote_deadline_is_adapter_owned_but_not_applied_to_payload_prese
     )
     assert actual is expected
     assert slow_capture.payload == b"received"
+    assert slow_capture.received_wall_time is not None
+    assert slow_capture.received_monotonic_ns is not None
 
 
 @pytest.mark.asyncio

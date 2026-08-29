@@ -11,24 +11,43 @@ from multi_market_arbitrage.core.ids import CollectorRunId
 from multi_market_arbitrage.pipeline import (
     CONTROL_REST_AUDIT_REPLACEMENT_RELEASE,
     WS_MARKET,
+    AuditMismatchCause,
 )
 from multi_market_arbitrage.pipeline.health import (
     AUDIT_DIVERGENCE_PENDING_REPRESENTATIVE_SCHEMA,
     AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVE_SCHEMA,
+    AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_CODEBOOKS,
+    AUDIT_STAGE_TIMING_TELEMETRY_STAGES,
+    COMPOSITE_PEAK_RSS_SOURCE,
+    LINUX_PYTHON_RU_MAXRSS_SOURCE,
     MAXIMUM_AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVES,
+    PROCESSOR_HISTORY_CHAIN_TELEMETRY_FIELDS,
+    PROCESSOR_RETENTION_TELEMETRY_SCHEMA,
 )
+from multi_market_arbitrage.research.calibration import (
+    HEALTH_V5_CAPACITY_MAXIMUM_PERIODIC_CHECKPOINT_BYTES,
+    HEALTH_V5_CAPACITY_MAXIMUM_TERMINAL_CHECKPOINT_BYTES,
+)
+from multi_market_arbitrage.venues.polymarket import PolymarketEndpointClass
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY))
 
+import benchmarks.gate1_audit_divergence as audit_divergence_module  # noqa: E402
 from benchmarks.gate1_audit_divergence import (  # noqa: E402
     CAPACITY_PENDING_SATURATION_KIND,
     HEALTH_EVIDENCE_MAXIMUM_BYTES,
     HEALTH_EVIDENCE_MAXIMUM_RECORDS,
     SIX_HOUR_CHECKPOINT_COUNT,
     WORKLOAD_VERSION,
+    _audit_http_rows_exact,  # pyright: ignore[reportPrivateUsage]
+    _audit_stage_rows_exact,  # pyright: ignore[reportPrivateUsage]
     _capacity_projection,  # pyright: ignore[reportPrivateUsage]
+    _compact_rows_omit_nested_fields,  # pyright: ignore[reportPrivateUsage]
+    _mismatch_rows_exact,  # pyright: ignore[reportPrivateUsage]
+    _public_http_rows_exact,  # pyright: ignore[reportPrivateUsage]
     _replay_workload,  # pyright: ignore[reportPrivateUsage]
+    _table_rows,  # pyright: ignore[reportPrivateUsage]
 )
 from benchmarks.gate1_audit_divergence import (  # noqa: E402
     RESULT_SCHEMA as AUDIT_DIVERGENCE_RESULT_SCHEMA,
@@ -59,6 +78,8 @@ from benchmarks.gate1_scan_report import (  # noqa: E402
     _whole_units_per_second,  # pyright: ignore[reportPrivateUsage]
 )
 from benchmarks.phase1_performance import (  # noqa: E402
+    CURRENT_RSS_KIB_SOURCE,
+    PYTHON_RU_MAXRSS_KIB_SOURCE,
     RESULT_SCHEMA,
     audit_http_benchmark,
     audit_pipeline_benchmarks,
@@ -74,7 +95,7 @@ def test_health_benchmark_uses_production_checkpoint_builder() -> None:
     checkpoint = build()
 
     assert HEALTH_RESULT_SCHEMA == "gate1-health-benchmark-v2"
-    assert checkpoint.schema_version == "gate1-health-checkpoint-v3"
+    assert checkpoint.schema_version == "gate1-health-checkpoint-v5"
     assert checkpoint.gate1_eligible_so_far
     assert checkpoint.target["mode"] == "EXPLICIT_GATE1"
     assert len(checkpoint.books) == 2
@@ -128,7 +149,7 @@ def test_audit_divergence_benchmark_covers_changed_paths_and_capacity() -> None:
         replay_repetitions=1,
     )
 
-    assert AUDIT_DIVERGENCE_RESULT_SCHEMA == "mma-gate1-audit-divergence-benchmark-v1"
+    assert AUDIT_DIVERGENCE_RESULT_SCHEMA == "mma-gate1-audit-divergence-benchmark-v2"
     assert result["schema_version"] == AUDIT_DIVERGENCE_RESULT_SCHEMA
     series_items = cast(tuple[dict[str, object], ...], result["series"])
     series = {cast(str, item["name"]): item for item in series_items}
@@ -149,6 +170,23 @@ def test_audit_divergence_benchmark_covers_changed_paths_and_capacity() -> None:
         allocation = cast(dict[str, int], measurement["allocation_probe"])
         assert timing["median_ns"] > 0
         assert allocation["peak_delta_bytes"] >= 0
+
+    resources = cast(dict[str, object], result["resources"])
+    before = cast(dict[str, object], resources["before"])
+    after = cast(dict[str, object], resources["after"])
+    for snapshot in (before, after):
+        current = cast(int | None, snapshot["current_rss_bytes"])
+        python_ru_maxrss = cast(int, snapshot["python_ru_maxrss_bytes"])
+        assert current is not None
+        assert snapshot["current_rss_source"] == (
+            audit_divergence_module.LINUX_PROC_STATUS_CURRENT_RSS_SOURCE
+        )
+        assert snapshot["python_ru_maxrss_source"] == LINUX_PYTHON_RU_MAXRSS_SOURCE
+        assert snapshot["same_sample_composite_peak_bytes"] == max(
+            current or 0,
+            python_ru_maxrss,
+        )
+        assert snapshot["same_sample_composite_peak_source"] == COMPOSITE_PEAK_RSS_SOURCE
 
     causal_validation = cast(
         dict[str, object],
@@ -197,11 +235,64 @@ def test_audit_divergence_benchmark_covers_changed_paths_and_capacity() -> None:
     assert identity["workload_version"] == WORKLOAD_VERSION == "adr-0054-production-paths-v2"
 
     capacity = cast(dict[str, int | bool], result["capacity_projection"])
+    bounds = cast(dict[str, object], result["bounds"])
+    maximum_periodic_checkpoint_bytes_acceptance = cast(
+        int,
+        bounds["maximum_periodic_checkpoint_bytes_acceptance"],
+    )
+    minimum_six_hour_file_headroom_bytes = cast(
+        int,
+        bounds["minimum_six_hour_file_headroom_bytes"],
+    )
     assert capacity["checkpoint_count"] == SIX_HOUR_CHECKPOINT_COUNT == 2_161
     assert capacity["maximum_records"] == HEALTH_EVIDENCE_MAXIMUM_RECORDS == 8_192
-    assert capacity["maximum_file_bytes"] == HEALTH_EVIDENCE_MAXIMUM_BYTES == 67_108_864
+    assert capacity["maximum_file_bytes"] == HEALTH_EVIDENCE_MAXIMUM_BYTES == 71_303_168
+    assert (
+        capacity["maximum_periodic_checkpoint_bytes"]
+        == HEALTH_V5_CAPACITY_MAXIMUM_PERIODIC_CHECKPOINT_BYTES
+        == 31_573
+    )
+    assert (
+        capacity["maximum_terminal_checkpoint_bytes"]
+        == HEALTH_V5_CAPACITY_MAXIMUM_TERMINAL_CHECKPOINT_BYTES
+        == 45_217
+    )
+    assert capacity["projected_file_bytes"] == 68_242_897
     assert capacity["projected_file_bytes"] <= HEALTH_EVIDENCE_MAXIMUM_BYTES
-    assert capacity["remaining_file_bytes"] > 0
+    assert (
+        maximum_periodic_checkpoint_bytes_acceptance
+        == (
+            capacity["maximum_file_bytes"]
+            - minimum_six_hour_file_headroom_bytes
+            - capacity["maximum_terminal_checkpoint_bytes"]
+        )
+        // capacity["periodic_checkpoint_count"]
+    )
+    assert maximum_periodic_checkpoint_bytes_acceptance == 32_018
+    assert (
+        capacity["maximum_periodic_checkpoint_bytes"]
+        <= maximum_periodic_checkpoint_bytes_acceptance
+    )
+    assert (
+        maximum_periodic_checkpoint_bytes_acceptance - capacity["maximum_periodic_checkpoint_bytes"]
+        == 445
+    )
+    assert capacity["remaining_file_bytes"] >= minimum_six_hour_file_headroom_bytes
+    assert capacity["unknown_host_source_field_count"] == 9
+    assert capacity["unknown_host_periodic_delta_bytes"] == 71
+    assert capacity["unknown_host_terminal_delta_bytes"] == 71
+    assert capacity["maximum_periodic_checkpoint_bytes"] == max(
+        capacity["known_host_periodic_checkpoint_bytes"],
+        capacity["unknown_host_periodic_checkpoint_bytes"],
+        capacity["replacement_capture_periodic_checkpoint_bytes"],
+        capacity["unknown_host_replacement_capture_periodic_checkpoint_bytes"],
+    )
+    assert capacity["maximum_terminal_checkpoint_bytes"] == max(
+        capacity["known_host_terminal_checkpoint_bytes"],
+        capacity["unknown_host_terminal_checkpoint_bytes"],
+        capacity["replacement_capture_terminal_checkpoint_bytes"],
+        capacity["unknown_host_replacement_capture_terminal_checkpoint_bytes"],
+    )
     assert capacity["within_file_bound"] is True
     assert capacity["within_record_bound"] is True
     capacity_shape = cast(dict[str, int | str | bool], result["capacity_evidence_shape"])
@@ -227,6 +318,227 @@ def test_audit_divergence_benchmark_covers_changed_paths_and_capacity() -> None:
     assert capacity_shape["current_eligibility_saturated"] is True
     assert capacity_shape["compact_pending_omits_nested_audit_outcome"] is True
     assert capacity_shape["compact_resolution_omits_nested_observed_divergence"] is True
+    assert capacity_shape["mismatch_cause_rows_exact"] is True
+    assert capacity_shape["processor_retention_exact"] is True
+    assert capacity_shape["processor_retention_row_count"] == 8
+    assert capacity_shape["processor_retention_schema"] == PROCESSOR_RETENTION_TELEMETRY_SCHEMA
+    assert capacity_shape["analytical_fragment_retention_row_count"] == 3
+    assert capacity_shape["audit_fault_current_count"] == 4_096
+    assert capacity_shape["audit_fault_current_representative_count"] == 2
+    assert capacity_shape["audit_fault_current_representatives_truncated"] is True
+    # These eight finite schema/enum columns were formerly repeated as long
+    # strings in every bounded representative.  V2 dictionary codes preserve
+    # every value while recovering deterministic periodic-file headroom.
+    assert capacity_shape["audit_fault_representative_dictionary_coded_field_count"] == len(
+        AUDIT_FAULT_LIFECYCLE_REPRESENTATIVE_CODEBOOKS
+    )
+    assert capacity_shape["audit_fault_representative_dictionary_coding_exact"] is True
+    assert capacity_shape["audit_fault_status_representative_count"] == 3
+    assert capacity_shape["audit_fault_status_set_complete"] is True
+    assert capacity_shape["audit_fault_lifecycle_retention_capacity"] == 64
+    assert capacity_shape["audit_fault_lifecycle_retention_retained"] == 64
+    assert capacity_shape["audit_fault_lifecycle_retention_total"] == 4_099
+    assert capacity_shape["audit_fault_lifecycle_retention_truncated"] is True
+    assert capacity_shape["audit_http_endpoint_row_count"] == 5
+    assert capacity_shape["audit_http_endpoint_rows_exact"] is True
+    assert capacity_shape["audit_stage_timing_row_count"] == len(
+        AUDIT_STAGE_TIMING_TELEMETRY_STAGES
+    )
+    assert capacity_shape["audit_stage_timing_populated"] is True
+    assert capacity_shape["audit_stage_timing_rows_exact"] is True
+    assert capacity_shape["decision_reason_count"] == 33
+    assert capacity_shape["decision_sticky_reason_count"] == 29
+    assert capacity_shape["processor_history_chain_count"] == len(
+        PROCESSOR_HISTORY_CHAIN_TELEMETRY_FIELDS
+    )
+    assert capacity_shape["public_http_endpoint_row_count"] == 5
+    assert capacity_shape["public_http_endpoint_rows_exact"] is True
+    assert capacity_shape["reported_top_transition_count"] == 2
+    assert capacity_shape["rss_discontinuity_row_count"] == 16
+    assert capacity_shape["resource_allocator_fields_populated"] is True
+    assert capacity_shape["python_allocation_group_count"] == 0
+    terminal_capacity_shape = cast(
+        dict[str, int | str | bool], result["terminal_capacity_evidence_shape"]
+    )
+    assert terminal_capacity_shape["python_allocation_group_count"] == 12
+    replacement_capture_shape = cast(
+        dict[str, int | str | bool],
+        result["replacement_capture_capacity_evidence_shape"],
+    )
+    assert replacement_capture_shape["pending_record_count"] == 0
+    assert replacement_capture_shape["replacement_capture_count"] == 2
+    assert replacement_capture_shape["replacement_capture_saturated"] is True
+
+
+def test_audit_divergence_current_rss_source_is_platform_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(audit_divergence_module.sys, "platform", "darwin")
+
+    assert audit_divergence_module._current_rss_bytes() == (  # pyright: ignore[reportPrivateUsage]
+        None,
+        "UNAVAILABLE_PLATFORM:darwin",
+    )
+
+
+def test_capacity_compactness_is_derived_from_schema_and_scalar_rows() -> None:
+    fields = ("record_sha256", "cause")
+    rows: tuple[object, ...] = (("a" * 64, "DEPTH_MISMATCH"),)
+
+    assert _compact_rows_omit_nested_fields(
+        rows,
+        row_fields=fields,
+        expected_row_fields=fields,
+        forbidden_fields=frozenset({"audit_outcome"}),
+    )
+    assert not _compact_rows_omit_nested_fields(
+        (("a" * 64, {"nested": "evidence"}),),
+        row_fields=fields,
+        expected_row_fields=fields,
+        forbidden_fields=frozenset({"audit_outcome"}),
+    )
+    assert (
+        _table_rows(
+            {"rows": rows, "schema": "test-table-v1"},
+            schema="test-table-v1",
+            row_fields=fields,
+            expected_row_fields=fields,
+        )
+        == rows
+    )
+    with pytest.raises(RuntimeError, match="schema is invalid"):
+        _table_rows(
+            {"rows": rows, "schema": "wrong-table-v1"},
+            schema="test-table-v1",
+            row_fields=fields,
+            expected_row_fields=fields,
+        )
+    with pytest.raises(RuntimeError, match="row is invalid"):
+        _table_rows(
+            {"rows": (("a" * 64,),), "schema": "test-table-v1"},
+            schema="test-table-v1",
+            row_fields=fields,
+            expected_row_fields=fields,
+        )
+    assert not _compact_rows_omit_nested_fields(
+        (("a" * 64, "DEPTH_MISMATCH", "nested"),),
+        row_fields=(*fields, "audit_outcome"),
+        expected_row_fields=fields,
+        forbidden_fields=frozenset({"audit_outcome"}),
+    )
+
+
+def test_capacity_mismatch_rows_reject_duplicate_causes_and_wrong_types() -> None:
+    rows = tuple(
+        (
+            cause.value,
+            f"{index + 1:064x}",
+            index,
+            f"instrument-{index}",
+            f"ingest-{index}",
+            f"{index + 100:064x}",
+        )
+        for index, cause in enumerate(AuditMismatchCause)
+    )
+    counts = {cause.value: 1 for cause in AuditMismatchCause}
+    assert _mismatch_rows_exact(rows, counts)
+
+    duplicate = list(rows)
+    duplicate[-1] = (rows[0][0], *duplicate[-1][1:])
+    assert not _mismatch_rows_exact(tuple(duplicate), counts)
+
+    wrong_type: list[tuple[object, ...]] = list(rows)
+    wrong_type[0] = (wrong_type[0][0], wrong_type[0][1], True, *wrong_type[0][3:])
+    assert not _mismatch_rows_exact(tuple(wrong_type), counts)
+
+
+def test_capacity_stage_rows_reject_duplicate_position_and_wrong_types() -> None:
+    row = (5, 1, 2, 3, 4, 1, 1, 5.0)
+    rows: tuple[object, ...] = (row,) * len(AUDIT_STAGE_TIMING_TELEMETRY_STAGES)
+    assert _audit_stage_rows_exact(rows)
+    assert not _audit_stage_rows_exact((*rows, row))
+
+    wrong_type: list[object] = list(rows)
+    wrong_type[0] = (5, 1, 2, 3, 4, "1", 1, 5.0)
+    assert not _audit_stage_rows_exact(tuple(wrong_type))
+
+
+def test_capacity_http_rows_reject_duplicate_endpoints_and_wrong_types() -> None:
+    endpoints = tuple(
+        endpoint.value
+        for endpoint in PolymarketEndpointClass
+        if endpoint is not PolymarketEndpointClass.MARKET_WEBSOCKET
+    )
+    audit_rows = tuple((endpoint, 1, 3, 1, 1, 0, 0, 0, 0) for endpoint in endpoints)
+    assert _audit_http_rows_exact(audit_rows)
+    duplicate_audit = list(audit_rows)
+    duplicate_audit[-1] = (audit_rows[0][0], *duplicate_audit[-1][1:])
+    assert not _audit_http_rows_exact(tuple(duplicate_audit))
+    wrong_audit_type = list(audit_rows)
+    wrong_audit_type[0] = (wrong_audit_type[0][0], True, *wrong_audit_type[0][2:])
+    assert not _audit_http_rows_exact(tuple(wrong_audit_type))
+    out_of_bound_audit: list[tuple[object, ...]] = list(audit_rows)
+    out_of_bound_audit[0] = (
+        out_of_bound_audit[0][0],
+        9_223_372_036_854_775_808,
+        9_223_372_036_854_775_808,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    )
+    assert not _audit_http_rows_exact(tuple(out_of_bound_audit))
+
+    public_rows = tuple(
+        (
+            endpoint,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0,
+            0,
+            0,
+            0,
+            0.0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            0,
+            0.0,
+        )
+        for endpoint in endpoints
+    )
+    assert _public_http_rows_exact(public_rows)
+    duplicate_public = list(public_rows)
+    duplicate_public[-1] = (public_rows[0][0], *duplicate_public[-1][1:])
+    assert not _public_http_rows_exact(tuple(duplicate_public))
+    wrong_public_type: list[tuple[object, ...]] = list(public_rows)
+    wrong_public_type[0] = (wrong_public_type[0][0], "0", *wrong_public_type[0][2:])
+    assert not _public_http_rows_exact(tuple(wrong_public_type))
+    out_of_bound_public: list[tuple[object, ...]] = list(public_rows)
+    out_of_bound_public[0] = (
+        out_of_bound_public[0][0],
+        9_223_372_036_854_775_808,
+        *out_of_bound_public[0][2:],
+    )
+    assert not _public_http_rows_exact(tuple(out_of_bound_public))
 
 
 def test_audit_divergence_replay_workload_journals_durable_v2_release() -> None:
@@ -249,11 +561,18 @@ def test_audit_divergence_replay_workload_journals_durable_v2_release() -> None:
 
 
 def test_audit_divergence_capacity_projection_binds_final_checkpoint() -> None:
-    projection = _capacity_projection(maximum_checkpoint_bytes=10)
+    projection = _capacity_projection(
+        maximum_periodic_checkpoint_bytes=10,
+        maximum_terminal_checkpoint_bytes=20,
+    )
 
     assert projection["checkpoint_count"] == 2_161
-    assert projection["projected_file_bytes"] == 21_610
-    assert projection["remaining_file_bytes"] == HEALTH_EVIDENCE_MAXIMUM_BYTES - 21_610
+    assert projection["periodic_checkpoint_count"] == 2_160
+    assert projection["terminal_checkpoint_count"] == 1
+    assert projection["projected_periodic_bytes"] == 21_600
+    assert projection["projected_terminal_bytes"] == 20
+    assert projection["projected_file_bytes"] == 21_620
+    assert projection["remaining_file_bytes"] == HEALTH_EVIDENCE_MAXIMUM_BYTES - 21_620
     assert projection["within_file_bound"] is True
     assert projection["within_record_bound"] is True
 
@@ -294,9 +613,13 @@ def test_scan_report_benchmark_emits_conservative_integral_throughput() -> None:
 async def test_phase1_benchmark_executes_production_audit_http_series() -> None:
     result = await audit_http_benchmark()
 
-    assert RESULT_SCHEMA == "mma-phase1-performance-final-c-v2"
+    assert RESULT_SCHEMA == "mma-phase1-performance-final-c-v3"
     assert result["name"] == "audit_http_adapter_success_mock_transport"
     assert result["sample_count"] == 50
+    assert result["rss_kib_after"] > 0
+    assert result["rss_kib_after_source"] == CURRENT_RSS_KIB_SOURCE
+    assert result["python_ru_maxrss_kib_after"] > 0
+    assert result["python_ru_maxrss_kib_after_source"] == PYTHON_RU_MAXRSS_KIB_SOURCE
     assert result["extra"]["endpoint_class"] == "CLOB_BOOK"
     assert result["extra"]["network_latency_included"] is False
 

@@ -18,6 +18,8 @@ from multi_market_arbitrage.journal import (
     ABSOLUTE_MAX_UNCOMPRESSED_SEGMENT_BYTES,
     JournalReader,
     load_run_completion_head,
+    pending_descriptor_scopes,
+    source_authority_scopes,
     verify_sealed_segment,
 )
 from multi_market_arbitrage.journal.reader import run_key_for
@@ -80,6 +82,9 @@ class DataValidationReport:
 class _RecognizedArtifactInventory:
     sealed_journal_segments: tuple[Path, ...]
     partial_journal_segments: tuple[Path, ...]
+    pending_journal_descriptors: tuple[Path, ...]
+    pending_journal_sources: tuple[Path, ...]
+    journal_source_authorities: tuple[Path, ...]
     journal_completions: tuple[Path, ...]
     parquet_fragments: tuple[Path, ...]
     parquet_fragment_manifests: tuple[Path, ...]
@@ -97,6 +102,9 @@ class _ValidatedPartial:
 def _recognized_artifacts(root: Path) -> _RecognizedArtifactInventory:
     sealed: list[Path] = []
     partials: list[Path] = []
+    pending_descriptors: list[Path] = []
+    pending_sources: list[Path] = []
+    source_authorities: list[Path] = []
     journal_completions: list[Path] = []
     parquet: list[Path] = []
     parquet_manifests: list[Path] = []
@@ -110,6 +118,12 @@ def _recognized_artifacts(root: Path) -> _RecognizedArtifactInventory:
             destination = sealed
         elif name.endswith(".jsonl.partial"):
             destination = partials
+        elif name.endswith(".jsonl.seal-pending.descriptor.json"):
+            destination = pending_descriptors
+        elif name.endswith(".jsonl.seal-pending"):
+            destination = pending_sources
+        elif name.startswith("run-") and name.endswith(".source-authority.json"):
+            destination = source_authorities
         elif name.startswith("run-") and name.endswith(".completed.json"):
             destination = journal_completions
         elif name.endswith(".parquet.manifest.json"):
@@ -129,6 +143,9 @@ def _recognized_artifacts(root: Path) -> _RecognizedArtifactInventory:
     return _RecognizedArtifactInventory(
         sealed_journal_segments=tuple(sorted(sealed)),
         partial_journal_segments=tuple(sorted(partials)),
+        pending_journal_descriptors=tuple(sorted(pending_descriptors)),
+        pending_journal_sources=tuple(sorted(pending_sources)),
+        journal_source_authorities=tuple(sorted(source_authorities)),
         journal_completions=tuple(sorted(journal_completions)),
         parquet_fragments=tuple(sorted(parquet)),
         parquet_fragment_manifests=tuple(sorted(parquet_manifests)),
@@ -268,6 +285,40 @@ def validate_data(root: Path, *, allow_incomplete: bool = False) -> DataValidati
                 journal_scopes.add(scope)
         except Exception as error:
             errors.append(f"{path}: {type(error).__name__}: {error}")
+    pending_directories: set[Path] = set()
+    for path in inventory.pending_journal_descriptors:
+        try:
+            _require_confined_regular(path, resolved, artifact="seal-pending descriptor")
+            pending_directories.add(path.parent)
+        except Exception as error:
+            errors.append(f"{path}: {type(error).__name__}: {error}")
+    for path in inventory.pending_journal_sources:
+        try:
+            _require_confined_regular(path, resolved, artifact="seal-pending source")
+            descriptor_path = path.with_name(f"{path.name}.descriptor.json")
+            if descriptor_path not in inventory.pending_journal_descriptors:
+                raise ValueError("seal-pending source lacks its provenance descriptor")
+        except Exception as error:
+            errors.append(f"{path}: {type(error).__name__}: {error}")
+    for directory in sorted(pending_directories):
+        try:
+            for collector_run_id, stream in pending_descriptor_scopes(directory):
+                journal_scopes.add((directory, collector_run_id, stream))
+        except Exception as error:
+            errors.append(f"{directory}: {type(error).__name__}: {error}")
+    authority_directories: set[Path] = set()
+    for path in inventory.journal_source_authorities:
+        try:
+            _require_confined_regular(path, resolved, artifact="journal source authority")
+            authority_directories.add(path.parent)
+        except Exception as error:
+            errors.append(f"{path}: {type(error).__name__}: {error}")
+    for directory in sorted(authority_directories):
+        try:
+            for collector_run_id, stream in source_authority_scopes(directory):
+                journal_scopes.add((directory, collector_run_id, stream))
+        except Exception as error:
+            errors.append(f"{directory}: {type(error).__name__}: {error}")
     for path in inventory.journal_completions:
         try:
             _require_confined_regular(path, resolved, artifact="journal run completion")

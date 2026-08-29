@@ -18,15 +18,19 @@ import pytest
 _REPOSITORY = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPOSITORY))
 
+import benchmarks.gate1_scan_report as scan_report_benchmark_module  # noqa: E402
 from benchmarks.gate1_scan_report import (  # noqa: E402
     SCHEMA_VERSION as BENCHMARK_SCHEMA_VERSION,
 )
 from benchmarks.gate1_scan_report import benchmark_scan_report  # noqa: E402
 from multi_market_arbitrage.core.ids import CollectorRunId, VenueId  # noqa: E402
+from multi_market_arbitrage.pipeline.health import (  # noqa: E402
+    COMPOSITE_PEAK_RSS_SOURCE,
+    LINUX_PYTHON_RU_MAXRSS_SOURCE,
+)
 from multi_market_arbitrage.research import (  # noqa: E402
     COMPLETE_SET_SCAN_SCHEMA_VERSION,
     SCAN_REPORT_SCHEMA_VERSION,
-    ScanReport,
     ScanReportLimits,
     ScanReportResourceError,
     build_scan_report,
@@ -207,23 +211,6 @@ def _old_report_oracle(root: Path) -> dict[str, object]:
     }
 
 
-def _semantic_projection(report: ScanReport) -> tuple[object, ...]:
-    return (
-        report.total_scans,
-        report.candidates,
-        report.validated_opportunities,
-        report.unique_opportunity_observations,
-        report.unique_lifecycles,
-        report.dispositions,
-        report.terminal_hash_count,
-        report.terminal_hash_order,
-        report.terminal_hash_sequence_sha256,
-        report.terminal_hash_samples,
-        report.resources.row_count,
-        report.resources.selected_materialized_bytes,
-    )
-
-
 def test_streaming_report_matches_old_small_dataset_oracle_and_is_deterministic(
     tmp_path: Path,
 ) -> None:
@@ -375,13 +362,43 @@ def test_scan_report_benchmark_uses_production_report(tmp_path: Path) -> None:
     assert result.compressed_bytes_per_second > 0
     assert result.wall_nanoseconds > 0
     assert result.cpu_nanoseconds > 0
-    assert result.peak_rss_bytes > 0
+    assert result.current_rss_before_bytes is not None
+    assert result.current_rss_after_bytes is not None
+    assert result.current_rss_before_source == (
+        scan_report_benchmark_module.LINUX_PROC_STATUS_CURRENT_RSS_SOURCE
+    )
+    assert result.current_rss_after_source == (
+        scan_report_benchmark_module.LINUX_PROC_STATUS_CURRENT_RSS_SOURCE
+    )
+    assert result.python_ru_maxrss_before_bytes > 0
+    assert result.python_ru_maxrss_after_bytes >= result.python_ru_maxrss_before_bytes
+    assert result.python_ru_maxrss_source == LINUX_PYTHON_RU_MAXRSS_SOURCE
+    assert result.same_sample_composite_peak_before_bytes == max(
+        result.current_rss_before_bytes,
+        result.python_ru_maxrss_before_bytes,
+    )
+    assert result.same_sample_composite_peak_after_bytes == max(
+        result.current_rss_after_bytes,
+        result.python_ru_maxrss_after_bytes,
+    )
+    assert result.same_sample_composite_peak_source == COMPOSITE_PEAK_RSS_SOURCE
     assert result.report_output_bytes > 0
     assert result.spill_bytes == 0
     assert result.temporary_storage == "NONE"
 
 
-def test_streaming_report_exceeds_wide_materialization_bound_but_not_peak_rss(
+def test_scan_report_benchmark_current_rss_source_is_platform_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(scan_report_benchmark_module.sys, "platform", "darwin")
+
+    assert scan_report_benchmark_module._current_rss_bytes() == (  # pyright: ignore[reportPrivateUsage]
+        None,
+        "UNAVAILABLE_PLATFORM:darwin",
+    )
+
+
+def test_streaming_report_exceeds_wide_materialization_bound_but_not_composite_peak_rss(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def write_without_statistics(
@@ -439,7 +456,10 @@ def test_streaming_report_exceeds_wide_materialization_bound_but_not_peak_rss(
     assert isinstance(measured_value, dict)
     measured = cast(dict[str, object], measured_value)
     assert int(cast(int, measured["source_full_materialized_bytes"])) > (_MATERIALIZATION_LIMIT)
-    assert int(cast(int, measured["peak_rss_bytes"])) < _MATERIALIZATION_LIMIT
+    assert (
+        int(cast(int, measured["same_sample_composite_peak_after_bytes"])) < _MATERIALIZATION_LIMIT
+    )
+    assert measured["same_sample_composite_peak_source"] == COMPOSITE_PEAK_RSS_SOURCE
     assert measured["source_rows"] == 129
     assert int(cast(int, measured["rows_per_second"])) > 0
     assert int(cast(int, measured["selected_materialized_bytes_per_second"])) > 0
@@ -448,7 +468,7 @@ def test_streaming_report_exceeds_wide_materialization_bound_but_not_peak_rss(
     assert measured["temporary_storage"] == "NONE"
 
 
-def test_failed_soak_original_and_rebuild_reports_are_semantically_equal() -> None:
+def test_failed_soak_original_and_corrected_rebuild_reports_are_well_formed() -> None:
     original_value = os.environ.get("MMA_GATE1_FAILED_ANALYTICAL_ORIGINAL")
     rebuilt_value = os.environ.get("MMA_GATE1_FAILED_ANALYTICAL_REBUILT")
     if original_value is None or rebuilt_value is None:
@@ -456,9 +476,23 @@ def test_failed_soak_original_and_rebuild_reports_are_semantically_equal() -> No
 
     original = build_scan_report(Path(original_value))
     rebuilt = build_scan_report(Path(rebuilt_value))
+    rebuilt_again = build_scan_report(Path(rebuilt_value) / "complete_set_scans")
 
     assert original.resources.full_materialized_bytes > _MATERIALIZATION_LIMIT
     assert rebuilt.resources.full_materialized_bytes > _MATERIALIZATION_LIMIT
-    assert _semantic_projection(original) == _semantic_projection(rebuilt)
+    assert rebuilt == rebuilt_again
     assert original.total_scans == 44_032
+    assert rebuilt.total_scans == 43_277
+    assert tuple((item.disposition, item.count) for item in rebuilt.dispositions) == (
+        ("BLOCKED", 19_717),
+        ("NO_CANDIDATE", 23_560),
+    )
+    assert rebuilt.candidates == 0
+    assert rebuilt.validated_opportunities == 0
+    assert rebuilt.unique_opportunity_observations == 0
+    assert rebuilt.unique_lifecycles == 0
+    assert original.terminal_hash_count == original.total_scans
+    assert rebuilt.terminal_hash_count == rebuilt.total_scans
     assert not original.terminal_hashes_complete
+    assert not rebuilt.terminal_hashes_complete
+    assert original.terminal_hash_sequence_sha256 != rebuilt.terminal_hash_sequence_sha256

@@ -120,13 +120,61 @@ Introducing Rust/C++ requires:
 ## 11. Storage benchmarking
 
 Measure:
-- raw journal append latency;
-- compression cost;
-- segment sealing;
+- raw journal append/data-`fsync` latency, including while a prior segment is
+  pending seal;
+- rotation handoff latency;
+- streaming compression and compressed-file publication;
+- manifest publication;
+- complete verification and verified-source cleanup;
+- ordered seal total latency and pending count/bytes/age;
 - Parquet batch write;
 - DuckDB query performance.
 
 Do not over-optimize canonical analytics at the expense of raw capture reliability.
+
+ADR-0057 journal benchmarks report p50/p95/p99/max for every stage, append and
+seal queue high-water marks, total queued-plus-in-service pending occupancy,
+active seal jobs, independent durable/manifest/verified progress, and maximum
+raw-durability latency during rotation. A forced seal longer than the audit
+freshness guard must not delay later response/PREPARE durability or canonical
+processing past the unchanged hard expiry.
+
+Pending capacity is justified from measured segment fill time, seal p95/p99/max,
+conservative six-hour raw rate, byte-threshold bursts, and disk headroom. The
+accepted Phase-1 values remain four outstanding segments including the active
+job, 256 MiB pending uncompressed bytes, 120 seconds oldest age, and one worker.
+Benchmarks fail rather than enlarge those values.
+
+The current pre-soak report schema is `phase1-pre-soak-calibration-v3`. It binds
+the seal-queue capacity and pending-seal byte limit and exposes active-segment,
+full pending-source, worst-case compressed scratch, metadata/atomic-write
+scratch, and aggregate recovery-evidence reserve bytes. The last component
+covers one maximum recovery tail plus the 64-record/256-KiB compact
+crash-evidence ledger. The reported
+`temporary_sealing_bytes` equals those five components exactly and enters the
+disk projection once. A missing component, favorable compression assumption,
+or historical v1-v2 report fails current ADR-0057 capacity qualification.
+
+This is a corrected v3 producer contract, not a schema change. Qualifying v3
+evidence carries `phase1-pre-soak-calibration-producer-contract-v1` and
+`phase1-pre-soak-calibration-projection-method-v2`; pre-correction v3 evidence
+lacking those bindings is nonqualifying. Generic
+stochastic rate fields continue to use ceiling integer projection from the
+WebSocket observation duration with 2.0x workload headroom. Health v5 is not
+rate-scaled from the mixed calibration file: the producer reads that current v5
+file through one no-follow descriptor, proves stable single-link file identity,
+matches the writer SHA-256, and binds that digest with observed periodic/
+terminal counts and record-size maxima,
+requires exactly one terminal record last, and projects the fixed six-hour
+cardinality of 2,160 periodic plus one terminal record. The report binds both
+the exact requested duration and exact completed monotonic duration. A health
+capacity overrun, completed duration shorter than requested, or remaining
+health-file margin below 2 MiB fails closed.
+
+At least 100 consecutive rotations exercise steady-state handoff/seal overlap.
+The report proves that compression and complete verification remain streaming,
+that append-owner wait attributable to ordinary seal work is zero, and that
+clean completion drains and reconciles all pending work.
 
 ## 12. Performance report
 
@@ -330,7 +378,9 @@ must benchmark and report:
   control construction, canonical serialization, durable-route processing,
   validation, state release and the first permitted recovery scan;
 - v2 audit trigger encoding and trigger/outcome reconciliation;
-- health decision and checkpoint-v3 construction/serialization;
+- health decision and checkpoint-v5 operational construction/serialization,
+  including compact ordered-journal seal evidence and explicit v1-v4
+  compatibility;
 - deterministic selection/serialization of every bounded current compact
   pending representative and the one latest compact resolution representative,
   including truncated-resolution-history behavior;
@@ -360,14 +410,18 @@ objects
 as compact raw-linked `gate1-audit-divergence-pending-representative-v1` records
 and at most one latest compact
 `gate1-audit-divergence-resolution-representative-v1`. These are bounded
-projections: exact totals, complete bounded pending/resolution objects in the
-processor summary and terminal hash, and the complete lifecycle chain remain
-authoritative. Storage-capacity evidence must saturate the benchmark fixture's
-two-pending-representative bound through the real checkpoint serializer. Because
-market-scoped recovery permits only one pending record for the current single
-Gate-1 target at a time, that two-record portion must be labeled as a bounded
-synthetic `ProcessorSummary` projection assembled from independently valid raw-
-linked lifecycle records, not as replay evidence.
+projections: exact totals, complete current pending/recovery objects in the
+processor summary and terminal hash, durable raw/control links, and the complete
+lifecycle chain remain authoritative. Completed recent full-object history is a
+diagnostic sample whose capacity cannot define new-schema semantic identity.
+Storage-capacity evidence must saturate the benchmark fixture's
+two-pending-representative bound through the real checkpoint serializer. The
+single-target production fixture durably stages the YES and NO audit starts
+before classifying either response, then opens both raw-linked divergences in
+one `CanonicalProcessor`. A separate state resolves both authoritative REST
+baselines and proves the simultaneously reachable two-replacement-capture
+shape. Capacity selects the largest serialized periodic and terminal record
+across both real states and both known/all-source-unknown host identities.
 Do not increase queue, response, storage, book-age
 or memory limits to obtain a favorable result. No benchmark result is claimed
 in this normative section until its exact command, source identity and output
@@ -385,3 +439,218 @@ Retain `gate1_audit_divergence_results.json`,
 `gate1_audit_divergence_report.md`, and
 `gate1_audit_divergence_artifacts.sha256` together with the exact source
 identity. This section intentionally records no unexecuted benchmark result.
+
+## 18. ADR-0055/ADR-0056/ADR-0057 operational-snapshot and saturation gate
+
+Before the next public candidate is accepted, the exact implementation SHA must
+run the `mma-gate1-final-pre-soak-capacity-v5` deterministic offline saturation
+benchmark. Its default Gate workload uses 6,096 scan-driving WebSocket events
+and 6,096 audit outcomes. Every scan-driving event refreshes both sides of both
+required books. Relative to the 4,096 saturation threshold, each phase contains
+two complete production 1,000-record post-saturation analytical batches. It
+also journals exactly 80,001 records with exactly 1,400 application-payload
+bytes per record against the production 10,000-event segment limit. The tail
+record forces all eight full-segment seal samples to complete before close.
+Gate-minimum mode rejects any other analytical batch size, journal segment
+limit or payload size, and any journal event count below `8 * 10,000 + 1`.
+
+Measure and retain:
+
+- `ProcessorOperationalSnapshot` construction p50/p95/p99/max at zero, half,
+  full, and post-saturation diagnostic occupancy;
+- full terminal-summary construction p50/p95/p99/max after frozen capture
+  cutoff;
+- event-loop blocking and exact 17-row
+  `mma-audit-stage-timing-telemetry-table-v2` coverage: audit network,
+  raw-durability, barrier, PREPARE construction/durability/processing,
+  final-attestation durability/processing, independently observed
+  response-to-PREPARE-decision and response-to-ATTEST-processing latency, plus
+  the retained non-substituting legacy total;
+- occupancy and approximate/deep retained bytes for scan results, audit
+  outcomes, mismatch diagnostics, divergence resolutions, reported-top
+  outcomes, lifecycle state, journal/analytical buffers, metrics and health/
+  availability/contribution writers;
+- Python allocation groups, PyArrow current/peak allocated bytes, process
+  current RSS with source, normalized Python `ru_maxrss` with source, the
+  conservative same-sample composite `peak_rss_bytes` with source,
+  native/allocator residual and post-saturation slope;
+- queue high-water marks, batch flushes, history saturation and at least eight
+  full production segment seals;
+- independent received-prefix oracle cost/results, fault-lifecycle transitions,
+  interval-contribution construction/reconciliation and typed-resync routing;
+- true concurrent-active contributor occupancy separately from cumulative
+  completed count/backlog/file/byte growth, including independent completion
+  while a shared interval stays open;
+- global active-period union and cross-stream count/digest/sequence/hash
+  reconciliation for composite-owner and separately supervised-owner fixtures;
+- replacement-capture attempt/next-retry/hard/run deadlines, connection churn
+  under one recovery/contributor identity, typed exhaustion and shutdown cost;
+- ordered journal handoff/seal overlap, pending count/bytes/age including the
+  in-service job, independent durable/manifest/verified progress, stage timing,
+  append-owner seal wait, and verified-drain completion.
+
+Operational-snapshot cost must remain approximately constant as diagnostic
+history grows. It may not construct/copy full recent histories, compute terminal
+hashes, or canonicalize history-sized objects. Full terminal work may be more
+expensive but occurs only after capture cutoff and must remain within explicit
+memory/work bounds.
+
+Compare full-object retention with domain-specific smaller samples, compact
+representatives plus complete chains/counters, and no production scan-result
+history where analytical persistence and the ordered scan chain remain
+authoritative. Diagnostic-sample capacity may not change new-schema terminal
+semantic identity. Do not use `gc.collect()`, allocator trimming, process
+restart, larger queues, a larger freshness guard, or weaker evidence as the
+primary correction.
+
+The current producer defaults under test are 256 scan results, 256 audit
+outcomes, 64 mismatch diagnostics, 64 completed divergence resolutions, 256
+reported-top outcomes, 64 audit-fault lifecycle records, 1,024
+validated-opportunity hashes, and 256 reference-refresh requests. Each domain
+has an independent hard cap and reports
+occupancy/capacity/total/truncation. The saturation benchmark decides whether
+these implementation values are defensible; their presence alone is not proof.
+Analytical telemetry retains current/high-water buffered records and bytes,
+flushes/flushed records, process-wide PyArrow current/peak allocated bytes, and
+three fixed-size fragment-SHA retention records. Each analytical dataset has a
+hard 4,096-fragment ceiling shared with the streaming report reader. The writer
+accounts for verified pre-existing fragments and rejects before directory
+creation, buffer detachment, Arrow materialization, or physical output when no
+slot remains. Thus exact completion SHA inventories consume bounded memory;
+the benchmark must assert retained counts and shallow byte estimates remain at
+or below their reported capacities, independently of buffered-record bounds.
+
+The deterministic offline command is:
+
+```bash
+capacity_root="$(mktemp -d /tmp/mma-gate1-capacity.XXXXXX)"
+uv run --frozen --all-groups --no-sync python benchmarks/gate1_pre_soak_capacity.py \
+  --artifact-root "${capacity_root}/artifacts" \
+  --output "${capacity_root}/final-capacity-benchmark.json"
+```
+
+The `mma-gate1-final-pre-soak-capacity-v5` JSON includes `latency`,
+`history_retention`, `post_saturation`, `domain_capacity`, `production_health`,
+`memory`, `analytical`, `journal`, `acceptance_policy`, and `acceptance`.
+`domain_capacity` separately saturates mismatch/resolution, audit-fault,
+reported-top, unresolved-active contributor and cumulative completed-
+contribution histories. It must exceed the active limit cumulatively without
+retaining completed records as active and exercise replacement exhaustion before
+shutdown. During
+every 64 audit outcomes (and the final outcome), it constructs and enqueues a real
+production health checkpoint, then performs audit classification before the
+event loop regains control. The report distinguishes health-build,
+classification-with-health, combined synchronous blocking, and actual
+scheduled-callback delay distributions. Every timing collector has fixed
+capacity at the saturation checkpoint, so benchmark instrumentation does not
+create a false post-saturation Python-memory slope.
+
+For health v5, capacity acceptance uses the maximum across known/unknown-host
+and current/replacement-capture periodic and terminal fixtures. The measured
+maxima are 31,573 bytes periodic and 45,217 bytes terminal. At ten-second
+cadence the fixed projection is 2,160 periodic records plus one terminal record:
+`2,160 * 31,573 + 1 * 45,217 = 68,242,897` bytes. The exact 68 MiB
+(71,303,168-byte) file cap leaves 3,060,271 bytes, above the fixed 2 MiB minimum
+headroom. The derived 32,018-byte periodic file-budget ceiling leaves an exact
+445-byte capacity-qualification margin above the 31,573-byte maximum; it is not
+an observed-record acceptance bound. The 8,192 checkpoint-count bound and
+cadence remain unchanged.
+Exceeding any projected record/file/count predicate fails rather than truncates
+or omits v5 evidence.
+
+Acceptance is not a pass-through. The synchronous budget is one quarter of the
+tighter configured health cadence and audit-freshness guard, reserving equal
+shares for acquisition, audit, health and persistence. The constancy factor is
+one plus the number of binary occupancy doublings to the largest bounded
+history. Post-saturation Python/RSS growth permits the maximum measured deep
+record plus one 1-MiB CPython allocator arena per bounded processor/analytical
+domain amortized over the measured interval (and one RSS page per event);
+equivalent analytical batch phases require zero PyArrow current-byte growth.
+Saturated scan/audit retained-record and deep retained-byte slopes must be
+exactly zero over the declared endpoint interval. Endpoint measurements must be
+phase-equivalent. Every consecutive post-capacity window must retain a fixed
+record count and may grow by no more than one measured record phase. All
+formulas and numerical limits are emitted in `acceptance_policy`.
+
+The v4 journal window compares the first through eighth completed full-segment
+samples. Positive first-to-last net growth is capped independently at 128 MiB
+RSS, 64 MiB traced Python current and 128 MiB native/allocator residual. It also
+requires production queue/group-commit/run-byte settings, exact ordered replay,
+manifest/completion cross-binding and zero active PyArrow allocation after
+analytical close. These offline predicates strengthen storage-transient
+coverage; they do not replace or relax the separate public post-saturation RSS
+formula.
+
+RSS instrumentation does not identify differently defined kernel readings as
+one metric. Periodic and terminal health evidence publishes `/proc/self/statm`
+current RSS, normalized Python `resource.getrusage(RUSAGE_SELF).ru_maxrss`, and
+their conservative same-sample maximum as three explicitly sourced fields.
+The maximum is the compatibility `peak_rss_bytes` value and must equal the
+maximum of both inputs. On Linux, current RSS is sourced exactly from
+`/proc/self/statm` and Python `ru_maxrss` is normalized from KiB; on Darwin,
+current RSS is explicitly unavailable and Python `ru_maxrss` is already bytes.
+Any other platform fails closed because its raw units are not established.
+Component-memory campaign evidence separately retains its
+externally sampled `/proc` current-RSS maximum and `/proc/self/smaps` current
+attribution; those diagnostics are not substituted for, or equality-compared
+with, Python `ru_maxrss`.
+Historical v5 records without the additive peak/Python-`ru_maxrss` source fields
+remain legacy-readable only: their `peak_rss_bytes` means normalized Python
+`ru_maxrss`, never the current composite definition. Current exact-source
+qualification rejects such a legacy-shaped record.
+
+Verified replay no longer retains a Python ingest-ID mapping proportional to
+event count. Exact uniqueness uses a temporary SQLite primary-key index capped
+at selected uncompressed raw bytes, with a fixed 2 MiB page cache and mmap
+disabled. This converts event-count growth from process memory into bounded
+command scratch already represented by the raw-sized replay/rebuild disk
+allowance. Cleanup is mandatory after exhaustion, error, and early iterator
+close; index resource exhaustion is verification failure rather than a reason
+to skip uniqueness.
+
+Calibration v3 reports `replay_rebuild_bytes` as projected uncompressed raw
+bytes plus projected analytical bytes, reserving one sequential exact-ID index
+and one rebuild/staging output. Concurrent full-run verification is not covered
+without additive reservation.
+
+After offline gates, the exact SHA must pass a new 60-second explicit-target
+smoke and a 5,400- to 7,200-second post-fix stability observation, preferring 7,200
+seconds, that runs materially beyond all retained-history saturation points.
+The stability report must include operational/terminal latency, stage-specific
+audit timing, fault/divergence/contribution lifecycles, history occupancy,
+Python/PyArrow/RSS attribution and a defensible post-saturation plateau.
+
+The predecessor v3 offline run for candidate `40acc02c...` exercised 10,001
+sequential lifecycles, 1,001 overlapping groups, 4,608 scans/audit outcomes,
+4,096 durable interval/
+contribution pairs, the genuine 64/attempted-65 active boundary, recovery
+exhaustion, 56 analytical flushes and two journal rotations. All 58 acceptance
+predicates passed. The six-hour availability projection is 5,566 intervals plus
+5,566 contributions and 34,882,122 bytes against the committed count/file/disk
+bounds. Active retained bytes remained constant after each sequential
+completion, and operational-snapshot p95 did not grow with cumulative history.
+
+The later public observation exposed post-saturation RSS growth that this v3
+workload did not bound at production storage-finalization scale. The v3 result
+is retained forensic evidence, not qualification of the corrected source.
+
+The authoritative pre-freeze working-tree run of the corrected dual-book v4
+workload completed with exit zero on 2026-08-27 and all 65 acceptance predicates
+true. It exercised 6,096 scan-driving events across both required books, 6,096
+audit outcomes, 24,389 analytical records across 27 flushes, and 80,001 journal
+records across eight full 10,000-record segments plus one tail record. From the
+first through eighth full-segment samples, RSS, traced-Python-current and native-
+residual net growth were respectively `48,582,656 B`, `17,520 B` and
+`48,565,136 B`, within the unchanged `128 MiB`, `64 MiB` and `128 MiB` bounds.
+The exact-zero saturated retained-record and deep-retained-byte predicates also
+passed. The retained result is
+`/home/peppaspan/mma_gate1_memory_remediation/20260827T010509Z_40acc02c3e64/offline/final-capacity-v4-publication-guard-final.json`
+(SHA-256 `aa626aa03eff5ee4c9d2cf767f7cf93eb42565e5422f8bfcf578f4f755340df2`).
+
+This is authoritative correction evidence before source freeze, not final
+exact-SHA qualification: it was not run from a new clean successor commit. The
+later e620 candidate's smoke passed, but its stability observation exposed the
+ordered-rotation ownership defect governed by ADR-0057. The source-modified
+successor must repeat the v4 pass, the new journal stress/fault gates, and the
+exact-SHA smoke and stability observation. No offline result can claim a six-
+hour soak or Gate-1 pass.

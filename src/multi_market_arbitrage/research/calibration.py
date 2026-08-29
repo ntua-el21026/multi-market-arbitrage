@@ -16,16 +16,32 @@ from pathlib import Path
 from multi_market_arbitrage.core.ids import is_sha256_hex
 from multi_market_arbitrage.core.limits import MAX_ARTIFACT_PATHS_PER_ROOT
 from multi_market_arbitrage.core.serialization import canonical_json_bytes, canonical_sha256
-from multi_market_arbitrage.journal import DEFAULT_MAX_UNCOMPRESSED_RUN_BYTES
+from multi_market_arbitrage.journal import (
+    DEFAULT_MAX_UNCOMPRESSED_RUN_BYTES,
+    JOURNAL_COMPLETION_MAX_BYTES,
+    JOURNAL_CRASH_EVIDENCE_MAX_BYTES,
+    JOURNAL_MANIFEST_MAX_BYTES,
+    JOURNAL_PENDING_DESCRIPTOR_MAX_BYTES,
+    JOURNAL_SOURCE_AUTHORITY_MAX_BYTES,
+    maximum_zstd_stream_compressed_bytes,
+)
 from multi_market_arbitrage.journal.recovery import atomic_write_bytes, fsync_directory
 
-CALIBRATION_SCHEMA_VERSION = "phase1-pre-soak-calibration-v2"
+CALIBRATION_SCHEMA_VERSION = "phase1-pre-soak-calibration-v3"
 CALIBRATION_BINDINGS_VERSION = "phase1-pre-soak-calibration-bindings-v1"
+CALIBRATION_PRODUCER_CONTRACT_VERSION = "phase1-pre-soak-calibration-producer-contract-v1"
+CALIBRATION_PROJECTION_METHOD_VERSION = "phase1-pre-soak-calibration-projection-method-v2"
 GATE1_PROJECTION_SECONDS = 21_600
 DEFAULT_HEADROOM_BASIS_POINTS = 20_000  # 2.0x measured workload.
 DEFAULT_DISK_SAFETY_BASIS_POINTS = 2_500  # Additional 25% after all workloads.
 QUEUE_THREAT_BASIS_POINTS = 9_000  # A 90% HWM leaves too little deterministic margin.
 STDIO_STREAM_LOG_STORAGE_MODEL = "STDIO_STREAM_ONLY_UNMANAGED"
+HEALTH_V5_CHECKPOINT_INTERVAL_NANOSECONDS = 10_000_000_000
+HEALTH_V5_MAXIMUM_CHECKPOINTS = 8_192
+HEALTH_V5_MAXIMUM_FILE_BYTES = 68 * 1024 * 1024
+HEALTH_V5_CAPACITY_MAXIMUM_PERIODIC_CHECKPOINT_BYTES = 31_573
+HEALTH_V5_CAPACITY_MAXIMUM_TERMINAL_CHECKPOINT_BYTES = 45_217
+HEALTH_V5_MINIMUM_FILE_HEADROOM_BYTES = 2 * 1024 * 1024
 
 
 class CalibrationDecisionReason(StrEnum):
@@ -40,6 +56,9 @@ class CalibrationDecisionReason(StrEnum):
     HEALTH_QUEUE_NEAR_CAPACITY = "HEALTH_QUEUE_NEAR_CAPACITY"
     HEALTH_CHECKPOINT_COUNT_LIMIT_THREATENED = "HEALTH_CHECKPOINT_COUNT_LIMIT_THREATENED"
     HEALTH_FILE_LIMIT_THREATENED = "HEALTH_FILE_LIMIT_THREATENED"
+    HEALTH_OBSERVATION_INCOMPLETE = "HEALTH_OBSERVATION_INCOMPLETE"
+    HEALTH_RECORD_CAPACITY_EXCEEDED = "HEALTH_RECORD_CAPACITY_EXCEEDED"
+    CALIBRATION_DURATION_INCOMPLETE = "CALIBRATION_DURATION_INCOMPLETE"
     INGESTION_LOSS = "INGESTION_LOSS"
     JOURNAL_FAILURE = "JOURNAL_FAILURE"
     ANALYTICAL_FAILURE = "ANALYTICAL_FAILURE"
@@ -266,7 +285,9 @@ class CalibrationQueueMeasurement:
 
 @dataclass(frozen=True, slots=True)
 class CalibrationMeasurements:
+    requested_duration_ns: int
     actual_duration_ns: int
+    completed_run_duration_ns: int
     websocket_messages: int
     websocket_bytes: int
     durable_raw_records: int
@@ -285,9 +306,19 @@ class CalibrationMeasurements:
     audit_failed: int
     audit_retries: int
     cpu_time_ns: int
+    current_rss_bytes: int | None
+    current_rss_source: str
     peak_rss_bytes: int
+    peak_rss_source: str
+    python_ru_maxrss_bytes: int
+    python_ru_maxrss_source: str
     analytical_bytes: int
     health_bytes: int
+    health_content_sha256: str
+    health_periodic_checkpoints: int
+    health_terminal_checkpoints: int
+    health_maximum_periodic_checkpoint_bytes: int
+    health_maximum_terminal_checkpoint_bytes: int
     log_bytes: int
     log_storage_model: str
     artifacts_created: int
@@ -301,9 +332,16 @@ class CalibrationMeasurements:
     gate1_eligible_so_far: bool
 
     def __post_init__(self) -> None:
-        if self.actual_duration_ns <= 0:
+        if (
+            self.requested_duration_ns <= 0
+            or self.actual_duration_ns <= 0
+            or self.completed_run_duration_ns <= 0
+        ):
             raise ValueError("calibration duration must be positive")
+        if self.actual_duration_ns > self.completed_run_duration_ns:
+            raise ValueError("WebSocket observation cannot exceed completed run duration")
         counts = (
+            self.completed_run_duration_ns,
             self.websocket_messages,
             self.websocket_bytes,
             self.durable_raw_records,
@@ -318,8 +356,13 @@ class CalibrationMeasurements:
             self.audit_retries,
             self.cpu_time_ns,
             self.peak_rss_bytes,
+            self.python_ru_maxrss_bytes,
             self.analytical_bytes,
             self.health_bytes,
+            self.health_periodic_checkpoints,
+            self.health_terminal_checkpoints,
+            self.health_maximum_periodic_checkpoint_bytes,
+            self.health_maximum_terminal_checkpoint_bytes,
             self.log_bytes,
             self.artifacts_created,
             self.existing_artifact_paths,
@@ -330,8 +373,24 @@ class CalibrationMeasurements:
         )
         if any(value < 0 for value in counts):
             raise ValueError("calibration measurements cannot be negative")
+        if self.current_rss_bytes is not None and self.current_rss_bytes < 0:
+            raise ValueError("calibration current RSS cannot be negative")
+        if self.peak_rss_bytes != max(
+            self.python_ru_maxrss_bytes,
+            self.current_rss_bytes or 0,
+        ):
+            raise ValueError("calibration peak RSS is not the exact same-sample composite")
+        rss_sources = (
+            self.current_rss_source,
+            self.peak_rss_source,
+            self.python_ru_maxrss_source,
+        )
+        if any(not source or len(source.encode("utf-8")) > 256 for source in rss_sources):
+            raise ValueError("calibration RSS sources must be explicit and bounded")
         if self.log_storage_model != STDIO_STREAM_LOG_STORAGE_MODEL or self.log_bytes != 0:
             raise ValueError("calibration log storage must bind the stdio-stream zero-byte model")
+        if not is_sha256_hex(self.health_content_sha256):
+            raise ValueError("calibration health evidence must bind a SHA-256 digest")
         dispositions = tuple(name for name, _count in self.scans_by_disposition)
         if any(not name or count < 0 for name, count in self.scans_by_disposition):
             raise ValueError("calibration scan disposition measurement is invalid")
@@ -362,11 +421,23 @@ class CalibrationMeasurements:
             },
             "canonical_events": self.canonical_events,
             "capture_healthy": self.capture_healthy,
+            "completed_run_duration_ns": self.completed_run_duration_ns,
             "cpu_time_ns": self.cpu_time_ns,
+            "current_rss_bytes": self.current_rss_bytes,
+            "current_rss_source": self.current_rss_source,
             "durable_raw_records": self.durable_raw_records,
             "existing_artifact_paths": self.existing_artifact_paths,
             "gate1_eligible_so_far": self.gate1_eligible_so_far,
             "health_bytes": self.health_bytes,
+            "health_content_sha256": self.health_content_sha256,
+            "health_maximum_periodic_checkpoint_bytes": (
+                self.health_maximum_periodic_checkpoint_bytes
+            ),
+            "health_maximum_terminal_checkpoint_bytes": (
+                self.health_maximum_terminal_checkpoint_bytes
+            ),
+            "health_periodic_checkpoints": self.health_periodic_checkpoints,
+            "health_terminal_checkpoints": self.health_terminal_checkpoints,
             "health_writer_failure_count": self.health_writer_failure_count,
             "ingestion_loss_count": self.ingestion_loss_count,
             "journal_data_fsyncs": self.journal_data_fsyncs,
@@ -377,8 +448,12 @@ class CalibrationMeasurements:
             "log_bytes": self.log_bytes,
             "log_storage_model": self.log_storage_model,
             "peak_rss_bytes": self.peak_rss_bytes,
+            "peak_rss_source": self.peak_rss_source,
+            "python_ru_maxrss_bytes": self.python_ru_maxrss_bytes,
+            "python_ru_maxrss_source": self.python_ru_maxrss_source,
             "queues": [item.to_record() for item in self.queues],
             "research_eligible": self.research_eligible,
+            "requested_duration_ns": self.requested_duration_ns,
             "scans": self.scans,
             "scans_by_disposition": [
                 {"count": count, "disposition": name} for name, count in self.scans_by_disposition
@@ -395,11 +470,20 @@ class CalibrationLimits:
     raw_run_cap_bytes: int = DEFAULT_MAX_UNCOMPRESSED_RUN_BYTES
     journal_segment_max_events: int = 10_000
     journal_segment_max_uncompressed_bytes: int = 64 * 1024 * 1024
+    journal_seal_queue_capacity: int = 4
+    journal_pending_seal_max_uncompressed_bytes: int = 256 * 1024 * 1024
     free_disk_bytes: int = 0
     minimum_free_disk_reserve_bytes: int = 0
-    health_checkpoint_interval_nanoseconds: int = 10_000_000_000
-    health_maximum_checkpoints: int = 8_192
-    health_maximum_file_bytes: int = 64 * 1024 * 1024
+    health_checkpoint_interval_nanoseconds: int = HEALTH_V5_CHECKPOINT_INTERVAL_NANOSECONDS
+    health_maximum_checkpoints: int = HEALTH_V5_MAXIMUM_CHECKPOINTS
+    health_maximum_file_bytes: int = HEALTH_V5_MAXIMUM_FILE_BYTES
+    health_capacity_maximum_periodic_checkpoint_bytes: int = (
+        HEALTH_V5_CAPACITY_MAXIMUM_PERIODIC_CHECKPOINT_BYTES
+    )
+    health_capacity_maximum_terminal_checkpoint_bytes: int = (
+        HEALTH_V5_CAPACITY_MAXIMUM_TERMINAL_CHECKPOINT_BYTES
+    )
+    health_minimum_file_headroom_bytes: int = HEALTH_V5_MINIMUM_FILE_HEADROOM_BYTES
     artifact_path_limit: int = MAX_ARTIFACT_PATHS_PER_ROOT
     headroom_basis_points: int = DEFAULT_HEADROOM_BASIS_POINTS
     disk_safety_basis_points: int = DEFAULT_DISK_SAFETY_BASIS_POINTS
@@ -409,11 +493,16 @@ class CalibrationLimits:
             self.raw_run_cap_bytes,
             self.journal_segment_max_events,
             self.journal_segment_max_uncompressed_bytes,
+            self.journal_seal_queue_capacity,
+            self.journal_pending_seal_max_uncompressed_bytes,
             self.artifact_path_limit,
             self.headroom_basis_points,
             self.health_checkpoint_interval_nanoseconds,
             self.health_maximum_checkpoints,
             self.health_maximum_file_bytes,
+            self.health_capacity_maximum_periodic_checkpoint_bytes,
+            self.health_capacity_maximum_terminal_checkpoint_bytes,
+            self.health_minimum_file_headroom_bytes,
         )
         if any(value <= 0 for value in positive):
             raise ValueError("calibration limits must be positive")
@@ -423,8 +512,35 @@ class CalibrationLimits:
             raise ValueError("calibration disk safety factor cannot be negative")
         if self.raw_run_cap_bytes > DEFAULT_MAX_UNCOMPRESSED_RUN_BYTES:
             raise ValueError("calibration cannot enlarge the Phase 1 raw-run cap")
+        if self.journal_seal_queue_capacity > 64:
+            raise ValueError("calibration seal queue capacity cannot exceed 64")
+        if not (
+            self.journal_segment_max_uncompressed_bytes
+            <= self.journal_pending_seal_max_uncompressed_bytes
+            <= self.raw_run_cap_bytes
+        ):
+            raise ValueError(
+                "calibration pending-seal bytes must cover one segment and remain in the run cap"
+            )
+        if self.journal_pending_seal_max_uncompressed_bytes > (
+            self.journal_seal_queue_capacity * self.journal_segment_max_uncompressed_bytes
+        ):
+            raise ValueError(
+                "calibration pending-seal bytes exceed the bounded descriptor inventory"
+            )
         if self.artifact_path_limit > MAX_ARTIFACT_PATHS_PER_ROOT:
             raise ValueError("calibration cannot enlarge the Phase 1 artifact-path cap")
+        if (
+            self.health_checkpoint_interval_nanoseconds != HEALTH_V5_CHECKPOINT_INTERVAL_NANOSECONDS
+            or self.health_maximum_checkpoints != HEALTH_V5_MAXIMUM_CHECKPOINTS
+            or self.health_maximum_file_bytes != HEALTH_V5_MAXIMUM_FILE_BYTES
+            or self.health_capacity_maximum_periodic_checkpoint_bytes
+            != HEALTH_V5_CAPACITY_MAXIMUM_PERIODIC_CHECKPOINT_BYTES
+            or self.health_capacity_maximum_terminal_checkpoint_bytes
+            != HEALTH_V5_CAPACITY_MAXIMUM_TERMINAL_CHECKPOINT_BYTES
+            or self.health_minimum_file_headroom_bytes != HEALTH_V5_MINIMUM_FILE_HEADROOM_BYTES
+        ):
+            raise ValueError("calibration cannot change the qualified health-v5 profile")
 
     def to_record(self) -> dict[str, object]:
         return {
@@ -435,8 +551,19 @@ class CalibrationLimits:
             "health_checkpoint_interval_nanoseconds": (self.health_checkpoint_interval_nanoseconds),
             "health_maximum_checkpoints": self.health_maximum_checkpoints,
             "health_maximum_file_bytes": self.health_maximum_file_bytes,
+            "health_capacity_maximum_periodic_checkpoint_bytes": (
+                self.health_capacity_maximum_periodic_checkpoint_bytes
+            ),
+            "health_capacity_maximum_terminal_checkpoint_bytes": (
+                self.health_capacity_maximum_terminal_checkpoint_bytes
+            ),
+            "health_minimum_file_headroom_bytes": self.health_minimum_file_headroom_bytes,
             "journal_segment_max_events": self.journal_segment_max_events,
             "journal_segment_max_uncompressed_bytes": (self.journal_segment_max_uncompressed_bytes),
+            "journal_seal_queue_capacity": self.journal_seal_queue_capacity,
+            "journal_pending_seal_max_uncompressed_bytes": (
+                self.journal_pending_seal_max_uncompressed_bytes
+            ),
             "minimum_free_disk_reserve_bytes": self.minimum_free_disk_reserve_bytes,
             "raw_run_cap_bytes": self.raw_run_cap_bytes,
         }
@@ -457,7 +584,19 @@ class CalibrationProjection:
     analytical_bytes: int
     health_bytes: int
     health_checkpoints: int
+    health_periodic_checkpoint_bytes: int
+    health_periodic_checkpoints: int
+    health_periodic_bytes: int
+    health_terminal_checkpoint_bytes: int
+    health_terminal_checkpoints: int
+    health_terminal_bytes: int
+    health_remaining_file_bytes: int
     log_bytes: int
+    temporary_sealing_active_bytes: int
+    temporary_sealing_pending_bytes: int
+    temporary_sealing_compressed_scratch_bytes: int
+    temporary_sealing_metadata_scratch_bytes: int
+    temporary_sealing_recovery_bytes: int
     temporary_sealing_bytes: int
     replay_rebuild_bytes: int
     disk_safety_bytes: int
@@ -477,11 +616,27 @@ class CalibrationProjection:
             "headroom_basis_points": self.headroom_basis_points,
             "health_bytes": self.health_bytes,
             "health_checkpoints": self.health_checkpoints,
+            "health_periodic_checkpoint_bytes": self.health_periodic_checkpoint_bytes,
+            "health_periodic_checkpoints": self.health_periodic_checkpoints,
+            "health_periodic_bytes": self.health_periodic_bytes,
+            "health_terminal_checkpoint_bytes": self.health_terminal_checkpoint_bytes,
+            "health_terminal_checkpoints": self.health_terminal_checkpoints,
+            "health_terminal_bytes": self.health_terminal_bytes,
+            "health_remaining_file_bytes": self.health_remaining_file_bytes,
             "journal_segments": self.journal_segments,
             "log_bytes": self.log_bytes,
             "minimum_free_disk_reserve_bytes": self.minimum_free_disk_reserve_bytes,
             "replay_rebuild_bytes": self.replay_rebuild_bytes,
             "scans": self.scans,
+            "temporary_sealing_active_bytes": self.temporary_sealing_active_bytes,
+            "temporary_sealing_compressed_scratch_bytes": (
+                self.temporary_sealing_compressed_scratch_bytes
+            ),
+            "temporary_sealing_metadata_scratch_bytes": (
+                self.temporary_sealing_metadata_scratch_bytes
+            ),
+            "temporary_sealing_pending_bytes": self.temporary_sealing_pending_bytes,
+            "temporary_sealing_recovery_bytes": self.temporary_sealing_recovery_bytes,
             "temporary_sealing_bytes": self.temporary_sealing_bytes,
             "total_required_disk_bytes": self.total_required_disk_bytes,
             "uncompressed_raw_bytes": self.uncompressed_raw_bytes,
@@ -516,10 +671,16 @@ class CalibrationReport:
     projection: CalibrationProjection
     decision: CalibrationDecision
     schema_version: str = CALIBRATION_SCHEMA_VERSION
+    producer_contract_version: str = CALIBRATION_PRODUCER_CONTRACT_VERSION
+    projection_method_version: str = CALIBRATION_PROJECTION_METHOD_VERSION
 
     def __post_init__(self) -> None:
         if self.schema_version != CALIBRATION_SCHEMA_VERSION:
             raise ValueError("unsupported calibration report schema")
+        if self.producer_contract_version != CALIBRATION_PRODUCER_CONTRACT_VERSION:
+            raise ValueError("unsupported calibration producer contract")
+        if self.projection_method_version != CALIBRATION_PROJECTION_METHOD_VERSION:
+            raise ValueError("unsupported calibration projection method")
 
     def content_record(self) -> dict[str, object]:
         return {
@@ -530,11 +691,15 @@ class CalibrationReport:
             "projection": self.projection.to_record(),
             "projection_method": {
                 "description": (
-                    "ceil(measured * 21600s / measured_duration) with the declared "
-                    "workload headroom; disk adds sealing, replay/rebuild, reserve, and safety"
+                    "rate fields use ceil(measured * 21600s / WebSocket observation duration) "
+                    "with declared workload headroom; health uses the greater of measured and "
+                    "capacity-qualified periodic/terminal record sizes at configured cadence; "
+                    "disk adds sealing, replay/rebuild, reserve, and safety"
                 ),
                 "integer_rounding": "CEILING",
             },
+            "producer_contract_version": self.producer_contract_version,
+            "projection_method_version": self.projection_method_version,
             "schema_version": self.schema_version,
         }
 
@@ -655,16 +820,49 @@ def build_calibration_report(
     )
     artifact_paths = measurements.existing_artifact_paths + projected_created_paths
     analytical_bytes = projection(measurements.analytical_bytes)
-    health_bytes = projection(measurements.health_bytes)
-    health_checkpoints = (
-        _ceil_div(
-            GATE1_PROJECTION_SECONDS * 1_000_000_000,
-            limits.health_checkpoint_interval_nanoseconds,
-        )
-        + 1
+    health_periodic_checkpoints = _ceil_div(
+        GATE1_PROJECTION_SECONDS * 1_000_000_000,
+        limits.health_checkpoint_interval_nanoseconds,
     )
+    health_terminal_checkpoints = 1
+    health_checkpoints = health_periodic_checkpoints + health_terminal_checkpoints
+    health_periodic_checkpoint_bytes = max(
+        measurements.health_maximum_periodic_checkpoint_bytes,
+        limits.health_capacity_maximum_periodic_checkpoint_bytes,
+    )
+    health_terminal_checkpoint_bytes = max(
+        measurements.health_maximum_terminal_checkpoint_bytes,
+        limits.health_capacity_maximum_terminal_checkpoint_bytes,
+    )
+    health_periodic_bytes = health_periodic_checkpoints * health_periodic_checkpoint_bytes
+    health_terminal_bytes = health_terminal_checkpoints * health_terminal_checkpoint_bytes
+    health_bytes = health_periodic_bytes + health_terminal_bytes
+    health_remaining_file_bytes = limits.health_maximum_file_bytes - health_bytes
     log_bytes = projection(measurements.log_bytes)
-    temporary_sealing_bytes = limits.journal_segment_max_uncompressed_bytes * 2
+    temporary_sealing_active_bytes = limits.journal_segment_max_uncompressed_bytes
+    temporary_sealing_pending_bytes = limits.journal_pending_seal_max_uncompressed_bytes
+    temporary_sealing_compressed_scratch_bytes = maximum_zstd_stream_compressed_bytes(
+        limits.journal_segment_max_uncompressed_bytes
+    )
+    temporary_sealing_metadata_scratch_bytes = (
+        limits.journal_seal_queue_capacity * JOURNAL_PENDING_DESCRIPTOR_MAX_BYTES
+        + JOURNAL_SOURCE_AUTHORITY_MAX_BYTES
+        + JOURNAL_MANIFEST_MAX_BYTES
+        + JOURNAL_COMPLETION_MAX_BYTES
+        + JOURNAL_MANIFEST_MAX_BYTES
+    )
+    temporary_sealing_recovery_bytes = (
+        limits.journal_segment_max_uncompressed_bytes + JOURNAL_CRASH_EVIDENCE_MAX_BYTES
+    )
+    temporary_sealing_bytes = sum(
+        (
+            temporary_sealing_active_bytes,
+            temporary_sealing_pending_bytes,
+            temporary_sealing_compressed_scratch_bytes,
+            temporary_sealing_metadata_scratch_bytes,
+            temporary_sealing_recovery_bytes,
+        )
+    )
     replay_rebuild_bytes = raw_bytes + analytical_bytes
     disk_workload = (
         raw_bytes
@@ -695,7 +893,19 @@ def build_calibration_report(
         analytical_bytes=analytical_bytes,
         health_bytes=health_bytes,
         health_checkpoints=health_checkpoints,
+        health_periodic_checkpoint_bytes=health_periodic_checkpoint_bytes,
+        health_periodic_checkpoints=health_periodic_checkpoints,
+        health_periodic_bytes=health_periodic_bytes,
+        health_terminal_checkpoint_bytes=health_terminal_checkpoint_bytes,
+        health_terminal_checkpoints=health_terminal_checkpoints,
+        health_terminal_bytes=health_terminal_bytes,
+        health_remaining_file_bytes=health_remaining_file_bytes,
         log_bytes=log_bytes,
+        temporary_sealing_active_bytes=temporary_sealing_active_bytes,
+        temporary_sealing_pending_bytes=temporary_sealing_pending_bytes,
+        temporary_sealing_compressed_scratch_bytes=(temporary_sealing_compressed_scratch_bytes),
+        temporary_sealing_metadata_scratch_bytes=temporary_sealing_metadata_scratch_bytes,
+        temporary_sealing_recovery_bytes=temporary_sealing_recovery_bytes,
         temporary_sealing_bytes=temporary_sealing_bytes,
         replay_rebuild_bytes=replay_rebuild_bytes,
         disk_safety_bytes=disk_safety_bytes,
@@ -713,8 +923,60 @@ def build_calibration_report(
         reasons.add(CalibrationDecisionReason.ARTIFACT_PATH_LIMIT_THREATENED)
     if health_checkpoints >= limits.health_maximum_checkpoints:
         reasons.add(CalibrationDecisionReason.HEALTH_CHECKPOINT_COUNT_LIMIT_THREATENED)
-    if health_bytes >= limits.health_maximum_file_bytes:
+    observed_health_checkpoints = (
+        measurements.health_periodic_checkpoints + measurements.health_terminal_checkpoints
+    )
+    if observed_health_checkpoints >= limits.health_maximum_checkpoints:
+        reasons.add(CalibrationDecisionReason.HEALTH_CHECKPOINT_COUNT_LIMIT_THREATENED)
+    if (
+        health_bytes >= limits.health_maximum_file_bytes
+        or health_remaining_file_bytes < limits.health_minimum_file_headroom_bytes
+        or measurements.health_bytes >= limits.health_maximum_file_bytes
+    ):
         reasons.add(CalibrationDecisionReason.HEALTH_FILE_LIMIT_THREATENED)
+    if (
+        measurements.health_periodic_checkpoints <= 0
+        or measurements.health_terminal_checkpoints != 1
+        or measurements.health_bytes <= 0
+        or measurements.health_maximum_periodic_checkpoint_bytes <= 0
+        or measurements.health_maximum_terminal_checkpoint_bytes <= 0
+        or measurements.health_bytes
+        < (
+            measurements.health_maximum_periodic_checkpoint_bytes
+            + measurements.health_maximum_terminal_checkpoint_bytes
+        )
+        or measurements.health_bytes
+        > (
+            measurements.health_periodic_checkpoints
+            * measurements.health_maximum_periodic_checkpoint_bytes
+            + measurements.health_terminal_checkpoints
+            * measurements.health_maximum_terminal_checkpoint_bytes
+        )
+        or measurements.health_periodic_checkpoints
+        < max(
+            _ceil_div(
+                measurements.requested_duration_ns,
+                limits.health_checkpoint_interval_nanoseconds,
+            )
+            - 1,
+            1,
+        )
+        or measurements.health_periodic_checkpoints
+        > _ceil_div(
+            measurements.requested_duration_ns,
+            limits.health_checkpoint_interval_nanoseconds,
+        )
+    ):
+        reasons.add(CalibrationDecisionReason.HEALTH_OBSERVATION_INCOMPLETE)
+    if (
+        measurements.health_maximum_periodic_checkpoint_bytes
+        > limits.health_capacity_maximum_periodic_checkpoint_bytes
+        or measurements.health_maximum_terminal_checkpoint_bytes
+        > limits.health_capacity_maximum_terminal_checkpoint_bytes
+    ):
+        reasons.add(CalibrationDecisionReason.HEALTH_RECORD_CAPACITY_EXCEEDED)
+    if measurements.completed_run_duration_ns < measurements.requested_duration_ns:
+        reasons.add(CalibrationDecisionReason.CALIBRATION_DURATION_INCOMPLETE)
     for queue in measurements.queues:
         if queue.threatened and (reason := _queue_reason(queue.name)) is not None:
             reasons.add(reason)
@@ -759,7 +1021,9 @@ def render_calibration_markdown(report: CalibrationReport) -> str:
             f"- Git commit: `{report.identity.git_commit}`",
             f"- Config SHA-256: `{report.identity.config_sha256}`",
             f"- Target SHA-256: `{report.identity.target.target_sha256}`",
-            f"- Measured duration: {measurement.actual_duration_ns} ns",
+            f"- WebSocket observation duration: {measurement.actual_duration_ns} ns",
+            f"- Requested duration: {measurement.requested_duration_ns} ns",
+            f"- Completed run duration: {measurement.completed_run_duration_ns} ns",
             f"- Projection duration: {projection.duration_seconds} s",
             f"- Workload headroom: {projection.headroom_basis_points / 10_000:.2f}x",
             f"- Measured raw growth: {measurement.uncompressed_raw_bytes} bytes",
@@ -778,7 +1042,24 @@ def render_calibration_markdown(report: CalibrationReport) -> str:
             ),
             f"- Health-checkpoint count bound: {report.limits.health_maximum_checkpoints}",
             f"- Projected health evidence: {projection.health_bytes} bytes",
+            f"- Health periodic record/count: "
+            f"{projection.health_periodic_checkpoint_bytes} bytes x "
+            f"{projection.health_periodic_checkpoints}",
+            f"- Health terminal record/count: "
+            f"{projection.health_terminal_checkpoint_bytes} bytes x "
+            f"{projection.health_terminal_checkpoints}",
             f"- Health-evidence file bound: {report.limits.health_maximum_file_bytes} bytes",
+            f"- Health-evidence file headroom: {projection.health_remaining_file_bytes} bytes",
+            (
+                "- Temporary journal sealing allowance "
+                "(active/pending/compressed/metadata/recovery/total): "
+                f"{projection.temporary_sealing_active_bytes} / "
+                f"{projection.temporary_sealing_pending_bytes} / "
+                f"{projection.temporary_sealing_compressed_scratch_bytes} / "
+                f"{projection.temporary_sealing_metadata_scratch_bytes} / "
+                f"{projection.temporary_sealing_recovery_bytes} / "
+                f"{projection.temporary_sealing_bytes} bytes"
+            ),
             (
                 f"- Log storage model: `{measurement.log_storage_model}` "
                 f"({measurement.log_bytes} managed bytes)"
@@ -787,7 +1068,12 @@ def render_calibration_markdown(report: CalibrationReport) -> str:
             f"- Free disk at calibration: {projection.free_disk_bytes} bytes",
             f"- Projected artifact paths: {projection.artifact_paths}",
             f"- Artifact path limit: {report.limits.artifact_path_limit}",
-            f"- Peak RSS: {measurement.peak_rss_bytes} bytes",
+            f"- Current RSS: {measurement.current_rss_bytes} bytes "
+            f"(`{measurement.current_rss_source}`)",
+            f"- Same-sample composite peak RSS: {measurement.peak_rss_bytes} bytes "
+            f"(`{measurement.peak_rss_source}`)",
+            f"- Python ru_maxrss: {measurement.python_ru_maxrss_bytes} bytes "
+            f"(`{measurement.python_ru_maxrss_source}`)",
             f"- CPU time: {measurement.cpu_time_ns} ns",
             "",
             "This bounded run is calibration evidence only; it is not the six-hour Gate-1 soak.",
@@ -822,6 +1108,9 @@ def write_calibration_artifacts(
         "bindings_version": CALIBRATION_BINDINGS_VERSION,
         "code_commit": report.identity.git_commit,
         "config_sha256": report.identity.config_sha256,
+        "health_content_sha256": report.measurements.health_content_sha256,
+        "producer_contract_version": report.producer_contract_version,
+        "projection_method_version": report.projection_method_version,
         "report_file_sha256": report_file_sha256,
         "report_sha256": report.report_sha256,
         "summary_file_sha256": summary_file_sha256,
@@ -856,10 +1145,18 @@ def write_calibration_artifacts(
 
 __all__ = [
     "CALIBRATION_BINDINGS_VERSION",
+    "CALIBRATION_PRODUCER_CONTRACT_VERSION",
+    "CALIBRATION_PROJECTION_METHOD_VERSION",
     "CALIBRATION_SCHEMA_VERSION",
     "DEFAULT_DISK_SAFETY_BASIS_POINTS",
     "DEFAULT_HEADROOM_BASIS_POINTS",
     "GATE1_PROJECTION_SECONDS",
+    "HEALTH_V5_CAPACITY_MAXIMUM_PERIODIC_CHECKPOINT_BYTES",
+    "HEALTH_V5_CAPACITY_MAXIMUM_TERMINAL_CHECKPOINT_BYTES",
+    "HEALTH_V5_CHECKPOINT_INTERVAL_NANOSECONDS",
+    "HEALTH_V5_MAXIMUM_CHECKPOINTS",
+    "HEALTH_V5_MAXIMUM_FILE_BYTES",
+    "HEALTH_V5_MINIMUM_FILE_HEADROOM_BYTES",
     "QUEUE_THREAT_BASIS_POINTS",
     "STDIO_STREAM_LOG_STORAGE_MODEL",
     "BoundedTreeUsage",

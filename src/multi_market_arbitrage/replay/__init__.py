@@ -2,6 +2,7 @@
 
 from .engine import (
     AnalyticalRebuildResult,
+    ReplayEnvelopeObserver,
     ReplayResult,
     ReplayTerminalHashMismatch,
     rebuild_analytical_from_journal,
@@ -11,6 +12,7 @@ from .engine import (
 
 __all__ = [
     "AnalyticalRebuildResult",
+    "ReplayEnvelopeObserver",
     "ReplayResult",
     "ReplayTerminalHashMismatch",
     "rebuild_analytical_from_journal",

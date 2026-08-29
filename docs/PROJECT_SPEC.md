@@ -62,6 +62,12 @@ The system is:
 - operationally recoverable;
 - incapable of silently promoting research assumptions into live risk.
 
+Evidence dimensions are explicit. A known exact observation with independently
+proven internal reconstruction is not relabeled internally unknown merely
+because official venue evidence cannot attribute an external cause. External
+unattribution never substitutes for required internal correctness, fail-closed
+recovery, provenance, or coverage proof.
+
 ## 4. Apparent edge is unproven
 
 An observed spread or payoff inconsistency is not an executable arbitrage until all required properties are established:

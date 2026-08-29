@@ -29,7 +29,7 @@ If current normative documents conflict, stop and report the contradiction.
 | `EVENT_MODEL.md` | Raw/canonical events and book health |
 | `DATA_ARCHITECTURE.md` | Raw/canonical/derived persistence |
 | `CONCURRENCY_AND_OWNERSHIP.md` | Async ownership/backpressure |
-| `ERROR_MODEL.md` | Failure classes, retries and reported-top transition behavior |
+| `ERROR_MODEL.md` | Failure classes, retries, reported-top transitions, audit evidence and fault lifecycles |
 | `SEMANTIC_MATCHING.md` | Relations, proof status and outcome partitions |
 | `STRATEGY_CONTRACTS.md` | Scanner/strategy boundaries |
 
@@ -57,10 +57,14 @@ If current normative documents conflict, stop and report the contradiction.
 | `PHASE_1_PERFORMANCE_BASELINE.md` | Historical measured performance evidence |
 | `GATE_1_SOAK_SPEC.md` | Normative Gate-1 acceptance contract |
 | `GATE_1_FAILURE_20260822.md` | Evidence/status summary for first failed six-hour soak |
+| `GATE_1_PUBLIC_PREFLIGHT_FAILURE_20260826.md` | Evidence/status summary for the exact-SHA public smoke and failed 7,200-second memory qualification |
 | `GATE_1_REMEDIATION_SPEC.md` | Normative current correction/rerun scope |
 | ADR-0052 | Continuous capture, audit fencing and Gate-1 evidence |
 | ADR-0053 | Bounded reported-top transition state |
 | ADR-0054 | Audit divergence state and Gate eligibility |
+| ADR-0055 | Audit/public-read fault evidence dimensions and lifecycles |
+| ADR-0056 | Availability-contributor ownership, interval-union reconciliation and bounded replacement recovery |
+| ADR-0057 | Non-blocking ordered raw-journal rotation and verified-drain completion |
 
 ## 5. Future phase specifications
 
@@ -82,7 +86,7 @@ If current normative documents conflict, stop and report the contradiction.
 | `RECONCILIATION.md` | Venue/internal convergence |
 | `SECURITY.md` | Threat/credential model |
 | `ENVIRONMENTS_AND_CONFIGURATION.md` | Runtime/config separation |
-| `OBSERVABILITY.md` | Logs, metrics, checkpoints and availability intervals |
+| `OBSERVABILITY.md` | Logs, metrics, checkpoints, fault lifecycles and availability/contribution evidence |
 | `OPERATIONS.md` | Runbooks |
 | `INCIDENT_RESPONSE.md` | Incident containment |
 | `DISASTER_RECOVERY.md` | Backup/restore/recovery |

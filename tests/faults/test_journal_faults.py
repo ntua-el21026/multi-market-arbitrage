@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -23,6 +25,7 @@ from multi_market_arbitrage.core.time import MonotonicTimestamp, UtcTimestamp
 from multi_market_arbitrage.ingestion import RawEventEnvelope
 from multi_market_arbitrage.journal import (
     JournalBackpressureError,
+    JournalConfigurationError,
     JournalReader,
     JournalRecoveryError,
     JournalWriteError,
@@ -31,10 +34,12 @@ from multi_market_arbitrage.journal import (
     recover_partial_file,
     verify_sealed_segment,
 )
+from multi_market_arbitrage.journal import recovery as recovery_module
 from multi_market_arbitrage.journal.models import JournalCorruptionError
 from multi_market_arbitrage.journal.reader import (
     DEFAULT_MAX_UNCOMPRESSED_SEGMENT_BYTES,
     completion_path_for_run,
+    run_key_for,
 )
 from multi_market_arbitrage.journal.recovery import atomic_write_bytes
 from multi_market_arbitrage.research import validate_data
@@ -107,6 +112,11 @@ def writer_config(
         max_uncompressed_bytes_per_segment=max_uncompressed_bytes_per_segment,
         max_uncompressed_bytes_per_run=max_uncompressed_bytes_per_run,
         submit_timeout_seconds=submit_timeout_seconds,
+        seal_queue_capacity=4,
+        max_pending_seal_uncompressed_bytes=min(
+            max_uncompressed_bytes_per_run,
+            4 * max_uncompressed_bytes_per_segment,
+        ),
         zstd_level=3,
     )
 
@@ -115,7 +125,7 @@ def test_truncated_partial_tail_is_preserved_as_explicit_evidence(tmp_path: Path
     run = CollectorRunId("recovery-run")
     records = envelope(run, 0).to_json_line() + envelope(run, 1).to_json_line()
     truncated = b'{"incomplete":'
-    partial = tmp_path / "crashed.jsonl.partial"
+    partial = tmp_path / f"run-{run_key_for(run)}.market.00000000000000000000.jsonl.partial"
     partial.write_bytes(records + truncated)
 
     report = recover_partial_file(partial)
@@ -162,12 +172,14 @@ async def test_fsync_failure_propagates_and_never_claims_durable(
     writer = RawJournalWriter(writer_config(tmp_path, run))
     await writer.start()
     original_fsync = os.fsync
-    fsync_calls = 0
 
     def failing_fsync(descriptor: int) -> None:
-        nonlocal fsync_calls
-        fsync_calls += 1
-        if fsync_calls == 2:
+        try:
+            target = os.readlink(f"/proc/self/fd/{descriptor}")
+            is_data_fsync = target.endswith(".jsonl.partial") and os.fstat(descriptor).st_size > 0
+        except OSError:
+            is_data_fsync = False
+        if is_data_fsync:
             raise OSError("injected disk failure")
         original_fsync(descriptor)
 
@@ -221,6 +233,65 @@ async def test_queue_saturation_is_explicit_backpressure(
 
 
 @pytest.mark.asyncio
+async def test_thread_pool_contention_keeps_slow_journal_nondurable_and_event_loop_live(
+    tmp_path: Path,
+) -> None:
+    run = CollectorRunId("thread-pool-contention-run")
+    loop = asyncio.get_running_loop()
+    # A single-worker default executor makes contention exact: the journal's
+    # durability call cannot begin until this independently owned job exits.
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+    writer = RawJournalWriter(writer_config(tmp_path, run))
+    await writer.start()
+
+    worker_entered = asyncio.Event()
+    release_worker = threading.Event()
+
+    def occupy_default_worker() -> None:
+        loop.call_soon_threadsafe(worker_entered.set)
+        if not release_worker.wait(timeout=5):
+            raise TimeoutError("test did not release the contended thread-pool worker")
+
+    occupier = asyncio.create_task(asyncio.to_thread(occupy_default_worker))
+    async with asyncio.timeout(5):
+        await worker_entered.wait()
+    submission = asyncio.create_task(writer.submit(envelope(run, 0)))
+    receipt = None
+    try:
+        for _ in range(100):
+            if writer.metrics.enqueued == 1:
+                break
+            await asyncio.sleep(0)
+
+        # Executor contention may delay physical durability, but it must not
+        # manufacture a durable receipt or block unrelated event-loop work.
+        assert writer.metrics.enqueued == 1
+        assert writer.metrics.durable == 0
+        assert writer.durability_watermark is None
+        assert not submission.done()
+        event_loop_advanced = asyncio.Event()
+        loop.call_soon(event_loop_advanced.set)
+        async with asyncio.timeout(1):
+            await event_loop_advanced.wait()
+
+        release_worker.set()
+        await occupier
+        async with asyncio.timeout(5):
+            receipt = await submission
+    finally:
+        release_worker.set()
+        await occupier
+        if not submission.done():
+            async with asyncio.timeout(5):
+                receipt = await submission
+        await writer.close()
+
+    assert receipt is not None
+    assert receipt.durability_watermark is not None
+    assert writer.metrics.durable == 1
+
+
+@pytest.mark.asyncio
 async def test_sealed_segment_tampering_is_detected(tmp_path: Path) -> None:
     run = CollectorRunId("tamper-run")
     writer = RawJournalWriter(writer_config(tmp_path, run))
@@ -258,12 +329,11 @@ async def test_startup_completes_orphan_sealed_segment_after_manifest_crash(
             await first_writer.close()
 
     assert len(await asyncio.to_thread(matching_paths, tmp_path, "*.jsonl.zst")) == 1
-    assert len(await asyncio.to_thread(matching_paths, tmp_path, "*.jsonl.partial")) == 1
+    assert len(await asyncio.to_thread(matching_paths, tmp_path, "*.jsonl.seal-pending")) == 1
+    assert len(await asyncio.to_thread(matching_paths, tmp_path, "*.descriptor.json")) == 1
     assert not await asyncio.to_thread(matching_paths, tmp_path, "*.manifest.json")
 
-    recovered_writer = RawJournalWriter(
-        replace(writer_config(tmp_path, run), writer_id=WriterId("recovery-writer"))
-    )
+    recovered_writer = RawJournalWriter(writer_config(tmp_path, run))
     await recovered_writer.start()
     await recovered_writer.submit(envelope(run, 1, b'{"book":2}'))
     await recovered_writer.close()
@@ -271,8 +341,71 @@ async def test_startup_completes_orphan_sealed_segment_after_manifest_crash(
     restored = JournalReader(tmp_path, run, stream="market").read_all()
     assert [item.payload_bytes for item in restored] == [b'{"book":1}', b'{"book":2}']
     manifests = JournalReader(tmp_path, run, stream="market").manifests()
-    assert "manifest_reconstructed_after_seal_crash" in manifests[0].recovery_evidence
+    assert "manifest_reconstructed_from_pending_descriptor" in manifests[0].recovery_evidence
     assert manifests[1].previous_segment_digest == manifests[0].segment_digest
+    assert all(manifest.writer_id == WriterId("writer") for manifest in manifests)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement_value"),
+    [
+        pytest.param("git_commit", "different-commit", id="git-commit"),
+        pytest.param("writer_id", WriterId("different-writer"), id="writer-id"),
+        pytest.param(
+            "writer_software_version",
+            "different-version",
+            id="writer-software-version",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_startup_rejects_existing_manifest_writer_provenance_mismatch(
+    tmp_path: Path,
+    field_name: str,
+    replacement_value: str | WriterId,
+) -> None:
+    run = CollectorRunId(f"resume-provenance-{field_name}")
+    config = writer_config(tmp_path, run)
+    first_writer = RawJournalWriter(config)
+    await first_writer.start()
+    await first_writer.submit(envelope(run, 0))
+    await first_writer.close(completed=False)
+    reader = JournalReader(tmp_path, run, stream="market")
+    manifests_before = reader.manifests()
+
+    resumed_writer = RawJournalWriter(replace(config, **{field_name: replacement_value}))
+    with pytest.raises(JournalConfigurationError, match="writer provenance differs"):
+        await resumed_writer.start()
+
+    assert not completion_path_for_run(tmp_path, run, "market").exists()
+    assert reader.manifests() == manifests_before
+    assert [item.ingest_seq for item in reader.read_all(include_partial=True)] == [0]
+
+
+@pytest.mark.asyncio
+async def test_startup_resumes_existing_manifests_with_identical_writer_provenance(
+    tmp_path: Path,
+) -> None:
+    run = CollectorRunId("resume-matching-provenance")
+    config = writer_config(tmp_path, run, max_events_per_segment=1)
+    first_writer = RawJournalWriter(config)
+    await first_writer.start()
+    await first_writer.submit(envelope(run, 0))
+    await first_writer.close(completed=False)
+
+    resumed_writer = RawJournalWriter(config)
+    await resumed_writer.start()
+    await resumed_writer.submit(envelope(run, 1))
+    await resumed_writer.close()
+
+    reader = JournalReader(tmp_path, run, stream="market")
+    assert [item.ingest_seq for item in reader.read_all()] == [0, 1]
+    head = reader.completion_heads()[0]
+    assert all(
+        (manifest.git_commit, manifest.writer_id, manifest.writer_software_version)
+        == (head.git_commit, head.writer_id, head.writer_software_version)
+        for manifest in reader.manifests()
+    )
 
 
 @pytest.mark.asyncio
@@ -452,3 +585,49 @@ def test_atomic_write_uses_unpredictable_exclusive_temporary_file(tmp_path: Path
     assert not target.is_symlink()
     assert victim.read_bytes() == b"do-not-touch"
     assert formerly_predictable.is_symlink()
+
+
+@pytest.mark.parametrize("error_number", [errno.EIO, errno.EMFILE, errno.EACCES])
+def test_directory_fsync_open_failure_is_not_reported_as_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_number: int,
+) -> None:
+    def fail_open(path: os.PathLike[str] | str, flags: int) -> int:
+        del path, flags
+        raise OSError(error_number, os.strerror(error_number))
+
+    monkeypatch.setattr(recovery_module.os, "open", fail_open)
+
+    with pytest.raises(OSError, match=os.strerror(error_number)) as caught:
+        recovery_module.fsync_directory(tmp_path)
+
+    assert caught.value.errno == error_number
+
+
+def test_directory_fsync_failure_propagates_and_closes_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened_descriptor: int | None = None
+    original_open = os.open
+
+    def record_open(path: os.PathLike[str] | str, flags: int) -> int:
+        nonlocal opened_descriptor
+        opened_descriptor = original_open(path, flags)
+        return opened_descriptor
+
+    def fail_fsync(descriptor: int) -> None:
+        assert descriptor == opened_descriptor
+        raise OSError(errno.EIO, os.strerror(errno.EIO))
+
+    monkeypatch.setattr(recovery_module.os, "open", record_open)
+    monkeypatch.setattr(recovery_module.os, "fsync", fail_fsync)
+
+    with pytest.raises(OSError, match="Input/output error"):
+        recovery_module.fsync_directory(tmp_path)
+
+    assert opened_descriptor is not None
+    with pytest.raises(OSError, match="Bad file descriptor") as caught:
+        os.fstat(opened_descriptor)
+    assert caught.value.errno == errno.EBADF

@@ -81,6 +81,12 @@ def test_counters_gauges_and_histograms_are_label_scoped() -> None:
     assert histogram.maximum == 5.0
     assert histogram.p50 == 4.0
     assert histogram.p95 == 5.0
+    retention = metrics.retention_snapshot
+    assert retention.series_count == 3
+    assert retention.histogram_series == 1
+    assert retention.histogram_sample_capacity_per_series == 3
+    assert retention.histogram_samples_retained == 3
+    assert retention.histogram_observations_total == 5
 
 
 def test_metric_validation_and_cardinality_bound() -> None:

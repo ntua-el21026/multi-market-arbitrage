@@ -3,13 +3,30 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 
+import multi_market_arbitrage.pipeline.health as health_module
+from multi_market_arbitrage.availability_authority import (
+    AuditAvailabilityAuthoritySnapshot,
+    AuditAvailabilityBinding,
+    AuditAvailabilityContributionChainSnapshot,
+    PublicReadFaultAvailabilityProjectionSnapshot,
+    audit_availability_chain_extend,
+    audit_availability_chain_seed,
+    audit_availability_contribution_chain_extend,
+    audit_availability_contribution_chain_seed,
+    empty_audit_availability_contribution_snapshot,
+    empty_public_read_fault_availability_projection,
+    public_read_fault_availability_chain_extend,
+    public_read_fault_availability_chain_seed,
+)
 from multi_market_arbitrage.core.config import Phase1Config, load_phase1_config
 from multi_market_arbitrage.core.exact import ExactDecimal, Price, Quantity
 from multi_market_arbitrage.core.ids import (
@@ -19,15 +36,26 @@ from multi_market_arbitrage.core.ids import (
     InstrumentId,
     MarketId,
     SubscriptionId,
+    WriterId,
 )
 from multi_market_arbitrage.core.provenance import RawSourceRef
+from multi_market_arbitrage.core.serialization import canonical_sha256
 from multi_market_arbitrage.core.time import MonotonicTimestamp, UtcTimestamp
 from multi_market_arbitrage.ingestion import RawEventEnvelope
-from multi_market_arbitrage.journal import JournalMetricsSnapshot
+from multi_market_arbitrage.journal import (
+    JournalMetricsSnapshot,
+    JournalWriteError,
+    JournalWriterConfig,
+    RawJournalWriter,
+)
 from multi_market_arbitrage.observability import (
+    AvailabilityCausalFamily,
     AvailabilityCause,
     AvailabilityEvidenceRuntimeSnapshot,
+    AvailabilityIntervalContribution,
+    AvailabilityRecoveryAction,
     AvailabilityRecoveryOutcome,
+    AvailabilityScope,
     HealthCheckpoint,
     HealthDecisionReason,
     HealthEvidenceRuntimeSnapshot,
@@ -35,12 +63,20 @@ from multi_market_arbitrage.observability import (
     InMemoryMetrics,
     SupervisedAvailabilityIntervalWriter,
     normalize_git_commit,
+    reconcile_published_availability_evidence,
 )
-from multi_market_arbitrage.pipeline import health as health_module
 from multi_market_arbitrage.pipeline.audit import (
+    AUDIT_FAILURE_V1_SCHEMA,
+    AUDIT_FAILURE_V2_SCHEMA,
+    AUDIT_START_V2_SCHEMA,
     AuditBookIdentity,
-    AuditDivergenceResolution,
     AuditFailureReason,
+    AuditFaultAffectedScope,
+    AuditFaultFailureEvidenceKind,
+    AuditFaultLifecycleRecord,
+    AuditFaultOrigin,
+    AuditFaultResolution,
+    AuditFaultStatus,
     AuditMismatchCause,
     AuditMismatchDiagnostic,
     AuditOutcome,
@@ -54,42 +90,73 @@ from multi_market_arbitrage.pipeline.channels import (
     REST_BOOK,
 )
 from multi_market_arbitrage.pipeline.health import (
+    ANALYTICAL_FRAGMENT_RETENTION_TELEMETRY_ROW_FIELDS,
+    ANALYTICAL_FRAGMENT_RETENTION_TELEMETRY_SCHEMA,
+    AUDIT_MISMATCH_REPRESENTATIVE_TELEMETRY_ROW_FIELDS,
+    AUDIT_MISMATCH_REPRESENTATIVE_TELEMETRY_SCHEMA,
+    AUDIT_STAGE_TIMING_TELEMETRY_SCHEMA,
+    AUDIT_STAGE_TIMING_TELEMETRY_STAGES,
+    COMPOSITE_PEAK_RSS_SOURCE,
+    DARWIN_PYTHON_RU_MAXRSS_SOURCE,
+    LINUX_CURRENT_RSS_OS_ERROR_SOURCE,
+    LINUX_CURRENT_RSS_SOURCE,
+    LINUX_PYTHON_RU_MAXRSS_SOURCE,
+    MAXIMUM_OPEN_AVAILABILITY_CONTRIBUTIONS,
+    PROCESSOR_RETENTION_TELEMETRY_ROW_FIELDS,
+    PROCESSOR_RETENTION_TELEMETRY_SCHEMA,
+    REPORTED_TOP_TRANSITION_HEALTH_TELEMETRY_FIELDS,
     AvailabilityInterruption,
     ObservationRuntimeHealth,
     ObservationRuntimeHealthSnapshot,
     ProcessResourceSnapshot,
     ProcessResourceTrendSnapshot,
+    PythonAllocationGroup,
     SupervisedProcessResourceSampler,
+    audit_availability_authority_reconciled,
     build_observation_health_checkpoint,
+    capture_terminal_process_resources,
+    normalize_python_ru_maxrss_bytes,
+    public_read_fault_availability_projection_reconciled,
 )
 from multi_market_arbitrage.pipeline.ingress import BoundedRawIngress
-from multi_market_arbitrage.pipeline.processor import CanonicalProcessor, ProcessorSummary
+from multi_market_arbitrage.pipeline.processor import (
+    CanonicalProcessor,
+    ProcessorAuditHttpEndpointSnapshot,
+    ProcessorBookOperationalSnapshot,
+    ProcessorOperationalSnapshot,
+    ProcessorRecoveryReason,
+    ProcessorRetentionDomain,
+    ProcessorRetentionSnapshot,
+)
+from multi_market_arbitrage.pipeline.replacement_recovery import (
+    ReplacementRecoveryAuthority,
+    ReplacementRecoveryBounds,
+    ReplacementSnapshotCandidate,
+)
 from multi_market_arbitrage.pipeline.targeting import (
     ObservationTargetMode,
     ResolvedPolymarketTarget,
 )
 from multi_market_arbitrage.pipeline.transitions import ReportedTopTransition
 from multi_market_arbitrage.reference import POLYMARKET_VENUE_ID
-from multi_market_arbitrage.research import AnalyticalRuntimeSnapshot
+from multi_market_arbitrage.research import (
+    AnalyticalFragmentRetentionSnapshot,
+    AnalyticalRuntimeSnapshot,
+)
 from multi_market_arbitrage.state import BookLevel, ImmutableOrderBookSnapshot
-from multi_market_arbitrage.venues.polymarket import ReceivedWebSocketMessage
-from multi_market_arbitrage.venues.polymarket.public_reads import PublicReadMetricsSnapshot
+from multi_market_arbitrage.venues.polymarket import (
+    PolymarketEndpointClass,
+    PolymarketHttpFailureCategory,
+    PolymarketRetryAfterDisposition,
+    PolymarketRetryBlockedReason,
+    ReceivedWebSocketMessage,
+)
+from multi_market_arbitrage.venues.polymarket.public_reads import (
+    PublicReadEndpointMetricsSnapshot,
+    PublicReadMetricsSnapshot,
+)
 
 FIXTURES = Path(__file__).parents[1] / "golden" / "fixtures"
-
-
-def test_audit_divergence_resolution_representatives_are_a_bounded_tail() -> None:
-    records = cast(
-        tuple[AuditDivergenceResolution, ...],
-        tuple(object() for _ in range(5)),
-    )
-
-    selected = health_module._audit_divergence_resolution_representatives(  # pyright: ignore[reportPrivateUsage]
-        records
-    )
-
-    assert selected == records[-health_module.MAXIMUM_AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVES :]
-    assert len(selected) == health_module.MAXIMUM_AUDIT_DIVERGENCE_RESOLUTION_REPRESENTATIVES
 
 
 class _ScopedProcessorView:
@@ -106,6 +173,10 @@ class _ScopedProcessorView:
         audit_mismatch_diagnostics_truncated: bool = False,
         audit_start_generation_rebases: int = 0,
         audit_divergences_resolved_same_generation: int | None = None,
+        operational_snapshot_transform: Callable[
+            [ProcessorOperationalSnapshot], ProcessorOperationalSnapshot
+        ]
+        | None = None,
     ) -> None:
         self._processor = processor
         self._snapshots = snapshots
@@ -119,12 +190,51 @@ class _ScopedProcessorView:
         self._audit_divergences_resolved_same_generation = (
             audit_divergences_resolved_same_generation
         )
+        self._operational_snapshot_transform = operational_snapshot_transform
+        self._audit_availability_bindings: tuple[AuditAvailabilityBinding, ...] = ()
+        self._audit_availability_contributions: tuple[AvailabilityIntervalContribution, ...] = ()
 
-    def summary(self) -> ProcessorSummary:
-        summary = replace(
-            self._processor.summary(),
+    @staticmethod
+    def _replace_retention(
+        snapshot: ProcessorOperationalSnapshot,
+        *,
+        domain: ProcessorRetentionDomain,
+        retained: int,
+        total: int,
+        truncated: bool = False,
+    ) -> tuple[ProcessorRetentionSnapshot, ...]:
+        return tuple(
+            replace(
+                item,
+                retained=retained,
+                capacity=max(item.capacity, retained),
+                total=max(total, retained + int(truncated)),
+                truncated=truncated,
+            )
+            if item.domain is domain
+            else item
+            for item in snapshot.retention
+        )
+
+    def operational_snapshot(self) -> ProcessorOperationalSnapshot:
+        snapshot = replace(
+            self._processor.operational_snapshot(),
+            books=tuple(
+                ProcessorBookOperationalSnapshot(
+                    instrument_id=book.instrument_id,
+                    market_id=book.market_id,
+                    generation=book.generation,
+                    health=book.health,
+                    invalidation_reason=book.invalidation_reason,
+                    market_version_id=book.market_version_id,
+                    precision_rule_version_id=book.precision_rule_version_id,
+                    cost_rule_set_version_id=book.cost_rule_set_version_id,
+                )
+                for book in self._snapshots
+            ),
             healthy_books=len(self._snapshots),
             audit_ineligible_books=len(self._audit_ineligible_instruments),
+            audit_ineligible_instruments=self._audit_ineligible_instruments,
             reported_top_transitions=self._reported_top_transitions,
             pending_reported_top_transitions=len(self._reported_top_transitions),
             audit_start_generation_rebases=self._audit_start_generation_rebases,
@@ -134,13 +244,107 @@ class _ScopedProcessorView:
             if cause_counts is None:
                 raise RuntimeError("test mismatch diagnostics require cause counts")
             mismatch_count = sum(count for _, count in cause_counts)
-            summary = replace(
-                summary,
+            if mismatch_count != len(self._audit_mismatch_diagnostics):
+                raise RuntimeError("test mismatch authority requires one diagnostic per mismatch")
+            authority_bindings: list[AuditAvailabilityBinding] = []
+            for index, diagnostic in enumerate(self._audit_mismatch_diagnostics):
+
+                def authority_source(phase: str, binding_index: int) -> RawSourceRef:
+                    label = f"pipeline-health-authority-{binding_index}-{phase}"
+                    return RawSourceRef(
+                        ingest_id=IngestId(label),
+                        payload_sha256=hashlib.sha256(label.encode()).hexdigest(),
+                    )
+
+                binding = (
+                    AuditAvailabilityBinding(
+                        request_id=f"pipeline-health-request-{index}",
+                        divergence_id=hashlib.sha256(
+                            f"pipeline-health-divergence-{index}".encode()
+                        ).hexdigest(),
+                        instrument_id=diagnostic.local_book.instrument_id.value,
+                        market_id=diagnostic.rest_book.market_id.value,
+                        audit_start_source=authority_source("start", index),
+                        audit_response_source=diagnostic.response_source,
+                        audit_classification_source=authority_source("classification", index),
+                    )
+                    .with_authoritative_resolution(authority_source("resolution", index))
+                    .with_replacement_release(authority_source("release", index))
+                )
+                authority_bindings.append(binding)
+            self._audit_availability_bindings = tuple(authority_bindings)
+            open_chain = audit_availability_chain_seed("open")
+            resolution_chain = audit_availability_chain_seed("resolution")
+            release_chain = audit_availability_chain_seed("release")
+            for binding in authority_bindings:
+                open_binding = replace(
+                    binding,
+                    authoritative_resolution_source=None,
+                    replacement_release_source=None,
+                )
+                resolved_binding = replace(binding, replacement_release_source=None)
+                open_chain = audit_availability_chain_extend(open_chain, "open", open_binding)
+                resolution_chain = audit_availability_chain_extend(
+                    resolution_chain,
+                    "resolution",
+                    resolved_binding,
+                )
+                release_chain = audit_availability_chain_extend(
+                    release_chain,
+                    "release",
+                    binding,
+                )
+            contribution_run_id = CollectorRunId("pipeline-health-audit-authority")
+            self._audit_availability_contributions = tuple(
+                AvailabilityIntervalContribution(
+                    contribution_id=f"pipeline-health-contribution-{index}",
+                    interval_id=f"pipeline-health-interval-{index}",
+                    collector_run_id=contribution_run_id,
+                    socket_generation=1,
+                    connection_id="pipeline-health-authority-connection",
+                    started_at=UtcTimestamp(1_000 + index * 10),
+                    started_monotonic=MonotonicTimestamp(
+                        contribution_run_id.value,
+                        10 + index * 10,
+                    ),
+                    ended_at=UtcTimestamp(1_005 + index * 10),
+                    ended_monotonic=MonotonicTimestamp(
+                        contribution_run_id.value,
+                        15 + index * 10,
+                    ),
+                    duration_nanoseconds=5,
+                    cause=AvailabilityCause.AUDIT_MISMATCH_RESYNCHRONIZATION,
+                    reason_code="REST_AUDIT_MISMATCH",
+                    source_evidence_ids=(f"audit-request:{binding.request_id}",),
+                    affected_instruments=(binding.instrument_id,),
+                    affected_scopes=(AvailabilityScope.SCANNER_RESEARCH_ELIGIBILITY,),
+                    recovery_action=AvailabilityRecoveryAction.RESNAPSHOT,
+                    initiating_contributor=True,
+                    recovery_outcome=AvailabilityRecoveryOutcome.RESTORED,
+                    request_id=binding.request_id,
+                    divergence_id=binding.divergence_id,
+                    instrument_id=binding.instrument_id,
+                    market_id=binding.market_id,
+                    audit_start_source=binding.audit_start_source,
+                    audit_response_source=binding.audit_response_source,
+                    audit_classification_source=binding.audit_classification_source,
+                    authoritative_resolution_source=(binding.authoritative_resolution_source),
+                    replacement_release_source=binding.replacement_release_source,
+                )
+                for index, binding in enumerate(authority_bindings)
+            )
+            latest_by_cause = {
+                diagnostic.cause: diagnostic for diagnostic in self._audit_mismatch_diagnostics
+            }
+            snapshot = replace(
+                snapshot,
                 rest_audits=mismatch_count,
                 rest_audit_mismatches=mismatch_count,
                 audit_mismatch_cause_counts=cause_counts,
-                audit_mismatch_diagnostics=self._audit_mismatch_diagnostics,
-                audit_mismatch_diagnostics_truncated=(self._audit_mismatch_diagnostics_truncated),
+                audit_mismatch_diagnostic_representatives=tuple(
+                    latest_by_cause[cause]
+                    for cause in sorted(latest_by_cause, key=lambda item: item.value)
+                ),
                 audit_start_trigger_counts=tuple(
                     (
                         trigger,
@@ -165,23 +369,67 @@ class _ScopedProcessorView:
                 audit_divergences_unknown=dict(cause_counts)[AuditMismatchCause.UNKNOWN],
                 audit_local_book_defects=dict(cause_counts)[AuditMismatchCause.LOCAL_BOOK_DEFECT],
                 audit_divergence_lifecycle_reconciled=True,
-                audit_divergence_resolution_records_truncated=(mismatch_count > 0),
+                audit_availability_authority=AuditAvailabilityAuthoritySnapshot(
+                    opened=mismatch_count,
+                    resolved=mismatch_count,
+                    released=mismatch_count,
+                    legacy_unverifiable=0,
+                    open_chain_sha256=open_chain,
+                    resolution_chain_sha256=resolution_chain,
+                    release_chain_sha256=release_chain,
+                    current_bindings=(),
+                ),
+                retention=self._replace_retention(
+                    snapshot,
+                    domain=ProcessorRetentionDomain.AUDIT_MISMATCH_DIAGNOSTICS,
+                    retained=len(self._audit_mismatch_diagnostics),
+                    total=mismatch_count,
+                    truncated=self._audit_mismatch_diagnostics_truncated,
+                ),
             )
+            if mismatch_count > 0:
+                snapshot = replace(
+                    snapshot,
+                    retention=self._replace_retention(
+                        snapshot,
+                        domain=ProcessorRetentionDomain.AUDIT_DIVERGENCE_RESOLUTIONS,
+                        retained=0,
+                        total=mismatch_count,
+                        truncated=True,
+                    ),
+                )
         if self._audit_divergences_resolved_same_generation is not None:
             same_generation = self._audit_divergences_resolved_same_generation
-            summary = replace(
-                summary,
+            snapshot = replace(
+                snapshot,
                 audit_divergences_resolved_by_authoritative_resnapshot=max(
                     0,
-                    summary.audit_divergences_observed - same_generation,
+                    snapshot.audit_divergences_observed - same_generation,
                 ),
                 audit_divergences_resolved_same_generation=same_generation,
             )
         if self._audit_outcomes is None:
-            return summary
-        return replace(
-            summary,
-            audit_outcomes=self._audit_outcomes,
+            return (
+                snapshot
+                if self._operational_snapshot_transform is None
+                else self._operational_snapshot_transform(snapshot)
+            )
+        last_match_monotonic_ns = max(
+            (
+                outcome.response_received_monotonic_ns
+                for outcome in self._audit_outcomes
+                if outcome.outcome is AuditOutcome.MATCH
+                and outcome.response_received_monotonic_ns is not None
+            ),
+            default=None,
+        )
+        barrier_lag_frames = tuple(
+            outcome.response_boundary_ordinal - outcome.starting_processed_ordinal
+            for outcome in self._audit_outcomes
+            if outcome.response_boundary_ordinal is not None
+        )
+        snapshot = replace(
+            snapshot,
             rest_audits=len(self._audit_outcomes),
             rest_audit_matches=sum(
                 outcome.outcome is AuditOutcome.MATCH for outcome in self._audit_outcomes
@@ -214,7 +462,41 @@ class _ScopedProcessorView:
                 for trigger in AuditTriggerReason
                 for outcome_kind in AuditOutcome
             ),
+            audit_last_successful_match_monotonic_ns=last_match_monotonic_ns,
+            audit_barrier_lag_frames_max=max(barrier_lag_frames, default=None),
+            audit_race_budget_exhaustions=sum(
+                outcome.reason is AuditFailureReason.RACE_RETRY_EXHAUSTED
+                for outcome in self._audit_outcomes
+            ),
+            retention=self._replace_retention(
+                snapshot,
+                domain=ProcessorRetentionDomain.AUDIT_OUTCOMES,
+                retained=len(self._audit_outcomes),
+                total=len(self._audit_outcomes),
+            ),
         )
+        return (
+            snapshot
+            if self._operational_snapshot_transform is None
+            else self._operational_snapshot_transform(snapshot)
+        )
+
+    def summary(self) -> None:
+        raise AssertionError("periodic health must not construct ProcessorSummary")
+
+    @property
+    def audit_availability_bindings(self) -> tuple[AuditAvailabilityBinding, ...]:
+        return self._audit_availability_bindings
+
+    @property
+    def audit_availability_contributions(
+        self,
+    ) -> tuple[AvailabilityIntervalContribution, ...]:
+        return self._audit_availability_contributions
+
+    @property
+    def canonical_processor(self) -> CanonicalProcessor:
+        return self._processor
 
     def snapshots(self) -> tuple[ImmutableOrderBookSnapshot, ...]:
         return self._snapshots
@@ -233,7 +515,18 @@ class _TransitionHealthView:
         return {
             "accepted_frame_count": 2,
             "age_nanoseconds": now.nanoseconds - 10,
+            "baseline_evidence_sha256": "b" * 64,
+            "deadline_monotonic_ns": 40,
+            "entry_source": "DELTA",
+            "first_admission_ordinal": 1,
+            "first_ingest_seq": 1,
             "frames_remaining": 6,
+            "latest_admission_ordinal": 2,
+            "latest_ingest_seq": 2,
+            "maximum_duration_ns": 30,
+            "maximum_frames": 8,
+            "monotonic_epoch_id": now.epoch_id,
+            "reason": "DELTA_REPORTED_TOP_CHANGED",
             "status": "PENDING",
             "target_best_ask": "0.60",
             "target_best_bid": "0.40",
@@ -401,7 +694,17 @@ def _checkpoint(
     untracked_source_clean: bool | None = True,
     resource_sampled_monotonic_ns: int | None = None,
     resource_trend_last_sample_monotonic_ns: int | None = None,
+    public_reads: PublicReadMetricsSnapshot | None = None,
+    metrics: InMemoryMetrics | None = None,
+    resources: ProcessResourceSnapshot | None = None,
+    resource_trend: ProcessResourceTrendSnapshot | None = None,
+    history_saturation_recorder: Callable[[int], None] | None = None,
+    analytical: AnalyticalRuntimeSnapshot | None = None,
+    availability_writer: AvailabilityEvidenceRuntimeSnapshot | None = None,
+    journal_snapshot: JournalMetricsSnapshot | None = None,
+    terminal: bool = False,
 ) -> HealthCheckpoint:
+    test_audit_contributions = empty_audit_availability_contribution_snapshot()
     if runtime_snapshot is None:
         runtime = ObservationRuntimeHealth()
         connection_id = ConnectionId.new()
@@ -409,6 +712,24 @@ def _checkpoint(
         runtime.begin_generation(connection_id, ingress)
         runtime.mark_connected(now_ns=10)
         runtime_snapshot = runtime.snapshot()
+        if isinstance(processor, _ScopedProcessorView):
+            processor_authority = processor.operational_snapshot().audit_availability_authority
+            contribution_chain = audit_availability_contribution_chain_seed()
+            for contribution in processor.audit_availability_contributions:
+                contribution_chain = audit_availability_contribution_chain_extend(
+                    contribution_chain,
+                    contribution.to_record(),
+                )
+            test_audit_contributions = AuditAvailabilityContributionChainSnapshot(
+                count=len(processor.audit_availability_contributions),
+                chain_sha256=contribution_chain,
+            )
+            runtime_snapshot = replace(
+                runtime_snapshot,
+                availability_contributions_emitted=test_audit_contributions.count,
+                audit_availability_authority=processor_authority,
+                audit_availability_contributions_emitted=test_audit_contributions,
+            )
     completed_availability_intervals = runtime_snapshot.unavailable_intervals - int(
         runtime_snapshot.current_unavailable_started_monotonic_ns is not None
     )
@@ -438,6 +759,7 @@ def _checkpoint(
     identity_unknown_fields = tuple(
         sorted(name for name, value in identity_values.items() if value is None)
     )
+    checkpoint_metrics = InMemoryMetrics() if metrics is None else metrics
     return build_observation_health_checkpoint(
         config=config,
         collector_run_id=collector_run_id,
@@ -445,28 +767,50 @@ def _checkpoint(
         target=target,
         runtime=runtime_snapshot,
         processor=processor,
-        journal=JournalMetricsSnapshot(
-            received=0,
-            enqueued=0,
-            appended=0,
-            durable=0,
-            sealed=0,
-            verified=0,
-            queue_depth=0,
-            queue_high_water=0,
-            backpressure_failures=0,
-            writer_failures=0,
-            recovered_records=0,
-            truncated_tails=0,
+        journal=(
+            JournalMetricsSnapshot(
+                received=0,
+                enqueued=0,
+                appended=0,
+                durable=0,
+                sealed=0,
+                verified=0,
+                queue_depth=0,
+                queue_high_water=0,
+                backpressure_failures=0,
+                writer_failures=0,
+                recovered_records=0,
+                truncated_tails=0,
+                queue_capacity=config.system.queue_capacity,
+                maximum_segment_events=config.storage.journal_segment_max_events,
+                maximum_segment_uncompressed_bytes=(
+                    config.storage.journal_segment_max_uncompressed_bytes
+                ),
+                seal_queue_capacity=config.storage.journal_seal_queue_capacity,
+                maximum_unverified_segments=config.storage.journal_seal_queue_capacity,
+                maximum_pending_uncompressed_bytes=(
+                    config.storage.journal_pending_seal_max_uncompressed_bytes
+                ),
+                maximum_pending_seal_age_nanoseconds=int(
+                    config.storage.journal_pending_seal_max_age_seconds * 1_000_000_000
+                ),
+                maximum_active_seal_jobs=1,
+            )
+            if journal_snapshot is None
+            else journal_snapshot
         ),
         journal_failure_type=None,
-        analytical=AnalyticalRuntimeSnapshot(
-            healthy=True,
-            accepted_records=0,
-            processed_records=0,
-            rejected_records=0,
-            queues=(),
-            failure_type=None,
+        analytical=(
+            AnalyticalRuntimeSnapshot(
+                healthy=True,
+                accepted_records=0,
+                processed_records=0,
+                rejected_records=0,
+                queues=(),
+                failure_type=None,
+            )
+            if analytical is None
+            else analytical
         ),
         health_writer=HealthEvidenceRuntimeSnapshot(
             healthy=True,
@@ -478,52 +822,82 @@ def _checkpoint(
             file_bytes=0,
             failure_type=None,
         ),
-        availability_writer=AvailabilityEvidenceRuntimeSnapshot(
-            healthy=True,
-            queue_depth=0,
-            queue_high_water=0,
-            accepted=completed_availability_intervals,
-            written=completed_availability_intervals,
-            rejected=0,
-            file_bytes=0,
-            unavailable_duration_nanoseconds=(runtime_snapshot.unavailable_total_nanoseconds),
-            longest_interval_nanoseconds=(runtime_snapshot.longest_unavailable_nanoseconds),
-            open_at_shutdown_intervals=(runtime_snapshot.availability_open_at_shutdown_intervals),
-            failure_type=None,
+        availability_writer=(
+            AvailabilityEvidenceRuntimeSnapshot(
+                healthy=True,
+                queue_depth=0,
+                queue_high_water=0,
+                accepted=completed_availability_intervals,
+                written=completed_availability_intervals,
+                rejected=0,
+                file_bytes=0,
+                unavailable_duration_nanoseconds=(runtime_snapshot.unavailable_total_nanoseconds),
+                longest_interval_nanoseconds=(runtime_snapshot.longest_unavailable_nanoseconds),
+                open_at_shutdown_intervals=(
+                    runtime_snapshot.availability_open_at_shutdown_intervals
+                ),
+                failure_type=None,
+                contributions_accepted=test_audit_contributions.count,
+                contributions_written=test_audit_contributions.count,
+                audit_contributions_accepted=test_audit_contributions.count,
+                audit_contributions_written=test_audit_contributions.count,
+                audit_contribution_accepted_chain_sha256=(test_audit_contributions.chain_sha256),
+                audit_contribution_written_chain_sha256=(test_audit_contributions.chain_sha256),
+                audit_contribution_expected_written_chain_sha256=(
+                    test_audit_contributions.chain_sha256
+                ),
+            )
+            if availability_writer is None
+            else availability_writer
         ),
-        public_reads=PublicReadMetricsSnapshot(
-            endpoints=(),
-            active_attempts=0,
-            active_attempts_high_water=0,
+        public_reads=(
+            PublicReadMetricsSnapshot(
+                endpoints=(),
+                active_attempts=0,
+                active_attempts_high_water=0,
+            )
+            if public_reads is None
+            else public_reads
         ),
-        metrics=InMemoryMetrics(),
-        resources=ProcessResourceSnapshot(
-            sampled_monotonic_ns=(
-                monotonic_now_ns
-                if resource_sampled_monotonic_ns is None
-                else resource_sampled_monotonic_ns
-            ),
-            free_disk_bytes=2 * 1024 * 1024 * 1024,
-            cpu_user_seconds=1.0,
-            cpu_system_seconds=0.5,
-            current_rss_bytes=900,
-            peak_rss_bytes=1024,
-            current_rss_source="test-current-rss",
+        metrics=checkpoint_metrics,
+        resources=(
+            ProcessResourceSnapshot(
+                sampled_monotonic_ns=(
+                    monotonic_now_ns
+                    if resource_sampled_monotonic_ns is None
+                    else resource_sampled_monotonic_ns
+                ),
+                free_disk_bytes=2 * 1024 * 1024 * 1024,
+                cpu_user_seconds=1.0,
+                cpu_system_seconds=0.5,
+                current_rss_bytes=900,
+                peak_rss_bytes=1000,
+                current_rss_source=LINUX_CURRENT_RSS_SOURCE,
+                peak_rss_source=COMPOSITE_PEAK_RSS_SOURCE,
+                python_ru_maxrss_bytes=1000,
+                python_ru_maxrss_source=LINUX_PYTHON_RU_MAXRSS_SOURCE,
+            )
+            if resources is None
+            else resources
         ),
-        resource_trend=ProcessResourceTrendSnapshot(
-            sample_count=2,
-            known_rss_sample_count=2,
-            first_sample_monotonic_ns=1,
-            last_sample_monotonic_ns=(
-                monotonic_now_ns
-                if resource_trend_last_sample_monotonic_ns is None
-                else resource_trend_last_sample_monotonic_ns
-            ),
-            start_rss_bytes=800,
-            end_rss_bytes=900,
-            maximum_current_rss_bytes=900,
-            largest_absolute_step_bytes=100,
-            linear_slope_bytes_per_second=10.0,
+        resource_trend=(
+            ProcessResourceTrendSnapshot(
+                sample_count=2,
+                known_rss_sample_count=2,
+                first_sample_monotonic_ns=1,
+                last_sample_monotonic_ns=(
+                    monotonic_now_ns
+                    if resource_trend_last_sample_monotonic_ns is None
+                    else resource_trend_last_sample_monotonic_ns
+                ),
+                start_rss_bytes=800,
+                end_rss_bytes=900,
+                maximum_current_rss_bytes=900,
+                largest_absolute_step_bytes=100,
+                linear_slope_bytes_per_second=10.0,
+            )
+            if resource_trend is None
+            else resource_trend
         ),
         host_identity=HostRuntimeIdentity(
             code_commit=exact_git_commit,
@@ -551,7 +925,21 @@ def _checkpoint(
         book_last_valid_receive_monotonic_ns=book_last_valid_receive_monotonic_ns,
         emitted_at=emitted_at,
         monotonic_now_ns=monotonic_now_ns,
+        history_saturation_recorder=history_saturation_recorder,
+        terminal=terminal,
+        raw_journal_completion_sha256=("d" * 64 if terminal else None),
     )
+
+
+def _processor_retention_records(value: object) -> dict[str, dict[str, object]]:
+    table = cast(dict[str, object], value)
+    assert table["schema"] == PROCESSOR_RETENTION_TELEMETRY_SCHEMA
+    rows = cast(tuple[tuple[object, ...], ...], table["rows"])
+    assert all(len(row) == len(PROCESSOR_RETENTION_TELEMETRY_ROW_FIELDS) for row in rows)
+    return {
+        cast(str, row[0]): dict(zip(PROCESSOR_RETENTION_TELEMETRY_ROW_FIELDS, row, strict=True))
+        for row in rows
+    }
 
 
 def _target_receive_times(
@@ -565,6 +953,954 @@ def _target_receive_times(
         ): received_monotonic_ns
         for native_token_id in (target.yes_token_id, target.no_token_id)
     }
+
+
+@pytest.mark.asyncio
+async def test_recovered_pending_journal_lifecycle_is_healthy_in_v5_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = CollectorRunId("health-recovered-pending")
+    journal_config = JournalWriterConfig(
+        root=tmp_path,
+        collector_run_id=run_id,
+        venue_id=POLYMARKET_VENUE_ID,
+        stream="market",
+        writer_id=WriterId("health-recovery-writer"),
+        writer_software_version="health-recovery-v1",
+        git_commit="a" * 40,
+        max_events_per_segment=1,
+        max_uncompressed_bytes_per_segment=1024 * 1024,
+        max_uncompressed_bytes_per_run=4 * 1024 * 1024,
+        seal_queue_capacity=4,
+        max_pending_seal_uncompressed_bytes=4 * 1024 * 1024,
+        max_pending_seal_age_seconds=30.0,
+    )
+    initial = RawJournalWriter(journal_config)
+
+    def fail_private_seal(_descriptor: object, _previous_digest: str | None) -> None:
+        raise OSError("injected retained pending segment")
+
+    monkeypatch.setattr(initial, "_seal_pending_segment", fail_private_seal)
+    await initial.start()
+    event = _raw_envelope(
+        run_id,
+        0,
+        "market",
+        b'{"kind":"health-recovery"}',
+        received_at=UtcTimestamp(1_800_000_000_000_000_000),
+    )
+    assert (await initial.submit(event)).ingest_seq == 0
+    with pytest.raises(JournalWriteError, match="retained pending"):
+        await initial.close(completed=False)
+
+    recovered = RawJournalWriter(journal_config)
+    await recovered.start()
+    try:
+        journal = recovered.metrics
+        assert journal.segment_handoffs == 1
+        assert journal.sealed_bytes_durable_transitions == 1
+        assert journal.manifest_durable_transitions == 1
+        assert journal.verified_transitions == 1
+        assert journal.source_partial_removed_transitions == 1
+        assert journal.durability_watermark_sequence == 0
+        assert journal.manifest_durable_watermark_sequence == 0
+        assert journal.verified_watermark_sequence == 0
+
+        config = load_phase1_config(Path("config/phase1.toml"))
+        updated_at = UtcTimestamp(1_800_000_000_000_000_000)
+        processor, target = _healthy_target_processor(config, updated_at=updated_at)
+        checkpoint = _checkpoint(
+            config=config,
+            target=target,
+            processor=processor,
+            book_last_valid_receive_monotonic_ns=_target_receive_times(target, 20),
+            emitted_at=updated_at,
+            monotonic_now_ns=20,
+            journal_snapshot=journal,
+        )
+
+        assert checkpoint.journal["healthy"] is True
+    finally:
+        await recovered.close(completed=False)
+
+
+def test_checkpoint_current_external_fault_is_nonsticky_until_terminal_and_recovers() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    updated_at = UtcTimestamp(1_800_000_000_000_000_000)
+    processor, target = _healthy_target_processor(config, updated_at=updated_at)
+    scoped = cast(_ScopedProcessorView, processor)
+    instrument_id = InstrumentId.from_native(POLYMARKET_VENUE_ID, target.yes_token_id)
+    market_id = MarketId.from_native(POLYMARKET_VENUE_ID, target.condition_id)
+    fault = _current_http_audit_fault(
+        instrument_id=instrument_id,
+        market_id=market_id,
+        native_asset_id=target.yes_token_id,
+        label="current-periodic",
+    )
+    public_reads = PublicReadMetricsSnapshot(
+        endpoints=(
+            _public_endpoint_metrics(
+                PolymarketEndpointClass.CLOB_BOOK,
+                final_failures=1,
+                exhausted_retry_budget=1,
+            ),
+        ),
+        active_attempts=0,
+        active_attempts_high_water=0,
+    )
+    current_processor = cast(
+        CanonicalProcessor,
+        _ScopedProcessorView(
+            scoped.canonical_processor,
+            scoped.snapshots(),
+            audit_ineligible_instruments=(instrument_id,),
+            operational_snapshot_transform=lambda snapshot: _with_http_audit_fault_lifecycle(
+                snapshot,
+                observed=1,
+                current=1,
+                resolved=0,
+                current_instrument_ids=(instrument_id,),
+                current_representatives=(fault,),
+            ),
+        ),
+    )
+
+    def build_checkpoint(
+        scoped_processor: CanonicalProcessor,
+        *,
+        terminal: bool = False,
+    ) -> HealthCheckpoint:
+        return _checkpoint(
+            config=config,
+            target=target,
+            processor=scoped_processor,
+            book_last_valid_receive_monotonic_ns=_target_receive_times(target, 20),
+            emitted_at=updated_at,
+            monotonic_now_ns=30,
+            public_reads=public_reads,
+            terminal=terminal,
+        )
+
+    periodic = build_checkpoint(current_processor)
+    terminal = build_checkpoint(current_processor, terminal=True)
+
+    assert (
+        cast(dict[str, object], periodic.audit["fault_lifecycles"])["evidence_reconciled"] is True
+    )
+    assert "availability_projection" not in cast(
+        dict[str, object], periodic.audit["fault_lifecycles"]
+    )
+    terminal_projection = cast(
+        dict[str, object],
+        cast(dict[str, object], terminal.audit["fault_lifecycles"])["availability_projection"],
+    )
+    assert terminal_projection == {
+        "completed": 0,
+        "completion_digest": public_read_fault_availability_chain_seed("completion"),
+        "evidence_reconciled": True,
+        "open_digest": public_read_fault_availability_chain_seed("open"),
+        "opened": 0,
+    }
+    assert {
+        HealthDecisionReason.AUDIT_FAILED,
+        HealthDecisionReason.HTTP_FINAL_FAILURE,
+        HealthDecisionReason.HTTP_INTEGRITY_UNAVAILABLE,
+    }.issubset(periodic.reason_codes)
+    assert periodic.gate1_sticky_reason_codes == ()
+    assert HealthDecisionReason.AUDIT_FAILED in terminal.gate1_sticky_reason_codes
+
+    recovered_processor = cast(
+        CanonicalProcessor,
+        _ScopedProcessorView(
+            scoped.canonical_processor,
+            scoped.snapshots(),
+            operational_snapshot_transform=lambda snapshot: _with_http_audit_fault_lifecycle(
+                snapshot,
+                observed=1,
+                current=0,
+                resolved=1,
+                current_instrument_ids=(),
+                current_representatives=(),
+            ),
+        ),
+    )
+    recovered = build_checkpoint(recovered_processor)
+
+    assert recovered.reason_codes == ()
+    assert recovered.gate1_sticky_reason_codes == ()
+    assert recovered.research_eligible is True
+    assert recovered.gate1_eligible_so_far is True
+
+
+def test_checkpoint_rejects_incomplete_current_fault_representatives_at_saturation() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    updated_at = UtcTimestamp(1_800_000_000_000_000_000)
+    processor, target = _healthy_target_processor(config, updated_at=updated_at)
+    scoped = cast(_ScopedProcessorView, processor)
+    market_id = MarketId.from_native(POLYMARKET_VENUE_ID, target.condition_id)
+    instrument_pairs = tuple(
+        sorted(
+            (
+                (
+                    InstrumentId.from_native(POLYMARKET_VENUE_ID, native_asset_id),
+                    native_asset_id,
+                )
+                for native_asset_id in (target.yes_token_id, target.no_token_id)
+            ),
+            key=lambda item: item[0].value,
+        )
+    )
+    instrument_ids = tuple(item[0] for item in instrument_pairs)
+    representatives = tuple(
+        _current_http_audit_fault(
+            instrument_id=instrument_id,
+            market_id=market_id,
+            native_asset_id=native_asset_id,
+            label=f"saturated-{index}",
+        )
+        for index, (instrument_id, native_asset_id) in enumerate(instrument_pairs)
+    )
+    public_reads = PublicReadMetricsSnapshot(
+        endpoints=(
+            _public_endpoint_metrics(
+                PolymarketEndpointClass.CLOB_BOOK,
+                final_failures=4_096,
+                exhausted_retry_budget=4_096,
+            ),
+        ),
+        active_attempts=0,
+        active_attempts_high_water=0,
+    )
+
+    def checkpoint_for(
+        current_representatives: tuple[AuditFaultLifecycleRecord, ...],
+    ) -> HealthCheckpoint:
+        view = cast(
+            CanonicalProcessor,
+            _ScopedProcessorView(
+                scoped.canonical_processor,
+                scoped.snapshots(),
+                audit_ineligible_instruments=instrument_ids,
+                operational_snapshot_transform=(
+                    lambda snapshot: _with_http_audit_fault_lifecycle(
+                        snapshot,
+                        observed=4_096,
+                        current=4_096,
+                        resolved=0,
+                        current_instrument_ids=instrument_ids,
+                        current_representatives=current_representatives,
+                    )
+                ),
+            ),
+        )
+        return _checkpoint(
+            config=config,
+            target=target,
+            processor=view,
+            book_last_valid_receive_monotonic_ns=_target_receive_times(target, 20),
+            emitted_at=updated_at,
+            monotonic_now_ns=30,
+            public_reads=public_reads,
+        )
+
+    exact = checkpoint_for(representatives)
+    incomplete = checkpoint_for(representatives[:1])
+
+    assert cast(dict[str, object], exact.audit["fault_lifecycles"])["evidence_reconciled"] is True
+    assert (
+        cast(dict[str, object], incomplete.audit["fault_lifecycles"])["evidence_reconciled"]
+        is False
+    )
+    assert HealthDecisionReason.AUDIT_FAILED in incomplete.gate1_sticky_reason_codes
+
+
+def _public_endpoint_metrics(
+    endpoint_class: PolymarketEndpointClass,
+    *,
+    final_failures: int,
+    exhausted_retry_budget: int,
+) -> PublicReadEndpointMetricsSnapshot:
+    return PublicReadEndpointMetricsSnapshot(
+        endpoint_class=endpoint_class,
+        requests=final_failures,
+        attempts=final_failures,
+        first_attempt_successes=0,
+        retries=0,
+        status_classes=(),
+        timeouts=0,
+        temporary_network_errors=0,
+        throttle_observations=0,
+        retry_after_observations=0,
+        retry_after_parsed_observations=0,
+        retry_after_malformed_observations=0,
+        cumulative_backoff_seconds=0.0,
+        exhausted_retry_budget=exhausted_retry_budget,
+        final_failures=final_failures,
+        local_rate_limit_waits=0,
+        local_rate_limit_wait_seconds=0.0,
+        latency_seconds=None,
+    )
+
+
+def _current_http_audit_fault(
+    *,
+    instrument_id: InstrumentId,
+    market_id: MarketId,
+    native_asset_id: str,
+    label: str,
+) -> AuditFaultLifecycleRecord:
+    def source(phase: str) -> RawSourceRef:
+        value = f"pipeline-health-{label}-{phase}"
+        return RawSourceRef(
+            ingest_id=IngestId(value),
+            payload_sha256=hashlib.sha256(value.encode()).hexdigest(),
+        )
+
+    return AuditFaultLifecycleRecord(
+        fault_id=hashlib.sha256(f"pipeline-health-{label}".encode()).hexdigest(),
+        request_id=f"pipeline-health-{label}",
+        instrument_id=instrument_id,
+        market_id=market_id,
+        native_asset_id=native_asset_id,
+        original_reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+        reason=AuditFailureReason.HTTP_REQUEST_FAILED,
+        origin=AuditFaultOrigin.EXTERNAL,
+        status=AuditFaultStatus.CURRENT,
+        request_started_monotonic_ns=10,
+        audit_start_source=source("start"),
+        failure_source=source("failure"),
+        observed_at=UtcTimestamp(1_800_000_000_000_000_000),
+        observed_monotonic_ns=20,
+        error_type="PolymarketHttpTransportError:TIMEOUT",
+        audit_start_schema=AUDIT_START_V2_SCHEMA,
+        failure_evidence_kind=AuditFaultFailureEvidenceKind.AUDIT_FAILURE_CONTROL,
+        failure_schema=AUDIT_FAILURE_V2_SCHEMA,
+        blocks_current_scope=True,
+        response_completed_monotonic_ns=15,
+        endpoint_class=PolymarketEndpointClass.CLOB_BOOK,
+        category=PolymarketHttpFailureCategory.TIMEOUT,
+        retryable=True,
+        attempt=3,
+        retry_after_disposition=PolymarketRetryAfterDisposition.ABSENT,
+        retry_exhausted=True,
+        retry_blocked_reason=PolymarketRetryBlockedReason.ATTEMPTS_EXHAUSTED,
+    )
+
+
+def _with_http_audit_fault_lifecycle(
+    snapshot: ProcessorOperationalSnapshot,
+    *,
+    observed: int,
+    current: int,
+    resolved: int,
+    current_instrument_ids: tuple[InstrumentId, ...],
+    current_representatives: tuple[AuditFaultLifecycleRecord, ...],
+) -> ProcessorOperationalSnapshot:
+    lifecycle_total = observed + resolved
+    retention = tuple(
+        replace(
+            item,
+            retained=min(lifecycle_total, item.capacity),
+            total=lifecycle_total,
+            truncated=lifecycle_total > min(lifecycle_total, item.capacity),
+        )
+        if item.domain is ProcessorRetentionDomain.AUDIT_FAULT_LIFECYCLES
+        else item
+        for item in snapshot.retention
+    )
+    endpoint_snapshots = (
+        ()
+        if observed == 0
+        else (
+            ProcessorAuditHttpEndpointSnapshot(
+                endpoint_class=PolymarketEndpointClass.CLOB_BOOK,
+                observed=observed,
+                current=current,
+                resolved=resolved,
+                permanent=0,
+                retry_exhaustions_observed=observed,
+                retry_exhaustions_current=current,
+                retry_exhaustions_resolved=resolved,
+                retry_exhaustions_permanent=0,
+            ),
+        )
+    )
+    return replace(
+        snapshot,
+        audit_faults_observed=observed,
+        audit_faults_current=current,
+        audit_faults_resolved=resolved,
+        audit_faults_permanent=0,
+        audit_http_faults_observed=observed,
+        audit_http_faults_resolved=resolved,
+        audit_http_faults_permanent=0,
+        audit_http_retry_exhaustions_observed=observed,
+        audit_http_retry_exhaustions_resolved=resolved,
+        audit_http_retry_exhaustions_permanent=0,
+        audit_http_endpoint_snapshots=endpoint_snapshots,
+        audit_fault_lifecycle_reconciled=True,
+        audit_fault_current_instrument_ids=current_instrument_ids,
+        audit_fault_current_representatives=current_representatives,
+        audit_fault_current_representatives_truncated=(current > len(current_representatives)),
+        audit_fault_lifecycle_representatives=current_representatives[-1:],
+        retention=retention,
+    )
+
+
+def test_audit_availability_reconciliation_rejects_mutated_written_prefix_chain() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    processor = CanonicalProcessor(config).operational_snapshot()
+    runtime = ObservationRuntimeHealth().snapshot()
+    writer = AvailabilityEvidenceRuntimeSnapshot(
+        healthy=True,
+        queue_depth=0,
+        queue_high_water=0,
+        accepted=0,
+        written=0,
+        rejected=0,
+        file_bytes=0,
+        unavailable_duration_nanoseconds=0,
+        longest_interval_nanoseconds=0,
+        open_at_shutdown_intervals=0,
+        failure_type=None,
+    )
+
+    assert audit_availability_authority_reconciled(processor, runtime, writer)
+    assert not audit_availability_authority_reconciled(
+        processor,
+        runtime,
+        replace(
+            writer,
+            audit_contribution_written_chain_sha256="f" * 64,
+        ),
+    )
+
+
+def test_slow_full_processor_summary_is_outside_periodic_health_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    updated_at = UtcTimestamp(1_800_000_000_000_000_000)
+    processor, target = _healthy_target_processor(config, updated_at=updated_at)
+    scoped = cast(_ScopedProcessorView, processor)
+
+    def prohibit_slow_full_projection(*_args: object, **_kwargs: object) -> None:
+        # A full terminal summary may take arbitrarily longer than the compact
+        # operational projection at saturated history occupancy.  Periodic
+        # health must make this injected path unreachable, not merely tolerate
+        # one particular duration.
+        raise AssertionError("periodic health entered the slow full processor path")
+
+    monkeypatch.setattr(scoped, "snapshots", prohibit_slow_full_projection)
+    monkeypatch.setattr(scoped.canonical_processor, "summary", prohibit_slow_full_projection)
+    monkeypatch.setattr(scoped.canonical_processor, "snapshots", prohibit_slow_full_projection)
+
+    checkpoint = _checkpoint(
+        config=config,
+        target=target,
+        processor=processor,
+        book_last_valid_receive_monotonic_ns=_target_receive_times(target, 10_000),
+        emitted_at=updated_at,
+        monotonic_now_ns=10_000,
+    )
+
+    assert checkpoint.books
+    assert checkpoint.resources["processor_operational"]
+
+
+def test_slow_operational_health_projection_is_measured_explicitly() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    updated_at = UtcTimestamp(1_800_000_000_000_000_000)
+    processor, target = _healthy_target_processor(config, updated_at=updated_at)
+    scoped = cast(_ScopedProcessorView, processor)
+    injected_delay_seconds = 0.01
+
+    class _SlowOperationalProjection(_ScopedProcessorView):
+        def operational_snapshot(self) -> ProcessorOperationalSnapshot:
+            time.sleep(injected_delay_seconds)
+            return super().operational_snapshot()
+
+    slow = cast(
+        CanonicalProcessor,
+        _SlowOperationalProjection(scoped.canonical_processor, scoped.snapshots()),
+    )
+    metrics = InMemoryMetrics()
+
+    checkpoint = _checkpoint(
+        config=config,
+        target=target,
+        processor=slow,
+        book_last_valid_receive_monotonic_ns=_target_receive_times(target, 10_000),
+        emitted_at=updated_at,
+        monotonic_now_ns=10_000,
+        metrics=metrics,
+    )
+
+    latency = cast(dict[str, object], checkpoint.resources["operational_snapshot_latency"])
+    assert latency["sample_count"] == latency["total_count"] == 1
+    assert cast(int, latency["latest_periodic_ns"]) >= int(injected_delay_seconds * 1e9)
+    assert checkpoint.resources["processor_operational"]
+
+
+def test_checkpoint_reports_explicit_prepare_and_attestation_stage_timings() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    updated_at = UtcTimestamp(1_800_000_000_000_000_000)
+    processor, target = _healthy_target_processor(config, updated_at=updated_at)
+    expected_stages = (
+        ("barrier_wait", "mma_rest_audit_stage_barrier_wait_ns"),
+        (
+            "prepare_construction",
+            "mma_rest_audit_stage_classification_construction_ns",
+        ),
+        ("prepare_durability", "mma_rest_audit_stage_classification_durability_ns"),
+        (
+            "prepare_durable_to_processed",
+            "mma_rest_audit_stage_classification_durable_to_processed_ns",
+        ),
+        ("prepare_processing", "mma_rest_audit_stage_classification_processing_ns"),
+        ("handoff_delay", "mma_rest_audit_stage_handoff_delay_ns"),
+        ("network", "mma_rest_audit_http_latency_ns"),
+        ("raw_durability", "mma_rest_audit_stage_raw_durability_ns"),
+        (
+            "raw_response_durable_to_processed",
+            "mma_rest_audit_stage_raw_response_durable_to_processed_ns",
+        ),
+        ("raw_response_processing", "mma_rest_audit_stage_raw_response_processing_ns"),
+        ("response_cleanup", "mma_rest_audit_stage_response_cleanup_ns"),
+        (
+            "response_to_prepare_decision",
+            "mma_rest_audit_stage_response_to_prepare_decision_ns",
+        ),
+        (
+            "attestation_durability",
+            "mma_rest_audit_stage_classification_attestation_durability_ns",
+        ),
+        (
+            "attestation_durable_to_processed",
+            "mma_rest_audit_stage_classification_attestation_durable_to_processed_ns",
+        ),
+        (
+            "attestation_processing",
+            "mma_rest_audit_stage_classification_attestation_processing_ns",
+        ),
+        (
+            "response_to_attestation",
+            "mma_rest_audit_stage_response_to_attestation_ns",
+        ),
+        (
+            "legacy_total_response_to_classification",
+            "mma_rest_audit_classification_latency_ns",
+        ),
+    )
+    assert AUDIT_STAGE_TIMING_TELEMETRY_SCHEMA == "mma-audit-stage-timing-telemetry-table-v2"
+    assert expected_stages == AUDIT_STAGE_TIMING_TELEMETRY_STAGES
+
+    metrics = InMemoryMetrics()
+    expected_maxima: list[float] = []
+    for index, (_stage, metric_name) in enumerate(expected_stages, start=1):
+        value = float(index * 1_000)
+        expected_maxima.append(value)
+        metrics.observe_histogram(metric_name, value)
+    checkpoint = _checkpoint(
+        config=config,
+        target=target,
+        processor=processor,
+        book_last_valid_receive_monotonic_ns=_target_receive_times(target, 10_000),
+        emitted_at=updated_at,
+        monotonic_now_ns=10_000,
+        metrics=metrics,
+    )
+
+    timing = cast(dict[str, object], checkpoint.audit["stage_timing_nanoseconds"])
+    assert timing["schema"] == AUDIT_STAGE_TIMING_TELEMETRY_SCHEMA
+    rows = cast(tuple[tuple[object, ...], ...], timing["rows"])
+    assert len(rows) == len(expected_stages)
+    assert tuple(row[0] for row in rows) == tuple(expected_maxima)
+    assert all(row[5] == row[6] == 1 for row in rows)
+
+
+@pytest.mark.parametrize("occupancy", ["zero", "half", "full"])
+def test_checkpoint_generation_is_history_capacity_independent(occupancy: str) -> None:
+    """Zero, half, and full diagnostic occupancy use the same compact contract."""
+
+    config = load_phase1_config(Path("config/phase1.toml"))
+    updated_at = UtcTimestamp(1_800_000_000_000_000_000)
+    processor, target = _healthy_target_processor(config, updated_at=updated_at)
+    scoped = cast(_ScopedProcessorView, processor)
+    base = scoped.operational_snapshot()
+    scan_retention = base.retention_for(ProcessorRetentionDomain.SCAN_RESULTS)
+    retained = {
+        "zero": 0,
+        "half": scan_retention.capacity // 2,
+        "full": scan_retention.capacity,
+    }[occupancy]
+
+    class _RetentionOccupancyView(_ScopedProcessorView):
+        def operational_snapshot(self) -> ProcessorOperationalSnapshot:
+            snapshot = super().operational_snapshot()
+            return replace(
+                snapshot,
+                retention=tuple(
+                    replace(
+                        item,
+                        retained=retained,
+                        total=retained,
+                        truncated=False,
+                    )
+                    if item.domain is ProcessorRetentionDomain.SCAN_RESULTS
+                    else item
+                    for item in snapshot.retention
+                ),
+            )
+
+    occupancy_processor = cast(
+        CanonicalProcessor,
+        _RetentionOccupancyView(
+            scoped.canonical_processor,
+            scoped.snapshots(),
+        ),
+    )
+    checkpoint = _checkpoint(
+        config=config,
+        target=target,
+        processor=occupancy_processor,
+        book_last_valid_receive_monotonic_ns=_target_receive_times(target, 10_000),
+        emitted_at=updated_at,
+        monotonic_now_ns=10_000,
+    )
+
+    operational = cast(dict[str, object], checkpoint.resources["processor_operational"])
+    retention = _processor_retention_records(operational["retention"])
+    scan_record = retention["scan_results"]
+    assert scan_record["retained"] == retained
+    assert checkpoint.books
+
+
+def test_checkpoint_reports_bounded_resource_telemetry_and_marks_saturation() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    updated_at = UtcTimestamp(1_800_000_000_000_000_000)
+    processor, target = _healthy_target_processor(config, updated_at=updated_at)
+    scoped = cast(_ScopedProcessorView, processor)
+
+    class _SaturatedRetentionView(_ScopedProcessorView):
+        def operational_snapshot(self) -> ProcessorOperationalSnapshot:
+            snapshot = super().operational_snapshot()
+            return replace(
+                snapshot,
+                retention=tuple(
+                    replace(
+                        item,
+                        retained=item.capacity,
+                        total=item.capacity + 1,
+                        truncated=True,
+                    )
+                    if item.domain is ProcessorRetentionDomain.SCAN_RESULTS
+                    else item
+                    for item in snapshot.retention
+                ),
+            )
+
+    saturated = cast(
+        CanonicalProcessor,
+        _SaturatedRetentionView(scoped.canonical_processor, scoped.snapshots()),
+    )
+    marked_at: list[int] = []
+    metrics = InMemoryMetrics()
+    fragment_retention = AnalyticalFragmentRetentionSnapshot(
+        domain="complete_set_scans",
+        retained=7,
+        capacity=4_096,
+        dataset_fragments_at_open=3,
+        dataset_fragment_reservations=10,
+        maximum_dataset_fragments=4_096,
+        container_shallow_bytes=120,
+        representative_hash_shallow_bytes=113,
+        estimated_retained_bytes=911,
+        maximum_estimated_retained_bytes=500_000,
+    )
+    checkpoint = _checkpoint(
+        config=config,
+        target=target,
+        processor=saturated,
+        book_last_valid_receive_monotonic_ns=_target_receive_times(target, 10_000),
+        emitted_at=updated_at,
+        monotonic_now_ns=10_000,
+        metrics=metrics,
+        resources=ProcessResourceSnapshot(
+            sampled_monotonic_ns=10_000,
+            free_disk_bytes=2 * 1024 * 1024 * 1024,
+            cpu_user_seconds=1.0,
+            cpu_system_seconds=0.5,
+            current_rss_bytes=10_000,
+            peak_rss_bytes=11_000,
+            current_rss_source=LINUX_CURRENT_RSS_SOURCE,
+            peak_rss_source=COMPOSITE_PEAK_RSS_SOURCE,
+            python_ru_maxrss_bytes=11_000,
+            python_ru_maxrss_source=LINUX_PYTHON_RU_MAXRSS_SOURCE,
+            python_tracemalloc_current_bytes=2_000,
+            python_tracemalloc_peak_bytes=3_000,
+            python_tracemalloc_source="test-tracemalloc",
+            pyarrow_current_bytes=500,
+            pyarrow_peak_bytes=700,
+        ),
+        history_saturation_recorder=marked_at.append,
+        analytical=AnalyticalRuntimeSnapshot(
+            healthy=True,
+            accepted_records=7,
+            processed_records=7,
+            rejected_records=0,
+            queues=(),
+            failure_type=None,
+            fragment_retention=(fragment_retention,),
+        ),
+    )
+
+    assert marked_at == [10_000]
+    operational = cast(dict[str, object], checkpoint.resources["processor_operational"])
+    retention = _processor_retention_records(operational["retention"])
+    scan_record = retention["scan_results"]
+    assert scan_record["estimated_retained_bytes"] == (
+        cast(int, scan_record["container_shallow_bytes"])
+        + cast(int, scan_record["retained"])
+        * cast(int, scan_record["representative_object_shallow_bytes"])
+    )
+    allocators = cast(dict[str, object], checkpoint.resources["memory_allocators"])
+    assert allocators["python_tracemalloc_current_bytes"] == 2_000
+    assert allocators["pyarrow_current_bytes"] == 500
+    assert allocators["native_allocator_residual_bytes"] == 7_500
+    latency = cast(dict[str, object], checkpoint.resources["operational_snapshot_latency"])
+    assert latency["sample_count"] == latency["total_count"] == 1
+    assert cast(int, latency["latest_periodic_ns"]) >= 0
+    post_saturation = cast(dict[str, object], checkpoint.resources["post_saturation_memory_trend"])
+    assert post_saturation["history_saturation_observed"] is True
+    analytical_retention = cast(dict[str, object], checkpoint.analytical["fragment_retention"])
+    assert analytical_retention["schema"] == ANALYTICAL_FRAGMENT_RETENTION_TELEMETRY_SCHEMA
+    analytical_rows = cast(tuple[tuple[object, ...], ...], analytical_retention["rows"])
+    assert len(analytical_rows) == 1
+    analytical_record = dict(
+        zip(
+            ANALYTICAL_FRAGMENT_RETENTION_TELEMETRY_ROW_FIELDS,
+            analytical_rows[0],
+            strict=True,
+        )
+    )
+    assert analytical_record == {
+        key: value
+        for key, value in fragment_retention.to_record().items()
+        if key != "byte_estimate_method"
+    }
+    assert analytical_retention["byte_estimate_method"] == (fragment_retention.byte_estimate_method)
+
+
+def test_terminal_resource_capture_bounds_python_allocation_groups(tmp_path: Path) -> None:
+    resources = capture_terminal_process_resources(tmp_path)
+
+    assert resources.python_tracemalloc_current_bytes is not None
+    assert resources.python_tracemalloc_peak_bytes is not None
+    assert resources.pyarrow_current_bytes is not None
+    assert resources.python_allocation_group_capture == ("TERMINAL_POST_CUTOFF_FILENAME_GROUPS")
+    assert len(resources.python_allocation_groups) <= 12
+    assert all(
+        isinstance(item, PythonAllocationGroup) for item in resources.python_allocation_groups
+    )
+
+
+def test_resource_capture_distinguishes_current_ru_maxrss_and_coherent_peak(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    current_rss_bytes = 420_605_952
+    normalized_ru_maxrss_bytes = 418_234_368
+    monkeypatch.setattr(
+        health_module,
+        "_current_rss_bytes",
+        lambda: (current_rss_bytes, LINUX_CURRENT_RSS_SOURCE),
+    )
+
+    def getrusage(_: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            ru_maxrss=normalized_ru_maxrss_bytes // 1024,
+            ru_utime=1.0,
+            ru_stime=0.5,
+        )
+
+    monkeypatch.setattr(
+        health_module.resource,
+        "getrusage",
+        getrusage,
+    )
+
+    resources = health_module.capture_process_resources(tmp_path)
+
+    assert resources.current_rss_bytes == current_rss_bytes
+    assert resources.current_rss_source == LINUX_CURRENT_RSS_SOURCE
+    assert resources.python_ru_maxrss_bytes == normalized_ru_maxrss_bytes
+    assert resources.python_ru_maxrss_source == (LINUX_PYTHON_RU_MAXRSS_SOURCE)
+    assert resources.peak_rss_bytes == current_rss_bytes
+    assert resources.peak_rss_source == (COMPOSITE_PEAK_RSS_SOURCE)
+
+
+def test_resource_capture_uses_ru_maxrss_when_it_exceeds_current(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    current_rss_bytes = 100_000
+    normalized_ru_maxrss_bytes = 200_704
+    monkeypatch.setattr(
+        health_module,
+        "_current_rss_bytes",
+        lambda: (current_rss_bytes, LINUX_CURRENT_RSS_SOURCE),
+    )
+
+    def getrusage(_: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            ru_maxrss=normalized_ru_maxrss_bytes // 1024,
+            ru_utime=1.0,
+            ru_stime=0.5,
+        )
+
+    monkeypatch.setattr(health_module.resource, "getrusage", getrusage)
+
+    resources = health_module.capture_process_resources(tmp_path)
+
+    assert resources.current_rss_bytes == current_rss_bytes
+    assert resources.python_ru_maxrss_bytes == normalized_ru_maxrss_bytes
+    assert resources.peak_rss_bytes == normalized_ru_maxrss_bytes
+
+
+def test_resource_capture_preserves_unavailable_current_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        health_module,
+        "_current_rss_bytes",
+        lambda: (None, LINUX_CURRENT_RSS_OS_ERROR_SOURCE),
+    )
+
+    def getrusage(_: int) -> SimpleNamespace:
+        return SimpleNamespace(ru_maxrss=123, ru_utime=1.0, ru_stime=0.5)
+
+    monkeypatch.setattr(health_module.resource, "getrusage", getrusage)
+
+    resources = health_module.capture_process_resources(tmp_path)
+
+    assert resources.current_rss_bytes is None
+    assert resources.current_rss_source == LINUX_CURRENT_RSS_OS_ERROR_SOURCE
+    assert resources.python_ru_maxrss_bytes == 123 * 1024
+    assert resources.peak_rss_bytes == resources.python_ru_maxrss_bytes
+
+
+def test_resource_capture_labels_non_linux_ru_maxrss_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(health_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        health_module,
+        "_current_rss_bytes",
+        lambda: (None, "UNAVAILABLE_PLATFORM:darwin"),
+    )
+
+    def getrusage(_: int) -> SimpleNamespace:
+        return SimpleNamespace(ru_maxrss=123_456, ru_utime=1.0, ru_stime=0.5)
+
+    monkeypatch.setattr(health_module.resource, "getrusage", getrusage)
+
+    resources = health_module.capture_process_resources(tmp_path)
+
+    assert resources.python_ru_maxrss_bytes == 123_456
+    assert resources.python_ru_maxrss_source == DARWIN_PYTHON_RU_MAXRSS_SOURCE
+    assert resources.peak_rss_bytes == 123_456
+
+
+def test_current_rss_capture_labels_darwin_before_touching_linux_procfs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(health_module.sys, "platform", "darwin")
+
+    assert health_module._current_rss_bytes() == (  # pyright: ignore[reportPrivateUsage]
+        None,
+        "UNAVAILABLE_PLATFORM:darwin",
+    )
+
+
+def test_ru_maxrss_normalization_fails_closed_on_unknown_platform_units() -> None:
+    with pytest.raises(RuntimeError, match="units are unsupported"):
+        normalize_python_ru_maxrss_bytes(123, platform_name="freebsd14")
+
+
+@pytest.mark.parametrize(
+    ("current_rss_bytes", "peak_rss_bytes", "python_ru_maxrss_bytes", "error"),
+    [
+        (2, 1, 1, "below current RSS"),
+        (1, 1, 2, "below Python ru_maxrss"),
+        (1, 3, 2, "equal the maximum"),
+    ],
+)
+def test_process_resource_snapshot_rejects_incoherent_sampled_peak(
+    current_rss_bytes: int,
+    peak_rss_bytes: int,
+    python_ru_maxrss_bytes: int,
+    error: str,
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        ProcessResourceSnapshot(
+            sampled_monotonic_ns=1,
+            free_disk_bytes=1,
+            cpu_user_seconds=0.0,
+            cpu_system_seconds=0.0,
+            current_rss_bytes=current_rss_bytes,
+            peak_rss_bytes=peak_rss_bytes,
+            current_rss_source=LINUX_CURRENT_RSS_SOURCE,
+            peak_rss_source=COMPOSITE_PEAK_RSS_SOURCE,
+            python_ru_maxrss_bytes=python_ru_maxrss_bytes,
+            python_ru_maxrss_source=LINUX_PYTHON_RU_MAXRSS_SOURCE,
+        )
+
+
+def test_process_resource_snapshot_rejects_unbounded_or_periodic_allocation_groups() -> None:
+    common: dict[str, object] = {
+        "sampled_monotonic_ns": 1,
+        "free_disk_bytes": 1,
+        "cpu_user_seconds": 0.0,
+        "cpu_system_seconds": 0.0,
+        "current_rss_bytes": 1,
+        "peak_rss_bytes": 1,
+        "peak_rss_source": COMPOSITE_PEAK_RSS_SOURCE,
+        "python_ru_maxrss_bytes": 1,
+        "python_ru_maxrss_source": LINUX_PYTHON_RU_MAXRSS_SOURCE,
+    }
+    with pytest.raises(ValueError, match="explicit and bounded"):
+        ProcessResourceSnapshot(
+            **common,  # type: ignore[arg-type]
+            current_rss_source="x" * 257,
+        )
+    with pytest.raises(ValueError, match="periodic resource evidence"):
+        ProcessResourceSnapshot(
+            **common,  # type: ignore[arg-type]
+            current_rss_source=LINUX_CURRENT_RSS_SOURCE,
+            python_allocation_groups=(PythonAllocationGroup("fixture.py", 1, 1),),
+        )
+    with pytest.raises(ValueError, match="composite RSS source is unsupported"):
+        ProcessResourceSnapshot(
+            **{**common, "peak_rss_source": "not-the-composite-source"},  # type: ignore[arg-type]
+            current_rss_source=LINUX_CURRENT_RSS_SOURCE,
+        )
+    with pytest.raises(ValueError, match="available Linux current RSS source is inconsistent"):
+        ProcessResourceSnapshot(
+            **common,  # type: ignore[arg-type]
+            current_rss_source="fabricated-current-rss-source",
+        )
+    with pytest.raises(ValueError, match="unavailable Linux current RSS source is inconsistent"):
+        ProcessResourceSnapshot(
+            **{  # type: ignore[arg-type]
+                **common,
+                "current_rss_bytes": None,
+                "current_rss_source": "UNAVAILABLE:fabricated",
+            },
+        )
 
 
 @pytest.mark.parametrize(
@@ -727,12 +2063,22 @@ def test_runtime_health_tracks_longest_completed_and_terminal_unavailable_interv
 
 def test_runtime_health_keeps_failure_domains_explicit() -> None:
     runtime = ObservationRuntimeHealth()
-    runtime.record_resync()
+    runtime.record_resync(
+        reasons=(
+            ProcessorRecoveryReason.TRANSPORT_DISCONNECT,
+            ProcessorRecoveryReason.REFERENCE_REFRESH,
+        )
+    )
     runtime.record_protocol_deviation()
     runtime.record_data_loss()
 
     snapshot = runtime.snapshot()
     assert snapshot.resyncs == 1
+    reason_counts = dict(snapshot.resync_reason_counts)
+    assert set(reason_counts) == {reason.value for reason in ProcessorRecoveryReason}
+    assert reason_counts[ProcessorRecoveryReason.TRANSPORT_DISCONNECT] == 1
+    assert reason_counts[ProcessorRecoveryReason.REFERENCE_REFRESH] == 1
+    assert reason_counts[ProcessorRecoveryReason.UNKNOWN] == 0
     assert snapshot.protocol_deviations == 1
     assert snapshot.data_loss_count == 1
     assert snapshot.ingress.overflows == 0
@@ -799,13 +2145,54 @@ def test_checkpoint_builder_emits_all_scoped_groups_and_fail_closed_decision() -
     assert checkpoint.http["active_attempts"] == 0
     assert checkpoint.recovery["longest_unavailable_nanoseconds"] == 0
     assert checkpoint.resources["current_rss_bytes"] == 900
-    assert checkpoint.resources["peak_rss_bytes"] == 1024
+    assert checkpoint.resources["peak_rss_bytes"] == 1000
+    assert checkpoint.resources["peak_rss_source"] == COMPOSITE_PEAK_RSS_SOURCE
+    assert checkpoint.resources["python_ru_maxrss_bytes"] == 1000
+    assert checkpoint.resources["python_ru_maxrss_source"] == LINUX_PYTHON_RU_MAXRSS_SOURCE
     rss_trend = cast(dict[str, object], checkpoint.resources["rss_trend"])
     host_identity = cast(dict[str, object], checkpoint.resources["host_runtime_identity"])
     assert rss_trend["start_rss_bytes"] == 800
     assert host_identity["cpu_model"] == "test-cpu"
     assert checkpoint.gate1_eligible_so_far is False
     assert HealthDecisionReason.BOOK_NOT_HEALTHY in checkpoint.reason_codes
+
+
+def test_checkpoint_propagates_contribution_queue_saturation() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    updated_at = UtcTimestamp(1_800_000_000_000_000_000)
+    processor, target = _healthy_target_processor(config, updated_at=updated_at)
+    writer = AvailabilityEvidenceRuntimeSnapshot(
+        healthy=True,
+        queue_depth=0,
+        queue_high_water=0,
+        accepted=0,
+        written=0,
+        rejected=0,
+        file_bytes=0,
+        unavailable_duration_nanoseconds=0,
+        longest_interval_nanoseconds=0,
+        open_at_shutdown_intervals=0,
+        failure_type=None,
+        contribution_queue_high_water=(config.health.availability_contribution_queue_capacity),
+    )
+
+    checkpoint = _checkpoint(
+        config=config,
+        target=target,
+        processor=processor,
+        book_last_valid_receive_monotonic_ns=_target_receive_times(target, 10_000),
+        emitted_at=updated_at,
+        monotonic_now_ns=10_000,
+        availability_writer=writer,
+    )
+
+    assert checkpoint.capture_healthy is True
+    assert checkpoint.research_eligible is True
+    assert checkpoint.gate1_eligible_so_far is False
+    assert checkpoint.reason_codes == (HealthDecisionReason.AVAILABILITY_QUEUE_SATURATED,)
+    assert checkpoint.gate1_sticky_reason_codes == (
+        HealthDecisionReason.AVAILABILITY_QUEUE_SATURATED,
+    )
 
 
 def test_checkpoint_book_freshness_accepts_exact_bound_and_scopes_selected_target() -> None:
@@ -996,7 +2383,10 @@ def test_checkpoint_exposes_current_reported_top_transition_and_blocks_research(
     yes_book = next(
         book for book in checkpoint.books if book["instrument_id"] == yes_instrument.value
     )
-    transition_record = cast(dict[str, object], yes_book["reported_top_transition"])
+    transition_values = cast(tuple[object, ...], yes_book["reported_top_transition"])
+    transition_record = dict(
+        zip(REPORTED_TOP_TRANSITION_HEALTH_TELEMETRY_FIELDS, transition_values, strict=True)
+    )
     transition_aggregate = cast(
         dict[str, object],
         checkpoint.audit["reported_top_transitions"],
@@ -1063,7 +2453,18 @@ def test_checkpoint_exposes_bounded_audit_mismatch_causes_and_source_identities(
     mismatch_evidence = cast(dict[str, object], checkpoint.audit["mismatch_causes"])
     divergence_evidence = cast(dict[str, object], checkpoint.audit["divergences"])
     trigger_evidence = cast(dict[str, object], checkpoint.audit["triggers"])
-    representatives = cast(tuple[dict[str, object], ...], mismatch_evidence["representatives"])
+    representative_table = cast(dict[str, object], mismatch_evidence["representatives"])
+    assert representative_table["schema"] == AUDIT_MISMATCH_REPRESENTATIVE_TELEMETRY_SCHEMA
+    representatives = tuple(
+        dict(
+            zip(
+                AUDIT_MISMATCH_REPRESENTATIVE_TELEMETRY_ROW_FIELDS,
+                row,
+                strict=True,
+            )
+        )
+        for row in cast(tuple[tuple[object, ...], ...], representative_table["rows"])
+    )
     assert checkpoint.audit["generation_rebases"] == 2
     assert mismatch_evidence["counts_reconciled"] is True
     assert mismatch_evidence["diagnostics_retained"] == 3
@@ -1074,12 +2475,11 @@ def test_checkpoint_exposes_bounded_audit_mismatch_causes_and_source_identities(
         "UNKNOWN",
     )
     unknown = representatives[-1]
-    response_source = cast(dict[str, str], unknown["response_source"])
-    assert response_source["ingest_id"] == "pipeline-health-latest-unknown-response"
-    assert response_source["payload_sha256"] == latest_unknown.response_source.payload_sha256
-    assert unknown["local_book_economic_sha256"] == (
-        latest_unknown.local_book.economic_content_sha256
-    )
+    assert unknown["diagnostic_sha256"] == canonical_sha256(latest_unknown)
+    assert unknown["context_evidence_count"] == 1
+    assert unknown["instrument_id"] == latest_unknown.local_book.instrument_id.value
+    assert unknown["response_ingest_id"] == "pipeline-health-latest-unknown-response"
+    assert unknown["response_payload_sha256"] == latest_unknown.response_source.payload_sha256
     assert divergence_evidence["evidence_reconciled"] is True
     assert divergence_evidence["observed"] == 3
     assert divergence_evidence["resolved_by_authoritative_resnapshot"] == 3
@@ -1164,9 +2564,9 @@ def test_mismatch_cause_total_inconsistency_is_gate_sticky() -> None:
     )
 
     class _InconsistentCauseProcessor(_ScopedProcessorView):
-        def summary(self) -> ProcessorSummary:
+        def operational_snapshot(self) -> ProcessorOperationalSnapshot:
             return replace(
-                super().summary(),
+                super().operational_snapshot(),
                 audit_mismatch_cause_counts=tuple((cause, 0) for cause in AuditMismatchCause),
             )
 
@@ -1205,8 +2605,8 @@ def test_current_audit_eligibility_count_inconsistency_is_gate_sticky() -> None:
     yes_instrument = InstrumentId.from_native(POLYMARKET_VENUE_ID, target.yes_token_id)
 
     class _InconsistentEligibilityProcessor(_ScopedProcessorView):
-        def summary(self) -> ProcessorSummary:
-            return replace(super().summary(), audit_ineligible_books=0)
+        def operational_snapshot(self) -> ProcessorOperationalSnapshot:
+            return replace(super().operational_snapshot(), audit_ineligible_books=0)
 
     inconsistent = cast(
         CanonicalProcessor,
@@ -1452,10 +2852,9 @@ def test_checkpoint_recovers_current_research_after_later_race_free_match() -> N
     assert checkpoint.capture_healthy is True
     assert checkpoint.research_eligible is True
     assert checkpoint.gate1_eligible_so_far is False
-    assert checkpoint.reason_codes == (
-        HealthDecisionReason.AUDIT_FAILED,
-        HealthDecisionReason.AUDIT_RACE_BUDGET_EXHAUSTED,
-    )
+    # Historical FAILED outcomes remain diagnostic, but only current or
+    # permanent fault lifecycle state contributes AUDIT_FAILED.
+    assert checkpoint.reason_codes == (HealthDecisionReason.AUDIT_RACE_BUDGET_EXHAUSTED,)
 
     ineligible_instrument = InstrumentId.from_native(
         POLYMARKET_VENUE_ID,
@@ -1499,6 +2898,114 @@ def test_checkpoint_recovers_current_research_after_later_race_free_match() -> N
         "required_ineligible_book_count": 1,
         "required_ineligible_instrument_ids": (ineligible_instrument.value,),
     }
+
+
+def test_resolved_audit_http_fault_cannot_cancel_unrelated_endpoint_failures() -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    updated_at = UtcTimestamp(1_800_000_000_000_000_000)
+    processor, target = _healthy_target_processor(config, updated_at=updated_at)
+    base_snapshot = processor.operational_snapshot()
+    endpoint_snapshots = tuple(
+        replace(
+            item,
+            observed=1,
+            resolved=1,
+            retry_exhaustions_observed=1,
+            retry_exhaustions_resolved=1,
+        )
+        if item.endpoint_class is PolymarketEndpointClass.CLOB_BOOK
+        else item
+        for item in base_snapshot.audit_http_endpoint_snapshots
+    )
+    retention = tuple(
+        replace(item, total=2, truncated=True)
+        if item.domain is ProcessorRetentionDomain.AUDIT_FAULT_LIFECYCLES
+        else item
+        for item in base_snapshot.retention
+    )
+    resolved_audit_snapshot = replace(
+        base_snapshot,
+        audit_faults_observed=1,
+        audit_faults_resolved=1,
+        audit_http_faults_observed=1,
+        audit_http_faults_resolved=1,
+        audit_http_retry_exhaustions_observed=1,
+        audit_http_retry_exhaustions_resolved=1,
+        audit_http_endpoint_snapshots=endpoint_snapshots,
+        audit_fault_lifecycle_reconciled=True,
+        retention=retention,
+    )
+
+    class _ResolvedAuditProcessorView:
+        def operational_snapshot(self) -> ProcessorOperationalSnapshot:
+            return resolved_audit_snapshot
+
+    resolved_audit_processor = cast(CanonicalProcessor, _ResolvedAuditProcessorView())
+    receive_times = _target_receive_times(target, 10_000)
+    only_resolved_audit_metrics = PublicReadMetricsSnapshot(
+        endpoints=(
+            _public_endpoint_metrics(
+                PolymarketEndpointClass.CLOB_BOOK,
+                final_failures=1,
+                exhausted_retry_budget=1,
+            ),
+        ),
+        active_attempts=0,
+        active_attempts_high_water=0,
+    )
+    reconciled = _checkpoint(
+        config=config,
+        target=target,
+        processor=resolved_audit_processor,
+        book_last_valid_receive_monotonic_ns=receive_times,
+        emitted_at=updated_at,
+        monotonic_now_ns=10_000,
+        public_reads=only_resolved_audit_metrics,
+    )
+    unrelated_gamma_failure = _checkpoint(
+        config=config,
+        target=target,
+        processor=resolved_audit_processor,
+        book_last_valid_receive_monotonic_ns=receive_times,
+        emitted_at=updated_at,
+        monotonic_now_ns=10_000,
+        public_reads=PublicReadMetricsSnapshot(
+            endpoints=(
+                *only_resolved_audit_metrics.endpoints,
+                _public_endpoint_metrics(
+                    PolymarketEndpointClass.GAMMA_GENERAL,
+                    final_failures=1,
+                    exhausted_retry_budget=1,
+                ),
+            ),
+            active_attempts=0,
+            active_attempts_high_water=0,
+        ),
+    )
+    underreported_audit_evidence = _checkpoint(
+        config=config,
+        target=target,
+        processor=resolved_audit_processor,
+        book_last_valid_receive_monotonic_ns=receive_times,
+        emitted_at=updated_at,
+        monotonic_now_ns=10_000,
+        public_reads=PublicReadMetricsSnapshot(
+            endpoints=(),
+            active_attempts=0,
+            active_attempts_high_water=0,
+        ),
+    )
+
+    assert HealthDecisionReason.HTTP_FINAL_FAILURE not in reconciled.reason_codes
+    assert HealthDecisionReason.HTTP_INTEGRITY_UNAVAILABLE not in reconciled.reason_codes
+    assert HealthDecisionReason.HTTP_FINAL_FAILURE in unrelated_gamma_failure.reason_codes
+    assert HealthDecisionReason.HTTP_INTEGRITY_UNAVAILABLE in unrelated_gamma_failure.reason_codes
+    assert HealthDecisionReason.AUDIT_FAILED in underreported_audit_evidence.reason_codes
+    fault_lifecycles = cast(
+        dict[str, object],
+        underreported_audit_evidence.audit["fault_lifecycles"],
+    )
+    assert fault_lifecycles["evidence_reconciled"] is False
 
 
 def test_checkpoint_audit_integrity_age_fails_closed_on_future_monotonic_response() -> None:
@@ -1554,10 +3061,561 @@ def test_checkpoint_audit_integrity_age_fails_closed_on_future_monotonic_respons
     assert checkpoint.capture["current_unavailable_nanoseconds"] is None
 
 
+def test_non_audit_interruption_rejects_recovery_only_audit_provenance() -> None:
+    source = RawSourceRef(
+        ingest_id=IngestId("non-audit-recovery-source"),
+        payload_sha256=hashlib.sha256(b"non-audit-recovery-source").hexdigest(),
+    )
+    interruption = AvailabilityInterruption(
+        cause=AvailabilityCause.EXTERNAL_CONNECTION_TRANSPORT,
+        reason_code="CONNECTION_CLOSED",
+    )
+
+    with pytest.raises(ValueError, match="non-audit interruption"):
+        replace(interruption, authoritative_resolution_source=source)
+    with pytest.raises(ValueError, match="non-audit interruption"):
+        replace(interruption, replacement_release_source=source)
+
+
+def test_public_read_fault_interruption_accepts_only_its_direct_identity_subset() -> None:
+    fault = _current_http_audit_fault(
+        instrument_id=InstrumentId("public-read-fault-direct-binding"),
+        market_id=MarketId("public-read-fault-direct-binding-market"),
+        native_asset_id="public-read-fault-direct-binding-asset",
+        label="public-read-fault-direct-binding",
+    )
+    interruption = AvailabilityInterruption(
+        cause=AvailabilityCause.PUBLIC_READ_FAULT,
+        reason_code=fault.reason.value,
+        source_evidence_ids=(f"audit-fault:{fault.fault_id}",),
+        affected_instruments=(fault.instrument_id,),
+        affected_scopes=(AvailabilityScope.AUDIT_ELIGIBILITY,),
+        recovery_action=AvailabilityRecoveryAction.RESNAPSHOT,
+        request_id=fault.request_id,
+        instrument_id=fault.instrument_id,
+        market_id=fault.market_id.value,
+        causal_family=AvailabilityCausalFamily.PUBLIC_READ_FAULT,
+        fault_lifecycle_id=fault.fault_id,
+    )
+
+    assert interruption.request_id == fault.request_id
+    with pytest.raises(ValueError, match="public-read fault interruption"):
+        replace(interruption, divergence_id="a" * 64)
+    with pytest.raises(ValueError, match="public-read fault interruption"):
+        replace(interruption, audit_start_source=fault.audit_start_source)
+    with pytest.raises(ValueError, match="public-read fault interruption"):
+        replace(interruption, recovery_id="mismatch-only-recovery")
+
+
+def test_public_read_fault_projection_accumulator_is_order_independent_and_counted() -> None:
+    faults = tuple(
+        _current_http_audit_fault(
+            instrument_id=InstrumentId(f"public-read-accumulator-instrument-{index}"),
+            market_id=MarketId(f"public-read-accumulator-market-{index}"),
+            native_asset_id=f"public-read-accumulator-asset-{index}",
+            label=f"public-read-accumulator-{index}",
+        )
+        for index in range(2)
+    )
+    first, second = tuple(fault.public_read_fault_availability_open_identity() for fault in faults)
+    seed = public_read_fault_availability_chain_seed("open")
+    first_then_second = public_read_fault_availability_chain_extend(
+        public_read_fault_availability_chain_extend(seed, "open", first),
+        "open",
+        second,
+    )
+    second_then_first = public_read_fault_availability_chain_extend(
+        public_read_fault_availability_chain_extend(seed, "open", second),
+        "open",
+        first,
+    )
+    first_twice = public_read_fault_availability_chain_extend(
+        public_read_fault_availability_chain_extend(seed, "open", first),
+        "open",
+        first,
+    )
+
+    assert first_then_second == second_then_first
+    assert first_twice not in {
+        seed,
+        public_read_fault_availability_chain_extend(seed, "open", first),
+        first_then_second,
+    }
+    assert PublicReadFaultAvailabilityProjectionSnapshot(
+        opened=2,
+        completed=0,
+        open_chain_sha256=first_twice,
+        completion_chain_sha256=public_read_fault_availability_chain_seed("completion"),
+    ) != PublicReadFaultAvailabilityProjectionSnapshot(
+        opened=1,
+        completed=0,
+        open_chain_sha256=public_read_fault_availability_chain_extend(seed, "open", first),
+        completion_chain_sha256=public_read_fault_availability_chain_seed("completion"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_public_read_fault_contributor_preserves_socket_and_closes_only_on_resolution(
+    tmp_path: Path,
+) -> None:
+    run_id = CollectorRunId("availability-public-read-fault")
+    writer = SupervisedAvailabilityIntervalWriter(
+        root=tmp_path,
+        collector_run_id=run_id,
+        queue_capacity=2,
+        maximum_intervals=4,
+        maximum_file_bytes=64 * 1024,
+    )
+    await writer.start()
+    runtime = ObservationRuntimeHealth(
+        collector_run_id=run_id,
+        availability_writer=writer,
+    )
+    connection_id = ConnectionId("availability-public-read-fault-connection")
+    runtime.begin_generation(connection_id, _ingress(connection_id))
+    runtime.mark_connected(
+        now_ns=10,
+        now_utc=UtcTimestamp(1_800_000_000_000_000_010),
+    )
+    instrument_id = InstrumentId("availability-public-read-fault-instrument")
+    fault = _current_http_audit_fault(
+        instrument_id=instrument_id,
+        market_id=MarketId("availability-public-read-fault-market"),
+        native_asset_id="availability-public-read-fault-asset",
+        label="availability-public-read-fault",
+    )
+
+    runtime.open_audit_fault_contributor(fault)
+    runtime.open_audit_fault_contributor(fault)
+
+    during_fault = runtime.snapshot(now_ns=25)
+    assert during_fault.socket_connected is True
+    assert during_fault.active_availability_contributors == 1
+    active_fault = runtime.active_availability_contributors[0]
+    assert active_fault.observation_count == 2
+    assert active_fault.causal_family.value == "PUBLIC_READ_FAULT"
+    assert active_fault.causal_lifecycle_id == f"fault:{fault.fault_id}"
+    assert active_fault.cause is AvailabilityCause.PUBLIC_READ_FAULT
+
+    overlapping_fault = _current_http_audit_fault(
+        instrument_id=instrument_id,
+        market_id=MarketId("availability-public-read-fault-market"),
+        native_asset_id="availability-public-read-fault-asset",
+        label="availability-public-read-fault-overlap",
+    )
+    runtime.open_audit_fault_contributor(overlapping_fault)
+    assert runtime.snapshot(now_ns=25).active_availability_contributors == 2
+
+    # A connected generation is not authoritative resolution for this cause.
+    runtime.mark_connected(
+        now_ns=30,
+        now_utc=UtcTimestamp(1_800_000_000_000_000_030),
+    )
+    assert runtime.snapshot(now_ns=30).active_availability_contributors == 2
+
+    resolution_source = RawSourceRef(
+        ingest_id=IngestId("availability-public-read-fault-resolution"),
+        payload_sha256=hashlib.sha256(b"availability-public-read-fault-resolution").hexdigest(),
+    )
+    resolved = replace(
+        fault,
+        status=AuditFaultStatus.RESOLVED,
+        blocks_current_scope=False,
+        resolution=AuditFaultResolution.LATER_FENCED_MATCH,
+        resolution_source=resolution_source,
+        resolved_at=UtcTimestamp(1_800_000_000_000_000_040),
+        resolved_monotonic_ns=40,
+    )
+    runtime.resolve_audit_fault_contributor(resolved)
+
+    after_first_resolution = runtime.snapshot(now_ns=40)
+    assert after_first_resolution.socket_connected is True
+    assert after_first_resolution.active_availability_contributors == 1
+    assert after_first_resolution.current_unavailable_started_monotonic_ns == 20
+
+    second_resolution_source = RawSourceRef(
+        ingest_id=IngestId("availability-public-read-fault-overlap-resolution"),
+        payload_sha256=hashlib.sha256(
+            b"availability-public-read-fault-overlap-resolution"
+        ).hexdigest(),
+    )
+    resolved_overlap = replace(
+        overlapping_fault,
+        status=AuditFaultStatus.RESOLVED,
+        blocks_current_scope=False,
+        resolution=AuditFaultResolution.LATER_FENCED_MATCH,
+        resolution_source=second_resolution_source,
+        resolved_at=UtcTimestamp(1_800_000_000_000_000_050),
+        resolved_monotonic_ns=50,
+    )
+    runtime.resolve_audit_fault_contributor(resolved_overlap)
+
+    after_resolution = runtime.snapshot(now_ns=50)
+    assert after_resolution.socket_connected is True
+    assert after_resolution.active_availability_contributors == 0
+    assert after_resolution.current_unavailable_started_monotonic_ns is None
+    assert after_resolution.public_read_fault_availability_projection.opened == 2
+    assert after_resolution.public_read_fault_availability_projection.completed == 2
+    summary = await writer.close(completed=True, terminal_active_causal_keys=())
+    assert summary.contribution_path is not None
+    assert (
+        summary.public_read_fault_projection_accepted
+        == summary.public_read_fault_projection_written
+        == after_resolution.public_read_fault_availability_projection
+    )
+    assert (
+        summary.public_read_fault_completion_expected_written_chain_sha256
+        == after_resolution.public_read_fault_availability_projection.completion_chain_sha256
+    )
+    assert reconcile_published_availability_evidence(
+        summary,
+        expected_audit_contributions=empty_audit_availability_contribution_snapshot(),
+        expected_public_read_fault_projection=(
+            after_resolution.public_read_fault_availability_projection
+        ),
+    ).reconciled
+    contributions = tuple(
+        json.loads(line)
+        for line in summary.contribution_path.read_text(encoding="utf-8").splitlines()
+    )
+    assert len(contributions) == 2
+    contribution = contributions[0]
+    assert contribution["cause_type"] == AvailabilityCause.PUBLIC_READ_FAULT.value
+    assert contribution["fault_lifecycle_id"] == fault.fault_id
+    assert contribution["observation_count"] == 2
+    assert contribution["affected_scopes"] == [
+        AuditFaultAffectedScope.AUDIT_ELIGIBILITY.value,
+        AuditFaultAffectedScope.SCANNER_RESEARCH_ELIGIBILITY.value,
+    ]
+    assert contribution["closure_reason_code"] == ("AUDIT_FAULT_LATER_FENCED_MATCH")
+    assert contributions[1]["fault_lifecycle_id"] == overlapping_fault.fault_id
+    assert contributions[1]["observation_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_public_read_fault_projection_reconciles_reverse_key_same_start_order(
+    tmp_path: Path,
+) -> None:
+    run_id = CollectorRunId("availability-public-read-fault-reverse-key")
+    writer = SupervisedAvailabilityIntervalWriter(
+        root=tmp_path,
+        collector_run_id=run_id,
+        queue_capacity=2,
+        maximum_intervals=4,
+        maximum_file_bytes=64 * 1024,
+    )
+    await writer.start()
+    runtime = ObservationRuntimeHealth(
+        collector_run_id=run_id,
+        availability_writer=writer,
+    )
+    connection_id = ConnectionId("availability-public-read-fault-reverse-key-connection")
+    runtime.begin_generation(connection_id, _ingress(connection_id))
+    runtime.mark_connected(
+        now_ns=10,
+        now_utc=UtcTimestamp(1_800_000_000_000_000_010),
+    )
+    faults = tuple(
+        _current_http_audit_fault(
+            instrument_id=InstrumentId(f"reverse-key-instrument-{index}"),
+            market_id=MarketId(f"reverse-key-market-{index}"),
+            native_asset_id=f"reverse-key-asset-{index}",
+            label=f"reverse-key-{index}",
+        )
+        for index in range(2)
+    )
+    reverse_key_faults = tuple(
+        sorted(
+            faults,
+            key=lambda fault: (
+                fault.public_read_fault_availability_open_identity().stable_causal_key
+            ),
+            reverse=True,
+        )
+    )
+    opening_identities = tuple(
+        fault.public_read_fault_availability_open_identity() for fault in reverse_key_faults
+    )
+    assert opening_identities[0].started_monotonic_ns == opening_identities[1].started_monotonic_ns
+    assert opening_identities[0].stable_causal_key > opening_identities[1].stable_causal_key
+    for fault in reverse_key_faults:
+        runtime.open_audit_fault_contributor(fault)
+
+    for index, fault in enumerate(reverse_key_faults):
+        resolution_source = RawSourceRef(
+            ingest_id=IngestId(f"reverse-key-resolution-{index}"),
+            payload_sha256=hashlib.sha256(f"reverse-key-resolution-{index}".encode()).hexdigest(),
+        )
+        runtime.resolve_audit_fault_contributor(
+            replace(
+                fault,
+                status=AuditFaultStatus.RESOLVED,
+                blocks_current_scope=False,
+                resolution=AuditFaultResolution.LATER_FENCED_MATCH,
+                resolution_source=resolution_source,
+                resolved_at=UtcTimestamp(1_800_000_000_000_000_040 + index),
+                resolved_monotonic_ns=40 + index,
+            )
+        )
+
+    terminal = runtime.snapshot(now_ns=50)
+    summary = await writer.close(completed=True, terminal_active_causal_keys=())
+    assert terminal.socket_connected is True
+    assert terminal.public_read_fault_availability_projection.opened == 2
+    assert terminal.public_read_fault_availability_projection.completed == 2
+    assert (
+        summary.public_read_fault_projection_accepted
+        == summary.public_read_fault_projection_written
+        == terminal.public_read_fault_availability_projection
+    )
+    reconciliation = reconcile_published_availability_evidence(
+        summary,
+        expected_audit_contributions=empty_audit_availability_contribution_snapshot(),
+        expected_public_read_fault_projection=(terminal.public_read_fault_availability_projection),
+    )
+    assert reconciliation.reconciled
+    assert summary.contribution_path is not None
+    contributions = tuple(
+        json.loads(line)
+        for line in summary.contribution_path.read_text(encoding="utf-8").splitlines()
+    )
+    assert tuple(item["stable_causal_key"] for item in contributions) == tuple(
+        identity.stable_causal_key for identity in opening_identities
+    )
+
+
+@pytest.mark.parametrize("mutation", ["omitted", "duplicated", "substituted"])
+def test_public_read_fault_projection_identity_disagreement_fails_terminal_health(
+    mutation: str,
+) -> None:
+    config = load_phase1_config(Path("config/phase1.toml"))
+    updated_at = UtcTimestamp(1_800_000_000_000_000_000)
+    base_processor, target = _healthy_target_processor(config, updated_at=updated_at)
+    scoped_base_processor = cast(_ScopedProcessorView, base_processor)
+    fault = _current_http_audit_fault(
+        instrument_id=InstrumentId.from_native(POLYMARKET_VENUE_ID, target.yes_token_id),
+        market_id=MarketId(target.condition_id),
+        native_asset_id=target.yes_token_id,
+        label=f"projection-{mutation}",
+    )
+    runtime = ObservationRuntimeHealth()
+    connection_id = ConnectionId(f"projection-{mutation}-connection")
+    runtime.begin_generation(connection_id, _ingress(connection_id))
+    runtime.mark_connected(now_ns=10, now_utc=updated_at)
+    runtime.open_audit_fault_contributor(fault)
+    resolution_source = RawSourceRef(
+        ingest_id=IngestId(f"projection-{mutation}-resolution"),
+        payload_sha256=hashlib.sha256(f"projection-{mutation}-resolution".encode()).hexdigest(),
+    )
+    resolved = replace(
+        fault,
+        status=AuditFaultStatus.RESOLVED,
+        blocks_current_scope=False,
+        resolution=AuditFaultResolution.LATER_FENCED_MATCH,
+        resolution_source=resolution_source,
+        resolved_at=UtcTimestamp(updated_at.nanoseconds_since_epoch + 40),
+        resolved_monotonic_ns=40,
+    )
+    runtime.resolve_audit_fault_contributor(resolved)
+    runtime_snapshot = runtime.snapshot(now_ns=50)
+    expected = runtime_snapshot.public_read_fault_availability_projection
+    projected_processor = _ScopedProcessorView(
+        scoped_base_processor.canonical_processor,
+        scoped_base_processor.snapshots(),
+        operational_snapshot_transform=lambda snapshot: replace(
+            snapshot,
+            public_read_fault_availability_projection=expected,
+        ),
+    )
+
+    open_identity = fault.public_read_fault_availability_open_identity()
+    completion_identity = resolved.public_read_fault_availability_completion_identity()
+    if mutation == "omitted":
+        observed = empty_public_read_fault_availability_projection()
+    elif mutation == "duplicated":
+        open_chain = public_read_fault_availability_chain_seed("open")
+        completion_chain = public_read_fault_availability_chain_seed("completion")
+        for _ in range(2):
+            open_chain = public_read_fault_availability_chain_extend(
+                open_chain,
+                "open",
+                open_identity,
+            )
+            completion_chain = public_read_fault_availability_chain_extend(
+                completion_chain,
+                "completion",
+                completion_identity,
+            )
+        observed = PublicReadFaultAvailabilityProjectionSnapshot(
+            opened=2,
+            completed=2,
+            open_chain_sha256=open_chain,
+            completion_chain_sha256=completion_chain,
+        )
+    else:
+        observed = PublicReadFaultAvailabilityProjectionSnapshot(
+            opened=1,
+            completed=1,
+            open_chain_sha256=public_read_fault_availability_chain_extend(
+                public_read_fault_availability_chain_seed("open"),
+                "open",
+                replace(open_identity, request_id=f"{open_identity.request_id}-substituted"),
+            ),
+            completion_chain_sha256=expected.completion_chain_sha256,
+        )
+    exact_writer = AvailabilityEvidenceRuntimeSnapshot(
+        healthy=True,
+        queue_depth=0,
+        queue_high_water=0,
+        accepted=runtime_snapshot.availability_records_emitted,
+        written=runtime_snapshot.availability_records_emitted,
+        rejected=0,
+        file_bytes=0,
+        unavailable_duration_nanoseconds=runtime_snapshot.unavailable_total_nanoseconds,
+        longest_interval_nanoseconds=runtime_snapshot.longest_unavailable_nanoseconds,
+        open_at_shutdown_intervals=0,
+        failure_type=None,
+        contributions_accepted=runtime_snapshot.availability_contributions_emitted,
+        contributions_written=runtime_snapshot.availability_contributions_emitted,
+        public_read_fault_projection_accepted=expected,
+        public_read_fault_projection_written=expected,
+        public_read_fault_completion_expected_written_chain_sha256=(
+            expected.completion_chain_sha256
+        ),
+    )
+    processor_snapshot = projected_processor.operational_snapshot()
+    assert public_read_fault_availability_projection_reconciled(
+        processor_snapshot,
+        runtime_snapshot,
+        exact_writer,
+    )
+
+    disagreeing_writer = replace(
+        exact_writer,
+        public_read_fault_projection_accepted=observed,
+        public_read_fault_projection_written=observed,
+        public_read_fault_completion_expected_written_chain_sha256=(
+            observed.completion_chain_sha256
+        ),
+    )
+    assert not public_read_fault_availability_projection_reconciled(
+        processor_snapshot,
+        runtime_snapshot,
+        disagreeing_writer,
+    )
+    checkpoint = _checkpoint(
+        config=config,
+        target=target,
+        processor=cast(CanonicalProcessor, projected_processor),
+        book_last_valid_receive_monotonic_ns=_target_receive_times(target, 50),
+        emitted_at=updated_at,
+        monotonic_now_ns=50,
+        runtime_snapshot=runtime_snapshot,
+        availability_writer=disagreeing_writer,
+        terminal=True,
+    )
+    assert HealthDecisionReason.AVAILABILITY_RECONCILIATION_FAILED in checkpoint.reason_codes
+    # ADR-0055 scopes this fault to audit/research eligibility; capture remains
+    # connected while the projection discrepancy still fails the Gate.
+    assert checkpoint.capture_healthy is True
+    assert checkpoint.gate1_eligible_so_far is False
+    compact_projection = cast(
+        dict[str, object],
+        cast(dict[str, object], checkpoint.audit["fault_lifecycles"])["availability_projection"],
+    )
+    assert compact_projection == {
+        "completed": expected.completed,
+        "completion_digest": expected.completion_chain_sha256,
+        "evidence_reconciled": False,
+        "open_digest": expected.open_chain_sha256,
+        "opened": expected.opened,
+    }
+
+
+@pytest.mark.asyncio
+async def test_permanent_public_read_fault_terminalizes_while_legacy_nonblocking_fault_does_not(
+    tmp_path: Path,
+) -> None:
+    run_id = CollectorRunId("availability-permanent-public-read-fault")
+    writer = SupervisedAvailabilityIntervalWriter(
+        root=tmp_path,
+        collector_run_id=run_id,
+        queue_capacity=2,
+        maximum_intervals=4,
+        maximum_file_bytes=64 * 1024,
+    )
+    await writer.start()
+    runtime = ObservationRuntimeHealth(
+        collector_run_id=run_id,
+        availability_writer=writer,
+    )
+    connection_id = ConnectionId("availability-permanent-public-read-fault-connection")
+    runtime.begin_generation(connection_id, _ingress(connection_id))
+    runtime.mark_connected(
+        now_ns=10,
+        now_utc=UtcTimestamp(1_800_000_000_000_000_010),
+    )
+    fault = _current_http_audit_fault(
+        instrument_id=InstrumentId("availability-permanent-public-read-fault-instrument"),
+        market_id=MarketId("availability-permanent-public-read-fault-market"),
+        native_asset_id="availability-permanent-public-read-fault-asset",
+        label="availability-permanent-public-read-fault",
+    )
+    legacy_nonblocking = replace(
+        fault,
+        origin=AuditFaultOrigin.INDETERMINATE,
+        status=AuditFaultStatus.PERMANENT,
+        failure_schema=AUDIT_FAILURE_V1_SCHEMA,
+        blocks_current_scope=False,
+        error_type=AuditFailureReason.HTTP_REQUEST_FAILED.value,
+        endpoint_class=None,
+        category=None,
+        retryable=None,
+        attempt=None,
+        retry_after_disposition=None,
+        retry_exhausted=None,
+        retry_blocked_reason=None,
+    )
+    runtime.open_audit_fault_contributor(legacy_nonblocking)
+    assert runtime.snapshot(now_ns=20).active_availability_contributors == 0
+
+    permanent = replace(
+        fault,
+        status=AuditFaultStatus.PERMANENT,
+    )
+    runtime.open_audit_fault_contributor(permanent)
+    terminal_keys = tuple(
+        contributor.stable_causal_key for contributor in runtime.active_availability_contributors
+    )
+    interval = runtime.finalize_open_interval(
+        cutoff_at=UtcTimestamp(1_800_000_000_000_000_100),
+        cutoff_monotonic_ns=100,
+    )
+    summary = await writer.close(
+        completed=True,
+        terminal_active_causal_keys=terminal_keys,
+    )
+
+    assert interval is not None
+    assert interval.open_at_shutdown is True
+    assert interval.research_eligibility_restored is False
+    assert summary.contribution_path is not None
+    contribution = json.loads(summary.contribution_path.read_text(encoding="utf-8"))
+    assert contribution["fault_lifecycle_id"] == permanent.fault_id
+    assert contribution["open_at_shutdown"] is True
+    assert contribution["closure_reason_code"] == "TERMINAL_CAPTURE_CUTOFF"
+
+
 @pytest.mark.asyncio
 async def test_runtime_health_emits_typed_recovered_availability_interval(
     tmp_path: Path,
 ) -> None:
+    def source(label: str) -> RawSourceRef:
+        return RawSourceRef(
+            ingest_id=IngestId(f"availability-{label}"),
+            payload_sha256=hashlib.sha256(label.encode()).hexdigest(),
+        )
+
     run_id = CollectorRunId.new()
     writer = SupervisedAvailabilityIntervalWriter(
         root=tmp_path,
@@ -1574,15 +3632,45 @@ async def test_runtime_health_emits_typed_recovered_availability_interval(
     failed_connection = ConnectionId("typed-availability-failed")
     runtime.begin_generation(failed_connection, _ingress(failed_connection))
     runtime.mark_connected(now_ns=10, now_utc=UtcTimestamp(1_000))
+    first_divergence = hashlib.sha256(b"availability-divergence-1").hexdigest()
+    second_divergence = hashlib.sha256(b"availability-divergence-2").hexdigest()
+    instrument = InstrumentId("availability-instrument")
+    second_instrument = InstrumentId("availability-instrument-2")
     interruption = AvailabilityInterruption(
         cause=AvailabilityCause.AUDIT_MISMATCH_RESYNCHRONIZATION,
         reason_code="REST_AUDIT_MISMATCH",
         source_evidence_ids=("audit-request:1",),
+        affected_instruments=(second_instrument,),
+        request_id="request-1",
+        divergence_id=first_divergence,
+        instrument_id=second_instrument,
+        market_id="market-1",
+        audit_start_source=source("start-1"),
+        audit_response_source=source("response-1"),
+        audit_classification_source=source("classification-1"),
     )
     runtime.mark_interrupted(
         now_ns=20,
         now_utc=UtcTimestamp(2_000),
         interruption=interruption,
+    )
+    coalesced_interruption = AvailabilityInterruption(
+        cause=AvailabilityCause.AUDIT_MISMATCH_RESYNCHRONIZATION,
+        reason_code="REST_AUDIT_MISMATCH",
+        source_evidence_ids=("audit-request:2",),
+        affected_instruments=(instrument,),
+        request_id="request-2",
+        divergence_id=second_divergence,
+        instrument_id=instrument,
+        market_id="market-1",
+        audit_start_source=source("start-2"),
+        audit_response_source=source("response-2"),
+        audit_classification_source=source("classification-2"),
+    )
+    runtime.mark_interrupted(
+        now_ns=30,
+        now_utc=UtcTimestamp(3_000),
+        interruption=coalesced_interruption,
     )
     during_ordered_drain = runtime.snapshot(now_ns=35)
     runtime.finish_generation(
@@ -1593,25 +3681,411 @@ async def test_runtime_health_emits_typed_recovered_availability_interval(
     )
     recovered_connection = ConnectionId("typed-availability-recovered")
     runtime.begin_generation(recovered_connection, _ingress(recovered_connection))
+    first_resolution_source = source("resolution-1")
+    second_resolution_source = source("resolution-2")
+    first_release_source = source("release-1")
+    second_release_source = source("release-2")
+    runtime.bind_contribution_authoritative_resolution(
+        divergence_id=first_divergence,
+        source=first_resolution_source,
+    )
+    runtime.bind_contribution_authoritative_resolution(
+        divergence_id=second_divergence,
+        source=second_resolution_source,
+    )
+
+    def released_authority(
+        *,
+        divergence_id: str,
+        affected_instrument: InstrumentId,
+        resolution_source: RawSourceRef,
+        release_source: RawSourceRef,
+        attempt_started_ns: int,
+        capture_ns: int,
+        release_ns: int,
+        capture_label: str,
+    ) -> ReplacementRecoveryAuthority:
+        authority = ReplacementRecoveryAuthority.start(
+            divergence_id=divergence_id,
+            resolution_source=resolution_source,
+            resolution_ingest_seq=10,
+            resolution_monotonic=MonotonicTimestamp(run_id.value, 41),
+            original_connection_id=failed_connection,
+            excluded_connection_ids=(),
+            required_instrument_ids=(affected_instrument,),
+            bounds=ReplacementRecoveryBounds(
+                maximum_attempts=2,
+                retry_delay_ns=5,
+                maximum_snapshot_age_ns=10,
+            ),
+            hard_deadline=MonotonicTimestamp(run_id.value, 100),
+            run_deadline=MonotonicTimestamp(run_id.value, 200),
+        ).start_attempt(
+            connection_id=recovered_connection,
+            started_monotonic=MonotonicTimestamp(run_id.value, attempt_started_ns),
+        )
+        authority = authority.observe_snapshot(
+            candidate=ReplacementSnapshotCandidate(
+                connection_id=recovered_connection,
+                instrument_ids=(affected_instrument,),
+                admission_ordinal=1,
+                ingest_seq=11,
+                received_monotonic=MonotonicTimestamp(run_id.value, capture_ns),
+                raw_source=source(capture_label),
+            ),
+            observed_monotonic=MonotonicTimestamp(run_id.value, capture_ns),
+        ).succeed_attempt(decided_monotonic=MonotonicTimestamp(run_id.value, capture_ns + 1))
+        return authority.release(
+            release_source=release_source,
+            release_ingest_seq=12,
+            release_monotonic=MonotonicTimestamp(run_id.value, release_ns),
+        )
+
+    first_recovery = released_authority(
+        divergence_id=first_divergence,
+        affected_instrument=second_instrument,
+        resolution_source=first_resolution_source,
+        release_source=first_release_source,
+        attempt_started_ns=42,
+        capture_ns=43,
+        release_ns=45,
+        capture_label="capture-1",
+    )
+    second_recovery = released_authority(
+        divergence_id=second_divergence,
+        affected_instrument=instrument,
+        resolution_source=second_resolution_source,
+        release_source=second_release_source,
+        attempt_started_ns=46,
+        capture_ns=47,
+        release_ns=50,
+        capture_label="capture-2",
+    )
+    runtime.bind_contribution_replacement_release(
+        divergence_id=first_divergence,
+        source=first_release_source,
+        ended_at=UtcTimestamp(1_400),
+        ended_monotonic_ns=45,
+        recovery_authority=first_recovery,
+    )
+    runtime.bind_contribution_replacement_release(
+        divergence_id=second_divergence,
+        source=second_release_source,
+        ended_at=UtcTimestamp(1_500),
+        ended_monotonic_ns=50,
+        recovery_authority=second_recovery,
+    )
     # UTC regresses while the run-scoped monotonic duration remains exact.
     runtime.mark_connected(now_ns=50, now_utc=UtcTimestamp(1_500))
     runtime.finish_generation(continuity_interrupted=False, now_ns=60)
 
     snapshot = runtime.snapshot(now_ns=60)
-    summary = await writer.close(completed=True)
+    summary = await writer.close(completed=True, terminal_active_causal_keys=())
 
     assert snapshot.unavailable_intervals == 1
     assert during_ordered_drain.socket_connected is False
     assert during_ordered_drain.current_unavailable_started_monotonic_ns == 20
     assert snapshot.unavailable_total_nanoseconds == 30
     assert snapshot.availability_records_emitted == 1
+    assert snapshot.availability_contributions_emitted == 2
     assert snapshot.availability_ledger_healthy is True
     assert summary.unavailable_duration_nanoseconds == 30
+    assert summary.contributions_written == 2
     record = json.loads(summary.path.read_text(encoding="utf-8"))
     assert record["started_at_utc_ns"] == 2_000
     assert record["started_monotonic_ns"] == 20
     assert record["cause_type"] == AvailabilityCause.AUDIT_MISMATCH_RESYNCHRONIZATION.value
     assert record["recovery_outcome"] == AvailabilityRecoveryOutcome.RESTORED.value
+    assert record["affected_instruments"] == sorted((instrument.value, second_instrument.value))
+    assert summary.contribution_path is not None
+    contribution_records = tuple(
+        json.loads(line)
+        for line in summary.contribution_path.read_text(encoding="utf-8").splitlines()
+    )
+    assert tuple(record["interval_id"] for record in contribution_records) == (
+        record["interval_id"],
+        record["interval_id"],
+    )
+    assert tuple(item["source_evidence_ids"] for item in contribution_records) == (
+        ["audit-request:1"],
+        ["audit-request:2"],
+    )
+    assert tuple(item["duration_ns"] for item in contribution_records) == (25, 20)
+    assert tuple(item["request_id"] for item in contribution_records) == (
+        "request-1",
+        "request-2",
+    )
+    assert tuple(item["joined_existing_interval"] for item in contribution_records) == (
+        False,
+        True,
+    )
+    replacement_recoveries = tuple(item["replacement_recovery"] for item in contribution_records)
+    assert tuple(item["recovery_id"] for item in replacement_recoveries) == (
+        first_recovery.recovery_id,
+        second_recovery.recovery_id,
+    )
+    assert tuple(item["status"] for item in replacement_recoveries) == ("RELEASED", "RELEASED")
+    assert tuple(item["last_result"] for item in replacement_recoveries) == (
+        "RELEASED",
+        "RELEASED",
+    )
+    assert tuple(item["last_failure"] for item in replacement_recoveries) == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_runtime_health_rebases_disconnect_union_to_earlier_drained_audit(
+    tmp_path: Path,
+) -> None:
+    def source(label: str) -> RawSourceRef:
+        return RawSourceRef(
+            ingest_id=IngestId(f"availability-rebase-{label}"),
+            payload_sha256=hashlib.sha256(label.encode()).hexdigest(),
+        )
+
+    run_id = CollectorRunId("availability-disconnect-audit-rebase")
+    writer = SupervisedAvailabilityIntervalWriter(
+        root=tmp_path,
+        collector_run_id=run_id,
+        queue_capacity=2,
+        maximum_intervals=4,
+        maximum_file_bytes=64 * 1024,
+    )
+    await writer.start()
+    runtime = ObservationRuntimeHealth(
+        collector_run_id=run_id,
+        availability_writer=writer,
+    )
+    connection_id = ConnectionId("availability-disconnect-audit-connection")
+    runtime.begin_generation(connection_id, _ingress(connection_id))
+    runtime.mark_connected(now_ns=50, now_utc=UtcTimestamp(500))
+    transport = AvailabilityInterruption(
+        cause=AvailabilityCause.EXTERNAL_CONNECTION_TRANSPORT,
+        reason_code="CONNECTION_CLOSED",
+        source_evidence_ids=("websocket-disconnect",),
+    )
+    runtime.mark_interrupted(
+        now_ns=200,
+        now_utc=UtcTimestamp(2_000),
+        interruption=transport,
+    )
+
+    # The audit response was received before the disconnect, but its ordered
+    # drain/classification discovers the mismatch after transport opened the
+    # union. Its receive boundary must become the exact interval opener.
+    instrument = InstrumentId("availability-delayed-audit-instrument")
+    audit = AvailabilityInterruption(
+        cause=AvailabilityCause.AUDIT_MISMATCH_RESYNCHRONIZATION,
+        reason_code="REST_AUDIT_MISMATCH",
+        source_evidence_ids=("audit-response:earlier",),
+        affected_instruments=(instrument,),
+        request_id="availability-delayed-audit-request",
+        divergence_id=hashlib.sha256(b"availability-delayed-audit-divergence").hexdigest(),
+        instrument_id=instrument,
+        market_id="availability-delayed-audit-market",
+        audit_start_source=source("start"),
+        audit_response_source=source("response"),
+        audit_classification_source=source("classification"),
+    )
+    runtime.mark_interrupted(
+        now_ns=100,
+        now_utc=UtcTimestamp(1_000),
+        interruption=audit,
+    )
+
+    during_drain = runtime.snapshot(now_ns=250)
+    terminal_active_causal_keys = tuple(
+        sorted(item.stable_causal_key for item in runtime.active_availability_contributors)
+    )
+    interval = runtime.finalize_open_interval(
+        cutoff_at=UtcTimestamp(3_000),
+        cutoff_monotonic_ns=300,
+    )
+    summary = await writer.close(
+        completed=True,
+        terminal_active_causal_keys=terminal_active_causal_keys,
+    )
+
+    assert interval is not None
+    assert during_drain.current_unavailable_started_monotonic_ns == 100
+    assert interval.started_monotonic.nanoseconds == 100
+    assert interval.started_at.nanoseconds_since_epoch == 1_000
+    assert interval.duration_nanoseconds == 200
+    assert interval.cause is AvailabilityCause.AUDIT_MISMATCH_RESYNCHRONIZATION
+    assert interval.reason_code == "REST_AUDIT_MISMATCH"
+    assert interval.source_evidence_ids == ("audit-response:earlier",)
+    assert summary.contribution_path is not None
+    contributions = tuple(
+        json.loads(line)
+        for line in summary.contribution_path.read_text(encoding="utf-8").splitlines()
+    )
+    assert tuple(item["source_evidence_ids"] for item in contributions) == (
+        ["audit-response:earlier"],
+        ["websocket-disconnect"],
+    )
+    assert tuple(item["started_monotonic_ns"] for item in contributions) == (100, 200)
+    assert tuple(item["started_at_utc_ns"] for item in contributions) == (1_000, 2_000)
+    assert tuple(item["duration_ns"] for item in contributions) == (200, 100)
+    assert tuple(item["initiating_contributor"] for item in contributions) == (True, False)
+
+
+@pytest.mark.asyncio
+async def test_runtime_health_repeated_observations_preserve_original_start_boundary(
+    tmp_path: Path,
+) -> None:
+    run_id = CollectorRunId("availability-repeated-rebase")
+    writer = SupervisedAvailabilityIntervalWriter(
+        root=tmp_path,
+        collector_run_id=run_id,
+        queue_capacity=2,
+        maximum_intervals=4,
+        maximum_file_bytes=64 * 1024,
+    )
+    await writer.start()
+    runtime = ObservationRuntimeHealth(
+        collector_run_id=run_id,
+        availability_writer=writer,
+    )
+    connection_id = ConnectionId("availability-repeated-rebase-connection")
+    runtime.begin_generation(connection_id, _ingress(connection_id))
+    runtime.mark_connected(now_ns=10, now_utc=UtcTimestamp(100))
+    first = AvailabilityInterruption(
+        cause=AvailabilityCause.EXTERNAL_CONNECTION_TRANSPORT,
+        reason_code="FIRST",
+        source_evidence_ids=("first",),
+    )
+    refined = AvailabilityInterruption(
+        cause=AvailabilityCause.AUDIT_FRESHNESS_EXPIRY,
+        reason_code="REFINED",
+        source_evidence_ids=("refined",),
+    )
+    simultaneous = AvailabilityInterruption(
+        cause=AvailabilityCause.PROTOCOL_SCHEMA_INVARIANT,
+        reason_code="SIMULTANEOUS_EARLIER_WALL",
+        source_evidence_ids=("simultaneous",),
+    )
+    runtime.mark_interrupted(now_ns=100, now_utc=UtcTimestamp(1_000), interruption=first)
+    runtime.mark_interrupted(now_ns=80, now_utc=UtcTimestamp(8_000), interruption=refined)
+    runtime.mark_interrupted(now_ns=90, now_utc=UtcTimestamp(6_000), interruption=refined)
+    runtime.mark_interrupted(now_ns=120, now_utc=UtcTimestamp(9_000), interruption=refined)
+    runtime.mark_interrupted(
+        now_ns=40,
+        now_utc=UtcTimestamp(4_000),
+        interruption=simultaneous,
+    )
+    terminal_active_causal_keys = tuple(
+        sorted(item.stable_causal_key for item in runtime.active_availability_contributors)
+    )
+    interval = runtime.finalize_open_interval(
+        # Wall time is permitted to regress; monotonic time remains authoritative.
+        cutoff_at=UtcTimestamp(3_000),
+        cutoff_monotonic_ns=150,
+    )
+    summary = await writer.close(
+        completed=True,
+        terminal_active_causal_keys=terminal_active_causal_keys,
+    )
+
+    assert interval is not None
+    assert interval.started_monotonic.nanoseconds == 40
+    assert interval.started_at.nanoseconds_since_epoch == 4_000
+    assert interval.cause is AvailabilityCause.PROTOCOL_SCHEMA_INVARIANT
+    assert interval.source_evidence_ids == ("simultaneous",)
+    assert interval.duration_nanoseconds == 110
+    assert summary.contribution_path is not None
+    contributions = tuple(
+        json.loads(line)
+        for line in summary.contribution_path.read_text(encoding="utf-8").splitlines()
+    )
+    assert tuple(item["source_evidence_ids"] for item in contributions) == (
+        ["simultaneous"],
+        ["refined"],
+        ["first"],
+    )
+    assert tuple(item["started_monotonic_ns"] for item in contributions) == (40, 80, 100)
+    assert tuple(item["started_at_utc_ns"] for item in contributions) == (4_000, 8_000, 1_000)
+    assert tuple(item["duration_ns"] for item in contributions) == (110, 70, 50)
+
+
+def test_runtime_health_rejects_rebase_across_completed_interval() -> None:
+    runtime = ObservationRuntimeHealth()
+    connection_id = ConnectionId("availability-non-overlap")
+    runtime.begin_generation(connection_id, _ingress(connection_id))
+    runtime.mark_connected(now_ns=0, now_utc=UtcTimestamp(0))
+    runtime.mark_interrupted(
+        now_ns=10,
+        now_utc=UtcTimestamp(100),
+        interruption=AvailabilityInterruption(
+            cause=AvailabilityCause.EXTERNAL_CONNECTION_TRANSPORT,
+            reason_code="FIRST_INTERVAL",
+        ),
+    )
+    runtime.mark_connected(now_ns=20, now_utc=UtcTimestamp(200))
+    runtime.mark_interrupted(
+        now_ns=30,
+        now_utc=UtcTimestamp(300),
+        interruption=AvailabilityInterruption(
+            cause=AvailabilityCause.AUDIT_FRESHNESS_EXPIRY,
+            reason_code="SECOND_INTERVAL",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="overlap a completed interval"):
+        runtime.mark_interrupted(
+            now_ns=19,
+            now_utc=UtcTimestamp(190),
+            interruption=AvailabilityInterruption(
+                cause=AvailabilityCause.PROTOCOL_SCHEMA_INVARIANT,
+                reason_code="INVALID_CROSS_INTERVAL_REBASE",
+            ),
+        )
+
+    snapshot = runtime.snapshot(now_ns=35)
+    assert snapshot.unavailable_intervals == 2
+    assert snapshot.unavailable_total_nanoseconds == 10
+    assert snapshot.current_unavailable_started_monotonic_ns == 30
+    assert snapshot.availability_ledger_healthy is False
+
+
+def test_runtime_health_enforces_bounded_contributors_after_duplicate_rebase() -> None:
+    runtime = ObservationRuntimeHealth()
+    connection_id = ConnectionId("availability-contributor-bound")
+    runtime.begin_generation(connection_id, _ingress(connection_id))
+    runtime.mark_connected(now_ns=0, now_utc=UtcTimestamp(0))
+    interruptions = tuple(
+        AvailabilityInterruption(
+            cause=AvailabilityCause.UNKNOWN,
+            reason_code=f"BOUNDED_CONTRIBUTOR_{index}",
+            source_evidence_ids=(f"bounded:{index}",),
+        )
+        for index in range(MAXIMUM_OPEN_AVAILABILITY_CONTRIBUTIONS)
+    )
+    for index, interruption in enumerate(interruptions):
+        runtime.mark_interrupted(
+            now_ns=100 + index,
+            now_utc=UtcTimestamp(1_000 + index),
+            interruption=interruption,
+        )
+
+    # Refining an existing semantic contributor does not consume another slot.
+    runtime.mark_interrupted(
+        now_ns=164,
+        now_utc=UtcTimestamp(5_000),
+        interruption=interruptions[-1],
+    )
+    with pytest.raises(RuntimeError, match="hard bound reached"):
+        runtime.mark_interrupted(
+            now_ns=165,
+            now_utc=UtcTimestamp(4_900),
+            interruption=AvailabilityInterruption(
+                cause=AvailabilityCause.UNKNOWN,
+                reason_code="CONTRIBUTOR_OVERFLOW",
+                source_evidence_ids=("bounded:overflow",),
+            ),
+        )
+
+    snapshot = runtime.snapshot(now_ns=200)
+    assert snapshot.current_unavailable_started_monotonic_ns == 100
+    assert snapshot.availability_ledger_healthy is False
 
 
 @pytest.mark.asyncio
@@ -1644,12 +4118,18 @@ async def test_runtime_health_bounds_open_interval_at_terminal_cutoff(
         ),
     )
 
+    terminal_active_causal_keys = tuple(
+        sorted(item.stable_causal_key for item in runtime.active_availability_contributors)
+    )
     interval = runtime.finalize_open_interval(
         cutoff_at=UtcTimestamp(3_000),
         cutoff_monotonic_ns=70,
     )
     snapshot = runtime.snapshot(now_ns=70)
-    summary = await writer.close(completed=True)
+    summary = await writer.close(
+        completed=True,
+        terminal_active_causal_keys=terminal_active_causal_keys,
+    )
 
     assert interval is not None
     assert interval.open_at_shutdown is True
@@ -1675,7 +4155,13 @@ async def test_resource_sampler_reports_current_rss_linear_slope_and_discontinui
             cpu_system_seconds=0.0,
             current_rss_bytes=100 + index * 10,
             peak_rss_bytes=1_000,
-            current_rss_source="test",
+            current_rss_source=LINUX_CURRENT_RSS_SOURCE,
+            peak_rss_source=COMPOSITE_PEAK_RSS_SOURCE,
+            python_ru_maxrss_bytes=1_000,
+            python_ru_maxrss_source=LINUX_PYTHON_RU_MAXRSS_SOURCE,
+            python_tracemalloc_current_bytes=1_000 + index * 20,
+            python_tracemalloc_peak_bytes=2_000,
+            python_tracemalloc_source="test",
         )
 
     failures: list[BaseException] = []
@@ -1687,7 +4173,10 @@ async def test_resource_sampler_reports_current_rss_linear_slope_and_discontinui
     )
     await sampler.start()
     async with asyncio.timeout(1.0):
-        await sampler.wait_for_sample_count(3)
+        pre_saturation = await sampler.wait_for_sample_count(2)
+        assert pre_saturation.latest is not None
+        sampler.mark_history_saturated(pre_saturation.latest.sampled_monotonic_ns)
+        await sampler.wait_for_sample_count(4)
     await sampler.close()
 
     trend = sampler.snapshot.trend
@@ -1699,6 +4188,14 @@ async def test_resource_sampler_reports_current_rss_linear_slope_and_discontinui
     assert trend.maximum_current_rss_bytes == trend.end_rss_bytes
     assert trend.largest_absolute_step_bytes == 10
     assert trend.linear_slope_bytes_per_second == pytest.approx(10.0)
+    assert trend.python_tracemalloc_known_sample_count >= 4
+    assert trend.python_tracemalloc_linear_slope_bytes_per_second == pytest.approx(20.0)
+    assert trend.history_saturation_started_monotonic_ns == (
+        pre_saturation.latest.sampled_monotonic_ns
+    )
+    assert trend.post_saturation_sample_count >= 2
+    assert trend.post_saturation_rss_linear_slope_bytes_per_second == pytest.approx(10.0)
+    assert trend.post_saturation_python_linear_slope_bytes_per_second == pytest.approx(20.0)
     assert len(trend.major_discontinuities) >= 2
     assert trend.major_discontinuities[0].delta_bytes == 10
     assert trend.major_discontinuities[0].previous_rss_bytes == 110

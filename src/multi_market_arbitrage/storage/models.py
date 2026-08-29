@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Self, cast
 
 from multi_market_arbitrage.core.ids import CollectorRunId, VenueId, is_sha256_hex
+from multi_market_arbitrage.core.limits import MAX_ANALYTICAL_FRAGMENTS_PER_DATASET
 from multi_market_arbitrage.core.serialization import canonical_sha256
 
 _SAFE_DATASET_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -77,6 +78,7 @@ class AnalyticalDatasetConfig:
     maximum_record_bytes: int = 8 * 1024 * 1024
     maximum_buffered_bytes: int = 64 * 1024 * 1024
     zstd_level: int = 9
+    maximum_fragments: int = MAX_ANALYTICAL_FRAGMENTS_PER_DATASET
 
     def __post_init__(self) -> None:
         if not self.dataset or _SAFE_DATASET_NAME.fullmatch(self.dataset) is None:
@@ -94,6 +96,11 @@ class AnalyticalDatasetConfig:
         if self.maximum_record_bytes > self.maximum_buffered_bytes:
             raise AnalyticalSchemaError(
                 "analytical record byte limit cannot exceed the buffer byte limit"
+            )
+        if not 1 <= self.maximum_fragments <= MAX_ANALYTICAL_FRAGMENTS_PER_DATASET:
+            raise AnalyticalSchemaError(
+                "analytical maximum fragments must be between 1 and "
+                f"{MAX_ANALYTICAL_FRAGMENTS_PER_DATASET}"
             )
         if not 1 <= self.zstd_level <= 22:
             raise AnalyticalSchemaError("Parquet zstd compression level must be between 1 and 22")

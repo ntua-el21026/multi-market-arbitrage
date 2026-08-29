@@ -76,6 +76,60 @@ Subscription options that change interpretation are recorded.
 ### I-24 Single-owner mutable state
 Mutable state domains have explicit owners; cross-module communication uses bounded message passing/immutable snapshots.
 
+### I-25 Orthogonal audit evidence
+Exact divergence observation, independent received-prefix reconstruction
+integrity, external causal attribution, and recovery state are separate evidence
+dimensions. An unattributable external cause never substitutes for required
+internal correctness or recovery proof.
+
+### I-26 Diagnostic retention is not semantic authority
+Changing the capacity of a bounded recent diagnostic sample cannot change new-
+schema replay semantic identity. Full raw/control evidence, analytical output,
+cumulative counts, ordered chains, and current pending/recovery state remain
+authoritative.
+
+### I-27 Direct availability attribution
+Every new exact audit divergence has exactly one direct contribution bound to
+exactly one non-overlapping availability interval. Global unavailable duration
+is the interval union, never the sum of contributions, and per-instrument
+research-ineligible coverage remains independently derivable.
+
+### I-28 Fault history is not current state
+Immutable public-read/audit fault observations and cumulative counters are not
+erased and do not alone proxy current gating. Exact lifecycle state governs
+current eligibility; unresolved, internal, permanent, or inconsistent faults
+remain Gate-sticky.
+
+### I-29 Non-blocking ordered journal rotation
+Ordinary compression, manifest publication, verification, or verified-source
+cleanup of an earlier durable segment does not block later raw records from
+reaching `DURABLE`. Pending seal work is single-owned, sequence-ordered, and
+bounded by count, bytes, age, and concurrency. Exhaustion fails raw persistence
+closed, and clean completion requires an exact verified drain and inventory
+reconciliation.
+
+The self-hashed handoff intent is write-ahead recovery evidence, not a state
+transition. Only active-to-pending rename plus directory `fsync` transfers
+ownership; pending without its exact intent is invalid and must not be inferred.
+
+### I-30 Raw source authority precedes unsealed bytes
+Every new run/stream publishes and file/directory-`fsync`s one immutable,
+self-hashed source-authority sidecar before creating or appending its active
+source. It binds exact provenance plus all identity/bounded-recovery writer
+policy and reconciles with every source, descriptor, manifest, and completion.
+An unsealed legacy source without authority is reader-only/unbound evidence and
+must never be resumed or relabeled by a writer. New completion heads bind the
+retained authority digest; missing, changed, temporary, or policy-conflicting
+authority fails closed.
+
+### I-31 Authoritative journal publication is joined
+Detachable seal work may only read authority and write private scratch.
+Authoritative rename, manifest publication, and cleanup belong to the joined
+ordered owner with an age/authority check before and after every finite
+transaction and before the next transition. A transaction that crosses expiry
+may finish only its exact recoverable crash window; no subsequent transition or
+false completion is permitted.
+
 ## B. Research invariants
 
 ### R-01 Layered economics
@@ -255,3 +309,13 @@ Every task has supervision, health, startup, and shutdown semantics.
 
 ### E-06 Performance cannot weaken correctness
 No validator/provenance/risk control is disabled to hit a latency target.
+
+### E-07 Operational diagnostics are bounded
+Periodic health projection is immutable, bounded by current state and finite
+matrices, and does not perform history-sized or terminal-hash work on the active
+acquisition/classification path.
+
+### E-08 Recovery reasons remain typed
+A known recovery/resynchronization initiating route retains one finite end-to-
+end reason. It is never collapsed into a generic schema/protocol or unknown
+label.

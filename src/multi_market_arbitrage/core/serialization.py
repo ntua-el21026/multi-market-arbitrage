@@ -94,11 +94,35 @@ def canonical_sha256(value: object, *, allow_floats: bool = False) -> str:
     return hashlib.sha256(canonical_json_bytes(value, allow_floats=allow_floats)).hexdigest()
 
 
+def canonical_sequence_sha256(values: Sequence[object], *, allow_floats: bool = False) -> str:
+    """Hash one canonical JSON array without materializing the whole array.
+
+    The digest is byte-identical to ``canonical_sha256(values)``. Keeping only
+    one canonicalized item live at a time bounds transient memory when the
+    source sequence is already retained by its single owner.
+    """
+
+    if isinstance(values, (str, bytes, bytearray)):
+        raise CanonicalSerializationError(
+            "canonical sequence hashing rejects scalar-like sequence values"
+        )
+
+    digest = hashlib.sha256()
+    digest.update(b"[")
+    for index, value in enumerate(values):
+        if index:
+            digest.update(b",")
+        digest.update(canonical_json_bytes(value, allow_floats=allow_floats))
+    digest.update(b"]")
+    return digest.hexdigest()
+
+
 __all__ = [
     "CanonicalSerializationError",
     "CanonicalValue",
     "canonical_json_bytes",
     "canonical_json_string",
+    "canonical_sequence_sha256",
     "canonical_sha256",
     "canonicalize",
 ]

@@ -7,6 +7,7 @@ import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Protocol
 
 from multi_market_arbitrage.core.config import (
     Phase1Config,
@@ -14,18 +15,27 @@ from multi_market_arbitrage.core.config import (
     ReplayClock,
 )
 from multi_market_arbitrage.core.ids import CollectorRunId
-from multi_market_arbitrage.ingestion import RawEventEnvelope
-from multi_market_arbitrage.journal import JournalReader
+from multi_market_arbitrage.ingestion import RawEnvelopeValidationError, RawEventEnvelope
+from multi_market_arbitrage.journal import JournalPendingPolicy, JournalReader
 from multi_market_arbitrage.journal.models import (
     ABSOLUTE_MAX_UNCOMPRESSED_SEGMENT_BYTES,
     JournalCorruptionError,
 )
 from multi_market_arbitrage.journal.reader import (
+    completion_path_for_run,
     load_run_completion_head,
     load_segment_manifest,
+    manifest_path_for_segment,
+    pending_descriptor_scopes,
+    run_key_for,
+    source_authority_scopes,
 )
 from multi_market_arbitrage.journal.recovery import fsync_directory
-from multi_market_arbitrage.pipeline.processor import CanonicalProcessor, ProcessorSummary
+from multi_market_arbitrage.pipeline.processor import (
+    CanonicalProcessor,
+    ProcessedEnvelope,
+    ProcessorSummary,
+)
 from multi_market_arbitrage.research.outputs import (
     Phase1AnalyticalOutputs,
     ResearchOutputSummary,
@@ -69,6 +79,21 @@ class ReplayTerminalHashMismatch(RuntimeError):
         self.actual = actual
 
 
+class ReplayEnvelopeObserver(Protocol):
+    """Public streaming observer for deterministic replay results.
+
+    Replay invokes the observer exactly once, in ingest order, immediately
+    after each envelope is processed. The engine retains no observer output;
+    consumers must enforce their own explicit state bound.
+    """
+
+    def observe_replayed_envelope(
+        self,
+        envelope: RawEventEnvelope,
+        processed: ProcessedEnvelope,
+    ) -> None: ...
+
+
 def _new_rebuild_root(journal_root: Path, output_root: Path) -> Path:
     """Require a fresh, disjoint destination below an existing real parent."""
 
@@ -109,6 +134,7 @@ def _run_replay(
     source_journal_git_commit: str | None,
     first_envelope: RawEventEnvelope | None = None,
     analytical_outputs: Phase1AnalyticalOutputs | None = None,
+    envelope_observer: ReplayEnvelopeObserver | None = None,
 ) -> ReplayResult:
     processor = CanonicalProcessor(
         config,
@@ -121,7 +147,9 @@ def _run_replay(
 
     def process(envelope: RawEventEnvelope) -> None:
         nonlocal first_ingest_seq, last_ingest_seq, raw_record_count
-        processor.process_replayed(envelope)
+        processed = processor.process_replayed(envelope)
+        if envelope_observer is not None:
+            envelope_observer.observe_replayed_envelope(envelope, processed)
         if first_ingest_seq is None:
             first_ingest_seq = envelope.ingest_seq
         last_ingest_seq = envelope.ingest_seq
@@ -148,15 +176,41 @@ def replay_run_ids(
 ) -> tuple[CollectorRunId, ...]:
     """Discover completed runs, plus interrupted prefixes only when requested."""
 
+    authority_temps = tuple(sorted(journal_root.glob(".run-*.source-authority.json.*.tmp")))
+    if authority_temps:
+        raise JournalCorruptionError(
+            "journal source-authority publication is incomplete: "
+            + ", ".join(path.name for path in authority_temps)
+        )
     values: dict[str, CollectorRunId] = {}
     for path in sorted(journal_root.glob("run-*.completed.json")):
         head = load_run_completion_head(path)
+        if path != completion_path_for_run(journal_root, head.collector_run_id, head.stream):
+            raise JournalCorruptionError(
+                f"completion replay discovery filename conflicts with content: {path}"
+            )
         values[head.collector_run_id.value] = head.collector_run_id
     if not include_partial:
         return tuple(values[key] for key in sorted(values))
     for path in sorted(journal_root.glob("*.jsonl.zst.manifest.json")):
         manifest = load_segment_manifest(path)
+        expected_segment = journal_root / (
+            f"run-{run_key_for(manifest.collector_run_id)}.{manifest.stream}."
+            f"{manifest.first_ingest_seq:020d}-{manifest.last_ingest_seq:020d}.jsonl.zst"
+        )
+        if path != manifest_path_for_segment(expected_segment):
+            raise JournalCorruptionError(
+                f"manifest replay discovery filename conflicts with content: {path}"
+            )
+        if expected_segment.is_symlink() or not expected_segment.is_file():
+            raise JournalCorruptionError(
+                f"manifest replay discovery lacks its regular sealed segment: {path}"
+            )
         values[manifest.collector_run_id.value] = manifest.collector_run_id
+    for collector_run_id, _stream in pending_descriptor_scopes(journal_root):
+        values[collector_run_id.value] = collector_run_id
+    for collector_run_id, _stream in source_authority_scopes(journal_root):
+        values[collector_run_id.value] = collector_run_id
     for path in sorted(journal_root.glob("*.jsonl.partial")):
         if path.is_symlink() or not path.is_file():
             raise JournalCorruptionError(
@@ -168,7 +222,23 @@ def replay_run_ids(
             raise JournalCorruptionError(
                 f"partial replay discovery record exceeds byte limit: {path}"
             )
-        envelope = RawEventEnvelope.from_json_line(first_line)
+        if not first_line:
+            # An empty successor is a valid crash-before-first-append window,
+            # but it carries no collector-run identity of its own. Any bound
+            # predecessor/descriptor scope was already discovered above.
+            continue
+        try:
+            envelope = RawEventEnvelope.from_json_line(first_line)
+        except RawEnvelopeValidationError as exc:
+            raise JournalCorruptionError(
+                f"partial replay discovery record is invalid: {path}"
+            ) from exc
+        expected_prefix = f"run-{run_key_for(envelope.collector_run_id)}."
+        expected_suffix = f".{envelope.ingest_seq:020d}.jsonl.partial"
+        if not path.name.startswith(expected_prefix) or not path.name.endswith(expected_suffix):
+            raise JournalCorruptionError(
+                f"partial replay discovery filename conflicts with content: {path}"
+            )
         values[envelope.collector_run_id.value] = envelope.collector_run_id
     return tuple(values[key] for key in sorted(values))
 
@@ -179,19 +249,45 @@ def replay_journal(
     config: Phase1Config,
     *,
     include_partial: bool = False,
+    envelope_observer: ReplayEnvelopeObserver | None = None,
 ) -> ReplayResult:
-    """Replay in run-scoped ingest order with no wall-clock reads or sleeps."""
+    """Replay in run-scoped ingest order with optional bounded stream observation."""
 
     _validate_replay_config(config)
-    reader = JournalReader(journal_root, collector_run_id)
+    pending_policy = JournalPendingPolicy(
+        maximum_pending_segments=config.storage.journal_seal_queue_capacity,
+        maximum_pending_uncompressed_bytes=(
+            config.storage.journal_pending_seal_max_uncompressed_bytes
+        ),
+        maximum_pending_age_nanoseconds=int(
+            config.storage.journal_pending_seal_max_age_seconds * 1_000_000_000
+        ),
+        maximum_segment_uncompressed_bytes=(config.storage.journal_segment_max_uncompressed_bytes),
+        maximum_run_uncompressed_bytes=config.storage.journal_run_max_uncompressed_bytes,
+    )
+    reader = JournalReader(
+        journal_root,
+        collector_run_id,
+        expected_pending_policy=pending_policy,
+    )
     heads = reader.completion_heads()
-    source_journal_git_commit = heads[0].git_commit if len(heads) == 1 else None
+    # A clean completion head is the primary source authority.  An explicitly
+    # interrupted, sealed-only prefix may use unanimous per-segment provenance
+    # without being promoted to a completed run.  Active partials or ambiguous
+    # provenance remain unbound and therefore select strict current semantics.
+    sealed_prefix_commit = (
+        reader.uncompleted_sealed_prefix_git_commit() if include_partial and not heads else None
+    )
+    source_journal_git_commit = (
+        heads[0].git_commit if len(heads) == 1 else sealed_prefix_commit or "UNBOUND_REPLAY_SOURCE"
+    )
     return _run_replay(
         journal_root=journal_root,
         collector_run_id=collector_run_id,
         config=config,
         envelopes=reader.iter_verified(include_partial=include_partial),
         source_journal_git_commit=source_journal_git_commit,
+        envelope_observer=envelope_observer,
     )
 
 
@@ -312,6 +408,7 @@ def rebuild_analytical_from_journal(
 
 __all__ = [
     "AnalyticalRebuildResult",
+    "ReplayEnvelopeObserver",
     "ReplayResult",
     "ReplayTerminalHashMismatch",
     "rebuild_analytical_from_journal",

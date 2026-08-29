@@ -159,7 +159,15 @@ It does **not** implement live order placement.
 ## 7. Persistence architecture
 
 ### Raw
-Append-only segmented application-payload journal.
+Append-only segmented application-payload journal. One append/data-`fsync`
+owner establishes ordered `DURABLE` receipts independently of one bounded
+ordered seal/manifest/verify owner. Rotation hands an immutable durable pending
+segment between those owners. A self-hashed write-ahead intent is published
+before rename but does not transfer ownership; active-to-pending rename plus
+directory `fsync` commits transfer, and runtime seal admission follows it.
+Ordinary compression and full verification cannot block later raw durability.
+Clean completion is published only after the ordered pending inventory drains,
+verifies, and reconciles exactly.
 
 ### Canonical/derived
 Parquet + Zstandard.
@@ -170,7 +178,12 @@ DuckDB.
 ### Future live control
 `OperationalStateStore` abstraction, initially SQLite WAL only when Gate 5 execution engineering begins.
 
-SQLite is not required in Phase 1.
+Phase 1 has no authoritative or intentionally persistent SQLite state. ADR-0057
+permits only a command-owned, bounded, non-WAL temporary SQLite index for exact
+cross-segment ingest-ID uniqueness during raw verification. That derived
+scratch is deleted when the iterator closes and does not instantiate
+`OperationalStateStore`; abrupt process death cannot make abandoned scratch
+authoritative or reusable.
 
 ## 8. Exact arithmetic
 
@@ -220,6 +233,11 @@ Health is scoped:
 - future risk/reconciliation health.
 
 Do not reuse one ambiguous global health enum.
+
+Periodic health consumes an immutable bounded `ProcessorOperationalSnapshot`
+whose construction is independent of recent diagnostic-history occupancy. Full
+processor summaries and terminal hashes are finalization/replay/offline
+authorities and are not periodic health-path work.
 
 ## 12. Research economics
 
@@ -285,6 +303,11 @@ Initial live implementation should require the referenced raw-journal durable wa
 
 Prefer single-owner mutable state and bounded queues.
 
+The raw journal has two non-overlapping single-owner domains: active append/
+durability and immutable pending seal/verify. Each uses a dedicated single-
+worker execution boundary, and pending seal count, bytes, age, concurrency, and
+unverified inventory are explicit fail-closed bounds.
+
 Scanners consume immutable snapshots.
 
 No unbounded queues or untracked fire-and-forget tasks.
@@ -294,6 +317,10 @@ No unbounded queues or untracked fire-and-forget tasks.
 Expected invalid external state produces typed validation outcomes.
 
 Transient infrastructure faults use bounded retries when safe.
+
+Audit evidence separates exact observation, independently verified received-
+prefix integrity, external causal attribution, and recovery state. Public-read
+fault history is separate from current pending/resolved state.
 
 Programming invariant failures fail affected scope closed; they are not swallowed.
 

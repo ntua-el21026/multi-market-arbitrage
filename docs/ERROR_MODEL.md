@@ -156,9 +156,33 @@ Invalid price/spread relationships remain schema/normalization failures.
 ## 9. REST audit outcomes
 
 `MATCH`, `MISMATCH`, `RACED` and `FAILED` remain governed by ADR-0052, with
-race-free divergence lifecycle and Gate treatment governed by ADR-0054.
+race-free divergence lifecycle governed by ADR-0054 and evidence dimensions,
+fault lifecycle, and refined Gate treatment governed by ADR-0055. ADR-0056
+governs availability-contributor ownership and bounded replacement recovery.
+ADR-0057 governs non-blocking ordered raw-journal rotation, pending-seal
+backpressure, and seal/recovery failure.
 
-Before classification, the response-boundary admission watermark must be durably/canonically processed. Relevant mutation across the window yields `RACED`; exact race-free divergence yields `MISMATCH`; insufficient evidence yields `FAILED`.
+Before PREPARE freezes the decision, the response-boundary admission watermark
+must be durably and canonically processed. Relevant mutation across the window
+yields `RACED`; exact race-free divergence yields `MISMATCH`; insufficient
+evidence yields `FAILED`.
+
+The response body and watermark must complete strictly inside their response
+deadline. New bound starts then require an inert durable PREPARE whose actual
+`fsync` completion and canonical-processing return are both strictly before
+hard expiry, followed by a source-bound classification-v2 attestation. The
+attestation must bind the PREPARE ID/SHA-256 and actual times and must find the
+prepared response, fence, book identity, health, transition, eligibility,
+fault, lifecycle and timing state unchanged. PREPARE `fsync`/processor-return
+equality or lateness, or any attestation reconciliation failure, is permanent
+internal
+`FAILED/BOOK_FRESHNESS_EXPIRED`; it produces no scan or restoration, cannot
+produce historical `MATCH`, `MISMATCH`, or `RACED`, and cannot promote
+freshness. The final attestation may become durable or be processed later only
+because it commits the already completed pre-expiry preparation; it cannot use
+later state, recompute another result, create a new decision, or promote current
+eligibility. Stage latency is retained to diagnose local scheduling work without
+changing this rule.
 
 An unresolved `ReportedTopTransition` makes the book non-comparable and cannot produce `MATCH`.
 
@@ -182,8 +206,13 @@ payload and are interpreted as `UNKNOWN_LEGACY`; timing is never used to guess
 a modern trigger. Start totals and trigger/outcome matrices must reconcile with
 the audit totals.
 
-Audit start/response/failure/classification evidence, trigger, and transition
-state are deterministic replay inputs.
+Audit start/response/failure, inert preparation, final attestation, trigger and
+transition state are deterministic replay inputs. Pending preparation source,
+captured state and the prepare/attest protocol selector are terminal authority.
+Completed attestations extend a dedicated ordered terminal chain. Omission of
+the selector is historical compatibility only when a verified completion head
+belongs to the finite retained pre-ADR-0055 producer set; a newer, absent or
+ambiguous source head fails closed.
 
 ### 9.1 Race-free divergence lifecycle
 
@@ -226,10 +255,22 @@ healthy. It first drains the admitted WebSocket prefix and requires no deferred
 or queued item and an active acquisition generation. Incrementals, reported BBO,
 partial coverage, the first binary leg, and socket readiness are insufficient.
 
+The replacement recovery has one stable identity across permitted connection
+generations and updates the same causal availability contributor. Its configured
+phase contract enforces finite attempt, retry-delay and hard-recovery limits,
+all bounded by the run deadline, while retaining first/latest attempt times,
+recovery and enclosing run deadlines, required/captured instruments, last typed
+failure and a deterministic evidence chain. Exact values are Phase-1
+configuration/specification decisions rather than error-model constants. Attempt
+or deadline exhaustion is a typed unresolved outcome: evidence and the
+contributor/interval remain open, scanner/research eligibility remains blocked,
+and recovery transitions to fail-closed degraded or terminal behavior instead
+of remaining indefinitely pending or creating a duplicate contributor.
+
 For a newly produced v2 audit, complete replacement coverage remains pending and
 audit-ineligible and every replacement snapshot emits zero scans. Only after the
 post-processing freshness/health checks pass may the coordinator durably journal
-`mma.control.rest-audit-replacement-release.v1`. Its bounded self-contained
+`mma.control.rest-audit-replacement-release.v2`. Its bounded self-contained
 payload commits the exact complete capture preimage and SHA-256; that preimage
 includes the divergence, market, original/replacement connections, required
 instruments, and every full-snapshot raw source with admission/ingest and
@@ -239,7 +280,10 @@ raw source. The canonical owner revalidates that evidence against current state
 before it clears capture/ineligibility and permits the recovery scan. Any
 pending divergence, reported-top transition, transition-resync blocker,
 non-capture audit-ineligible owner, stale/future latest L2 receive time,
-`UNKNOWN` cause or `LOCAL_BOOK_DEFECT` prevents projection and acceptance.
+unsupported generic `UNKNOWN` cause or `LOCAL_BOOK_DEFECT` prevents projection
+and acceptance. `EXTERNAL_CAUSE_UNATTRIBUTED` is permitted only when the ADR-0055
+independent oracle proves the exact received prefix and every recovery,
+contribution, interval, replay, and rebuild condition reconciles.
 
 An already admitted frame can never be overtaken by a release control. A frame
 received after the sampled decision is later evidence; likewise, a socket end
@@ -248,11 +292,13 @@ retroactively moving the accepted release. Multiple same-market captures release
 in deterministic order, with no scan until the final control clears the group.
 
 New audit starts for the affected asset are suppressed before their START
-control, scanner/research remains blocked, and the typed interval remains open
-until the release control has been durably processed and all required
-books/scopes and explicit audit eligibility recover. The interval ends at
-exactly that release decision wall/monotonic time, never at the earlier final
-snapshot receive or processing time.
+control, scanner/research remains blocked, and the mismatch contributor remains
+active until the release control has been durably processed and all required
+books/scopes and explicit audit eligibility recover. That contributor ends at
+exactly the release decision wall/monotonic time, never at the earlier final
+snapshot receive or processing time. The global interval ends at the same
+boundary only if this removal empties the complete active-contributor set;
+otherwise it remains open for the other active causes.
 
 A resnapshot failure leaves `AUDIT_DIVERGENCE_PENDING`. Shutdown after REST
 resolution but before full replacement coverage instead leaves
@@ -266,10 +312,12 @@ controls fail before state mutation and also retain protocol/invariant failure
 evidence.
 
 Immutable v1 audit-start journals predate the release channel. Replay preserves
-their deterministic snapshot-only auto-release and legacy terminal hash without
-inventing a control. This is a replay-compatibility exception only: new
-producers cannot emit v1 state or use auto-release, and v2 replay never
-synthesizes an omitted control.
+their deterministic snapshot-only auto-release semantics without inventing a
+control. Their raw/control bytes and previously recorded terminal hashes remain
+immutable historical evidence; replay under terminal-v3 deterministically
+records a distinct new terminal hash. This is a replay-compatibility exception
+only: new producers cannot emit v1 state or use auto-release, and v2 replay
+never synthesizes an omitted control.
 
 ### 9.2 Historical, current, and Gate-sticky state
 
@@ -289,14 +337,188 @@ Observed and authoritatively resolved external divergence remains visible but
 is not, by itself, a permanent Gate blocker. Pending divergence and pending
 replacement capture are distinct current fail-closed blockers. An incomplete
 replacement capture at terminal cutoff maps to terminal unresolved divergence.
-Terminal unresolved divergence, a new-contract unknown, local-book defect, or
-any lifecycle/trigger/writer/availability/replay/hash reconciliation failure is
-Gate-sticky.
+ADR-0056 attempt/deadline exhaustion transitions replacement authority from
+retry-pending to typed exhausted-unresolved before shutdown while the causal
+contributor and interval remain open; it cannot continue retrying or remain
+indefinitely pending. Terminal cutoff adds exact open-at-shutdown evidence
+without restoring eligibility.
+Terminal unresolved divergence, an unsupported generic/new-contract unknown,
+internal reconstruction indeterminacy/defect, local-book defect, or any
+lifecycle/trigger/writer/availability/replay/hash reconciliation failure is
+Gate-sticky. `EXTERNAL_CAUSE_UNATTRIBUTED` is a nonsticky external-attribution
+result only after every ADR-0055/ADR-0056 proof and recovery condition completes.
 
 `AUDIT_DIVERGENCE_RESOLVED_SAME_GENERATION` is reserved evidence vocabulary;
 ADR-0054 does not permit it as a live Phase-1 closure path.
 
-## 10. Error identity
+### 9.3 Orthogonal mismatch evidence
+
+Every new exact mismatch records separately:
+
+- an immutable typed observation fact;
+- independent received-prefix reconstruction integrity;
+- external causal attribution; and
+- current/terminal recovery state.
+
+The independent bounded oracle replays exact quantity-bearing frames from the
+full WebSocket baseline through the response watermark without using the
+production book mutation implementation. Exact agreement proves received-prefix
+reconstruction only. It does not prove transport continuity or an external
+cause. `INTERNAL_RECONSTRUCTION_DEFECT` and
+`INTERNAL_RECONSTRUCTION_INDETERMINATE` fail closed and are Gate-sticky.
+`EXTERNAL_CAUSE_UNATTRIBUTED` preserves an unprovable external field without
+turning known observation or proven internal state into generic unknown.
+
+### 9.4 Public-read and audit fault lifecycle
+
+HTTP failure, audit failure, and retry exhaustion are immutable historical
+facts. Current-schema faults also open or update explicit current fault state
+for the dependent integrity/book/research scope. A later exact audit,
+authoritative resnapshot, or complete replacement release closes current state
+only when its versioned lifecycle binds the original fault, affected scope,
+recovery source, and close chronology.
+
+A recovered fault may remove current gating only when failure-v2 evidence proves
+external origin, `retryable=true`, and either `TIMEOUT`, `NETWORK`, or an
+`HTTP_STATUS` in {408, 425, 429, 500, 502, 503, 504}. Retry exhaustion does not
+relax that whitelist. Its counter, lifecycle, and lost-coverage contribution
+remain. Failure-v1, response/local protocol, indeterminate, non-retryable,
+and other-status faults are permanent. Unresolved required integrity failure,
+exhausted recovery at shutdown, data loss, false classification, locally caused
+PREPARE durability/processing deadline miss, internal/permanent fault, missing
+coverage, or
+evidence inconsistency is Gate-sticky. Cumulative failure counters alone never
+act as current-state proxies.
+
+Compatibility is bound to exact failure-evidence kind and source schema.
+Failure-v1 and classification-v1 controls are permanent historical-only facts
+with `blocks_current_scope=false`; failure-v2 and classification-v2 carry
+current authority. Direct REST responses and unversioned invalidation controls
+record `failure_schema=null` rather than inventing one and use start-v1 versus
+start-v2 as their explicit authority boundary. Fault identity binds evidence
+kind, actual nullable source schema, start schema, and exact Boolean authority;
+none is inferred from `error_type`. Release may bypass extra sibling
+ineligibility only when it is proved solely by non-current historical faults;
+every other current, pending, transition, resync, or nonfault cause still
+blocks, and history is retained.
+
+Current-schema audit HTTP metadata is accepted only for `CLOB_BOOK` and only
+when category, status, retryability, Retry-After, exhaustion, and retry-blocked
+fields form a truthful final public-read failure. `HTTP_STATUS` requires a
+non-2xx status with whitelist-derived retryability; non-status categories may
+carry only no status or a 2xx response observed before transport/body failure.
+Contradictory endpoint or retry evidence is a normalization failure and cannot
+enter recoverable lifecycle or endpoint-reconciliation accounting. The typed
+error name must match the category. Attempt zero is legal only for pre-attempt
+`DEADLINE_EXCEEDED`; attempt exhaustion must occur on the configured final
+attempt; and Retry-After-policy closure requires a parsed delay strictly above
+the configured maximum before that final attempt. Its durable value is bounded
+consistently at `10000000000000000000` nanoseconds across producer, command,
+and parser. A known local effective
+reason always dominates original transport metadata and is classified
+`INTERNAL/PERMANENT`.
+
+### 9.5 Availability-contributor lifecycle
+
+One deterministic causal key represents each unresolved audit divergence,
+public-read fault, transport interruption, reported-top transition, reference
+recovery, resource/writer fault, or target lifecycle. Repeated symptoms update a
+bounded observation count and evidence digest on that contributor; they do not
+create duplicate active entries. Active authority therefore measures unresolved
+causal concurrency, while completed-contributor count, file/artifact inventory
+and bytes are separately bounded cumulative history.
+
+When a causal lifecycle resolves, one immutable completed-contributor record is
+handed independently to bounded durable derived-evidence persistence and removed
+from active authority even if its stable parent interval remains open. Global
+interval duration is the union of time with at least one active contributor.
+At the terminal cutoff, every remaining contributor records explicit open-at-
+shutdown evidence, remains unresolved and Gate-sticky, and cannot restore
+eligibility. Missing/duplicate/orphan contributions, a completed contributor
+still active, union/count/digest/sequence/hash mismatch, or partial evidence
+claimed as complete fails closed for Gate evidence without contaminating raw
+capture.
+
+## 10. Raw-journal seal and recovery failure
+
+Append/data-`fsync` durability and ordered seal/verify publication are separate
+authorities. A receipt already established as `DURABLE` remains true if later
+compression, manifest publication, verification, cleanup, or recovery fails.
+That later failure nevertheless makes the journal unhealthy, stops new
+authoritative admission, preserves every durable active/pending source, and
+prevents clean completion.
+
+Expected typed families are:
+
+- handoff-intent publication or active-to-pending commit failure: rotation
+  infrastructure fault retaining the last exact recoverable state;
+- pending descriptor/count/byte/age or disk exhaustion: bounded resource/
+  backpressure fault;
+- compression, file/directory `fsync`, rename, manifest, verification, or
+  cleanup failure: seal infrastructure fault with exact lifecycle stage;
+- range, chain, hash, scope, provenance, path, or completed-inventory conflict:
+  corruption/recovery ambiguity; and
+- impossible owner transition, unknown result, or out-of-order publication:
+  programming invariant violation.
+
+No family permits dropping or reordering a pending source, revoking a durable
+receipt, silently enlarging a bound, treating an incomplete inventory as
+completed, or retrying ambiguous mutation of authoritative raw evidence.
+Recovery may resume an expected crash window only after exact streaming
+identity validation. Otherwise it fails closed without source mutation.
+
+Prepared handoff intent is not a lifecycle transition. Recovery may complete
+the declared active-to-pending rename only when the self-hashed intent, exact
+active source, absent pending destination, and all identities agree. A pending
+source with its exact intent is revalidated and the directory re-`fsync`ed
+before committed recognition. A pending source without intent is rejected; the
+descriptor is never reconstructed from the pending bytes.
+
+Intent without active or pending source is recovery ambiguity unless exact
+matching sealed bytes and manifest completely reverify against that intent as a
+verified-cleanup crash window. Only that exact case permits durable orphan-
+intent cleanup.
+
+Recovered pending work retains the original age budget. Startup initializes
+age from the intent's validated, nonfuture handoff UTC and thereafter advances
+it with the current process's monotonic clock. Invalid/future wall chronology,
+or age already at or above the hard bound, is typed fail-closed exhaustion;
+restart, persisted cross-process monotonic values, and filesystem timestamps
+cannot renew or redefine the budget.
+
+The handoff UTC is sampled before its same-process monotonic origin. Therefore
+a deschedule between those calls is charged to the live monotonic age and
+cannot be omitted from recovered UTC age after restart.
+
+New writers require the durable self-hashed run/stream source-authority
+sidecar before active bytes exist. Missing or conflicting authority,
+publication temporaries, source/config mismatch, or an unsealed legacy source
+without authority is recovery ambiguity before mutation. Historical unbound
+partials remain forensic-reader input only; a writer does not relabel their
+provenance. Completion v2 binds the exact authority SHA-256, so later sidecar
+removal or replacement cannot downgrade a completed run to legacy semantics.
+
+The detachable seal worker owns only read-only validation and private scratch.
+It can be revoked at the pending-age boundary without later authoritative
+mutation. Sealed rename, manifest publication, and each source/descriptor
+cleanup transition belong to the joined ordered publication owner. Authority
+is checked before and after each finite transaction and before entering the
+next. If an entered syscall returns after expiry, only that transaction's exact
+documented crash window survives and the remainder is prohibited. A syscall
+that never returns cannot be safely preempted in-process; close may remain
+blocked under that native host/filesystem failure, as with append `fsync`, and
+must be handled by host qualification and external monitoring rather than a
+false in-process completion.
+
+The offline exact ingest-ID index is derived verification scratch. A confirmed
+duplicate ID is raw corruption. SQLite creation/page-limit/query/cleanup failure
+is `JournalVerificationResourceError`, a typed verification infrastructure or
+capacity failure: it blocks replay,
+rebuild and Gate acceptance without mutating raw authority or falsely claiming
+that the raw bytes themselves are corrupt. The temporary index is never an
+ADR-0030 operational-state database.
+
+## 11. Error identity
 
 Operational errors carry where relevant:
 
@@ -308,9 +530,30 @@ Operational errors carry where relevant:
 - UTC and monotonic time;
 - bounded non-secret evidence.
 
+Recovery/resynchronization additionally carries one finite reason from
+`AUDIT_MISMATCH_RECOVERY`, `REPORTED_TOP_TRANSITION_FAILURE`,
+`FRESHNESS_EXPIRY`, `REFERENCE_REFRESH`, `TRANSPORT_DISCONNECT`,
+`CANONICAL_STATE_INVALIDATION`, `SCHEMA_PROTOCOL_ERROR`,
+`BACKPRESSURE_RESOURCE`, `TARGET_LIFECYCLE`, or `UNKNOWN`. Known initiating
+evidence is not collapsed into a generic schema/protocol label. A genuine
+unknown remains explicit.
+
+Canonical invalidation evidence maps exhaustively: `DISCONNECT` to
+`TRANSPORT_DISCONNECT`; `BACKPRESSURE_DATA_LOSS` to `BACKPRESSURE_RESOURCE`;
+`STALE_SNAPSHOT` to `FRESHNESS_EXPIRY`; `UNKNOWN_PRECISION` and
+`UNKNOWN_REFERENCE_DATA` to `REFERENCE_REFRESH`;
+`MARKET_RESOLVED_REFERENCE_REFRESH` to `TARGET_LIFECYCLE`;
+`IMPOSSIBLE_STATE` to `CANONICAL_STATE_INVALIDATION`; `SCHEMA_VIOLATION`,
+`INVALID_PRICE`, `INVALID_QUANTITY`, and `PROTOCOL_VIOLATION` to
+`SCHEMA_PROTOCOL_ERROR`; and `REST_AUDIT_MISMATCH` to
+`AUDIT_MISMATCH_RECOVERY`. Reported-top failures retain
+`REPORTED_TOP_TRANSITION_FAILURE` even when their lower-level invalidation is
+protocol or canonical-state related. `UNKNOWN` is reserved for recovery
+evidence that supplies no supported initiating route.
+
 Primary invariant errors and cascading consequences must be distinguishable. Post-run analysis must not count one root failure as many independent causes.
 
-## 11. Health interaction
+## 12. Health interaction
 
 Repeated transient errors may degrade scope according to explicit policy.
 
@@ -323,11 +566,15 @@ availability intervals remain explicit.
 
 Historical mismatch count is never used as a proxy for current unresolved
 state. Fully evidenced authoritative recovery does not erase the observation,
-but it may remove the current blocker under ADR-0054. A local-book defect,
-new-contract unknown, terminal unresolved divergence, failed recovery, or
-evidence inconsistency remains sticky.
+but it may remove the current blocker under ADR-0054/ADR-0055/ADR-0056. The same rule
+applies to a fully evidenced recovered external public-read transient. A local-
+book or internal reconstruction defect, internal indeterminacy, unsupported
+generic unknown, terminal unresolved divergence, locally caused deadline miss,
+failed recovery, or evidence inconsistency remains sticky. Recoverable current
+audit/HTTP reasons are visible but nonsticky at periodic checkpoints; if still
+current at terminal cutoff they are promoted to sticky unresolved reasons.
 
-## 12. Test requirements
+## 13. Test requirements
 
 Fault/adversarial coverage includes:
 
@@ -335,11 +582,40 @@ Fault/adversarial coverage includes:
 - HTTP/WS metric isolation;
 - duplicate/malformed/unsupported payloads;
 - queue and disk faults;
+- pending-seal descriptor, byte and age exhaustion, including queued-plus-
+  in-service accounting and no false completion;
+- compression, sealed-file `fsync`/rename, manifest, verification and cleanup
+  failures with authoritative pending-source preservation;
+- crash recovery at handoff-intent prepare, active-to-pending commit, sealed-
+  publication, manifest-publication, verification and cleanup boundaries,
+  including intent-plus-active completion, pending-without-intent rejection,
+  multiple pending segments and a later active suffix;
+- delayed authoritative rename/source-unlink/descriptor-unlink calls that cross
+  pending expiry, proving the entered transaction is joined and no subsequent
+  namespace transition or false completion occurs;
+- source-authority publication crash windows, active-only source/config
+  laundering rejection, completion-v2 binding, and historical unbound reader-
+  only compatibility;
+- an ordinary seal deliberately held longer than the freshness guard while a
+  later response and PREPARE become durable/processed before their unchanged
+  hard expiry;
 - audit watermark/deadline/epoch/generation ambiguity;
+- response before deadline with PREPARE durability/processing at or after expiry,
+  which remains `FAILED/BOOK_FRESHNESS_EXPIRED`, plus a delayed exact attestation
+  of timely unchanged PREPARE that creates no new decision or freshness;
 - race/retry exhaustion;
 - v1 `UNKNOWN_LEGACY` and deterministic v2 trigger encoding/reconciliation;
 - observed, pending, authoritatively resolved, terminal unresolved,
-  new-contract unknown and local-book-defect divergence states;
+  unsupported generic/new-contract unknown and local-book-defect divergence
+  states;
+- exact observation plus independently proven received-prefix reconstruction
+  and `EXTERNAL_CAUSE_UNATTRIBUTED` attribution;
+- independent-oracle detection of a deliberate reconstruction defect and an
+  indeterminate proof remaining sticky;
+- external 5xx/timeout followed by exact lifecycle recovery, unresolved failure
+  at shutdown, and locally caused PREPARE durability/processing deadline miss;
+- every typed recovery/resynchronization reason and evidence-preserving
+  `UNKNOWN` fallback;
 - resnapshot failure, disconnect and shutdown while divergence is pending;
 - REST resolution followed by one incomplete replacement leg, audit-launch
   suppression, and release only after all full snapshots from one new
@@ -347,20 +623,28 @@ Fault/adversarial coverage includes:
 - a delayed sibling beyond `scanner.maximum_book_age`, plus stale, future and
   cross-epoch replacement sources, being pruned while capture and the interval
   remain pending;
-- an independent post-processing freshness rejection before interval closure;
+- an independent post-processing freshness rejection before mismatch-contributor
+  closure;
 - zero scans from every v2 replacement snapshot, durable release-control
-  processing as the first permitted recovery scan, and interval closure at that
-  control's exact sampled decision wall/monotonic time;
+  processing as the first permitted recovery scan, mismatch-contributor closure
+  at that control's exact sampled decision wall/monotonic time, and global
+  interval closure there only when the full active set becomes empty;
 - self-contained capture-preimage/digest, connection, raw-source and receive-
   chronology binding, plus rejection of missing, malformed, noncanonical,
   capture-mismatched, wrong-connection, future, cross-epoch and stale v2 release
   controls without state mutation;
-- replay-only v1 snapshot auto-release with unchanged terminal hash and no
-  synthesized release control, while new producers remain v2-only;
+- replay-only v1 snapshot auto-release with no synthesized release control,
+  immutable historical raw/control bytes, and an explicitly distinct
+  terminal-v3 replay hash, while new producers remain v2-only;
 - slow canonical return beyond the freshness bound leaving zero scans, capture
   pending and the availability interval open;
 - terminal unresolved treatment for incomplete or unreleased replacement
   capture;
+- bounded replacement attempts and next-retry/hard/run deadlines under one
+  recovery/contributor identity, with typed exhaustion and no indefinite pending;
+- independent contributor closure while a shared interval remains open,
+  separate active/cumulative bounds, and exact interval/contribution
+  count/digest/union/sequence/hash reconciliation;
 - proof that later same-generation equality cannot clear live pending state;
 - health/analytical writer failure;
 - all failed-soak reported-top windows;
