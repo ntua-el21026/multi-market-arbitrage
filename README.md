@@ -1,9 +1,12 @@
-# Multi_Market_Arbitrage
+# Multi Market Arbitrage Research
 
-Multi-venue quantitative arbitrage, market-making, and delta-neutral trading research platform for prediction markets and crypto.
+Read-only market-data correctness and replay infrastructure for quantitative
+execution research. The implemented Phase 1 collector/scanner is Polymarket-only;
+Kalshi, Kraken, multi-venue semantics and trading execution remain later gated
+work, not current production capabilities.
 
-**Initial venues:** Polymarket, Kalshi, Kraken  
-**Architecture:** Python modular monolith  
+**Planned venues:** Polymarket, Kalshi, Kraken
+**Architecture:** Python modular monolith
 **Current project state:** Phase-1 Gate-1 audit-divergence remediation; first six-hour soak remains failed
 
 **Live trading:** Structurally unavailable in Phase 1
@@ -105,8 +108,29 @@ uv run --frozen --all-groups mma scan-report data/analytical
 
 See [`docs/PHASE_1_IMPLEMENTATION.md`](docs/PHASE_1_IMPLEMENTATION.md) for the current pre-soak implementation behavior and [`docs/GATE_1_REMEDIATION_SPEC.md`](docs/GATE_1_REMEDIATION_SPEC.md) for the validation still required.
 
+## Offline validation and evidence
+
+With the declared Python environment synchronized, run the synthetic/local suites:
+
+~~~bash
+uv run --frozen --all-groups pytest -q
+~~~
+
+This suite exercises journal faults, replay, book invariants, reference comparisons,
+freshness and data-validation boundaries. A test pass does not replace the required
+smoke, stability observation, independently authorized six-hour soak or Gate-1
+acceptance. The retained failure and zero-candidate observations remain evidence,
+not profitability estimates. Public observation commands above contact external
+services; they are not prerequisites for an offline code review.
+
+Maintained by Michail-Athanasios Peppas. Source and source-bound evidence include
+AI-assisted development/review records; external data and dependencies retain
+their attribution and terms.
+
 ## Repository policy
 
-The repository is private and proprietary. There is intentionally no open-source license.
+The current repository is private and proprietary; no open-source reuse license
+is granted. A reviewed public source release remains an owner decision, separate
+from acceptance of the research system or authorization for live operation.
 
 Collected market data, credentials, live state, and large research artifacts must not be committed to Git.
