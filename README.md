@@ -152,7 +152,7 @@ acceptance. The retained failure and zero-candidate observations remain evidence
 not profitability estimates. Public observation commands above contact external
 services; they are not prerequisites for an offline code review.
 
-Maintained by **Michail-Athanasios Peppas**.
+Maintained by **Michail Athanasios Peppas**.
 
 ## Data handling
 
