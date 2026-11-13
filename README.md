@@ -86,7 +86,7 @@ Phase-2 research may continue in parallel. Production Kalshi, Kraken, semantic-e
 
 ## Phase 1 development
 
-Clone the private repository with an authorized GitHub account:
+Clone the repository:
 
 ```bash
 git clone https://github.com/ntua-el21026/multi-market-arbitrage.git
@@ -158,8 +158,8 @@ their attribution and terms.
 
 ## Repository policy
 
-The current repository is private and proprietary; no open-source reuse license
-is granted. A reviewed public source release remains an owner decision, separate
-from acceptance of the research system or authorization for live operation.
+The repository is publicly readable and proprietary; no open-source reuse
+license is granted. Source availability does not establish acceptance of the
+research system or authorization for live operation.
 
 Collected market data, credentials, live state, and large research artifacts must not be committed to Git.
