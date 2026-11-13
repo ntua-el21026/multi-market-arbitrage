@@ -152,14 +152,8 @@ acceptance. The retained failure and zero-candidate observations remain evidence
 not profitability estimates. Public observation commands above contact external
 services; they are not prerequisites for an offline code review.
 
-Maintained by Michail-Athanasios Peppas. Source and source-bound evidence include
-AI-assisted development/review records; external data and dependencies retain
-their attribution and terms.
+Maintained by **Michail-Athanasios Peppas**.
 
-## Repository policy
-
-The repository is publicly readable and proprietary; no open-source reuse
-license is granted. Source availability does not establish acceptance of the
-research system or authorization for live operation.
+## Data handling
 
 Collected market data, credentials, live state, and large research artifacts must not be committed to Git.
