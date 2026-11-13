@@ -142,8 +142,6 @@ rewrite the migration-only decision evidence.
 - Extension compatibility is based on ordinary CPython 3.14 wheels; free-threaded
   behavior is not assumed.
 - Exact pins require deliberate recurring maintenance instead of automatic drift.
-- Security audit results remain current-advisory evidence, not a permanent claim that
-  a lock is vulnerability-free.
 - The measured migration retained exact semantic/replay behavior and improved many
   latency series, but it also increased selected serialization p50 values and
   fresh-process peak RSS. Those regressions remain visible rather than being averaged
