@@ -86,6 +86,13 @@ Phase-2 research may continue in parallel. Production Kalshi, Kraken, semantic-e
 
 ## Phase 1 development
 
+Clone the private repository with an authorized GitHub account:
+
+```bash
+git clone https://github.com/ntua-el21026/multi-market-arbitrage.git
+cd multi-market-arbitrage
+```
+
 The reproducible baseline is ordinary-GIL CPython 3.14.7 with `uv==0.12.5`, exact direct dependency pins, and a committed transitive lock:
 
 ```bash
@@ -107,6 +114,28 @@ uv run --frozen --all-groups mma scan-report data/analytical
 ```
 
 See [`docs/PHASE_1_IMPLEMENTATION.md`](docs/PHASE_1_IMPLEMENTATION.md) for the current pre-soak implementation behavior and [`docs/GATE_1_REMEDIATION_SPEC.md`](docs/GATE_1_REMEDIATION_SPEC.md) for the validation still required.
+
+## Source, configuration and data
+
+| Component | Location and responsibility |
+| --- | --- |
+| CLI | [Command parser](src/multi_market_arbitrage/cli/main.py); bounded observation, calibration, replay, validation and reporting |
+| Venue and pipeline | [Polymarket adapter](src/multi_market_arbitrage/venues/polymarket/) and [canonical processing](src/multi_market_arbitrage/pipeline/) |
+| Durable evidence | [Journal](src/multi_market_arbitrage/journal/), [replay](src/multi_market_arbitrage/replay/) and [analytical storage](src/multi_market_arbitrage/storage/) |
+| Research checks | [Complete-set scanner](src/multi_market_arbitrage/scanners/polymarket_complete_set/) and [test suites](tests/) |
+| Runtime policy | [phase1.toml](config/phase1.toml), including storage bounds, freshness, public-read budgets and recorded-order replay |
+
+Run commands from the repository root. Default local outputs are `data/raw`,
+`data/analytical` and `data/health`; captured runs are excluded from Git. A clean
+clone supplies source, specifications and synthetic test fixtures, rather than
+the private six-hour failure journal. An authorized holder must supply that
+unchanged capture and its run identity to reproduce its historical findings.
+
+Replay accepts an optional `--expect-terminal-hash` to compare an independently
+recorded terminal state. Analytical reconstruction requires a fresh output
+directory whose parent exists and which is disjoint from the raw journal.
+Preserve source journals and manifests when sharing a replay; copying only
+derived Parquet files does not reproduce capture ordering or provenance.
 
 ## Offline validation and evidence
 
